@@ -1,0 +1,8 @@
+[alias]
+t = "test --workspace"
+c = "clippy --workspace --all-targets"
+r = "run -p miol-cli --"
+ck = "check --workspace --all-targets"
+
+[build]
+rustdocflags = ["-D", "warnings"]
