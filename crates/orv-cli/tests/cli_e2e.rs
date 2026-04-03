@@ -162,3 +162,33 @@ fn build_server_fixture_emits_native_binary_that_runs() {
 
     let _ = fs::remove_dir_all(&output_dir);
 }
+
+#[test]
+fn dump_pipeline_server_fixture_shows_stage_graph() {
+    let fixture = fixture_path("fixtures/ok/server-basic.orv");
+    let output = run_orv(&["dump", "pipeline", fixture.to_str().expect("utf-8 path")]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("Compile Pipeline"));
+    assert!(stdout.contains("1. Load     OK"));
+    assert!(stdout.contains("2. Lex      OK"));
+    assert!(stdout.contains("3. Parse    OK"));
+    assert!(stdout.contains("4. Analyze  OK"));
+    assert!(stdout.contains("5. Runtime  OK"));
+    assert!(stdout.contains("6. Build    READY"));
+    assert!(stdout.contains("- GET /api/health -> @response json"));
+}
+
+#[test]
+fn dump_pipeline_ui_fixture_marks_runtime_as_skipped() {
+    let fixture = fixture_path("fixtures/ok/counter.orv");
+    let output = run_orv(&["dump", "pipeline", fixture.to_str().expect("utf-8 path")]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("Compile Pipeline"));
+    assert!(stdout.contains("4. Analyze  OK"));
+    assert!(stdout.contains("5. Runtime  SKIPPED"));
+    assert!(stdout.contains("6. Build    SKIPPED"));
+}

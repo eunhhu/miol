@@ -5,7 +5,10 @@ use clap::Parser;
 use orv_analyzer::dump_hir;
 use orv_compiler::{FrontendFailure, load_path};
 use orv_diagnostics::render_diagnostics;
-use orv_runtime::{Request, compile_program, emit_build, execute_request, render_response};
+use orv_runtime::{
+    AdapterKind, Request, RouteAction, compile_program, emit_build, execute_request,
+    render_response,
+};
 
 #[derive(Parser)]
 #[command(name = "orv", version, about = "Integrated Platform Development DSL")]
@@ -71,6 +74,11 @@ enum DumpTarget {
         /// Path to the .orv source file
         file: PathBuf,
     },
+    /// Dump a stage-by-stage compile pipeline view
+    Pipeline {
+        /// Path to the .orv source file
+        file: PathBuf,
+    },
 }
 
 fn main() {
@@ -105,6 +113,9 @@ fn main() {
             }
             DumpTarget::Hir { file } => {
                 run_dump_hir(&file);
+            }
+            DumpTarget::Pipeline { file } => {
+                run_dump_pipeline(&file);
             }
         },
     }
@@ -212,6 +223,86 @@ fn run_dump_hir(path: &PathBuf) {
     println!("{}", dump_hir(&analysis.analysis().hir));
 }
 
+fn run_dump_pipeline(path: &PathBuf) {
+    let loaded = load_or_exit(path);
+    let source_name = loaded.source_name().to_owned();
+    let source_len = loaded.source().len();
+    let line_count = loaded
+        .source_map()
+        .line_index(loaded.file_id())
+        .line_count();
+    let (tokens, diagnostics) = loaded.tokenize();
+    if diagnostics.has_errors() {
+        render_diagnostics(loaded.source_map(), &diagnostics.into_vec());
+        process::exit(1);
+    }
+
+    let token_count = tokens.len();
+    let parsed = match loaded.parse() {
+        Ok(parsed) => parsed,
+        Err(failure) => render_failure_and_exit(failure),
+    };
+    let item_count = parsed.module().items.len();
+    let analysis = match parsed.analyze() {
+        Ok(analysis) => analysis,
+        Err(failure) => render_failure_and_exit(failure),
+    };
+
+    let mut out = String::new();
+    out.push_str("Compile Pipeline\n");
+    out.push_str("================\n");
+    out.push_str("1. Load     OK\n");
+    out.push_str(&format!("   file: {source_name}\n"));
+    out.push_str(&format!("   bytes: {source_len}\n"));
+    out.push_str(&format!("   lines: {line_count}\n"));
+    out.push_str("2. Lex      OK\n");
+    out.push_str(&format!("   tokens: {token_count}\n"));
+    out.push_str("3. Parse    OK\n");
+    out.push_str(&format!("   items: {item_count}\n"));
+    out.push_str("4. Analyze  OK\n");
+    out.push_str(&format!(
+        "   symbols: {}\n",
+        analysis.analysis().symbols.len()
+    ));
+    out.push_str(&format!(
+        "   scopes: {}\n",
+        analysis.analysis().scopes.len()
+    ));
+
+    match compile_program(&analysis.analysis().hir) {
+        Ok(program) => {
+            out.push_str("5. Runtime  OK\n");
+            out.push_str(&format!(
+                "   adapter: {}\n",
+                match program.adapter {
+                    AdapterKind::DirectMatch => "direct-match",
+                }
+            ));
+            out.push_str(&format!("   listen: {}\n", program.server.listen));
+            out.push_str(&format!("   routes: {}\n", program.server.routes.len()));
+            for route in &program.server.routes {
+                out.push_str(&format!(
+                    "   - {} {} -> {}\n",
+                    route.method,
+                    route.path,
+                    describe_route_action(&route.action)
+                ));
+            }
+            out.push_str("6. Build    READY\n");
+            out.push_str("   backend: direct native adapter via rustc -O\n");
+            out.push_str("   outputs: program.json, direct_adapter.rs, orv-app\n");
+        }
+        Err(error) => {
+            out.push_str("5. Runtime  SKIPPED\n");
+            out.push_str(&format!("   reason: {error}\n"));
+            out.push_str("6. Build    SKIPPED\n");
+            out.push_str("   reason: runtime program could not be lowered\n");
+        }
+    }
+
+    print!("{out}");
+}
+
 fn load_or_exit(path: &PathBuf) -> orv_compiler::LoadedUnit {
     match load_path(path) {
         Ok(loaded) => loaded,
@@ -234,4 +325,12 @@ fn render_failure_and_exit(failure: FrontendFailure) -> ! {
     let (source_map, diagnostics) = failure.into_parts();
     render_diagnostics(&source_map, &diagnostics.into_vec());
     process::exit(1);
+}
+
+fn describe_route_action(action: &RouteAction) -> &'static str {
+    match action {
+        RouteAction::JsonResponse { .. } => "@response json",
+        RouteAction::StaticServe { .. } => "@serve static",
+        RouteAction::HtmlServe { .. } => "@serve html",
+    }
 }
