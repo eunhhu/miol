@@ -1,0 +1,8 @@
+pub define CounterPage() -> @html {
+  @body {
+    let sig count: i32 = 0
+    @text "{count}"
+    @button "+" %onClick={count += 1}
+    @button "-" %onClick={count -= 1}
+  }
+}

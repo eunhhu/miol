@@ -1,0 +1,11 @@
+@server {
+  @listen 8080
+
+  @route GET /api/health {
+    return @response 200 { "status": "ok" }
+  }
+
+  @route GET / {
+    @serve ./public
+  }
+}
