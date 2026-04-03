@@ -717,17 +717,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "orv-analyzer"
+version = "0.1.0"
+dependencies = [
+ "orv-diagnostics",
+ "orv-hir",
+ "orv-resolve",
+ "orv-span",
+ "orv-syntax",
+ "pretty_assertions",
+]
+
+[[package]]
 name = "orv-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "orv-analyzer",
+ "orv-compiler",
  "orv-core",
  "orv-diagnostics",
+ "orv-runtime",
  "orv-span",
  "orv-syntax",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "orv-compiler"
+version = "0.1.0"
+dependencies = [
+ "orv-analyzer",
+ "orv-core",
+ "orv-diagnostics",
+ "orv-span",
+ "orv-syntax",
+ "pretty_assertions",
 ]
 
 [[package]]
@@ -753,6 +780,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "orv-hir"
+version = "0.1.0"
+dependencies = [
+ "pretty_assertions",
+]
+
+[[package]]
 name = "orv-macros"
 version = "0.1.0"
 dependencies = [
@@ -771,6 +805,17 @@ dependencies = [
  "orv-span",
  "orv-syntax",
  "pretty_assertions",
+]
+
+[[package]]
+name = "orv-runtime"
+version = "0.1.0"
+dependencies = [
+ "orv-hir",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

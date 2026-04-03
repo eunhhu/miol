@@ -1,0 +1,22 @@
+[package]
+name = "orv-analyzer"
+description = "Semantic analysis and HIR lowering for the orv language"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orv-diagnostics = { workspace = true }
+orv-hir = { workspace = true }
+orv-resolve = { workspace = true }
+orv-span = { workspace = true }
+orv-syntax = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

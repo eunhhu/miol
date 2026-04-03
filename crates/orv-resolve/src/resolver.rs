@@ -443,8 +443,11 @@ impl Resolver {
                 }
             }
             Expr::Node(node_expr) => {
-                for pos in &node_expr.positional {
-                    self.resolve_expr(pos);
+                let node_name = node_expr.name.node().to_string();
+                for (index, pos) in node_expr.positional.iter().enumerate() {
+                    if should_resolve_node_positional(&node_name, index, pos.node()) {
+                        self.resolve_expr(pos);
+                    }
                 }
                 for prop in &node_expr.properties {
                     self.resolve_expr(&prop.node().value);
@@ -475,6 +478,27 @@ impl Resolver {
             | Expr::Error => {}
         }
     }
+}
+
+fn should_resolve_node_positional(node_name: &str, index: usize, expr: &Expr) -> bool {
+    match (node_name, index, expr) {
+        ("route", 0, Expr::Ident(method))
+            if matches!(
+                method.as_str(),
+                "*" | "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+            ) =>
+        {
+            false
+        }
+        ("route", 1, Expr::Ident(path)) if is_path_like_atom(path) || path == "*" => false,
+        ("serve", _, Expr::Ident(path)) if is_path_like_atom(path) => false,
+        ("env", 0, Expr::Ident(_)) | ("env", 0, Expr::StringLiteral(_)) => false,
+        _ => true,
+    }
+}
+
+fn is_path_like_atom(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with("./") || value.starts_with("../")
 }
 
 /// Resolves all names in a parsed module.

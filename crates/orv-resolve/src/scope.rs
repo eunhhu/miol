@@ -176,6 +176,16 @@ impl ScopeMap {
         self.scopes.len()
     }
 
+    /// Returns the scope id at the given arena index, if it exists.
+    pub fn scope_id_at(&self, index: usize) -> Option<ScopeId> {
+        if index < self.scopes.len() {
+            let raw = u32::try_from(index).expect("too many scopes");
+            Some(ScopeId::new(raw))
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` if there are no scopes.
     pub const fn is_empty(&self) -> bool {
         self.scopes.is_empty()

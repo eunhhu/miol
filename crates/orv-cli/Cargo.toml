@@ -17,6 +17,9 @@ orv-core = { workspace = true }
 orv-span = { workspace = true }
 orv-diagnostics = { workspace = true }
 orv-syntax = { workspace = true }
+orv-analyzer = { workspace = true }
+orv-compiler = { workspace = true }
+orv-runtime = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
-use orv_core::source::SourceLoader;
+use orv_analyzer::dump_hir;
+use orv_compiler::{FrontendFailure, load_path};
 use orv_diagnostics::render_diagnostics;
+use orv_runtime::{Request, compile_program, emit_build, execute_request, render_response};
 
 #[derive(Parser)]
 #[command(name = "orv", version, about = "Integrated Platform Development DSL")]
@@ -20,6 +22,25 @@ enum Commands {
     Check {
         /// Path to the .orv source file
         file: PathBuf,
+    },
+    /// Execute a request through the reference runtime
+    Run {
+        /// Path to the .orv source file
+        file: PathBuf,
+        /// HTTP method to execute
+        #[arg(long, default_value = "GET")]
+        method: String,
+        /// Request path to execute
+        #[arg(long, default_value = "/")]
+        path: String,
+    },
+    /// Build a direct adapter binary and manifest
+    Build {
+        /// Path to the .orv source file
+        file: PathBuf,
+        /// Output directory for build artifacts
+        #[arg(long, default_value = "dist")]
+        output_dir: PathBuf,
     },
     /// Dump internal representations
     Dump {
@@ -45,6 +66,11 @@ enum DumpTarget {
         /// Path to the .orv source file
         file: PathBuf,
     },
+    /// Dump lowered HIR for a source file
+    Hir {
+        /// Path to the .orv source file
+        file: PathBuf,
+    },
 }
 
 fn main() {
@@ -61,6 +87,12 @@ fn main() {
         Some(Commands::Check { file }) => {
             run_check(&file);
         }
+        Some(Commands::Run { file, method, path }) => {
+            run_runtime(&file, &method, &path);
+        }
+        Some(Commands::Build { file, output_dir }) => {
+            run_build(&file, &output_dir);
+        }
         Some(Commands::Dump { target }) => match target {
             DumpTarget::Source { file } => {
                 run_dump_source(&file);
@@ -71,106 +103,135 @@ fn main() {
             DumpTarget::Ast { file } => {
                 run_dump_ast(&file);
             }
+            DumpTarget::Hir { file } => {
+                run_dump_hir(&file);
+            }
         },
     }
 }
 
-fn load_source(path: &PathBuf) -> (SourceLoader, Option<orv_span::FileId>) {
-    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-    let root = absolute.parent().unwrap_or_else(|| absolute.as_ref());
-    let display_name = path.display().to_string();
-
-    let mut loader = SourceLoader::new(root);
-    let file_id = loader.load_absolute(&absolute, &display_name);
-    (loader, file_id)
+fn run_check(path: &PathBuf) {
+    let analysis = analyze_or_exit(path);
+    let name = analysis.source_map().name(analysis.file_id());
+    println!(
+        "check: {name} \u{2014} {} items, {} symbols, {} scopes, ok",
+        analysis.module().items.len(),
+        analysis.analysis().symbols.len(),
+        analysis.analysis().scopes.len()
+    );
 }
 
-fn run_check(path: &PathBuf) {
-    let (loader, file_id) = load_source(path);
+fn run_runtime(path: &PathBuf, method: &str, request_path: &str) {
+    let analysis = analyze_or_exit(path);
+    let program = match compile_program(&analysis.analysis().hir) {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("runtime compile error: {error}");
+            process::exit(1);
+        }
+    };
+    let response = match execute_request(
+        &program,
+        &Request {
+            method,
+            path: request_path,
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("runtime execution error: {error}");
+            process::exit(1);
+        }
+    };
+    print!("{}", render_response(&response));
+}
 
-    if let Some(id) = file_id {
-        let source_map = loader.source_map();
-        let name = source_map.name(id);
-        let source = source_map.source(id);
-        let line_count = source_map.line_index(id).line_count();
-        let byte_count = source.len();
-        println!("check: {name} \u{2014} {line_count} lines, {byte_count} bytes, ok");
-    } else {
-        let (source_map, diagnostics) = loader.into_parts();
-        render_diagnostics(&source_map, &diagnostics.into_vec());
-        process::exit(1);
-    }
+fn run_build(path: &PathBuf, output_dir: &PathBuf) {
+    let analysis = analyze_or_exit(path);
+    let program = match compile_program(&analysis.analysis().hir) {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("runtime compile error: {error}");
+            process::exit(1);
+        }
+    };
+    let artifacts = match emit_build(&program, output_dir) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            eprintln!("build error: {error}");
+            process::exit(1);
+        }
+    };
+    println!("build: {}", path.display());
+    println!("adapter: direct-match");
+    println!("manifest: {}", artifacts.manifest_path.display());
+    println!("source: {}", artifacts.adapter_source_path.display());
+    println!("binary: {}", artifacts.binary_path.display());
 }
 
 fn run_dump_tokens(path: &PathBuf) {
-    let (loader, file_id) = load_source(path);
+    let loaded = load_or_exit(path);
+    let source_map = loaded.source_map();
+    let (tokens, diags) = loaded.tokenize();
 
-    if let Some(id) = file_id {
-        let source_map = loader.source_map();
-        let source = source_map.source(id);
-        let lexer = orv_syntax::lexer::Lexer::new(source, id);
-        let (tokens, diags) = lexer.tokenize();
-
-        if diags.has_errors() {
-            let diag_vec: Vec<_> = diags.into_vec();
-            render_diagnostics(source_map, &diag_vec);
-        }
-
-        for token in &tokens {
-            let span = token.span();
-            let (_, line, col) = source_map.resolve(span);
-            println!("{:>4}:{:<3} {:?}", line + 1, col, token.node());
-        }
-    } else {
-        let (source_map, diagnostics) = loader.into_parts();
-        render_diagnostics(&source_map, &diagnostics.into_vec());
+    if diags.has_errors() {
+        render_diagnostics(source_map, &diags.into_vec());
         process::exit(1);
+    }
+
+    for token in &tokens {
+        let span = token.span();
+        let (_, line, col) = source_map.resolve(span);
+        println!("{:>4}:{:<3} {:?}", line + 1, col, token.node());
     }
 }
 
 fn run_dump_ast(path: &PathBuf) {
-    let (loader, file_id) = load_source(path);
-
-    if let Some(id) = file_id {
-        let source_map = loader.source_map();
-        let source = source_map.source(id);
-        let lexer = orv_syntax::lexer::Lexer::new(source, id);
-        let (tokens, lex_diags) = lexer.tokenize();
-
-        if lex_diags.has_errors() {
-            render_diagnostics(source_map, &lex_diags.into_vec());
-        }
-
-        let (module, parse_diags) = orv_syntax::parser::parse(tokens);
-
-        if parse_diags.has_errors() {
-            render_diagnostics(source_map, &parse_diags.into_vec());
-        }
-
-        println!("{}", orv_syntax::parser::dump_ast(&module));
-    } else {
-        let (source_map, diagnostics) = loader.into_parts();
-        render_diagnostics(&source_map, &diagnostics.into_vec());
-        process::exit(1);
-    }
+    let parsed = match load_or_exit(path).parse() {
+        Ok(parsed) => parsed,
+        Err(failure) => render_failure_and_exit(failure),
+    };
+    println!("{}", parsed.dump_ast());
 }
 
 fn run_dump_source(path: &PathBuf) {
-    let (loader, file_id) = load_source(path);
+    let loaded = load_or_exit(path);
+    let source_map = loaded.source_map();
+    let name = source_map.name(loaded.file_id());
+    let source = source_map.source(loaded.file_id());
+    let line_count = source_map.line_index(loaded.file_id()).line_count();
+    let byte_count = source.len();
+    println!("file: {name}");
+    println!("file_id: {}", loaded.file_id().raw());
+    println!("bytes: {byte_count}");
+    println!("lines: {line_count}");
+}
 
-    if let Some(id) = file_id {
-        let source_map = loader.source_map();
-        let name = source_map.name(id);
-        let source = source_map.source(id);
-        let line_count = source_map.line_index(id).line_count();
-        let byte_count = source.len();
-        println!("file: {name}");
-        println!("file_id: {}", id.raw());
-        println!("bytes: {byte_count}");
-        println!("lines: {line_count}");
-    } else {
-        let (source_map, diagnostics) = loader.into_parts();
-        render_diagnostics(&source_map, &diagnostics.into_vec());
-        process::exit(1);
+fn run_dump_hir(path: &PathBuf) {
+    let analysis = analyze_or_exit(path);
+    println!("{}", dump_hir(&analysis.analysis().hir));
+}
+
+fn load_or_exit(path: &PathBuf) -> orv_compiler::LoadedUnit {
+    match load_path(path) {
+        Ok(loaded) => loaded,
+        Err(failure) => render_failure_and_exit(failure),
     }
+}
+
+fn analyze_or_exit(path: &PathBuf) -> orv_compiler::AnalyzedUnit {
+    let parsed = match load_or_exit(path).parse() {
+        Ok(parsed) => parsed,
+        Err(failure) => render_failure_and_exit(failure),
+    };
+    match parsed.analyze() {
+        Ok(analysis) => analysis,
+        Err(failure) => render_failure_and_exit(failure),
+    }
+}
+
+fn render_failure_and_exit(failure: FrontendFailure) -> ! {
+    let (source_map, diagnostics) = failure.into_parts();
+    render_diagnostics(&source_map, &diagnostics.into_vec());
+    process::exit(1);
 }
