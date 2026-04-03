@@ -39,10 +39,61 @@ impl<'src> Lexer<'src> {
     /// plus the accumulated diagnostics.
     pub fn tokenize(mut self) -> (Vec<Spanned<TokenKind>>, DiagnosticBag) {
         let mut tokens = Vec::new();
+        // Track nested string interpolation depth so that `}` inside an
+        // interpolation resumes string scanning instead of producing `RBrace`.
+        let mut interp_depth: u32 = 0;
+        let mut brace_depth_stack: Vec<u32> = Vec::new();
         loop {
             let tok = self.next_token();
             let is_eof = *tok.node() == TokenKind::Eof;
-            tokens.push(tok);
+
+            match tok.node() {
+                TokenKind::StringInterpStart(_) => {
+                    // Entering an interpolation hole — push the current brace
+                    // nesting depth so we know when the matching `}` closes the
+                    // interpolation rather than a block.
+                    brace_depth_stack.push(interp_depth);
+                    interp_depth = 0;
+                    tokens.push(tok);
+                }
+                TokenKind::LBrace if !brace_depth_stack.is_empty() => {
+                    interp_depth += 1;
+                    tokens.push(tok);
+                }
+                TokenKind::RBrace if !brace_depth_stack.is_empty() && interp_depth == 0 => {
+                    // This `}` closes the interpolation hole — resume string
+                    // scanning instead of emitting RBrace.
+                    let cont = self.continue_string();
+                    match cont.node() {
+                        TokenKind::StringInterpMiddle(_) => {
+                            // Another `{` found — stay in interpolation mode.
+                            // Push the old depth back then start a new level.
+                            let old = brace_depth_stack.pop().unwrap_or(0);
+                            brace_depth_stack.push(old);
+                            interp_depth = 0;
+                            tokens.push(cont);
+                        }
+                        TokenKind::StringInterpEnd(_) => {
+                            // String closed — restore the outer brace depth.
+                            interp_depth = brace_depth_stack.pop().unwrap_or(0);
+                            tokens.push(cont);
+                        }
+                        _ => {
+                            // Error token from unterminated string.
+                            interp_depth = brace_depth_stack.pop().unwrap_or(0);
+                            tokens.push(cont);
+                        }
+                    }
+                }
+                TokenKind::RBrace if !brace_depth_stack.is_empty() => {
+                    interp_depth -= 1;
+                    tokens.push(tok);
+                }
+                _ => {
+                    tokens.push(tok);
+                }
+            }
+
             if is_eof {
                 break;
             }
