@@ -19,7 +19,7 @@ mod tests {
 
     #[test]
     fn test_orv_macro() {
-        let _result = orv! {
+        orv! {
             hello world
         };
     }

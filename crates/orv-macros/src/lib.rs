@@ -15,7 +15,6 @@ pub fn orv(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         {
             // TODO: implement DSL expansion
-            ()
         }
     };
 

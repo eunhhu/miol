@@ -196,10 +196,7 @@ mod tests {
         let file = source_map.add("test.orv", "let x = @badnode\nlet y = 2");
 
         let diag = Diagnostic::error("unknown node `@badnode`")
-            .with_label(Label::primary(
-                Span::new(file, 8, 16),
-                "not a valid node",
-            ))
+            .with_label(Label::primary(Span::new(file, 8, 16), "not a valid node"))
             .with_note("valid nodes include @div, @text, @button");
 
         let output = render_diagnostics_to_string(&source_map, &[diag]);
@@ -213,10 +210,7 @@ mod tests {
             output.contains("not a valid node"),
             "should contain the label text"
         );
-        assert!(
-            output.contains("test.orv"),
-            "should contain the filename"
-        );
+        assert!(output.contains("test.orv"), "should contain the filename");
         assert!(
             output.contains("valid nodes include @div, @text, @button"),
             "should contain the note"
@@ -229,10 +223,7 @@ mod tests {
 
         let mut source_map = SourceMap::default();
         let main_file = source_map.add("main.orv", "import components.Missing");
-        let comp_file = source_map.add(
-            "components.orv",
-            "pub define Button() -> @button \"ok\"",
-        );
+        let comp_file = source_map.add("components.orv", "pub define Button() -> @button \"ok\"");
 
         let diag = Diagnostic::error("unresolved import `Missing`")
             .with_label(Label::primary(

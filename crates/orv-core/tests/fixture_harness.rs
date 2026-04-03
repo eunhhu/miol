@@ -12,7 +12,12 @@ use std::path::PathBuf;
 
 fn fixtures_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir.parent().unwrap().parent().unwrap().join("fixtures")
+    manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fixtures")
 }
 
 fn orv_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
