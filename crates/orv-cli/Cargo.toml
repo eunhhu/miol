@@ -16,6 +16,7 @@ path = "src/main.rs"
 orv-core = { workspace = true }
 orv-span = { workspace = true }
 orv-diagnostics = { workspace = true }
+orv-syntax = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

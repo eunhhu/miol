@@ -35,6 +35,11 @@ enum DumpTarget {
         /// Path to the .orv source file
         file: PathBuf,
     },
+    /// Dump token stream for a source file
+    Tokens {
+        /// Path to the .orv source file
+        file: PathBuf,
+    },
 }
 
 fn main() {
@@ -54,6 +59,9 @@ fn main() {
         Some(Commands::Dump { target }) => match target {
             DumpTarget::Source { file } => {
                 run_dump_source(&file);
+            }
+            DumpTarget::Tokens { file } => {
+                run_dump_tokens(&file);
             }
         },
     }
@@ -79,6 +87,32 @@ fn run_check(path: &PathBuf) {
         let line_count = source_map.line_index(id).line_count();
         let byte_count = source.len();
         println!("check: {name} \u{2014} {line_count} lines, {byte_count} bytes, ok");
+    } else {
+        let (source_map, diagnostics) = loader.into_parts();
+        render_diagnostics(&source_map, &diagnostics.into_vec());
+        process::exit(1);
+    }
+}
+
+fn run_dump_tokens(path: &PathBuf) {
+    let (loader, file_id) = load_source(path);
+
+    if let Some(id) = file_id {
+        let source_map = loader.source_map();
+        let source = source_map.source(id);
+        let lexer = orv_syntax::lexer::Lexer::new(source, id);
+        let (tokens, diags) = lexer.tokenize();
+
+        if diags.has_errors() {
+            let diag_vec: Vec<_> = diags.into_vec();
+            render_diagnostics(source_map, &diag_vec);
+        }
+
+        for token in &tokens {
+            let span = token.span();
+            let (_, line, col) = source_map.resolve(span);
+            println!("{:>4}:{:<3} {:?}", line + 1, col, token.node());
+        }
     } else {
         let (source_map, diagnostics) = loader.into_parts();
         render_diagnostics(&source_map, &diagnostics.into_vec());
