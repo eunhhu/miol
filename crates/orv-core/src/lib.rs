@@ -1,8 +1,10 @@
+pub mod source;
+
 pub use orv_diagnostics as diagnostics;
 pub use orv_macros::orv;
 pub use orv_span as span;
 
-pub fn version() -> &'static str {
+pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
