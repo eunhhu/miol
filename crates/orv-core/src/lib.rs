@@ -1,4 +1,6 @@
+pub use orv_diagnostics as diagnostics;
 pub use orv_macros::orv;
+pub use orv_span as span;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -18,5 +20,18 @@ mod tests {
         let _result = orv! {
             hello world
         };
+    }
+
+    #[test]
+    fn test_span_reexport() {
+        let id = span::FileId::new(0);
+        let s = span::Span::new(id, 0, 5);
+        assert_eq!(s.len(), 5);
+    }
+
+    #[test]
+    fn test_diagnostics_reexport() {
+        let diag = diagnostics::Diagnostic::error("test");
+        assert!(diag.is_error());
     }
 }
