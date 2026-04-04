@@ -1667,12 +1667,24 @@ impl Parser {
                             path_str.push_str(&s);
                             self.pos += 1;
                         }
+                        TokenKind::IntLiteral(value) => {
+                            path_str.push_str(&value.to_string());
+                            self.pos += 1;
+                        }
                         TokenKind::Slash => {
                             path_str.push('/');
                             self.pos += 1;
                         }
                         TokenKind::Dot => {
                             path_str.push('.');
+                            self.pos += 1;
+                        }
+                        TokenKind::Colon => {
+                            path_str.push(':');
+                            self.pos += 1;
+                        }
+                        TokenKind::Minus => {
+                            path_str.push('-');
                             self.pos += 1;
                         }
                         _ => break,
@@ -2671,6 +2683,29 @@ mod tests {
                 other => panic!("expected map literal, got {other:?}"),
             },
             other => panic!("expected Binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_route_path_with_param_segment() {
+        let (module, diags) = parse_source("@route GET /users/:id {\n  @serve ./public\n}");
+        assert!(
+            !diags.has_errors(),
+            "errors: {:?}",
+            diags.iter().collect::<Vec<_>>()
+        );
+        match module.items[0].node() {
+            Item::Stmt(Stmt::Expr(expr)) => match expr.node() {
+                Expr::Node(node) => {
+                    assert_eq!(node.name.node().to_string(), "route");
+                    assert_eq!(node.positional.len(), 2);
+                    assert!(
+                        matches!(node.positional[1].node(), Expr::Ident(path) if path == "/users/:id")
+                    );
+                }
+                other => panic!("expected route node, got {other:?}"),
+            },
+            other => panic!("expected route statement, got {other:?}"),
         }
     }
 

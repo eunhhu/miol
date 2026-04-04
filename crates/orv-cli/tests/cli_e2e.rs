@@ -216,6 +216,66 @@ fn check_when_non_exhaustive_enum_reports_error() {
 }
 
 #[test]
+fn check_route_fetch_program_succeeds() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-fetch-ok-{unique}.orv"));
+    fs::write(
+        &path,
+        "@server {\n  let getUsers = @route GET /api/users {\n    let users = [\"kim\"]\n    return @response 200 { users: users }\n  }\n\n  @route GET / {\n    let page = @html {\n      @body {\n        let sig data = await getUsers.fetch()\n        data.users.len()\n      }\n    }\n    @serve page\n  }\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn check_route_fetch_missing_param_reports_error() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-fetch-param-err-{unique}.orv"));
+    fs::write(
+        &path,
+        "@server {\n  let getUser = @route GET /api/users/:id {\n    return @response 200 { user: \"kim\" }\n  }\n\n  @route GET / {\n    let page = @html {\n      @body {\n        await getUser.fetch()\n      }\n    }\n    @serve page\n  }\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("requires `param={...}`"));
+}
+
+#[test]
+fn check_fetch_on_non_route_symbol_reports_error() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-fetch-non-route-err-{unique}.orv"));
+    fs::write(
+        &path,
+        "function bad() -> {\n  let value = 1\n  value.fetch()\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("`.fetch()` is only valid on route references"));
+}
+
+#[test]
 fn check_server_fixture_succeeds() {
     let fixture = fixture_path("fixtures/ok/server-basic.orv");
     let output = run_orv(&["check", fixture.to_str().expect("utf-8 path")]);

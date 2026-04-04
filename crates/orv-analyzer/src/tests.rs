@@ -376,3 +376,76 @@ fn when_variant_payload_arity_is_checked() {
         "unexpected diagnostics: {messages:?}"
     );
 }
+
+#[test]
+fn route_fetch_response_shape_is_available_in_same_scope() {
+    let (_, diagnostics) = analyze_source(
+        "@server {\n  let getUsers = @route GET /api/users {\n    let users = [\"kim\"]\n    return @response 200 { users: users }\n  }\n\n  @route GET / {\n    let page = @html {\n      @body {\n        let sig data = await getUsers.fetch()\n        data.users.len()\n      }\n    }\n    @serve page\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.iter().any(|message| {
+            message.contains("type mismatch")
+                || message.contains("unknown field")
+                || message.contains("`.fetch()`")
+        }),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn route_fetch_requires_path_params() {
+    let (_, diagnostics) = analyze_source(
+        "@server {\n  let getUser = @route GET /api/users/:id {\n    return @response 200 { user: \"kim\" }\n  }\n\n  @route GET / {\n    let page = @html {\n      @body {\n        await getUser.fetch()\n      }\n    }\n    @serve page\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.contains("requires `param={...}`") }),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn route_fetch_rejects_body_on_get_routes() {
+    let (_, diagnostics) = analyze_source(
+        "@server {\n  let getUser = @route GET /api/users/:id {\n    return @response 200 { user: \"kim\" }\n  }\n\n  @route GET / {\n    let page = @html {\n      @body {\n        await getUser.fetch(param={ id: \"42\" }, body={ force: \"true\" })\n      }\n    }\n    @serve page\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("does not accept a request body")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn fetch_on_non_route_symbol_is_rejected() {
+    let (_, diagnostics) =
+        analyze_source("function bad() -> {\n  let value = 1\n  value.fetch()\n}\n");
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`.fetch()` is only valid on route references")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}

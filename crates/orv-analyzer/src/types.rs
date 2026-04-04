@@ -26,6 +26,7 @@ enum Ty {
     Named(String),
     Struct(String),
     Enum(String),
+    Route(RouteSig),
     Nullable(Box<Ty>),
     Vec(Box<Ty>),
     HashMap(Box<Ty>, Box<Ty>),
@@ -47,6 +48,7 @@ impl Ty {
             | Self::Named(name)
             | Self::Struct(name)
             | Self::Enum(name) => name.clone(),
+            Self::Route(route) => format!("route {} {}", route.method, route.path),
             Self::Nullable(inner) => format!("{}?", inner.display()),
             Self::Vec(inner) => format!("Vec<{}>", inner.display()),
             Self::HashMap(key, value) => {
@@ -94,6 +96,14 @@ struct FunctionSig {
 #[derive(Debug, Clone)]
 struct StructSpec {
     fields: BTreeMap<String, Ty>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteSig {
+    method: String,
+    path: String,
+    path_params: Vec<String>,
+    response: Box<Ty>,
 }
 
 #[derive(Debug, Clone)]
@@ -646,6 +656,9 @@ impl<'a> TypeChecker<'a> {
 
         if let Expr::Field { object, field } = callee.node() {
             let object_ty = self.infer_expr(object, None);
+            if field.node() == "fetch" {
+                return self.infer_route_fetch_call(expr, &object_ty, args);
+            }
             if field.node() == "len" && args.is_empty() {
                 if matches!(
                     object_ty,
@@ -809,6 +822,9 @@ impl<'a> TypeChecker<'a> {
             }
             return expected.cloned().unwrap_or(Ty::String);
         }
+        if name == "route" {
+            return self.infer_route_node(node, span);
+        }
 
         for positional in &node.positional {
             let _ = self.infer_expr(positional, None);
@@ -836,6 +852,105 @@ impl<'a> TypeChecker<'a> {
         }
 
         Ty::Node(name)
+    }
+
+    fn infer_route_node(&mut self, node: &NodeExpr, span: orv_span::Span) -> Ty {
+        let Some((method, path)) = endpoint_route_parts(node) else {
+            for positional in &node.positional {
+                let _ = self.infer_expr(positional, None);
+            }
+            if let Some(body) = &node.body {
+                let _ = self.infer_expr(body, None);
+            }
+            return Ty::Node("route".to_owned());
+        };
+
+        let mut response_ty = Ty::Unknown;
+        if let Some(Expr::Block(stmts)) = node.body.as_deref().map(Spanned::node) {
+            self.push_scope();
+            for stmt in stmts {
+                if let Some(found) = self.route_response_type_from_stmt(stmt) {
+                    response_ty = merge_route_response_types(&response_ty, &found);
+                }
+                let _ = self.check_stmt(stmt.node(), None);
+            }
+            self.pop_scope();
+        } else if let Some(body) = &node.body {
+            let _ = self.infer_expr(body, None);
+            self.emit_type_error(span, "@route body must be a block");
+        }
+
+        Ty::Route(RouteSig {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            path_params: path_params(path),
+            response: Box::new(response_ty),
+        })
+    }
+
+    fn route_response_type_from_stmt(&mut self, stmt: &Spanned<Stmt>) -> Option<Ty> {
+        match stmt.node() {
+            Stmt::Return(Some(expr)) | Stmt::Expr(expr) => self.route_response_type_from_expr(expr),
+            Stmt::If(if_stmt) => {
+                let then_ty = self.route_response_type_from_expr(&if_stmt.then_body);
+                let else_ty = if_stmt
+                    .else_body
+                    .as_ref()
+                    .and_then(|body| self.route_response_type_from_expr(body));
+                match (then_ty, else_ty) {
+                    (Some(left), Some(right)) => Some(merge_route_response_types(&left, &right)),
+                    (Some(left), None) => Some(left),
+                    (None, Some(right)) => Some(right),
+                    (None, None) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn route_response_type_from_expr(&mut self, expr: &Spanned<Expr>) -> Option<Ty> {
+        match expr.node() {
+            Expr::Node(node) if node.name.node().to_string() == "response" => {
+                Some(match node.body.as_deref() {
+                    Some(body) => self.infer_expr(body, None),
+                    None => Ty::Void,
+                })
+            }
+            Expr::Block(stmts) => {
+                let mut found = None;
+                self.push_scope();
+                for stmt in stmts {
+                    if let Some(ty) = self.route_response_type_from_stmt(stmt) {
+                        found = Some(match found {
+                            Some(existing) => merge_route_response_types(&existing, &ty),
+                            None => ty,
+                        });
+                    }
+                    let _ = self.check_stmt(stmt.node(), None);
+                }
+                self.pop_scope();
+                found
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_route_fetch_call(
+        &mut self,
+        expr: &Spanned<Expr>,
+        object_ty: &Ty,
+        args: &[Spanned<orv_syntax::ast::CallArg>],
+    ) -> Ty {
+        let Ty::Route(route) = object_ty else {
+            for arg in args {
+                let _ = self.infer_expr(&arg.node().value, None);
+            }
+            self.emit_type_error(expr.span(), "`.fetch()` is only valid on route references");
+            return Ty::Error;
+        };
+
+        self.check_route_fetch_arguments(expr, route, args);
+        route.response.as_ref().clone()
     }
 
     fn infer_when(
@@ -896,6 +1011,10 @@ impl<'a> TypeChecker<'a> {
 
     fn field_type(&mut self, span: orv_span::Span, object_ty: &Ty, field: &str) -> Ty {
         match object_ty {
+            Ty::Route(route) if field == "fetch" => Ty::Function {
+                params: Vec::new(),
+                ret: route.response.clone(),
+            },
             Ty::Struct(name) => self
                 .registry
                 .struct_spec(name)
@@ -1181,6 +1300,150 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn check_route_fetch_arguments(
+        &mut self,
+        expr: &Spanned<Expr>,
+        route: &RouteSig,
+        args: &[Spanned<orv_syntax::ast::CallArg>],
+    ) {
+        let mut seen = HashSet::new();
+        let mut provided_param = false;
+
+        for arg in args {
+            let Some(name) = &arg.node().name else {
+                let _ = self.infer_expr(&arg.node().value, None);
+                self.emit_type_error(
+                    arg.span(),
+                    "route `.fetch()` currently requires named arguments only",
+                );
+                continue;
+            };
+
+            let arg_name = name.node().as_str();
+            if !seen.insert(arg_name.to_owned()) {
+                self.emit_type_error(
+                    arg.span(),
+                    format!("route `.fetch()` argument `{arg_name}` is passed more than once"),
+                );
+                let _ = self.infer_expr(&arg.node().value, None);
+                continue;
+            }
+
+            match arg_name {
+                "param" => {
+                    provided_param = true;
+                    let actual = self.infer_expr(&arg.node().value, None);
+                    self.expect_string_object_shape(
+                        arg.node().value.span(),
+                        &actual,
+                        &route.path_params,
+                        "route param object",
+                        true,
+                    );
+                }
+                "query" | "header" => {
+                    let actual = self.infer_expr(&arg.node().value, None);
+                    self.expect_string_map_like(
+                        arg.node().value.span(),
+                        &actual,
+                        format!("route `{arg_name}` object"),
+                    );
+                }
+                "body" => {
+                    let actual = self.infer_expr(&arg.node().value, None);
+                    let method = route.method.as_str();
+                    if !method_allows_body(method) {
+                        self.emit_type_error(
+                            arg.span(),
+                            format!("route `{}` does not accept a request body", route.method),
+                        );
+                    }
+                    if !matches!(
+                        actual,
+                        Ty::Object(_) | Ty::HashMap(_, _) | Ty::Unknown | Ty::Error
+                    ) {
+                        self.emit_type_error(
+                            arg.node().value.span(),
+                            "route request bodies must be object-like values",
+                        );
+                    }
+                }
+                other => {
+                    let _ = self.infer_expr(&arg.node().value, None);
+                    self.emit_type_error(
+                        arg.span(),
+                        format!("route `.fetch()` has no argument named `{other}`"),
+                    );
+                }
+            }
+        }
+
+        if !route.path_params.is_empty() && !provided_param {
+            self.emit_type_error(
+                expr.span(),
+                format!(
+                    "route `.fetch()` for `{}` requires `param={{...}}`",
+                    route.path
+                ),
+            );
+        }
+        if route.path_params.is_empty() && provided_param {
+            self.emit_type_error(
+                expr.span(),
+                format!("route `{}` has no path parameters", route.path),
+            );
+        }
+    }
+
+    fn expect_string_object_shape(
+        &mut self,
+        span: orv_span::Span,
+        actual: &Ty,
+        required_keys: &[String],
+        label: &str,
+        exact: bool,
+    ) {
+        match actual {
+            Ty::Object(fields) => {
+                for key in required_keys {
+                    let Some(value_ty) = fields.get(key) else {
+                        self.emit_type_error(span, format!("{label} is missing `{key}`"));
+                        continue;
+                    };
+                    self.expect_assignable(span, &Ty::String, value_ty);
+                }
+
+                if exact {
+                    for key in fields.keys() {
+                        if !required_keys.contains(key) {
+                            self.emit_type_error(span, format!("{label} has extra key `{key}`"));
+                        }
+                    }
+                }
+            }
+            Ty::Unknown | Ty::Error => {}
+            _ => {
+                self.emit_type_error(span, format!("{label} must be an object literal"));
+            }
+        }
+    }
+
+    fn expect_string_map_like(&mut self, span: orv_span::Span, actual: &Ty, label: String) {
+        match actual {
+            Ty::Object(fields) => {
+                for value_ty in fields.values() {
+                    self.expect_assignable(span, &Ty::String, value_ty);
+                }
+            }
+            Ty::HashMap(key, value) => {
+                self.expect_assignable(span, &Ty::String, key);
+                self.expect_assignable(span, &Ty::String, value);
+            }
+            Ty::Unknown | Ty::Error => {}
+            _ => self.emit_type_error(span, format!("{label} must be an object or HashMap")),
+        }
+    }
+
     fn condition_narrowings(&self, expr: &Spanned<Expr>) -> Vec<Narrowing> {
         match expr.node() {
             Expr::Binary { left, op, right }
@@ -1264,6 +1527,7 @@ fn is_assignable(expected: &Ty, actual: &Ty) -> bool {
         | (Ty::Struct(a), Ty::Struct(b))
         | (Ty::Enum(a), Ty::Enum(b))
         | (Ty::Node(a), Ty::Node(b)) => a == b,
+        (Ty::Route(a), Ty::Route(b)) => a == b,
         (Ty::Nullable(inner), Ty::Void) => !matches!(**inner, Ty::Void),
         (Ty::Nullable(inner), other) => is_assignable(inner, other),
         (Ty::Vec(a), Ty::Vec(b)) => is_assignable(a, b),
@@ -1320,4 +1584,50 @@ fn is_int_type(name: &str) -> bool {
 
 fn is_float_type(name: &str) -> bool {
     matches!(name, "f32" | "f64")
+}
+
+fn endpoint_route_parts(node: &NodeExpr) -> Option<(&str, &str)> {
+    if node.positional.len() < 2 {
+        return None;
+    }
+
+    let method = match node.positional.first()?.node() {
+        Expr::Ident(value) if is_http_method(value) => value.as_str(),
+        _ => return None,
+    };
+    let path = match node.positional.get(1)?.node() {
+        Expr::Ident(value) if value == "*" || value.starts_with('/') => value.as_str(),
+        Expr::StringLiteral(value) if value == "*" || value.starts_with('/') => value.as_str(),
+        _ => return None,
+    };
+    Some((method, path))
+}
+
+fn path_params(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|segment| segment.strip_prefix(':'))
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn merge_route_response_types(left: &Ty, right: &Ty) -> Ty {
+    if matches!(left, Ty::Unknown) {
+        return right.clone();
+    }
+    if matches!(right, Ty::Unknown) || same_type(left, right) {
+        return left.clone();
+    }
+    Ty::Unknown
+}
+
+fn is_http_method(method: &str) -> bool {
+    matches!(
+        method,
+        "*" | "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+    )
+}
+
+fn method_allows_body(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH")
 }
