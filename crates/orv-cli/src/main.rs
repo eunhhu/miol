@@ -1,10 +1,11 @@
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
 use orv_analyzer::dump_hir;
-use orv_compiler::{FrontendFailure, dump_project_graph, load_path};
+use orv_compiler::{FrontendFailure, dump_workspace_graph, load_path, load_project_graph};
 use orv_diagnostics::render_diagnostics;
 use orv_runtime::{
     AdapterKind, Request, RouteAction, compile_program, emit_build, execute_request,
@@ -181,14 +182,17 @@ fn run_runtime(path: &PathBuf, method: &str, request_path: &str) {
 
 fn run_build(path: &PathBuf, output_dir: &PathBuf, emit: BuildEmit) {
     let analysis = analyze_or_exit(path);
-    let graph = analysis.project_graph();
+    let workspace_graph = match load_project_graph(path) {
+        Ok(graph) => graph,
+        Err(failure) => render_failure_and_exit(failure),
+    };
     if emit == BuildEmit::ProjectGraph {
         if let Err(error) = fs::create_dir_all(output_dir) {
             eprintln!("build error: {error}");
             process::exit(1);
         }
         let output_path = output_dir.join("project-graph.json");
-        if let Err(error) = write_project_graph(&graph, &output_path) {
+        if let Err(error) = write_project_graph(&workspace_graph, &output_path) {
             eprintln!("build error: {error}");
             process::exit(1);
         }
@@ -213,7 +217,7 @@ fn run_build(path: &PathBuf, output_dir: &PathBuf, emit: BuildEmit) {
         }
     };
     let graph_path = output_dir.join("project-graph.json");
-    if let Err(error) = write_project_graph(&graph, &graph_path) {
+    if let Err(error) = write_project_graph(&workspace_graph, &graph_path) {
         eprintln!("build error: {error}");
         process::exit(1);
     }
@@ -269,8 +273,11 @@ fn run_dump_hir(path: &PathBuf) {
 }
 
 fn run_dump_project_graph(path: &PathBuf) {
-    let analysis = analyze_or_exit(path);
-    println!("{}", dump_project_graph(&analysis.project_graph()));
+    let graph = match load_project_graph(path) {
+        Ok(graph) => graph,
+        Err(failure) => render_failure_and_exit(failure),
+    };
+    println!("{}", dump_workspace_graph(&graph));
 }
 
 fn run_dump_pipeline(path: &PathBuf) {
@@ -318,12 +325,44 @@ fn run_dump_pipeline(path: &PathBuf) {
         "   scopes: {}\n",
         analysis.analysis().scopes.len()
     ));
-    let graph = analysis.project_graph();
+    let graph = match load_project_graph(path) {
+        Ok(graph) => graph,
+        Err(failure) => render_failure_and_exit(failure),
+    };
     out.push_str("5. Graph    OK\n");
-    out.push_str(&format!("   pages: {}\n", graph.pages.len()));
-    out.push_str(&format!("   signals: {}\n", graph.signals.len()));
-    out.push_str(&format!("   routes: {}\n", graph.routes.len()));
-    out.push_str(&format!("   fetches: {}\n", graph.fetches.len()));
+    out.push_str(&format!("   modules: {}\n", graph.modules.len()));
+    out.push_str(&format!(
+        "   pages: {}\n",
+        graph
+            .modules
+            .iter()
+            .map(|module| module.pages.len())
+            .sum::<usize>()
+    ));
+    out.push_str(&format!(
+        "   signals: {}\n",
+        graph
+            .modules
+            .iter()
+            .map(|module| module.signals.len())
+            .sum::<usize>()
+    ));
+    out.push_str(&format!(
+        "   routes: {}\n",
+        graph
+            .modules
+            .iter()
+            .map(|module| module.routes.len())
+            .sum::<usize>()
+    ));
+    out.push_str(&format!(
+        "   fetches: {}\n",
+        graph
+            .modules
+            .iter()
+            .map(|module| module.fetches.len())
+            .sum::<usize>()
+    ));
 
     match compile_program(&analysis.analysis().hir) {
         Ok(program) => {
@@ -394,8 +433,8 @@ fn describe_route_action(action: &RouteAction) -> &'static str {
 }
 
 fn write_project_graph(
-    graph: &orv_compiler::ProjectGraph,
-    output_path: &std::path::Path,
+    graph: &orv_compiler::WorkspaceGraph,
+    output_path: &Path,
 ) -> Result<(), std::io::Error> {
     let json = serde_json::to_vec_pretty(graph)
         .map_err(|error| std::io::Error::other(error.to_string()))?;

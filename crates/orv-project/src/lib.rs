@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use orv_hir::{Expr, ItemKind, Module, NodeExpr, ResolvedName, Stmt};
+use orv_hir::{Expr, ItemKind, Module, NodeExpr, Pattern, ResolvedName, Stmt};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -16,6 +16,13 @@ pub struct ProjectGraph {
     pub signals: Vec<SignalInfo>,
     pub routes: Vec<RouteInfo>,
     pub fetches: Vec<FetchEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceGraph {
+    pub entry: String,
+    pub modules: Vec<ProjectGraph>,
+    pub dependencies: Vec<ModuleDependency>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -55,6 +62,12 @@ pub struct RouteInfo {
 pub struct FetchEdge {
     pub owner: String,
     pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ModuleDependency {
+    pub from: String,
+    pub to: String,
 }
 
 pub fn build_project_graph(module_name: impl Into<String>, module: &Module) -> ProjectGraph {
@@ -155,6 +168,83 @@ pub fn dump_project_graph(graph: &ProjectGraph) -> String {
     out.push_str(&format!("fetches: {}\n", graph.fetches.len()));
     for fetch in &graph.fetches {
         out.push_str(&format!("- fetch {} -> {}\n", fetch.owner, fetch.target));
+    }
+
+    out
+}
+
+pub fn dump_workspace_graph(graph: &WorkspaceGraph) -> String {
+    let mut out = String::new();
+    out.push_str("Project Graph\n");
+    out.push_str("=============\n");
+    out.push_str(&format!("entry: {}\n", graph.entry));
+    out.push_str(&format!("modules: {}\n", graph.modules.len()));
+    out.push_str(&format!("dependencies: {}\n", graph.dependencies.len()));
+
+    let import_count: usize = graph
+        .modules
+        .iter()
+        .map(|module| module.imports.len())
+        .sum();
+    let function_count: usize = graph
+        .modules
+        .iter()
+        .map(|module| module.functions.len())
+        .sum();
+    let define_count: usize = graph
+        .modules
+        .iter()
+        .map(|module| module.defines.len())
+        .sum();
+    let page_count: usize = graph.modules.iter().map(|module| module.pages.len()).sum();
+    let signal_count: usize = graph
+        .modules
+        .iter()
+        .map(|module| module.signals.len())
+        .sum();
+    let route_count: usize = graph.modules.iter().map(|module| module.routes.len()).sum();
+    let fetch_count: usize = graph
+        .modules
+        .iter()
+        .map(|module| module.fetches.len())
+        .sum();
+    out.push_str(&format!("imports: {import_count}\n"));
+    out.push_str(&format!("functions: {function_count}\n"));
+    out.push_str(&format!("defines: {define_count}\n"));
+    out.push_str(&format!("pages: {page_count}\n"));
+    out.push_str(&format!("signals: {signal_count}\n"));
+    out.push_str(&format!("routes: {route_count}\n"));
+    out.push_str(&format!("fetches: {fetch_count}\n"));
+
+    for dependency in &graph.dependencies {
+        out.push_str(&format!("- dep {} -> {}\n", dependency.from, dependency.to));
+    }
+
+    for module in &graph.modules {
+        out.push_str(&format!("\n[module] {}\n", module.module));
+        for page in &module.pages {
+            out.push_str(&format!("- page {} ({})\n", page.owner, page.domain));
+        }
+        for signal in &module.signals {
+            let deps = if signal.dependencies.is_empty() {
+                "none".to_owned()
+            } else {
+                signal.dependencies.join(", ")
+            };
+            out.push_str(&format!(
+                "- signal {}.{} deps: {}\n",
+                signal.owner, signal.name, deps
+            ));
+        }
+        for route in &module.routes {
+            out.push_str(&format!(
+                "- route {} {} -> {}\n",
+                route.method, route.path, route.action
+            ));
+        }
+        for fetch in &module.fetches {
+            out.push_str(&format!("- fetch {} -> {}\n", fetch.owner, fetch.target));
+        }
     }
 
     out
@@ -290,6 +380,12 @@ impl<'a> GraphWalker<'a> {
             Expr::Block { stmts, .. } => {
                 for stmt in stmts {
                     self.walk_stmt(stmt, owner);
+                }
+            }
+            Expr::When { subject, arms } => {
+                self.walk_expr(subject, owner);
+                for arm in arms {
+                    self.walk_expr(&arm.body, owner);
                 }
             }
             Expr::Object(fields) | Expr::Map(fields) => {
@@ -451,6 +547,19 @@ fn collect_dependencies(expr: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
+        Expr::When { subject, arms } => {
+            collect_dependencies(subject, out);
+            for arm in arms {
+                let mut arm_dependencies = BTreeSet::new();
+                collect_dependencies(&arm.body, &mut arm_dependencies);
+                let mut bindings = BTreeSet::new();
+                collect_pattern_bindings(&arm.pattern, &mut bindings);
+                for binding in bindings {
+                    arm_dependencies.remove(&binding);
+                }
+                out.extend(arm_dependencies);
+            }
+        }
         Expr::Object(fields) | Expr::Map(fields) => {
             for field in fields {
                 collect_dependencies(&field.value, out);
@@ -486,6 +595,26 @@ fn collect_dependencies(expr: &Expr, out: &mut BTreeSet<String>) {
         | Expr::BoolLiteral(_)
         | Expr::Void
         | Expr::Error => {}
+    }
+}
+
+fn collect_pattern_bindings(pattern: &Pattern, out: &mut BTreeSet<String>) {
+    match pattern {
+        Pattern::Binding(name) => {
+            out.insert(name.clone());
+        }
+        Pattern::Variant { fields, .. } => {
+            for field in fields {
+                collect_pattern_bindings(field, out);
+            }
+        }
+        Pattern::Wildcard
+        | Pattern::IntLiteral(_)
+        | Pattern::FloatLiteral(_)
+        | Pattern::StringLiteral(_)
+        | Pattern::BoolLiteral(_)
+        | Pattern::Void
+        | Pattern::Error => {}
     }
 }
 
@@ -532,5 +661,41 @@ mod tests {
         assert!(dump.contains("page CounterPage (html)"));
         assert!(dump.contains("signal CounterPage.count deps: none"));
         assert!(dump.contains("route GET / -> static-serve"));
+    }
+
+    #[test]
+    fn workspace_dump_includes_dependency_edges() {
+        let graph = WorkspaceGraph {
+            entry: "main.orv".to_owned(),
+            modules: vec![ProjectGraph {
+                module: "main.orv".to_owned(),
+                imports: Vec::new(),
+                functions: Vec::new(),
+                defines: vec![DefineInfo {
+                    name: "Home".to_owned(),
+                    return_domain: Some("html".to_owned()),
+                }],
+                structs: Vec::new(),
+                enums: Vec::new(),
+                type_aliases: Vec::new(),
+                pages: vec![PageInfo {
+                    owner: "Home".to_owned(),
+                    domain: "html".to_owned(),
+                }],
+                signals: Vec::new(),
+                routes: Vec::new(),
+                fetches: Vec::new(),
+            }],
+            dependencies: vec![ModuleDependency {
+                from: "main.orv".to_owned(),
+                to: "components/Button.orv".to_owned(),
+            }],
+        };
+
+        let dump = dump_workspace_graph(&graph);
+        assert!(dump.contains("entry: main.orv"));
+        assert!(dump.contains("modules: 1"));
+        assert!(dump.contains("dependencies: 1"));
+        assert!(dump.contains("- dep main.orv -> components/Button.orv"));
     }
 }

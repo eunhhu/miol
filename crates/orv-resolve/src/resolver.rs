@@ -8,7 +8,8 @@
 use orv_diagnostics::{Diagnostic, DiagnosticBag, Label};
 use orv_span::{Span, Spanned};
 use orv_syntax::ast::{
-    BindingStmt, DefineItem, Expr, ForStmt, FunctionItem, IfStmt, Item, Module, Stmt, WhileStmt,
+    BindingStmt, DefineItem, Expr, ForStmt, FunctionItem, IfStmt, Item, Module, Pattern, Stmt,
+    WhileStmt,
 };
 
 use crate::scope::{ScopeId, ScopeKind, ScopeMap};
@@ -432,6 +433,15 @@ impl Resolver {
                 }
                 self.pop_scope(scope);
             }
+            Expr::When { subject, arms } => {
+                self.resolve_expr(subject);
+                for arm in arms {
+                    let scope = self.push_scope(ScopeKind::WhenArm);
+                    self.declare_pattern_bindings(&arm.node().pattern);
+                    self.resolve_expr(&arm.node().body);
+                    self.pop_scope(scope);
+                }
+            }
             Expr::Object(fields) => {
                 for field in fields {
                     self.resolve_expr(&field.node().value);
@@ -481,6 +491,31 @@ impl Resolver {
             | Expr::BoolLiteral(_)
             | Expr::Void
             | Expr::Error => {}
+        }
+    }
+
+    fn declare_pattern_bindings(&mut self, pattern: &Spanned<Pattern>) {
+        match pattern.node() {
+            Pattern::Binding(name) => {
+                self.declare(
+                    name,
+                    pattern.span(),
+                    SymbolKind::Variable,
+                    Visibility::Private,
+                );
+            }
+            Pattern::Variant { fields, .. } => {
+                for field in fields {
+                    self.declare_pattern_bindings(field);
+                }
+            }
+            Pattern::Wildcard
+            | Pattern::IntLiteral(_)
+            | Pattern::FloatLiteral(_)
+            | Pattern::StringLiteral(_)
+            | Pattern::BoolLiteral(_)
+            | Pattern::Void
+            | Pattern::Error => {}
         }
     }
 }

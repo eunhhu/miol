@@ -298,6 +298,22 @@ impl<'a> HirLowerer<'a> {
                     stmts,
                 }
             }
+            AstExpr::When { subject, arms } => orv_hir::Expr::When {
+                subject: Box::new(self.lower_expr(subject)),
+                arms: arms
+                    .iter()
+                    .map(|arm| {
+                        let scope = self.take_scope(ScopeKind::WhenArm);
+                        let pattern = lower_pattern(&arm.node().pattern);
+                        let body = self.with_scope(scope, |this| this.lower_expr(&arm.node().body));
+                        orv_hir::WhenArm {
+                            scope: scope.raw(),
+                            pattern,
+                            body,
+                        }
+                    })
+                    .collect(),
+            },
             AstExpr::Object(fields) => orv_hir::Expr::Object(
                 fields
                     .iter()
@@ -434,6 +450,23 @@ fn lower_assign_op(op: ast::AssignOp) -> orv_hir::AssignOp {
         ast::AssignOp::Assign => orv_hir::AssignOp::Assign,
         ast::AssignOp::AddAssign => orv_hir::AssignOp::AddAssign,
         ast::AssignOp::SubAssign => orv_hir::AssignOp::SubAssign,
+    }
+}
+
+fn lower_pattern(pattern: &orv_span::Spanned<ast::Pattern>) -> orv_hir::Pattern {
+    match pattern.node() {
+        ast::Pattern::Wildcard => orv_hir::Pattern::Wildcard,
+        ast::Pattern::Binding(name) => orv_hir::Pattern::Binding(name.clone()),
+        ast::Pattern::IntLiteral(value) => orv_hir::Pattern::IntLiteral(*value),
+        ast::Pattern::FloatLiteral(value) => orv_hir::Pattern::FloatLiteral(*value),
+        ast::Pattern::StringLiteral(value) => orv_hir::Pattern::StringLiteral(value.clone()),
+        ast::Pattern::BoolLiteral(value) => orv_hir::Pattern::BoolLiteral(*value),
+        ast::Pattern::Void => orv_hir::Pattern::Void,
+        ast::Pattern::Variant { path, fields } => orv_hir::Pattern::Variant {
+            path: path.iter().map(spanned_string).collect(),
+            fields: fields.iter().map(lower_pattern).collect(),
+        },
+        ast::Pattern::Error => orv_hir::Pattern::Error,
     }
 }
 

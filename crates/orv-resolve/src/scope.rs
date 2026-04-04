@@ -37,6 +37,8 @@ pub enum ScopeKind {
     ForLoop,
     /// A `while` loop body.
     WhileLoop,
+    /// A single `when` arm body.
+    WhenArm,
 }
 
 /// A single lexical scope containing name-to-symbol bindings.

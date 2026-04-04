@@ -35,6 +35,13 @@ fn temp_dir(prefix: &str) -> PathBuf {
     path
 }
 
+fn write_file(path: &std::path::Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent dir should be created");
+    }
+    fs::write(path, contents).expect("file should be written");
+}
+
 #[test]
 fn check_hello_fixture_succeeds() {
     let fixture = fixture_path("fixtures/ok/hello.orv");
@@ -110,6 +117,102 @@ fn check_empty_map_without_context_reports_type_error() {
 
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
     assert!(stderr.contains("cannot infer the value type of an empty map literal"));
+}
+
+#[test]
+fn check_nullable_narrowing_program_succeeds() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-nullable-ok-{unique}.orv"));
+    fs::write(
+        &path,
+        "struct User {\n  name: string\n}\nfunction greet(user: User?): string -> {\n  if user != void {\n    user.name\n  } else {\n    \"anonymous\"\n  }\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn check_named_arguments_program_succeeds() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-named-args-ok-{unique}.orv"));
+    fs::write(
+        &path,
+        "function add(a: i32, b: i32): i32 -> a + b\nlet total: i32 = add(b=10, a=30)\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn check_named_arguments_unknown_parameter_reports_error() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-named-args-err-{unique}.orv"));
+    fs::write(
+        &path,
+        "function add(a: i32, b: i32): i32 -> a + b\nlet total: i32 = add(c=10, a=30)\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("has no parameter named `c`"));
+}
+
+#[test]
+fn check_when_enum_program_succeeds() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-when-ok-{unique}.orv"));
+    fs::write(
+        &path,
+        "enum Result {\n  Ok(i32)\n  Err(string)\n}\nfunction unwrap(result: Result): i32 -> when result {\n  Result.Ok(value) -> value\n  Result.Err(_) -> 0\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn check_when_non_exhaustive_enum_reports_error() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-when-err-{unique}.orv"));
+    fs::write(
+        &path,
+        "enum Result {\n  Ok(i32)\n  Err(string)\n}\nfunction unwrap(result: Result): i32 -> when result {\n  Result.Ok(value) -> value\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("non-exhaustive `when`"));
 }
 
 #[test]
@@ -273,4 +376,38 @@ fn dump_project_graph_counter_fixture_shows_pages_and_signals() {
     assert!(stdout.contains("signals: 1"));
     assert!(stdout.contains("page CounterPage (html)"));
     assert!(stdout.contains("signal CounterPage.count deps: none"));
+}
+
+#[test]
+fn dump_project_graph_follows_local_imported_modules() {
+    let root = temp_dir("orv-project-graph-recursive-cli");
+    write_file(
+        &root.join("main.orv"),
+        "import components.Button\nimport libs.counter\npub define Home() -> @html {\n  @body {\n    let sig count: i32 = 0\n    @Button \"ok\"\n  }\n}\n",
+    );
+    write_file(
+        &root.join("components/Button.orv"),
+        "pub define Button(label: string) -> @button label\n",
+    );
+    write_file(
+        &root.join("libs/counter.orv"),
+        "pub function counter(): i32 -> 1\n",
+    );
+
+    let output = run_orv(&[
+        "dump",
+        "project-graph",
+        root.join("main.orv").to_str().expect("utf-8 path"),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("entry: main.orv"));
+    assert!(stdout.contains("modules: 3"));
+    assert!(stdout.contains("- dep main.orv -> components/Button.orv"));
+    assert!(stdout.contains("- dep main.orv -> libs/counter.orv"));
+    assert!(stdout.contains("[module] components/Button.orv"));
+    assert!(stdout.contains("[module] libs/counter.orv"));
+
+    let _ = fs::remove_dir_all(&root);
 }

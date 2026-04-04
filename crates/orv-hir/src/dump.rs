@@ -224,6 +224,15 @@ fn dump_expr(expr: &Expr, out: &mut String, depth: usize) {
                 dump_expr(body, out, depth + 1);
             }
         }
+        Expr::When { arms, .. } => {
+            for arm in arms {
+                indent(out, depth + 1);
+                out.push_str(&format!("arm scope#{} ", arm.scope));
+                dump_pattern_inline(&arm.pattern, out);
+                out.push('\n');
+                dump_expr(&arm.body, out, depth + 2);
+            }
+        }
         _ => {}
     }
 }
@@ -322,6 +331,20 @@ fn dump_expr_inline(expr: &Expr, out: &mut String) {
             out.push(']');
         }
         Expr::Block { scope, .. } => out.push_str(&format!("block scope#{scope}")),
+        Expr::When { subject, arms } => {
+            out.push_str("when ");
+            dump_expr_inline(subject, out);
+            out.push_str(" { ");
+            for (index, arm) in arms.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern_inline(&arm.pattern, out);
+                out.push_str(" -> ");
+                dump_expr_inline(&arm.body, out);
+            }
+            out.push_str(" }");
+        }
         Expr::Object(fields) => {
             out.push('{');
             for (index, field) in fields.iter().enumerate() {
@@ -381,6 +404,32 @@ fn dump_expr_inline(expr: &Expr, out: &mut String) {
             dump_expr_inline(inner, out);
         }
         Expr::Error => out.push_str("<error>"),
+    }
+}
+
+fn dump_pattern_inline(pattern: &Pattern, out: &mut String) {
+    match pattern {
+        Pattern::Wildcard => out.push('_'),
+        Pattern::Binding(name) => out.push_str(name),
+        Pattern::IntLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::FloatLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::StringLiteral(value) => out.push_str(&format!("{value:?}")),
+        Pattern::BoolLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::Void => out.push_str("void"),
+        Pattern::Variant { path, fields } => {
+            out.push_str(&path.join("."));
+            if !fields.is_empty() {
+                out.push('(');
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    dump_pattern_inline(field, out);
+                }
+                out.push(')');
+            }
+        }
+        Pattern::Error => out.push_str("<error-pattern>"),
     }
 }
 

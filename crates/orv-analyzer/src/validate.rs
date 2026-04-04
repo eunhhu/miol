@@ -115,6 +115,12 @@ impl Validator {
                     self.validate_stmt(stmt.node(), domain);
                 }
             }
+            Expr::When { subject, arms } => {
+                self.validate_expr(subject, domain);
+                for arm in arms {
+                    self.validate_expr(&arm.node().body, domain);
+                }
+            }
             Expr::Object(fields) => {
                 for field in fields {
                     self.validate_expr(&field.node().value, domain);

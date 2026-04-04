@@ -144,6 +144,29 @@ pub struct WhileStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct WhenArm {
+    pub scope: ScopeRef,
+    pub pattern: Pattern,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Binding(String),
+    IntLiteral(i64),
+    FloatLiteral(f64),
+    StringLiteral(String),
+    BoolLiteral(bool),
+    Void,
+    Variant {
+        path: Vec<String>,
+        fields: Vec<Pattern>,
+    },
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(i64),
     FloatLiteral(f64),
@@ -181,6 +204,10 @@ pub enum Expr {
     Block {
         scope: ScopeRef,
         stmts: Vec<Stmt>,
+    },
+    When {
+        subject: Box<Expr>,
+        arms: Vec<WhenArm>,
     },
     Object(Vec<ObjectField>),
     Map(Vec<ObjectField>),

@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use orv_diagnostics::{Diagnostic, DiagnosticBag, Label};
 use orv_span::Spanned;
 use orv_syntax::ast::{
-    AssignOp, BindingStmt, Expr, FunctionItem, Item, Module, NodeExpr, Stmt, StructItem, TypeExpr,
+    AssignOp, BindingStmt, EnumItem, Expr, FunctionItem, Item, Module, NodeExpr, Pattern, Stmt,
+    StructItem, TypeExpr,
 };
 
 pub fn type_check(module: &Module) -> DiagnosticBag {
@@ -24,6 +25,7 @@ enum Ty {
     Float(String),
     Named(String),
     Struct(String),
+    Enum(String),
     Nullable(Box<Ty>),
     Vec(Box<Ty>),
     HashMap(Box<Ty>, Box<Ty>),
@@ -40,9 +42,11 @@ impl Ty {
             Self::Void => "void".to_owned(),
             Self::Bool => "bool".to_owned(),
             Self::String => "string".to_owned(),
-            Self::Int(name) | Self::Float(name) | Self::Named(name) | Self::Struct(name) => {
-                name.clone()
-            }
+            Self::Int(name)
+            | Self::Float(name)
+            | Self::Named(name)
+            | Self::Struct(name)
+            | Self::Enum(name) => name.clone(),
             Self::Nullable(inner) => format!("{}?", inner.display()),
             Self::Vec(inner) => format!("Vec<{}>", inner.display()),
             Self::HashMap(key, value) => {
@@ -75,8 +79,15 @@ impl Ty {
 }
 
 #[derive(Debug, Clone)]
+struct ParamSig {
+    name: String,
+    ty: Ty,
+    has_default: bool,
+}
+
+#[derive(Debug, Clone)]
 struct FunctionSig {
-    params: Vec<Ty>,
+    params: Vec<ParamSig>,
     ret: Ty,
 }
 
@@ -85,8 +96,19 @@ struct StructSpec {
     fields: BTreeMap<String, Ty>,
 }
 
+#[derive(Debug, Clone)]
+struct EnumVariantSpec {
+    fields: Vec<Ty>,
+}
+
+#[derive(Debug, Clone)]
+struct EnumSpec {
+    variants: HashMap<String, EnumVariantSpec>,
+}
+
 struct Registry<'a> {
     structs: HashMap<String, &'a StructItem>,
+    enums: HashMap<String, &'a EnumItem>,
     aliases: HashMap<String, &'a Spanned<TypeExpr>>,
     functions: HashMap<String, FunctionSig>,
 }
@@ -94,11 +116,15 @@ struct Registry<'a> {
 impl<'a> Registry<'a> {
     fn new(module: &'a Module) -> Self {
         let mut structs = HashMap::new();
+        let mut enums = HashMap::new();
         let mut aliases = HashMap::new();
         for item in &module.items {
             match item.node() {
                 Item::Struct(struct_item) => {
                     structs.insert(struct_item.name.node().clone(), struct_item);
+                }
+                Item::Enum(enum_item) => {
+                    enums.insert(enum_item.name.node().clone(), enum_item);
                 }
                 Item::TypeAlias(alias) => {
                     aliases.insert(alias.name.node().clone(), &alias.ty);
@@ -109,6 +135,7 @@ impl<'a> Registry<'a> {
 
         let mut registry = Self {
             structs,
+            enums,
             aliases,
             functions: HashMap::new(),
         };
@@ -122,12 +149,14 @@ impl<'a> Registry<'a> {
                 let params = function
                     .params
                     .iter()
-                    .map(|param| {
-                        param
+                    .map(|param| ParamSig {
+                        name: param.node().name.node().clone(),
+                        ty: param
                             .node()
                             .ty
                             .as_ref()
-                            .map_or(Ty::Unknown, |ty| self.resolve_type_expr(ty.node()))
+                            .map_or(Ty::Unknown, |ty| self.resolve_type_expr(ty.node())),
+                        has_default: param.node().default.is_some(),
                     })
                     .collect();
                 let ret = function
@@ -198,6 +227,9 @@ impl<'a> Registry<'a> {
         if self.structs.contains_key(name) {
             return Ty::Struct(name.to_owned());
         }
+        if self.enums.contains_key(name) {
+            return Ty::Enum(name.to_owned());
+        }
         if let Some(alias) = self.aliases.get(name) {
             if !visiting.insert(name.to_owned()) {
                 return Ty::Error;
@@ -227,12 +259,47 @@ impl<'a> Registry<'a> {
     fn function_sig(&self, name: &str) -> Option<&FunctionSig> {
         self.functions.get(name)
     }
+
+    fn enum_spec(&self, name: &str) -> Option<EnumSpec> {
+        let enum_item = self.enums.get(name)?;
+        let variants = enum_item
+            .variants
+            .iter()
+            .map(|variant| {
+                (
+                    variant.node().name.node().clone(),
+                    EnumVariantSpec {
+                        fields: variant
+                            .node()
+                            .fields
+                            .iter()
+                            .map(|field| self.resolve_type_expr(field.node()))
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        Some(EnumSpec { variants })
+    }
 }
 
 struct TypeChecker<'a> {
     registry: Registry<'a>,
     diagnostics: DiagnosticBag,
     scopes: Vec<HashMap<String, Ty>>,
+}
+
+#[derive(Debug, Clone)]
+struct Narrowing {
+    name: String,
+    then_ty: Ty,
+    else_ty: Ty,
+}
+
+enum PatternCoverage {
+    Wildcard,
+    Variant(String),
+    Other,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -266,7 +333,7 @@ impl<'a> TypeChecker<'a> {
                         self.bind(
                             function.name.node().clone(),
                             Ty::Function {
-                                params: sig.params.clone(),
+                                params: sig.params.iter().map(|param| param.ty.clone()).collect(),
                                 ret: Box::new(sig.ret.clone()),
                             },
                         );
@@ -367,13 +434,16 @@ impl<'a> TypeChecker<'a> {
             Stmt::If(if_stmt) => {
                 let condition_ty = self.infer_expr(&if_stmt.condition, Some(&Ty::Bool));
                 self.expect_assignable(if_stmt.condition.span(), &Ty::Bool, &condition_ty);
+                let narrowings = self.condition_narrowings(&if_stmt.condition);
 
                 self.push_scope();
+                self.apply_branch_narrowings(&narrowings, true);
                 let then_ty = self.infer_expr(&if_stmt.then_body, expected);
                 self.pop_scope();
 
                 let else_ty = if let Some(else_body) = &if_stmt.else_body {
                     self.push_scope();
+                    self.apply_branch_narrowings(&narrowings, false);
                     let ty = self.infer_expr(else_body, expected);
                     self.pop_scope();
                     ty
@@ -431,7 +501,7 @@ impl<'a> TypeChecker<'a> {
                 self.registry
                     .function_sig(name)
                     .map(|sig| Ty::Function {
-                        params: sig.params.clone(),
+                        params: sig.params.iter().map(|param| param.ty.clone()).collect(),
                         ret: Box::new(sig.ret.clone()),
                     })
                     .unwrap_or(Ty::Unknown)
@@ -459,9 +529,13 @@ impl<'a> TypeChecker<'a> {
                             Ty::Error
                         }
                     }
-                    orv_syntax::ast::BinOp::Eq
-                    | orv_syntax::ast::BinOp::NotEq
-                    | orv_syntax::ast::BinOp::Lt
+                    orv_syntax::ast::BinOp::Eq | orv_syntax::ast::BinOp::NotEq => {
+                        if !is_equality_comparable(&left_ty, &right_ty) {
+                            self.type_mismatch(expr.span(), &left_ty, &right_ty);
+                        }
+                        Ty::Bool
+                    }
+                    orv_syntax::ast::BinOp::Lt
                     | orv_syntax::ast::BinOp::LtEq
                     | orv_syntax::ast::BinOp::Gt
                     | orv_syntax::ast::BinOp::GtEq => {
@@ -546,6 +620,7 @@ impl<'a> TypeChecker<'a> {
                 self.pop_scope();
                 tail
             }
+            Expr::When { subject, arms } => self.infer_when(expr.span(), subject, arms, expected),
             Expr::Object(fields) => self.infer_object(expr.span(), fields, expected),
             Expr::Map(fields) => self.infer_map(expr.span(), fields, expected),
             Expr::Array(items) => self.infer_array(expr.span(), items, expected),
@@ -565,20 +640,7 @@ impl<'a> TypeChecker<'a> {
         if let Expr::Ident(name) = callee.node()
             && let Some(sig) = self.registry.function_sig(name).cloned()
         {
-            if args.len() != sig.params.len() {
-                self.emit_type_error(
-                    expr.span(),
-                    format!(
-                        "function `{name}` expects {} argument(s), got {}",
-                        sig.params.len(),
-                        args.len()
-                    ),
-                );
-            }
-            for (arg, expected_ty) in args.iter().zip(&sig.params) {
-                let actual = self.infer_expr(&arg.node().value, Some(expected_ty));
-                self.expect_assignable(arg.node().value.span(), expected_ty, &actual);
-            }
+            self.check_declared_call_arguments(expr, name, &sig, args);
             return sig.ret.clone();
         }
 
@@ -776,6 +838,62 @@ impl<'a> TypeChecker<'a> {
         Ty::Node(name)
     }
 
+    fn infer_when(
+        &mut self,
+        span: orv_span::Span,
+        subject: &Spanned<Expr>,
+        arms: &[Spanned<orv_syntax::ast::WhenArm>],
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let subject_ty = self.infer_expr(subject, None);
+        let mut result_ty: Option<Ty> = None;
+        let mut covered_variants = HashSet::new();
+        let mut has_wildcard = false;
+
+        for arm in arms {
+            self.push_scope();
+            let coverage = self.check_pattern(&arm.node().pattern, &subject_ty);
+            let arm_ty = self.infer_expr(&arm.node().body, expected);
+            self.pop_scope();
+
+            if let Some(existing) = &result_ty {
+                if !same_type(existing, &arm_ty) {
+                    self.type_mismatch(arm.node().body.span(), existing, &arm_ty);
+                    result_ty = Some(Ty::Unknown);
+                }
+            } else {
+                result_ty = Some(arm_ty);
+            }
+
+            match coverage {
+                PatternCoverage::Wildcard => has_wildcard = true,
+                PatternCoverage::Variant(name) => {
+                    covered_variants.insert(name);
+                }
+                PatternCoverage::Other => {}
+            }
+        }
+
+        if let Ty::Enum(enum_name) = &subject_ty
+            && !has_wildcard
+            && let Some(spec) = self.registry.enum_spec(enum_name)
+        {
+            for variant in spec.variants.keys() {
+                if !covered_variants.contains(variant) {
+                    self.emit_type_error(
+                        span,
+                        format!(
+                            "non-exhaustive `when` for `{enum_name}`: missing variant `{variant}`"
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        result_ty.unwrap_or(Ty::Unknown)
+    }
+
     fn field_type(&mut self, span: orv_span::Span, object_ty: &Ty, field: &str) -> Ty {
         match object_ty {
             Ty::Struct(name) => self
@@ -804,6 +922,127 @@ impl<'a> TypeChecker<'a> {
                 ret: Box::new(Ty::Int("i32".to_owned())),
             },
             _ => Ty::Unknown,
+        }
+    }
+
+    fn check_pattern(&mut self, pattern: &Spanned<Pattern>, subject_ty: &Ty) -> PatternCoverage {
+        match pattern.node() {
+            Pattern::Wildcard => PatternCoverage::Wildcard,
+            Pattern::Binding(name) => {
+                self.bind(name.clone(), subject_ty.clone());
+                PatternCoverage::Other
+            }
+            Pattern::IntLiteral(_) => {
+                self.expect_pattern_type(
+                    pattern.span(),
+                    subject_ty,
+                    &contextual_int(Some(subject_ty)),
+                );
+                PatternCoverage::Other
+            }
+            Pattern::FloatLiteral(_) => {
+                self.expect_pattern_type(
+                    pattern.span(),
+                    subject_ty,
+                    &contextual_float(Some(subject_ty)),
+                );
+                PatternCoverage::Other
+            }
+            Pattern::StringLiteral(_) => {
+                self.expect_pattern_type(pattern.span(), subject_ty, &Ty::String);
+                PatternCoverage::Other
+            }
+            Pattern::BoolLiteral(_) => {
+                self.expect_pattern_type(pattern.span(), subject_ty, &Ty::Bool);
+                PatternCoverage::Other
+            }
+            Pattern::Void => {
+                self.expect_pattern_type(pattern.span(), subject_ty, &Ty::Void);
+                PatternCoverage::Other
+            }
+            Pattern::Variant { path, fields } => {
+                self.check_variant_pattern(pattern.span(), path, fields, subject_ty)
+            }
+            Pattern::Error => PatternCoverage::Other,
+        }
+    }
+
+    fn check_variant_pattern(
+        &mut self,
+        span: orv_span::Span,
+        path: &[Spanned<String>],
+        fields: &[Spanned<Pattern>],
+        subject_ty: &Ty,
+    ) -> PatternCoverage {
+        let Some((enum_name, variant_name)) = self.resolve_pattern_variant(path, subject_ty) else {
+            self.emit_type_error(span, "variant patterns require an enum-typed subject");
+            return PatternCoverage::Other;
+        };
+
+        let Some(spec) = self.registry.enum_spec(&enum_name) else {
+            self.emit_type_error(span, format!("unknown enum `{enum_name}` in pattern"));
+            return PatternCoverage::Other;
+        };
+        let Some(variant) = spec.variants.get(&variant_name) else {
+            self.emit_type_error(
+                span,
+                format!("enum `{enum_name}` has no variant `{variant_name}`"),
+            );
+            return PatternCoverage::Other;
+        };
+
+        if variant.fields.len() != fields.len() {
+            self.emit_type_error(
+                span,
+                format!(
+                    "variant `{enum_name}.{variant_name}` expects {} field(s), found {}",
+                    variant.fields.len(),
+                    fields.len()
+                ),
+            );
+        }
+
+        for (field_pattern, field_ty) in fields.iter().zip(&variant.fields) {
+            self.check_pattern(field_pattern, field_ty);
+        }
+
+        PatternCoverage::Variant(variant_name)
+    }
+
+    fn resolve_pattern_variant(
+        &self,
+        path: &[Spanned<String>],
+        subject_ty: &Ty,
+    ) -> Option<(String, String)> {
+        let subject_enum = match subject_ty {
+            Ty::Enum(name) => Some(name.clone()),
+            Ty::Nullable(inner) => match inner.as_ref() {
+                Ty::Enum(name) => Some(name.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        match path {
+            [variant] => subject_enum.map(|enum_name| (enum_name, variant.node().clone())),
+            [enum_name, variant_name] => {
+                if let Some(subject_enum) = subject_enum
+                    && subject_enum != *enum_name.node()
+                {
+                    return None;
+                }
+                Some((enum_name.node().clone(), variant_name.node().clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn expect_pattern_type(&mut self, span: orv_span::Span, subject_ty: &Ty, pattern_ty: &Ty) {
+        if matches!(subject_ty, Ty::Unknown | Ty::Error) {
+            return;
+        }
+        if !is_equality_comparable(subject_ty, pattern_ty) {
+            self.type_mismatch(span, subject_ty, pattern_ty);
         }
     }
 
@@ -850,6 +1089,156 @@ impl<'a> TypeChecker<'a> {
         self.diagnostics
             .push(Diagnostic::error(message.into()).with_label(Label::primary(span, "here")));
     }
+
+    fn check_declared_call_arguments(
+        &mut self,
+        expr: &Spanned<Expr>,
+        function_name: &str,
+        sig: &FunctionSig,
+        args: &[Spanned<orv_syntax::ast::CallArg>],
+    ) {
+        let mut assigned = vec![false; sig.params.len()];
+        let mut next_positional = 0usize;
+        let mut saw_named = false;
+
+        for arg in args {
+            if let Some(name) = &arg.node().name {
+                saw_named = true;
+                let Some(index) = sig
+                    .params
+                    .iter()
+                    .position(|param| param.name == *name.node())
+                else {
+                    self.emit_type_error(
+                        arg.span(),
+                        format!(
+                            "function `{function_name}` has no parameter named `{}`",
+                            name.node()
+                        ),
+                    );
+                    let _ = self.infer_expr(&arg.node().value, None);
+                    continue;
+                };
+
+                if assigned[index] {
+                    self.emit_type_error(
+                        arg.span(),
+                        format!(
+                            "parameter `{}` is passed more than once to `{function_name}`",
+                            name.node()
+                        ),
+                    );
+                }
+                assigned[index] = true;
+                let expected_ty = &sig.params[index].ty;
+                let actual = self.infer_expr(&arg.node().value, Some(expected_ty));
+                self.expect_assignable(arg.node().value.span(), expected_ty, &actual);
+                continue;
+            }
+
+            if saw_named {
+                self.emit_type_error(
+                    arg.span(),
+                    format!(
+                        "positional arguments must come before named arguments in `{function_name}`"
+                    ),
+                );
+            }
+
+            while next_positional < assigned.len() && assigned[next_positional] {
+                next_positional += 1;
+            }
+            if next_positional >= sig.params.len() {
+                self.emit_type_error(
+                    arg.span(),
+                    format!(
+                        "function `{function_name}` expects at most {} argument(s), got {}",
+                        sig.params.len(),
+                        args.len()
+                    ),
+                );
+                let _ = self.infer_expr(&arg.node().value, None);
+                continue;
+            }
+
+            assigned[next_positional] = true;
+            let expected_ty = &sig.params[next_positional].ty;
+            let actual = self.infer_expr(&arg.node().value, Some(expected_ty));
+            self.expect_assignable(arg.node().value.span(), expected_ty, &actual);
+            next_positional += 1;
+        }
+
+        for (index, param) in sig.params.iter().enumerate() {
+            if !assigned[index] && !param.has_default {
+                self.emit_type_error(
+                    expr.span(),
+                    format!(
+                        "function `{function_name}` is missing required argument `{}`",
+                        param.name
+                    ),
+                );
+            }
+        }
+    }
+
+    fn condition_narrowings(&self, expr: &Spanned<Expr>) -> Vec<Narrowing> {
+        match expr.node() {
+            Expr::Binary { left, op, right }
+                if matches!(
+                    op.node(),
+                    orv_syntax::ast::BinOp::Eq | orv_syntax::ast::BinOp::NotEq
+                ) =>
+            {
+                self.narrow_from_void_comparison(left, op.node(), right)
+                    .into_iter()
+                    .collect()
+            }
+            Expr::Paren(inner) => self.condition_narrowings(inner),
+            _ => Vec::new(),
+        }
+    }
+
+    fn narrow_from_void_comparison(
+        &self,
+        left: &Spanned<Expr>,
+        op: &orv_syntax::ast::BinOp,
+        right: &Spanned<Expr>,
+    ) -> Option<Narrowing> {
+        let (ident, ty) = match (left.node(), right.node()) {
+            (Expr::Ident(name), Expr::Void) => (name.as_str(), self.lookup(name)?),
+            (Expr::Void, Expr::Ident(name)) => (name.as_str(), self.lookup(name)?),
+            _ => return None,
+        };
+
+        let Ty::Nullable(inner) = ty else {
+            return None;
+        };
+
+        let (then_ty, else_ty) = match op {
+            orv_syntax::ast::BinOp::NotEq => (inner.as_ref().clone(), Ty::Void),
+            orv_syntax::ast::BinOp::Eq => (Ty::Void, inner.as_ref().clone()),
+            _ => return None,
+        };
+
+        Some(Narrowing {
+            name: ident.to_owned(),
+            then_ty,
+            else_ty,
+        })
+    }
+
+    fn apply_branch_narrowings(&mut self, narrowings: &[Narrowing], then_branch: bool) {
+        for narrowing in narrowings {
+            self.bind(
+                narrowing.name.clone(),
+                if then_branch {
+                    narrowing.then_ty.clone()
+                } else {
+                    narrowing.else_ty.clone()
+                },
+            );
+        }
+    }
 }
 
 fn contextual_int(expected: Option<&Ty>) -> Ty {
@@ -873,6 +1262,7 @@ fn is_assignable(expected: &Ty, actual: &Ty) -> bool {
         (Ty::Int(a), Ty::Int(b)) | (Ty::Float(a), Ty::Float(b)) => a == b,
         (Ty::Named(a), Ty::Named(b))
         | (Ty::Struct(a), Ty::Struct(b))
+        | (Ty::Enum(a), Ty::Enum(b))
         | (Ty::Node(a), Ty::Node(b)) => a == b,
         (Ty::Nullable(inner), Ty::Void) => !matches!(**inner, Ty::Void),
         (Ty::Nullable(inner), other) => is_assignable(inner, other),
@@ -911,6 +1301,14 @@ fn is_assignable(expected: &Ty, actual: &Ty) -> bool {
 
 fn same_type(left: &Ty, right: &Ty) -> bool {
     left == right || matches!(left, Ty::Unknown) || matches!(right, Ty::Unknown)
+}
+
+fn is_equality_comparable(left: &Ty, right: &Ty) -> bool {
+    same_type(left, right)
+        || matches!(
+            (left, right),
+            (Ty::Nullable(_), Ty::Void) | (Ty::Void, Ty::Nullable(_))
+        )
 }
 
 fn is_int_type(name: &str) -> bool {

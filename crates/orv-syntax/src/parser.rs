@@ -8,8 +8,8 @@ use orv_span::{Span, Spanned};
 use crate::ast::{
     AssignOp, BinOp, BindingStmt, CallArg, DefineItem, EnumItem, EnumVariant, Expr, ForStmt,
     FunctionItem, IfStmt, ImportItem, Item, Module, NodeExpr, NodeName, ObjectField, Param,
-    Property, Stmt, StringPart, StructField, StructItem, TypeAliasItem, TypeExpr, UnaryOp,
-    WhileStmt,
+    Pattern, Property, Stmt, StringPart, StructField, StructItem, TypeAliasItem, TypeExpr, UnaryOp,
+    WhenArm, WhileStmt,
 };
 use crate::token::TokenKind;
 
@@ -1327,6 +1327,7 @@ impl Parser {
                 Spanned::new(Expr::Paren(Box::new(inner)), start.merge(end))
             }
             TokenKind::LBracket => self.parse_array_literal(),
+            TokenKind::When => self.parse_when_expr(),
             TokenKind::Hash if matches!(self.peek_at(1), TokenKind::LBrace) => {
                 self.parse_map_literal()
             }
@@ -1339,6 +1340,145 @@ impl Parser {
                 self.pos += 1;
                 Spanned::new(Expr::Error, start)
             }
+        }
+    }
+
+    fn parse_when_expr(&mut self) -> Spanned<Expr> {
+        let start = self.current_span();
+        self.pos += 1; // consume `when`
+
+        let subject = self.parse_expr();
+        self.skip_newlines();
+        if self
+            .expect(&TokenKind::LBrace, "`{` after when subject")
+            .is_none()
+        {
+            return Spanned::new(Expr::Error, start.merge(subject.span()));
+        }
+
+        let mut arms = Vec::new();
+        self.skip_newlines();
+
+        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
+            let arm_start = self.current_span();
+            let pattern = self.parse_pattern();
+            self.skip_newlines();
+            if self.expect(&TokenKind::Arrow, "`->` in when arm").is_none() {
+                self.synchronize_to_newline();
+                self.skip_newlines();
+                continue;
+            }
+            let body = self.parse_expr();
+            let arm_end = body.span();
+            arms.push(Spanned::new(
+                WhenArm { pattern, body },
+                arm_start.merge(arm_end),
+            ));
+            self.skip_newlines();
+        }
+
+        let end = self.current_span();
+        self.expect(&TokenKind::RBrace, "`}`");
+        Spanned::new(
+            Expr::When {
+                subject: Box::new(subject),
+                arms,
+            },
+            start.merge(end),
+        )
+    }
+
+    fn parse_pattern(&mut self) -> Spanned<Pattern> {
+        let start = self.current_span();
+
+        match self.peek().clone() {
+            TokenKind::IntLiteral(value) => {
+                self.pos += 1;
+                Spanned::new(Pattern::IntLiteral(value), start)
+            }
+            TokenKind::FloatLiteral(value) => {
+                self.pos += 1;
+                Spanned::new(Pattern::FloatLiteral(value), start)
+            }
+            TokenKind::StringLiteral(value) => {
+                self.pos += 1;
+                Spanned::new(Pattern::StringLiteral(value), start)
+            }
+            TokenKind::True => {
+                self.pos += 1;
+                Spanned::new(Pattern::BoolLiteral(true), start)
+            }
+            TokenKind::False => {
+                self.pos += 1;
+                Spanned::new(Pattern::BoolLiteral(false), start)
+            }
+            TokenKind::Void => {
+                self.pos += 1;
+                Spanned::new(Pattern::Void, start)
+            }
+            TokenKind::Ident(name) if name == "_" => {
+                self.pos += 1;
+                Spanned::new(Pattern::Wildcard, start)
+            }
+            TokenKind::Ident(_) => self.parse_ident_pattern(),
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error("invalid when pattern")
+                        .with_label(Label::primary(start, "pattern expected here")),
+                );
+                self.pos += 1;
+                Spanned::new(Pattern::Error, start)
+            }
+        }
+    }
+
+    fn parse_ident_pattern(&mut self) -> Spanned<Pattern> {
+        let start = self.current_span();
+        let Some(first) = self.expect_ident("pattern identifier") else {
+            return Spanned::new(Pattern::Error, start);
+        };
+
+        let mut path = vec![first];
+        while self.at(&TokenKind::Dot) && matches!(self.peek_at(1), TokenKind::Ident(_)) {
+            self.pos += 1; // consume `.`
+            if let Some(segment) = self.expect_ident("pattern path segment") {
+                path.push(segment);
+            } else {
+                break;
+            }
+        }
+
+        let fields = if self.at(&TokenKind::LParen) {
+            self.pos += 1; // consume `(`
+            let mut fields = Vec::new();
+            self.skip_newlines();
+            while !self.at(&TokenKind::RParen) && !self.at_eof() {
+                fields.push(self.parse_pattern());
+                self.skip_newlines();
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+            }
+            self.expect(&TokenKind::RParen, "`)`");
+            fields
+        } else {
+            Vec::new()
+        };
+
+        let span = start.merge(self.current_span());
+        let is_variant = path.len() > 1
+            || !fields.is_empty()
+            || path[0]
+                .node()
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase);
+
+        if is_variant {
+            Spanned::new(Pattern::Variant { path, fields }, span)
+        } else {
+            Spanned::new(Pattern::Binding(path[0].node().clone()), span)
         }
     }
 
@@ -1969,6 +2109,21 @@ fn dump_expr(expr: &Expr, out: &mut String, depth: usize) {
                 dump_expr(body.node(), out, depth + 1);
             }
         }
+        Expr::When { subject, arms } => {
+            indent(out, depth);
+            out.push_str("When\n");
+            indent(out, depth + 1);
+            out.push_str("subject: ");
+            dump_expr_inline(subject.node(), out);
+            out.push('\n');
+            for arm in arms {
+                indent(out, depth + 1);
+                out.push_str("arm ");
+                dump_pattern_inline(arm.node().pattern.node(), out);
+                out.push('\n');
+                dump_expr(arm.node().body.node(), out, depth + 2);
+            }
+        }
         _ => {
             indent(out, depth);
             dump_expr_inline(expr, out);
@@ -2095,7 +2250,53 @@ fn dump_expr_inline(expr: &Expr, out: &mut String) {
         Expr::Block(stmts) => {
             out.push_str(&format!("{{ {} stmts }}", stmts.len()));
         }
+        Expr::When { subject, arms } => {
+            out.push_str("when ");
+            dump_expr_inline(subject.node(), out);
+            out.push_str(" { ");
+            for (index, arm) in arms.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern_inline(arm.node().pattern.node(), out);
+                out.push_str(" -> ");
+                dump_expr_inline(arm.node().body.node(), out);
+            }
+            out.push_str(" }");
+        }
         Expr::Error => out.push_str("<error>"),
+    }
+}
+
+fn dump_pattern_inline(pattern: &Pattern, out: &mut String) {
+    match pattern {
+        Pattern::Wildcard => out.push('_'),
+        Pattern::Binding(name) => out.push_str(name),
+        Pattern::IntLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::FloatLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::StringLiteral(value) => out.push_str(&format!("\"{value}\"")),
+        Pattern::BoolLiteral(value) => out.push_str(&value.to_string()),
+        Pattern::Void => out.push_str("void"),
+        Pattern::Variant { path, fields } => {
+            out.push_str(
+                &path
+                    .iter()
+                    .map(|segment| segment.node().as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+            if !fields.is_empty() {
+                out.push('(');
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    dump_pattern_inline(field.node(), out);
+                }
+                out.push(')');
+            }
+        }
+        Pattern::Error => out.push_str("<error-pattern>"),
     }
 }
 
@@ -2536,6 +2737,64 @@ mod tests {
                 assert_eq!(e.variants[1].node().fields.len(), 2);
             }
             other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_when_expression_with_literal_and_wildcard_arms() {
+        let (module, diags) = parse_source("when status {\n  200 -> \"ok\"\n  _ -> \"error\"\n}");
+        assert!(
+            !diags.has_errors(),
+            "errors: {:?}",
+            diags.iter().collect::<Vec<_>>()
+        );
+
+        match module.items[0].node() {
+            Item::Stmt(Stmt::Expr(expr)) => {
+                let Expr::When { subject, arms } = expr.node() else {
+                    panic!("expected When expression, got {:?}", expr.node());
+                };
+                assert!(matches!(subject.node(), Expr::Ident(name) if name == "status"));
+                assert_eq!(arms.len(), 2);
+                assert!(matches!(
+                    arms[0].node().pattern.node(),
+                    Pattern::IntLiteral(200)
+                ));
+                assert!(matches!(arms[1].node().pattern.node(), Pattern::Wildcard));
+            }
+            other => panic!("expected When expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_when_expression_with_variant_payload_pattern() {
+        let (module, diags) =
+            parse_source("when result {\n  Result.Ok(value) -> value\n  Result.Err(_) -> 0\n}");
+        assert!(
+            !diags.has_errors(),
+            "errors: {:?}",
+            diags.iter().collect::<Vec<_>>()
+        );
+
+        match module.items[0].node() {
+            Item::Stmt(Stmt::Expr(expr)) => {
+                let Expr::When { arms, .. } = expr.node() else {
+                    panic!("expected When expression, got {:?}", expr.node());
+                };
+                assert_eq!(arms.len(), 2);
+                match arms[0].node().pattern.node() {
+                    Pattern::Variant { path, fields } => {
+                        assert_eq!(path.len(), 2);
+                        assert_eq!(path[0].node(), "Result");
+                        assert_eq!(path[1].node(), "Ok");
+                        assert!(
+                            matches!(fields[0].node(), Pattern::Binding(name) if name == "value")
+                        );
+                    }
+                    other => panic!("expected variant pattern, got {other:?}"),
+                }
+            }
+            other => panic!("expected When expression, got {other:?}"),
         }
     }
 

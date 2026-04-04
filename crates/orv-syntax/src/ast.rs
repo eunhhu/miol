@@ -194,6 +194,28 @@ pub struct WhileStmt {
     pub body: Spanned<Expr>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WhenArm {
+    pub pattern: Spanned<Pattern>,
+    pub body: Spanned<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard,
+    Binding(String),
+    IntLiteral(i64),
+    FloatLiteral(f64),
+    StringLiteral(String),
+    BoolLiteral(bool),
+    Void,
+    Variant {
+        path: Vec<Spanned<String>>,
+        fields: Vec<Spanned<Pattern>>,
+    },
+    Error,
+}
+
 // ── Expressions ─────────────────────────────────────────────────────────────
 
 /// An expression.
@@ -248,6 +270,11 @@ pub enum Expr {
     },
     /// Block: `{ stmts... }`
     Block(Vec<Spanned<Stmt>>),
+    /// Pattern matching: `when subject { pattern -> expr }`
+    When {
+        subject: Box<Spanned<Expr>>,
+        arms: Vec<Spanned<WhenArm>>,
+    },
     /// Object literal: `{ key: value, ... }`
     Object(Vec<Spanned<ObjectField>>),
     /// HashMap literal: `#{ key: value, ... }`

@@ -194,6 +194,99 @@ fn function_return_type_mismatch_is_reported() {
 }
 
 #[test]
+fn nullable_ident_is_narrowed_in_if_then_branch() {
+    let (_, diagnostics) = analyze_source(
+        "struct User {\n  name: string\n}\nfunction greet(user: User?): string -> {\n  if user != void {\n    user.name\n  } else {\n    \"anonymous\"\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.iter().any(|message| {
+            message.contains("type mismatch")
+                || message.contains("unknown field")
+                || message.contains("attempted to call")
+        }),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn nullable_ident_is_narrowed_in_if_else_branch() {
+    let (_, diagnostics) = analyze_source(
+        "struct User {\n  name: string\n}\nfunction greet(user: User?): string -> {\n  if user == void {\n    \"anonymous\"\n  } else {\n    user.name\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.iter().any(|message| {
+            message.contains("type mismatch")
+                || message.contains("unknown field")
+                || message.contains("attempted to call")
+        }),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn named_arguments_can_be_reordered_for_declared_functions() {
+    let (_, diagnostics) = analyze_source(
+        "function add(a: i32, b: i32): i32 -> a + b\nlet total: i32 = add(b=10, a=30)\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.iter().any(|message| message.contains("parameter")
+            || message.contains("missing required")
+            || message.contains("type mismatch")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn named_arguments_report_unknown_parameter() {
+    let (_, diagnostics) = analyze_source(
+        "function add(a: i32, b: i32): i32 -> a + b\nlet total: i32 = add(c=10, a=30)\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("has no parameter named `c`")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn named_arguments_report_missing_required_parameter() {
+    let (_, diagnostics) =
+        analyze_source("function add(a: i32, b: i32): i32 -> a + b\nlet total: i32 = add(a=30)\n");
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("missing required argument `b`")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
 fn hash_map_literal_matches_declared_type() {
     let (_, diagnostics) = analyze_source(
         "let scores: HashMap<string, i32> = #{ alice: 1, bob: 2 }\nlet total: i32 = scores.len()\nlet keys: Vec<string> = scores.keys()\nlet values: Vec<i32> = scores.values()\n",
@@ -223,6 +316,63 @@ fn empty_map_literal_requires_context() {
         messages
             .iter()
             .any(|message| message.contains("cannot infer the value type of an empty map literal")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn when_enum_variant_binding_resolves_inside_arm_body() {
+    let (analysis, diagnostics) = analyze_source(
+        "enum Result {\n  Ok(i32)\n  Err(string)\n}\nfunction unwrap(result: Result): i32 -> when result {\n  Result.Ok(value) -> value\n  Result.Err(_) -> 0\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !diagnostics.has_errors(),
+        "unexpected diagnostics: {messages:?}"
+    );
+
+    let output = dump_hir(&analysis.hir);
+    assert!(output.contains("when result@symbol#"));
+    assert!(output.contains("arm scope#"));
+    assert!(output.contains("value@symbol#"));
+}
+
+#[test]
+fn when_requires_exhaustive_enum_coverage_without_wildcard() {
+    let (_, diagnostics) = analyze_source(
+        "enum Result {\n  Ok(i32)\n  Err(string)\n}\nfunction unwrap(result: Result): i32 -> when result {\n  Result.Ok(value) -> value\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("non-exhaustive `when`")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn when_variant_payload_arity_is_checked() {
+    let (_, diagnostics) = analyze_source(
+        "enum Result {\n  Ok(i32)\n}\nfunction unwrap(result: Result): i32 -> when result {\n  Result.Ok(left, right) -> left\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("expects 1 field(s), found 2")),
         "unexpected diagnostics: {messages:?}"
     );
 }
