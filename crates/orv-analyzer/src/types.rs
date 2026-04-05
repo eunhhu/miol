@@ -297,6 +297,7 @@ struct TypeChecker<'a> {
     registry: Registry<'a>,
     diagnostics: DiagnosticBag,
     scopes: Vec<HashMap<String, Ty>>,
+    route_stack: Vec<RouteSig>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +319,7 @@ impl<'a> TypeChecker<'a> {
             registry,
             diagnostics: DiagnosticBag::new(),
             scopes: vec![HashMap::new()],
+            route_stack: Vec::new(),
         }
     }
 
@@ -825,6 +827,9 @@ impl<'a> TypeChecker<'a> {
         if name == "route" {
             return self.infer_route_node(node, span);
         }
+        if let Some(accessor_ty) = self.infer_request_accessor(node, span, expected) {
+            return accessor_ty;
+        }
 
         for positional in &node.positional {
             let _ = self.infer_expr(positional, None);
@@ -854,6 +859,65 @@ impl<'a> TypeChecker<'a> {
         Ty::Node(name)
     }
 
+    fn infer_request_accessor(
+        &mut self,
+        node: &NodeExpr,
+        span: orv_span::Span,
+        expected: Option<&Ty>,
+    ) -> Option<Ty> {
+        let name = node.name.node().to_string();
+        let is_accessor = matches!(
+            name.as_str(),
+            "body" | "param" | "query" | "header" | "method" | "path" | "context"
+        );
+        let Some(route) = self.current_route().cloned() else {
+            if is_accessor && (name != "body" || node.body.is_none()) {
+                self.emit_type_error(
+                    span,
+                    format!("`@{name}` is only valid inside a route handler"),
+                );
+                return Some(Ty::Unknown);
+            }
+            return None;
+        };
+
+        match name.as_str() {
+            "body" if node.body.is_none() => {
+                for positional in &node.positional {
+                    let _ = self.infer_expr(positional, None);
+                }
+                Some(expected.cloned().unwrap_or(Ty::Unknown))
+            }
+            "param" => {
+                self.expect_accessor_arity(node, 1, "@param");
+                if let Some(key) = node.positional.first() {
+                    self.validate_string_atom_like(key, "@param");
+                    self.validate_route_param_reference(key, &route);
+                }
+                Some(Ty::Nullable(Box::new(Ty::String)))
+            }
+            "query" | "header" => {
+                self.expect_accessor_arity(node, 1, &format!("@{name}"));
+                if let Some(key) = node.positional.first() {
+                    self.validate_string_atom_like(key, &format!("@{name}"));
+                }
+                Some(Ty::Nullable(Box::new(Ty::String)))
+            }
+            "method" | "path" => {
+                self.expect_accessor_arity(node, 0, &format!("@{name}"));
+                Some(Ty::String)
+            }
+            "context" => {
+                self.expect_accessor_arity(node, 1, "@context");
+                if let Some(key) = node.positional.first() {
+                    self.validate_string_atom_like(key, "@context");
+                }
+                Some(expected.cloned().unwrap_or(Ty::Unknown))
+            }
+            _ => None,
+        }
+    }
+
     fn infer_route_node(&mut self, node: &NodeExpr, span: orv_span::Span) -> Ty {
         let Some((method, path)) = endpoint_route_parts(node) else {
             for positional in &node.positional {
@@ -865,8 +929,15 @@ impl<'a> TypeChecker<'a> {
             return Ty::Node("route".to_owned());
         };
 
+        let route = RouteSig {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            path_params: path_params(path),
+            response: Box::new(Ty::Unknown),
+        };
         let mut response_ty = Ty::Unknown;
         if let Some(Expr::Block(stmts)) = node.body.as_deref().map(Spanned::node) {
+            self.push_route(route.clone());
             self.push_scope();
             for stmt in stmts {
                 if let Some(found) = self.route_response_type_from_stmt(stmt) {
@@ -875,15 +946,16 @@ impl<'a> TypeChecker<'a> {
                 let _ = self.check_stmt(stmt.node(), None);
             }
             self.pop_scope();
+            self.pop_route();
         } else if let Some(body) = &node.body {
             let _ = self.infer_expr(body, None);
             self.emit_type_error(span, "@route body must be a block");
         }
 
         Ty::Route(RouteSig {
-            method: method.to_owned(),
-            path: path.to_owned(),
-            path_params: path_params(path),
+            method: route.method,
+            path: route.path,
+            path_params: route.path_params,
             response: Box::new(response_ty),
         })
     }
@@ -1187,6 +1259,18 @@ impl<'a> TypeChecker<'a> {
         self.scopes.pop();
     }
 
+    fn push_route(&mut self, route: RouteSig) {
+        self.route_stack.push(route);
+    }
+
+    fn pop_route(&mut self) {
+        self.route_stack.pop();
+    }
+
+    fn current_route(&self) -> Option<&RouteSig> {
+        self.route_stack.last()
+    }
+
     fn expect_assignable(&mut self, span: orv_span::Span, expected: &Ty, actual: &Ty) {
         if !is_assignable(expected, actual) {
             self.type_mismatch(span, expected, actual);
@@ -1444,6 +1528,44 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn expect_accessor_arity(&mut self, node: &NodeExpr, expected: usize, label: &str) {
+        if node.positional.len() != expected {
+            self.emit_type_error(
+                node.name.span(),
+                format!(
+                    "{label} expects {expected} positional argument(s), got {}",
+                    node.positional.len()
+                ),
+            );
+        }
+    }
+
+    fn validate_string_atom_like(&mut self, expr: &Spanned<Expr>, label: &str) {
+        match expr.node() {
+            Expr::Ident(_) | Expr::StringLiteral(_) => {}
+            _ => self.emit_type_error(
+                expr.span(),
+                format!("{label} expects a string-like key or identifier"),
+            ),
+        }
+    }
+
+    fn validate_route_param_reference(&mut self, expr: &Spanned<Expr>, route: &RouteSig) {
+        let key = match expr.node() {
+            Expr::StringLiteral(value) | Expr::Ident(value) => value.as_str(),
+            _ => return,
+        };
+        if !route.path_params.iter().any(|param| param == key) {
+            self.emit_type_error(
+                expr.span(),
+                format!(
+                    "@param `{key}` is not declared in route path `{}`",
+                    route.path
+                ),
+            );
+        }
+    }
+
     fn condition_narrowings(&self, expr: &Spanned<Expr>) -> Vec<Narrowing> {
         match expr.node() {
             Expr::Binary { left, op, right }
@@ -1528,6 +1650,9 @@ fn is_assignable(expected: &Ty, actual: &Ty) -> bool {
         | (Ty::Enum(a), Ty::Enum(b))
         | (Ty::Node(a), Ty::Node(b)) => a == b,
         (Ty::Route(a), Ty::Route(b)) => a == b,
+        (Ty::Nullable(expected_inner), Ty::Nullable(actual_inner)) => {
+            is_assignable(expected_inner, actual_inner)
+        }
         (Ty::Nullable(inner), Ty::Void) => !matches!(**inner, Ty::Void),
         (Ty::Nullable(inner), other) => is_assignable(inner, other),
         (Ty::Vec(a), Ty::Vec(b)) => is_assignable(a, b),

@@ -449,3 +449,57 @@ fn fetch_on_non_route_symbol_is_rejected() {
         "unexpected diagnostics: {messages:?}"
     );
 }
+
+#[test]
+fn route_request_accessors_have_expected_types() {
+    let (_, diagnostics) = analyze_source(
+        "@server {\n  let createUser = @route POST /api/users/:id {\n    let id: string? = @param \"id\"\n    let page: string? = @query \"page\"\n    let auth: string? = @header \"Authorization\"\n    let method: string = @method\n    let path: string = @path\n    let ctx: string = @context \"requestId\"\n    let payload: HashMap<string, string> = @body\n    return @response 200 { ok: true }\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.iter().any(|message| {
+            message.contains("type mismatch")
+                || message.contains("only valid inside a route handler")
+                || message.contains("expects")
+        }),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn route_param_accessor_rejects_unknown_path_key() {
+    let (_, diagnostics) = analyze_source(
+        "@server {\n  let getUser = @route GET /api/users/:id {\n    let slug = @param \"slug\"\n    return @response 200 { ok: true }\n  }\n}\n",
+    );
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("@param `slug` is not declared")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn route_accessor_outside_route_is_rejected() {
+    let (_, diagnostics) = analyze_source("function bad() -> @param \"id\"\n");
+
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`@param` is only valid inside a route handler")),
+        "unexpected diagnostics: {messages:?}"
+    );
+}

@@ -276,6 +276,45 @@ fn check_fetch_on_non_route_symbol_reports_error() {
 }
 
 #[test]
+fn check_route_accessors_program_succeeds() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-route-accessor-ok-{unique}.orv"));
+    fs::write(
+        &path,
+        "@server {\n  let createUser = @route POST /api/users/:id {\n    let id: string? = @param \"id\"\n    let page: string? = @query \"page\"\n    let auth: string? = @header \"Authorization\"\n    let method: string = @method\n    let path: string = @path\n    let ctx: string = @context \"requestId\"\n    let payload: HashMap<string, string> = @body\n    return @response 200 { ok: true }\n  }\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn check_route_param_accessor_unknown_key_reports_error() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("orv-cli-route-accessor-err-{unique}.orv"));
+    fs::write(
+        &path,
+        "@server {\n  let getUser = @route GET /api/users/:id {\n    let slug = @param \"slug\"\n    return @response 200 { ok: true }\n  }\n}\n",
+    )
+    .expect("temp source should be written");
+
+    let output = run_orv(&["check", path.to_str().expect("utf-8 path")]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("@param `slug` is not declared"));
+}
+
+#[test]
 fn check_server_fixture_succeeds() {
     let fixture = fixture_path("fixtures/ok/server-basic.orv");
     let output = run_orv(&["check", fixture.to_str().expect("utf-8 path")]);

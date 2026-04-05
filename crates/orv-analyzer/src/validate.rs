@@ -194,6 +194,10 @@ impl Validator {
             "listen" => !matches!(domain, DomainContext::Server),
             "route" => !matches!(domain, DomainContext::Server),
             "serve" | "response" => !matches!(domain, DomainContext::Route),
+            "param" | "query" | "header" | "method" | "path" | "context" => {
+                !matches!(domain, DomainContext::Route)
+            }
+            "body" if node.body.is_none() => !matches!(domain, DomainContext::Route),
             "body" | "div" | "text" | "input" | "button" | "vstack" | "hstack" => {
                 !matches!(domain, DomainContext::Html)
             }
@@ -291,6 +295,15 @@ impl Validator {
                         ),
                     );
                 }
+            }
+            "param" | "query" | "header" | "context" => {
+                self.expect_arity(node, 1, &format!("@{name}"));
+            }
+            "method" | "path" => {
+                self.expect_arity(node, 0, &format!("@{name}"));
+            }
+            "body" if node.body.is_none() => {
+                self.expect_arity(node, 0, "@body");
             }
             _ => {}
         }
