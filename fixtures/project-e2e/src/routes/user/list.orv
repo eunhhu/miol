@@ -1,3 +1,11 @@
-import lib.db.fetchUsers
+import ...lib.db.db
 
-pub function listUsers(): Vec<string> -> fetchUsers()
+pub define List() -> @route GET /list {
+  let skip = @query skip ?? 0
+  let limit = @query limit ?? 50
+  let users = @db.find User {
+    @skip skip
+    @limit limit
+  }
+  @respond 200 { data: users }
+}

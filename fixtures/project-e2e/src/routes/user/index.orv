@@ -1,3 +1,6 @@
-import routes.user.list.listUsers
+import *.*
 
-pub function userCount(): i32 -> listUsers().len()
+pub define UserController() -> @route /user {
+  @List
+  @Delete
+}

@@ -1,33 +1,22 @@
 import pages.home.Home
 import pages.notfound.NotFound
-import middlewares.ratelimit.allowRequest
+import middlewares.ratelimit.RateLimit
 import styles.global.DS
-import routes.health.healthStatus
-import routes.user.list.listUsers
-import routes.user.delete.deleteUser
-import routes.user.index.userCount
+import routes.health.Health
+import routes.user.User
 
-let port: i32 = 3000
+let port: i32 = @env PORT ?? 3000
 
 @server {
   @listen port
 
-  @route GET /api/health {
-    @respond 200 { status: healthStatus() }
+  @route /api {
+    @RateLimit 1000 1m
+    @Health
+    @User
   }
 
-  @route GET /api/users {
-    let allowed = allowRequest()
-    @respond 200 { allowed: allowed, data: listUsers() }
-  }
-
-  @route DELETE /api/users/:id {
-    let id = @param "id"
-    let deleted = deleteUser(id ?? "")
-    @respond 200 { deleted: deleted }
-  }
-
-  @route GET / {
+  @route GET * {
     @serve @html {
       @head {
         @DS
@@ -36,15 +25,10 @@ let port: i32 = 3000
         @meta "viewport" "width=device-width, initial-scale=1"
       }
       @body {
-        @Home %count={userCount()}
-      }
-    }
-  }
-
-  @route GET /not-found {
-    @serve @html {
-      @body {
-        @NotFound
+        when @path[0] {
+          "" -> @Home %count={userCount()} // ssr moment
+          _ -> @NotFound
+        }
       }
     }
   }

@@ -1,1 +1,3 @@
-pub function healthStatus(): string -> "ok"
+pub define Health() -> @route GET /health {
+  @respond 200 "OK"
+}

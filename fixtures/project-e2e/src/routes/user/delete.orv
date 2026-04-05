@@ -1,3 +1,16 @@
-import lib.db.removeUser
+import oql.transaction
+import ...db.db
 
-pub function deleteUser(id: string): bool -> removeUser(id)
+pub define Delete() -> @route DELETE /:id {
+  let id = @param id
+  let result = await @transaction {
+    @db.delete User { @where { id } }
+    @db.delete Post { @where { user: { id } } }
+    @db.delete Like { @where { user: { id } } }
+  }
+  if result.ok {
+    @respond 200 { message: "User deleted" }
+  } else {
+    @respond 500 { message: "Failed to delete user" }
+  }
+}

@@ -1,1 +1,23 @@
-pub function allowRequest(): bool -> true
+let mut rateLimitStore: Map<string, (i64, i32)> = {}
+
+pub define RateLimit(max: i32?, time: string?) -> @after {
+  let time = time ?? @token \d+[smhd]
+  let max = max ?? @token \d+
+  let ip = @header "X-Forwarded-For" ?? @header "X-Real-IP" ?? @request.ip
+
+  if rateLimitStore.has(ip) {
+    let (expire, count) = rateLimitStore.get(ip)
+    if Date.now() > expire {
+      rateLimitStore.set(ip, (Date.now() + time, 1))
+    } else {
+      rateLimitStore.set(ip, (expire, count + 1))
+    }
+  } else {
+    rateLimitStore.set(ip, (Date.now() + time, 1))
+  }
+  
+  if rateLimitStore.get(ip).1 > max {
+    @io.out "User exceeded rate limit: {ip}"
+    @respond 429 "Too many requests"
+  }
+}
