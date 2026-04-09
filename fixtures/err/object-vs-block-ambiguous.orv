@@ -1,6 +1,0 @@
-// ERROR: ambiguous {} — could be object literal or code block
-// The parser should handle this case gracefully
-let x = {
-  name: "test"
-  let y = 10
-}

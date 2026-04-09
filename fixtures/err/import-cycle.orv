@@ -1,7 +1,0 @@
-// ERROR: circular import dependency
-// This file imports from a module that imports back to this file
-import { helper } from "./import-cycle-b"
-
-pub function greet() -> string {
-  helper()
-}

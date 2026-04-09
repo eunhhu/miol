@@ -1,6 +1,0 @@
-// ERROR: @env with incompatible type annotation
-@server {
-  // Array type cannot be coerced from environment variable string
-  let data: []i32 = @env DATA_LIST
-  @listen 3000
-}

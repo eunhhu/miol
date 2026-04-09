@@ -1,3 +1,0 @@
-pub define Health() -> @route GET /health {
-  @respond 200 "OK"
-}

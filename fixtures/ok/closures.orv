@@ -1,5 +1,0 @@
-// Closure expressions with string operations (no arithmetic to avoid type inference limits)
-let greet = name -> "Hello, {name}!"
-
-let names = ["Kim", "Lee", "Park"]
-let greeted = names.map(name -> "Hi {name}")

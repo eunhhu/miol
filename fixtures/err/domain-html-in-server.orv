@@ -1,7 +1,0 @@
-// ERROR: @div is not valid in server context
-@server {
-  @listen 8080
-  @div {
-    @text "this should not be here"
-  }
-}

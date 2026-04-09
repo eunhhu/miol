@@ -1,6 +1,0 @@
-// Null coalesce operator
-let name: string? = void
-let display = name ?? "Anonymous"
-
-let timeout: i32? = void
-let actual = timeout ?? 5000

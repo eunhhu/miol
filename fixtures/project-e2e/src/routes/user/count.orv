@@ -1,6 +1,0 @@
-import ...lib.db.db
-
-pub function userCount(): i32 -> {
-  let users: Vec<User> = @db find User
-  return users.length
-}

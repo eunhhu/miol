@@ -1,6 +1,0 @@
-// ERROR: @children can only be used inside a define body
-@html {
-  @body {
-    @children
-  }
-}

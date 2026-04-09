@@ -1,6 +1,0 @@
-// ERROR: design token nodes are not valid in html context
-@html {
-  @body {
-    @color "primary" "#000"
-  }
-}

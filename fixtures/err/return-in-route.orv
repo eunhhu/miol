@@ -1,8 +1,0 @@
-// ERROR: return is not valid inside route-domain blocks
-@server {
-  @listen 3000
-
-  @route GET /api/data {
-    return { "data": "invalid" }
-  }
-}

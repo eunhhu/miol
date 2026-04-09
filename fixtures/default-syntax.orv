@@ -1,0 +1,325 @@
+
+// 자료형
+// 원시 타입은 기본 C 타입 사용
+// byte, ubyte, short, ushort, int, uint, long, ulong, float, double, bool, string, void
+// void는 js의 undefined같은거, python의 None같은거
+let x: void = void
+let isValid: bool = false
+let name: string = "John"
+let age: int = 30
+let height: float = 1.75
+@out x isValid name age height // void false John 30 1.75
+@out Type(x) // void
+
+// 고급 타입
+// Vector, Tuple, Object, Set, Map, Function, Domain
+let vector: int[] = [1, 2, 3] // or Vector<int>
+let tuple: (int, string) = (1, "hello") // or Tuple<int, string>
+let object: {name: string, age: int} = {name: "John", age: 30}
+let set: Set<int> = Set{1, 2, 3}
+let map: Map<string, int> = Map{"a": 1, "b": 2}
+function printHello(msg: string) -> {
+  @out msg
+}
+define Hello() -> {
+  printHello("Hello")
+}
+@Hello // Hello
+@out Type(vector) // Vector<int>
+@out Type(tuple) // Tuple<int, string>
+@out Type(object) // Object {name: string, age: int} - 오브젝트 타입은 출력할때만 이렇게 나옴.
+@out Type(set) // Set<int>
+@out Type(map) // Map<string, int>
+@out Type(printHello) // Function<string>
+@out Type(Hello) // Domain
+
+// 반대로 타입을 가져와서 사용가능
+let newMap: Type(map) = Map{"c": 3, "d": 4}
+@out newMap // Map{"c": 3, "d": 4}
+
+// 타입
+enum SizeUnit { Px = "px", Em = "em", Rem = "rem" }
+type Size = "{uint}{SizeUnit}" | "auto" | uint
+// enum Status { Pending = 0, Running = 1, Completed = 2 } // in-line 방식
+enum Status { // multi-line 방식
+  Pending = 0
+  Running = 1
+  Completed = 2
+}
+struct User { // literal object type
+  name: string
+  age: int
+}
+let mut user: User = { name: "John", age: 30 } // in-line object
+user.name = "Jane"
+user["name"] = "Bob"
+user = {
+  name: "Bob" // multi-line object는 쉼표 안적어도됨
+  age: 25
+}
+
+// generic
+struct Box<T> {
+  value: T
+}
+let box: Box<int> = { value: 1 }
+struct Post {
+  title: string
+  content: string
+  likes: int
+  tags: {name: string}[]
+  creator: User
+  nullable: string?
+}
+
+// type casting
+let n: int = 8
+let new_n: short = n as short
+let f: float = 3.15
+let new_f: int = int.from(f)
+let s: string = string.from(f)
+
+// 변수
+let name: string = "John"
+let mut count: int = 0
+let sig signed_count: int = -10
+
+@out "name: {name}, count: {count}, signed_count: {signed_count}"
+
+signed_count = 30 // 바꾸면 반응형이라 자동으로 출력됨
+
+// 상수
+
+const PI: float = 3.14159
+
+// 함수
+
+function add(a: int, b: int): int -> {
+  return a + b
+}
+
+let result: int = add(1, 2)
+@out "result: {result}"
+
+function double(x: int): int -> x * 2
+let doubled: int = double(5)
+@out "doubled: {doubled}"
+
+function triple(x: int): int -> {
+  x * 3 // implicit return
+}
+let tripled: int = triple(5)
+@out "tripled: {tripled}"
+
+// 조건문
+
+let condition: bool = true
+if condition {
+  @out "condition is true"
+}
+
+let n = 10
+if n > 5 {
+  @out "n is greater than 5"
+} else if n < 5 {
+  @out "n is less than 5"
+} else {
+  @out "n is equal to 5"
+}
+
+// 3항 연산자
+n > 5 ? {
+  @out "n is greater than 5"
+} : {
+  @out "n is less than or equal to 5"
+}
+
+let message = n > 5 ? { // code block도 넣을 수 있음
+  return "n is greater than 5"
+} : "n is less than or equal to 5"
+@out message
+
+when n {
+  10 -> @out "n is 10"
+  20 -> @out "n is 20"
+  25..30 -> @out "n is between 25 and 30"
+  !5 -> @out "n is not 5"
+  _ -> {
+    @out "n is something else"
+  }
+}
+
+let vec = [1, 2, 3, 4, 5]
+when vec {
+  in 4 -> @out "Vec contains 4"
+  $.length > 3 -> @out "Vec has more than 3 elements"
+  _ -> @out "Vec does not contain 4"
+}
+
+let obj = { name: "John", age: 30 }
+when obj {
+  in "name" -> @out "Obj has name"
+  $.name == "John" -> @out "Obj name is John"
+  _ -> @out "Obj does not have name"
+}
+
+let string = "Hello world"
+when string {
+  in "world" -> @out "String has Hello"
+  $.length > 3 -> @out "String length is greater than 3"
+  _ -> @out "String does not have Hello"
+}
+
+// 반복문
+
+for i in 0..10 {
+  @out "i: {i}"
+}
+
+for item in [1, 2, 3, 4, 5] {
+  if item == 1 : continue
+  @out "item: {item}"
+}
+
+for (item, index) in ["apple", "banana", "cherry"] {
+  @out "item: {item}, index: {index}"
+}
+
+while true {
+  @out "This will run forever"
+  break
+}
+
+// 비동기
+
+async function fetchData() {
+  @out "Fetching data..."
+  await sleep(1000)
+  return "data"
+}
+let data = await fetchData()
+@out "data: {data}"
+
+// try-catch
+
+try {
+
+} catch error {
+  @out error
+}
+
+// 도메인
+
+// 기존의 xml/html 태그 문법을 참고함
+// <xml prop key=value>
+//   <nested />
+//   <innerTag prop />
+// </xml>
+
+// 보일러플레이트를 전부빼고 아래와 같이 만듦
+// @domain prop key=value {
+//   @nested
+//   @innerTag prop
+// }
+
+// 도메인은 기본적으로 어떤 액션을 실행시키기 위함
+// 리턴값이 있을수도 있음
+define MyDomain( // 도메인 선언
+  prop1: int? // 프로퍼티 정의
+  prop2: string? // 여기도 오브젝트랑 마찬가지로 줄바꿈이 있기에 쉼표가 생략 가능
+) -> {
+  token { // 허용되는 타입들
+    size: "{number}px"? // return ("{number}"px)[] typed value
+    others: string // return string[] typed value
+  }
+
+  @out "MyDomain created with prop1: {prop1}, prop2: {prop2}"
+  @out "and includes {others[0]} and {size[0]}"
+
+  @content // block 안에 내용을 그대로 받아와 실행
+
+  define SubDomain {
+    @out "subdomain here"
+  }
+
+  // 도메인 내 define, content 라인 위치에 따라 호이스팅되어 실행 시점이 다름
+  return void
+}
+
+// 사용
+@MyDomain prop1=5 prop2="hey" 23px 54px asdf "spaced string" rewq 11 // prop1, prop2는 property, 나머지는 token
+@MyDomain {
+  // 여기 코드랑
+  let n = 0
+  @out "hello, {n}"
+
+  @SubDomain // nested
+
+  // 여기 코드같은 경우에는 도메인 정의 내 @content 위치로 들어가게됨
+  @out "it's {n}"
+}
+
+// 표준 라이브러리
+
+// io
+let input: string = @in "값을 입력:"
+@out "입력한 값: {input}"
+
+// fs
+let mut file: File = await @fs.read "test.txt"
+@out "파일 내용: {file.content}"
+
+await @fs.write "test.txt" "Hello, World!" utf-8
+@out "파일 쓰기 완료"
+
+// http
+let mut response: Response = await @fetch GET "https://api.example.com"
+@out "Status: {response.status}"
+@out "Body: {response.body}"
+
+// process
+let mut result: ProcessResult = await @process.run "ls -la"
+@out "Process finished with code: {result.code}"
+@out "Output: {result.output}"
+
+// math
+let a: int = 10
+let b: int = 20
+let c: int = 30
+
+let max_value: int = max(a, b, c)
+@out "Max: {max_value}"
+
+let min_value: int = min(a, b, c)
+@out "Min: {min_value}"
+
+let s = sin(30)
+@out "sin(30): {s}"
+
+let sqrt = 2 ** 3
+@out "2^3: {sqrt}"
+
+let log = log(10)
+@out "log(10): {log}"
+
+// time
+let now: Time = now()
+@out "현재 시간: {now.year}-{now.month}-{now.day} {now.hour}:{now.minute}:{now.second}"
+
+let today: Time = today()
+@out "오늘: {today.year}-{today.month}-{today.day}"
+
+let tomorrow: Time = tomorrow()
+@out "내일: {tomorrow.year}-{tomorrow.month}-{tomorrow.day}"
+
+let yesterday: Time = yesterday()
+@out "어제: {yesterday.year}-{yesterday.month}-{yesterday.day}"
+
+// server
+let server: Server = @server {
+  @listen 8080
+
+  @route GET / {
+    @respond 200 {"message": "Hello, World!"}
+  }
+}

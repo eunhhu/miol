@@ -1,2 +1,0 @@
-// ERROR: @listen is not valid outside @server context
-@listen 3000

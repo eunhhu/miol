@@ -1,9 +1,0 @@
-// ERROR: multiple @respond in the same route
-@server {
-  @listen 3000
-
-  @route GET /api/data {
-    @respond 200 { "first": true }
-    @respond 200 { "second": true }
-  }
-}
