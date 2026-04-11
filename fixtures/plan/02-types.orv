@@ -1,0 +1,337 @@
+// =====================================================
+// 02-types.orv — 타입 시스템
+// =====================================================
+//
+// 모듈 시스템, 고급 타입, struct, enum, type alias,
+// generic, nullable, 컬렉션, 타입 추론.
+
+// -----------------------------------------------------
+// 모듈 시스템 (import / pub)
+// -----------------------------------------------------
+
+// 파일 구조 예시:
+// src/
+//   main.orv
+//   models/
+//     user.orv    — pub struct User, pub function createUser
+//     post.orv    — pub struct Post, pub define PostCard
+//   utils/
+//     format.orv  — pub function formatDate, pub function slugify
+//   server.orv    — pub define App
+
+// 단일 import
+import models.user.User
+import models.user.createUser
+
+// 선택적 import (Python 스타일)
+import models.post.{Post, PostCard}
+
+// 전체 import
+import utils.format.*
+
+// 사용
+let user: User = createUser({ name: "Alice", email: "alice@orv.dev" })
+let slug: string = slugify("Hello World")
+@PostCard post={somePost}
+
+// pub이 없으면 해당 파일 스코프에서만 접근 가능
+// src/models/user.orv 에서:
+//   pub struct User { ... }         ← 외부에서 import 가능
+//   struct InternalCache { ... }    ← user.orv 내부에서만 사용
+
+// 표준 라이브러리 — 별도 import 없이 사용 가능
+// db, jwt, hash, crypto 등은 orv 표준 라이브러리에 내장 (bun처럼)
+// orv-db: orv 프로젝트에 최적화된 자체 DB (redis/SQL 대신)
+//   → elixir가 redis 대신 자체 인메모리 DB를 쓰는 것과 같은 철학
+//   → 프로젝트 특화 최적화가 가능하도록 설계
+
+// -----------------------------------------------------
+// 컬렉션 타입
+// -----------------------------------------------------
+
+// Vector — 동적 배열
+let numbers: int[] = [1, 2, 3, 4, 5]
+let names: Vector<string> = ["Alice", "Bob", "Charlie"]
+@out numbers[0]       // 1
+@out names.length     // 3
+
+// Tuple — 고정 길이, 이종 타입
+let pair: (int, string) = (1, "hello")
+let triple: Tuple<int, string, bool> = (42, "world", true)
+@out pair             // (1, hello)
+
+// Object — 리터럴 오브젝트
+let person = { name: "John", age: 30 }
+@out person.name      // John
+@out person["age"]    // 30
+
+// Set — 유일 값 집합
+let unique: Set<int> = Set{1, 2, 3, 3, 2}
+@out unique           // Set{1, 2, 3}
+
+// Map — 키-값 쌍
+let scores: Map<string, int> = Map{"alice": 95, "bob": 87}
+@out scores["alice"]  // 95
+
+// 타입 확인
+@out Type(numbers)    // Vector<int>
+@out Type(pair)       // Tuple<int, string>
+@out Type(person)     // Object {name: string, age: int}
+@out Type(unique)     // Set<int>
+@out Type(scores)     // Map<string, int>
+
+// 타입을 가져와서 재사용
+let newMap: Type(scores) = Map{"charlie": 92}
+@out newMap           // Map{"charlie": 92}
+
+// -----------------------------------------------------
+// enum
+// -----------------------------------------------------
+
+// in-line
+enum SizeUnit { Px = "px", Em = "em", Rem = "rem" }
+
+// multi-line
+enum Status {
+  Pending = 0
+  Running = 1
+  Completed = 2
+}
+
+@out Status.Pending   // 0
+@out SizeUnit.Px      // px
+
+// enum을 when과 함께
+let current: Status = Status.Running
+when current {
+  Status.Pending -> @out "대기 중"
+  Status.Running -> @out "실행 중"
+  Status.Completed -> @out "완료"
+}
+
+// -----------------------------------------------------
+// type alias
+// -----------------------------------------------------
+
+// 리터럴 타입 + 유니온
+type Size = "{uint}{SizeUnit}" | "auto" | uint
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE"
+type Result<T> = T | Error
+
+let padding: Size = "16px"
+let margin: Size = "auto"
+let width: Size = 100
+
+@out padding   // 16px
+@out margin    // auto
+@out width     // 100
+
+// -----------------------------------------------------
+// struct
+// -----------------------------------------------------
+
+struct User {
+  name: string
+  age: int
+}
+
+// in-line object
+let mut user: User = { name: "John", age: 30 }
+@out user.name    // John
+
+// 필드 접근 — dot, bracket
+user.name = "Jane"
+user["name"] = "Bob"
+
+// multi-line object (쉼표 생략 가능)
+user = {
+  name: "Bob"
+  age: 25
+}
+@out user         // {name: "Bob", age: 25}
+
+// 복합 struct
+struct Post {
+  title: string
+  content: string
+  likes: int
+  tags: {name: string}[]  // inline object 배열
+  creator: User
+  nullable: string?       // nullable
+}
+
+let post: Post = {
+  title: "First Post"
+  content: "Hello world"
+  likes: 42
+  tags: [{name: "orv"}, {name: "lang"}]
+  creator: { name: "Alice", age: 28 }
+  nullable: void
+}
+
+@out post.title              // First Post
+@out post.tags[0].name       // orv
+@out post.creator.name       // Alice
+@out post.nullable           // void
+
+// -----------------------------------------------------
+// generic
+// -----------------------------------------------------
+
+struct Box<T> {
+  value: T
+}
+
+let intBox: Box<int> = { value: 42 }
+let strBox: Box<string> = { value: "hello" }
+
+@out intBox.value   // 42
+@out strBox.value   // hello
+
+struct Pair<A, B> {
+  first: A
+  second: B
+}
+
+let kv: Pair<string, int> = { first: "score", second: 100 }
+@out "{kv.first}: {kv.second}"  // score: 100
+
+// generic 함수
+function identity<T>(x: T): T -> x
+@out identity(42)        // 42
+@out identity("hello")   // hello
+
+function map<T, U>(items: T[], fn: Function<T, U>): U[] -> {
+  let mut result: U[] = []
+  for item in items {
+    result.push(fn(item))
+  }
+  result
+}
+
+let doubled: int[] = map([1, 2, 3], (x) -> x * 2)
+@out doubled  // [2, 4, 6]
+
+// -----------------------------------------------------
+// nullable
+// -----------------------------------------------------
+
+// ? 접미사로 nullable 선언
+let maybe: string? = void
+let sure: string? = "exists"
+
+@out maybe   // void
+@out sure    // exists
+
+// null coalescing
+let fallback: string = maybe ?? "default"
+@out fallback  // default
+
+// optional chaining과 when
+when maybe {
+  void -> @out "값이 없음"
+  _ -> @out "값: {maybe}"
+}
+
+// struct에서 nullable
+struct Config {
+  host: string
+  port: int
+  ssl: bool?
+  timeout: int?
+}
+
+let config: Config = {
+  host: "localhost"
+  port: 8080
+  ssl: void
+  timeout: void
+}
+
+let useSSL: bool = config.ssl ?? false
+let timeoutMs: int = config.timeout ?? 30000
+@out "SSL: {useSSL}, Timeout: {timeoutMs}"
+
+// -----------------------------------------------------
+// 컬렉션 메서드
+// -----------------------------------------------------
+
+let items: int[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+// filter
+let evens: int[] = items.filter((x) -> x % 2 == 0)
+@out evens  // [2, 4, 6, 8, 10]
+
+// map
+let squares: int[] = items.map((x) -> x * x)
+@out squares  // [1, 4, 9, 16, 25, 36, 49, 64, 81, 100]
+
+// reduce
+let sum: int = items.reduce(0, (acc, x) -> acc + x)
+@out sum  // 55
+
+// find
+let found: int? = items.find((x) -> x > 7)
+@out found  // 8
+
+// some / every
+@out items.some((x) -> x > 5)   // true
+@out items.every((x) -> x > 0)  // true
+
+// sort
+let unsorted: int[] = [3, 1, 4, 1, 5, 9, 2, 6]
+let sorted: int[] = unsorted.sort((a, b) -> a - b)
+@out sorted  // [1, 1, 2, 3, 4, 5, 6, 9]
+
+// chaining
+let result: int = [1, 2, 3, 4, 5]
+  .filter((x) -> x % 2 == 1)
+  .map((x) -> x * 10)
+  .reduce(0, (acc, x) -> acc + x)
+@out result  // 90
+
+// Map 메서드
+let mut dict: Map<string, int> = Map{"a": 1, "b": 2, "c": 3}
+@out dict.keys()    // ["a", "b", "c"]
+@out dict.values()  // [1, 2, 3]
+@out dict.has("a")  // true
+
+for (key, value) in dict {
+  @out "{key} = {value}"
+}
+
+// Set 메서드
+let setA: Set<int> = Set{1, 2, 3, 4}
+let setB: Set<int> = Set{3, 4, 5, 6}
+@out setA.union(setB)        // Set{1, 2, 3, 4, 5, 6}
+@out setA.intersect(setB)    // Set{3, 4}
+@out setA.difference(setB)   // Set{1, 2}
+
+// -----------------------------------------------------
+// 함수 타입
+// -----------------------------------------------------
+
+// 함수도 first-class 값
+function greet(name: string): string -> "hello, {name}"
+@out Type(greet)  // Function<string>
+
+// 변수에 함수 할당
+let fn: Function<int, int> = (x) -> x * 2
+@out fn(5)  // 10
+
+// 고차 함수
+function apply(x: int, f: Function<int, int>): int -> f(x)
+@out apply(5, (x) -> x + 10)  // 15
+
+// 클로저
+function makeCounter(): Function<void, int> -> {
+  let mut count: int = 0
+  () -> {
+    count = count + 1
+    count
+  }
+}
+let counter = makeCounter()
+@out counter()  // 1
+@out counter()  // 2
+@out counter()  // 3

@@ -1,0 +1,1128 @@
+// =====================================================
+// 06-fullstack-showcase.orv — 풀스택 통합 쇼케이스
+// =====================================================
+//
+// default.md의 비전을 하나의 파일로 증명.
+// "프로젝트 하나, 파일 하나, 풀서비스 하나"
+//
+// 이 파일 하나가 생성하는 것:
+//   - 서버 바이너리 (네이티브 or WASM)
+//   - 클라이언트 번들 (HTML + JS 브릿지 + WASM + CSS)
+//   - 정적 자산 라우트
+//   - 내부 RPC + 외부 JSON API
+//   - 미들웨어 체인
+//   - 페이지별 최적 렌더링 전략
+//
+// 그리고 컴파일러가 알아서:
+//   - 안 쓰는 코드 제거 (DCE)
+//   - 독립 쿼리 병렬화
+//   - 루프 내 fetch 배칭
+//   - 내부 RPC 바이너리 직렬화
+//   - HTTP 메타데이터 컴파일타임 확정
+//   - 페이지별 SSG/CSR/SSR 자동 판정
+
+// =============================================================
+//
+//  1. 타입 스키마
+//
+// =============================================================
+
+struct User {
+  id: int
+  name: string
+  email: string
+  avatar: string?
+  role: string
+  createdAt: string
+}
+
+struct Post {
+  id: int
+  title: string
+  content: string
+  author: User
+  tags: string[]
+  likes: int
+  createdAt: string
+}
+
+struct Comment {
+  id: int
+  postId: int
+  author: User
+  content: string
+  createdAt: string
+}
+
+struct LoginRequest {
+  email: string
+  password: string
+}
+
+struct RegisterRequest {
+  name: string
+  email: string
+  password: string
+}
+
+struct AuthPayload {
+  id: int
+  role: string
+}
+
+struct DashboardData {
+  user: User
+  recentPosts: Post[]
+  totalLikes: int
+  followerCount: int
+}
+
+struct PaginatedResponse<T> {
+  items: T[]
+  total: int
+  page: int
+  pageSize: int
+  hasNext: bool
+}
+
+enum NotificationType {
+  Info = "info"
+  Warning = "warning"
+  Error = "error"
+  Success = "success"
+}
+
+pub const SITE_NAME: string = "Orv Showcase"
+pub const VERSION: string = "1.0.0"
+
+// =============================================================
+//
+//  2. 미들웨어
+//
+// =============================================================
+
+define Auth() -> @before {
+  let bearer: string? = @header Authorization
+  when bearer {
+    void -> @respond 401 { error: "Authorization required" }
+    _ -> {
+      let token = bearer[7:]
+      try {
+        let payload: AuthPayload = jwt.verify(token, @env SECRET)
+        @next {payload}
+      } catch error {
+        @respond 401 { error: "Invalid token" }
+      }
+    }
+  }
+}
+
+define AdminOnly() -> @before {
+  let payload: AuthPayload = @context.payload
+  when payload.role {
+    "admin" -> @next
+    _ -> @respond 403 { error: "Admin access required" }
+  }
+}
+
+define RateLimit(max: int, window: int?) -> @before {
+  let ip = @request.ip
+  let key: string = "rate:{ip}:{@request.path}"
+  let count = await redis.incr(key)
+  if count == 1 {
+    await redis.expire(key, window ?? 60)
+  }
+  if count > max {
+    @respond 429 {
+      error: "Too many requests"
+      retryAfter: window ?? 60
+    }
+  }
+  @next
+}
+
+define Cors(origin: string?) -> @before {
+  @response.headers["Access-Control-Allow-Origin"] = origin ?? "*"
+  @response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE"
+  @response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+  if @request.method == "OPTIONS" {
+    @respond 204 {}
+  }
+  @next
+}
+
+define AccessLog() -> @after {
+  let duration = @response.duration
+  let status = @response.status
+  let emoji: string = status < 400 ? "✓" : "✗"
+  @out "[{emoji}] {@request.method} {@request.path} → {status} ({duration}ms)"
+  @next
+}
+
+define ErrorHandler() -> @after {
+  if @response.status >= 500 {
+    @out "[FATAL] {@request.method} {@request.path}"
+    @out "  Error: {@response.body}"
+    await monitor.report({
+      path: @request.path
+      status: @response.status
+      body: @response.body
+      timestamp: now()
+    })
+  }
+  @next
+}
+
+// =============================================================
+//
+//  3. UI 컴포넌트 (도메인)
+//
+// =============================================================
+
+// 기본 레이아웃
+define Layout(title: string) -> @html {
+  @head {
+    @title "{title} — {SITE_NAME}"
+    @meta name="viewport" content="width=device-width, initial-scale=1.0"
+  }
+  @body {
+    @NavBar
+    @div {
+      %class="container"
+      @content
+    }
+    @Footer
+  }
+
+  define Header(subtitle: string?) -> @div {
+    %class="page-header"
+    @h1 "{title}"
+    if subtitle != void {
+      @p "{subtitle}"
+    }
+  }
+}
+
+// 네비게이션
+define NavBar() -> @nav {
+  %class="navbar"
+  @div {
+    %class="navbar-brand"
+    @a href="/" "{SITE_NAME}"
+  }
+  @div {
+    %class="navbar-links"
+    @a href="/" "Home"
+    @a href="/blog" "Blog"
+    @a href="/about" "About"
+    @a href="/dashboard" "Dashboard"
+  }
+}
+
+// 푸터
+define Footer() -> @footer {
+  %class="footer"
+  @p "© 2026 {SITE_NAME}. Built with Orv."
+  @p "Version {VERSION}"
+}
+
+// 카드 컴포넌트
+define Card(title: string, subtitle: string?) -> @div {
+  %class="card"
+  @div {
+    %class="card-header"
+    @h3 "{title}"
+    if subtitle != void {
+      @p "{subtitle}"
+    }
+  }
+  @div {
+    %class="card-body"
+    @content
+  }
+}
+
+// 알림 컴포넌트
+define Notification(
+  type: NotificationType
+  dismissable: bool?
+) -> {
+  token {
+    message: string
+  }
+  @div {
+    %class="notification notification-{type}"
+    @p "{message[0]}"
+    if dismissable ?? false {
+      @button onClick={@this.remove()} "×"
+    }
+  }
+}
+
+// 사용자 아바타
+define Avatar(user: User, size: string?) -> @div {
+  %class="avatar avatar-{size ?? "md"}"
+  when user.avatar {
+    void -> @div {
+      %class="avatar-placeholder"
+      "{user.name[0]}"
+    }
+    _ -> @img src="{user.avatar}" alt="{user.name}"
+  }
+}
+
+// 포스트 카드
+define PostCard(post: Post) -> @Card title="{post.title}" subtitle="by {post.author.name}" {
+  @p "{post.content[:200]}..."
+  @div {
+    %class="post-meta"
+    @span "❤ {post.likes}"
+    @span "🏷 {post.tags.join(", ")}"
+    @span "{post.createdAt}"
+  }
+}
+
+// 로딩 스피너
+define Spinner(size: string?) -> @div {
+  %class="spinner spinner-{size ?? "md"}"
+}
+
+// 빈 상태
+define EmptyState(
+  title: string
+  description: string?
+) -> @div {
+  %class="empty-state"
+  @h3 "{title}"
+  if description != void {
+    @p "{description}"
+  }
+}
+
+// 페이지네이션
+define Pagination(
+  current: int
+  total: int
+  onPageChange: Function<int, void>
+) -> @div {
+  %class="pagination"
+  if current > 1 {
+    @button onClick={onPageChange(current - 1)} "← Prev"
+  }
+  @span "Page {current} of {total}"
+  if current < total {
+    @button onClick={onPageChange(current + 1)} "Next →"
+  }
+}
+
+// =============================================================
+//
+//  4. API 라우트
+//
+// =============================================================
+
+// 인증 API
+let authApi = @route /api/auth {
+  @route POST /login {
+    let body: LoginRequest = @request.body
+    let user = await db.findByEmail(body.email)
+
+    when user {
+      void -> @respond 401 { error: "Invalid credentials" }
+      _ -> {
+        let valid: bool = await hash.verify(body.password, user.passwordHash)
+        if !valid {
+          @respond 401 { error: "Invalid credentials" }
+        }
+        let token = jwt.sign(
+          { id: user.id, role: user.role },
+          @env SECRET
+        )
+        @respond 200 { token: token, user: user }
+      }
+    }
+  }
+
+  @route POST /register {
+    let body: RegisterRequest = @request.body
+    let existing = await db.findByEmail(body.email)
+
+    when existing {
+      void -> {
+        let passwordHash = await hash.create(body.password)
+        let user = await db.createUser({
+          name: body.name
+          email: body.email
+          passwordHash: passwordHash
+          role: "member"
+          createdAt: string.from(now())
+        })
+        let token = jwt.sign(
+          { id: user.id, role: user.role },
+          @env SECRET
+        )
+        @respond 201 { token: token, user: user }
+      }
+      _ -> @respond 409 { error: "Email already exists" }
+    }
+  }
+
+  @route POST /refresh {
+    @Auth
+    let payload: AuthPayload = @context.payload
+    let token = jwt.sign(payload, @env SECRET)
+    @respond 200 { token: token }
+  }
+}
+
+// 사용자 API
+let userApi = @route /api/users {
+  @route GET / {
+    let page: int = int.from(@request.query.page ?? "1")
+    let limit: int = int.from(@request.query.limit ?? "20")
+    let users = await db.findUsers(page, limit)
+    let total = await db.countUsers()
+    // → users와 total은 독립 → 자동 병렬 실행
+
+    @respond 200 {
+      items: users
+      total: total
+      page: page
+      pageSize: limit
+      hasNext: page * limit < total
+    }
+  }
+
+  @route GET /:id {
+    let id: int = @path.id as int
+    let user = await db.findUser(id)
+    when user {
+      void -> @respond 404 { error: "User not found" }
+      _ -> @respond 200 { user: user }
+    }
+  }
+
+  @route PUT /:id {
+    @Auth
+    let id: int = @path.id as int
+    let payload: AuthPayload = @context.payload
+    if payload.id != id && payload.role != "admin" {
+      @respond 403 { error: "Cannot edit other users" }
+    }
+    let body = @request.body
+    let user = await db.updateUser(id, body)
+    @respond 200 { user: user }
+  }
+}
+
+// 포스트 API
+let postApi = @route /api/posts {
+  @route GET / {
+    let page: int = int.from(@request.query.page ?? "1")
+    let limit: int = int.from(@request.query.limit ?? "20")
+    let tag: string? = @request.query.tag
+
+    let posts = when tag {
+      void -> await db.findPosts(page, limit)
+      _ -> await db.findPostsByTag(tag, page, limit)
+    }
+    let total = await db.countPosts(tag)
+
+    @respond 200 {
+      items: posts
+      total: total
+      page: page
+      pageSize: limit
+      hasNext: page * limit < total
+    }
+  }
+
+  @route GET /:id {
+    let id: int = @path.id as int
+    let post = await db.findPost(id)
+    let comments = await db.findComments(id)
+    // → post와 comments는 독립 → 자동 병렬
+
+    when post {
+      void -> @respond 404 { error: "Post not found" }
+      _ -> @respond 200 { post: post, comments: comments }
+    }
+  }
+
+  @route POST / {
+    @Auth
+    let payload: AuthPayload = @context.payload
+    let body = @request.body
+    let post = await db.createPost({
+      title: body.title
+      content: body.content
+      author: payload.id
+      tags: body.tags ?? []
+      likes: 0
+      createdAt: string.from(now())
+    })
+    @respond 201 { post: post }
+  }
+
+  @route POST /:id/like {
+    @Auth
+    let id: int = @path.id as int
+    await db.incrementLikes(id)
+    @respond 200 { liked: true }
+  }
+
+  @route POST /:id/comments {
+    @Auth
+    let id: int = @path.id as int
+    let payload: AuthPayload = @context.payload
+    let body = @request.body
+    let comment = await db.createComment({
+      postId: id
+      author: payload.id
+      content: body.content
+      createdAt: string.from(now())
+    })
+    @respond 201 { comment: comment }
+  }
+}
+
+// =============================================================
+//
+//  5. 페이지 (렌더링 전략 자동 판정)
+//
+// =============================================================
+
+// ── (a) 정적 페이지 ── sig 0, await 0 → 빌드 시 HTML 확정
+
+pub define HomePage() -> @Layout title="Home" {
+  @Layout.Header subtitle="프로젝트 특화 풀서비스 플랫폼"
+
+  @div {
+    %class="hero"
+    @h2 "하나의 파일, 하나의 프로젝트, 하나의 번들"
+    @p "orv는 당신의 프로젝트에 딱 맞는 최적의 번들을 생성합니다."
+    @p "안 쓰는 건 포함하지 않습니다. 필요 없으면 런타임도 없습니다."
+  }
+
+  @div {
+    %class="features"
+    @Card title="Zero-overhead" {
+      @p "사용한 기능만 번들에 포함."
+      @p "DOM 안 쓰면 DOM 런타임 없음."
+    }
+    @Card title="Zero-runtime" {
+      @p "sig 없는 페이지는 순수 HTML."
+      @p "JS도 WASM도 없음."
+    }
+    @Card title="프로젝트 특화" {
+      @p "범용 프레임워크가 아님."
+      @p "이 프로젝트를 위한 최적화."
+    }
+  }
+}
+// → 판정: 정적 생성
+// → 번들에 JS/WASM 없음, 순수 HTML 파일
+
+pub define AboutPage() -> @Layout title="About" {
+  @Layout.Header
+
+  @Card title="Why Orv?" {
+    @p "기존 생태계는 호환성을 위해 성능을 포기합니다."
+    @p "SQL은 웹이든 게임이든 같은 방식으로 저장합니다."
+    @p "HTTP도 랜딩 웹앱이든 게임 웹앱이든 같은 통신입니다."
+    @p "orv는 프로젝트의 목적에 맞게 전 레이어를 최적화합니다."
+  }
+
+  @Card title="Performance Targets" {
+    @p "SPA 번들: ≤ 3kb (바닐라 1-2kb, React 40-50kb)"
+    @p "백엔드 RPS: ≥ drogon"
+    @p "바이너리: ≥ Rust"
+    @p "복잡한 프로젝트일수록 Rust보다 빠르게"
+  }
+
+  @Card title="Platform" {
+    @p "단순 언어가 아닌 플랫폼."
+    @p "DSL 에디터 + GUI + NUI 통합."
+    @p "의사코드 수준으로 적어도 프로덕트가 나옴."
+  }
+}
+// → 판정: 정적 생성
+
+// ── (b) 클라이언트 페이지 ── sig 있지만 서버 데이터 없음
+
+pub define CounterPage() -> @Layout title="Counter" {
+  @Layout.Header subtitle="클라이언트 렌더링 데모"
+
+  let sig count: int = 0
+  let sig history: int[] = []
+
+  @Card title="Counter" {
+    @p "현재 값: {count}"
+    @div {
+      %class="button-group"
+      @button onClick={count -= 1} "-"
+      @button onClick={count = 0} "Reset"
+      @button onClick={count += 1} "+"
+    }
+    @button onClick={history = history.concat([count])} "기록 저장"
+  }
+
+  if history.length > 0 {
+    @Card title="History" {
+      @ul {
+        for (val, idx) in history {
+          @li "#{idx + 1}: {val}"
+        }
+      }
+    }
+  }
+}
+// → 판정: 클라이언트 렌더링
+// → 빈 HTML 쉘 + WASM 번들
+
+pub define TodoPage() -> @Layout title="Todo" {
+  @Layout.Header subtitle="클라이언트 상태 관리 데모"
+
+  struct TodoItem {
+    id: int
+    text: string
+    done: bool
+  }
+
+  let sig todos: TodoItem[] = []
+  let sig input: string = ""
+  let sig nextId: int = 1
+  let sig filter: string = "all"
+
+  define TodoFilter() -> @div {
+    %class="todo-filter"
+    @button onClick={filter = "all"} "All ({todos.length})"
+    @button onClick={filter = "active"} "Active ({todos.filter(t -> !t.done).length})"
+    @button onClick={filter = "done"} "Done ({todos.filter(t -> t.done).length})"
+  }
+
+  let filtered: TodoItem[] = when filter {
+    "active" -> todos.filter(t -> !t.done)
+    "done" -> todos.filter(t -> t.done)
+    _ -> todos
+  }
+
+  @Card title="Todos" {
+    @div {
+      %class="todo-input"
+      @input value="{input}" onInput={(e) -> input = e.target.value} placeholder="할 일 입력..."
+      @button onClick={
+        if input.length > 0 {
+          todos = todos.concat([{ id: nextId, text: input, done: false }])
+          nextId += 1
+          input = ""
+        }
+      } "추가"
+    }
+
+    @TodoFilter
+
+    @ul {
+      for todo in filtered {
+        @li {
+          %class=todo.done ? "done" : ""
+          @input type="checkbox" checked={todo.done} onChange={
+            todos = todos.map(t -> t.id == todo.id ? { ...t, done: !t.done } : t)
+          }
+          @span "{todo.text}"
+          @button onClick={
+            todos = todos.filter(t -> t.id != todo.id)
+          } "×"
+        }
+      }
+    }
+
+    if filtered.length == 0 {
+      @EmptyState title="할 일이 없습니다" description="새 할 일을 추가해보세요."
+    }
+  }
+}
+// → 판정: 클라이언트 렌더링
+
+// ── (c) 서버 렌더링 페이지 ── await + sig → SSR + hydration
+
+pub define DashboardPage() -> @Layout title="Dashboard" {
+  @Layout.Header subtitle="서버 렌더링 데모"
+
+  // 서버에서 데이터 fetch — 독립 쿼리 자동 병렬
+  let sig user: User = await userApi.fetch("/me")
+  let sig recentPosts: Post[] = await postApi.fetch("/?limit=5")
+  let sig stats = await api.fetch("/stats")
+
+  @div {
+    %class="dashboard-header"
+    @Avatar user={user} size="lg"
+    @h2 "Welcome, {user.name}"
+    @p "Role: {user.role}"
+  }
+
+  @div {
+    %class="dashboard-stats"
+    @Card title="Posts" {
+      @p "{stats.totalPosts}"
+    }
+    @Card title="Likes" {
+      @p "{stats.totalLikes}"
+    }
+    @Card title="Followers" {
+      @p "{stats.followerCount}"
+    }
+  }
+
+  @Card title="Recent Posts" {
+    for post in recentPosts {
+      @PostCard post={post}
+    }
+    if recentPosts.length == 0 {
+      @EmptyState title="아직 포스트가 없습니다"
+    }
+  }
+}
+// → 판정: 서버 렌더링
+// → user, recentPosts, stats 독립 → 자동 병렬 fetch
+// → 서버에서 HTML 생성 + 클라이언트 hydration
+
+pub define BlogPage() -> @Layout title="Blog" {
+  @Layout.Header subtitle="포스트 목록"
+
+  let sig page: int = 1
+  let sig tag: string? = void
+  let sig data: PaginatedResponse<Post> = await postApi.fetch("/?page={page}&tag={tag ?? ""}")
+
+  // 태그 필터
+  let sig tags: string[] = await api.fetch("/tags")
+  @div {
+    %class="tag-filter"
+    @button onClick={tag = void; page = 1; data = await postApi.fetch("/?page=1")} "전체"
+    for t in tags {
+      @button onClick={
+        tag = t
+        page = 1
+        data = await postApi.fetch("/?page=1&tag={t}")
+      } "#{t}"
+    }
+  }
+
+  // 포스트 목록
+  for post in data.items {
+    @PostCard post={post}
+  }
+
+  if data.items.length == 0 {
+    @EmptyState title="포스트가 없습니다" description="다른 태그를 선택해보세요."
+  }
+
+  // 페이지네이션
+  let totalPages: int = (data.total + data.pageSize - 1) / data.pageSize
+  @Pagination
+    current={page}
+    total={totalPages}
+    onPageChange={(p) -> {
+      page = p
+      data = await postApi.fetch("/?page={p}&tag={tag ?? ""}")
+    }}
+}
+// → 판정: 서버 렌더링
+// → 초기 데이터는 SSR, 페이지 전환/필터는 클라이언트 hydration
+
+pub define PostDetailPage(postId: int) -> @Layout title="Post" {
+  let sig post: Post = await postApi.fetch("/{postId}")
+  let sig comments: Comment[] = await api.fetch("/posts/{postId}/comments")
+  // → post와 comments 독립 → 자동 병렬
+
+  @article {
+    @h1 "{post.title}"
+    @div {
+      %class="post-author"
+      @Avatar user={post.author} size="sm"
+      @span "{post.author.name}"
+      @span "{post.createdAt}"
+    }
+    @div {
+      %class="post-content"
+      @p "{post.content}"
+    }
+    @div {
+      %class="post-tags"
+      for tag in post.tags {
+        @span "#{tag}"
+      }
+    }
+
+    // 좋아요
+    let sig liked: bool = false
+    let sig likes: int = post.likes
+    @button onClick={
+      if !liked {
+        await postApi.fetch("/{postId}/like", method="POST")
+        liked = true
+        likes += 1
+      }
+    } "❤ {likes}"
+  }
+
+  // 댓글
+  @Card title="Comments ({comments.length})" {
+    for comment in comments {
+      @div {
+        %class="comment"
+        @div {
+          @Avatar user={comment.author} size="sm"
+          @span "{comment.author.name}"
+          @span "{comment.createdAt}"
+        }
+        @p "{comment.content}"
+      }
+    }
+
+    // 댓글 작성
+    let sig newComment: string = ""
+    @div {
+      %class="comment-form"
+      @textarea value="{newComment}" onInput={(e) -> newComment = e.target.value} placeholder="댓글 작성..."
+      @button onClick={
+        if newComment.length > 0 {
+          let c = await api.fetch("/posts/{postId}/comments", method="POST", body={ content: newComment })
+          comments = comments.concat([c])
+          newComment = ""
+        }
+      } "작성"
+    }
+  }
+}
+// → 판정: 서버 렌더링
+
+// ── (d) 로그인 페이지 ── 클라이언트 (서버 데이터 없이 시작)
+
+pub define LoginPage() -> @Layout title="Login" {
+  @Layout.Header
+
+  let sig email: string = ""
+  let sig password: string = ""
+  let sig error: string? = void
+  let sig loading: bool = false
+
+  @Card title="Login" {
+    if error != void {
+      @Notification type=NotificationType.Error "{error}"
+    }
+
+    @form onSubmit={(e) -> {
+      e.preventDefault()
+      loading = true
+      error = void
+      try {
+        let res = await authApi.fetch("/login", method="POST", body={
+          email: email
+          password: password
+        })
+        localStorage.set("token", res.token)
+        navigate("/dashboard")
+      } catch err {
+        error = "로그인 실패: 이메일 또는 비밀번호를 확인하세요."
+      }
+      loading = false
+    }} {
+      @div {
+        @label "이메일"
+        @input type="email" value="{email}" onInput={(e) -> email = e.target.value} placeholder="email@example.com"
+      }
+      @div {
+        @label "비밀번호"
+        @input type="password" value="{password}" onInput={(e) -> password = e.target.value}
+      }
+      @button type="submit" disabled={loading} {
+        if loading { "로그인 중..." } else { "로그인" }
+      }
+    }
+
+    @p "계정이 없으신가요?"
+    @a href="/register" "회원가입"
+  }
+}
+// → 판정: 클라이언트 렌더링
+
+// =============================================================
+//
+//  6. 서버 — 모든 것을 하나로
+//
+// =============================================================
+
+@server {
+  @listen int.from(@env PORT ?? "8080")
+
+  // ── 전역 미들웨어 ──
+  @Cors origin={@env CORS_ORIGIN ?? "*"}
+  @AccessLog
+  @ErrorHandler
+
+  // ── 정적 자산 ──
+  @route GET /assets {
+    @serve ./public
+  }
+
+  @route GET /favicon.ico {
+    @serve ./public/favicon.ico
+  }
+
+  // ── 내부 API (let 바인딩 → 바이너리 RPC) ──
+  // authApi, userApi, postApi는 위에서 let으로 선언됨
+  // → 내부 RPC 자동 적용
+  // → .fetch()로만 접근, 바이너리 직렬화
+
+  // ── 추가 내부 API ──
+  let api = @route /api {
+    @route GET /stats {
+      @Auth
+      let payload: AuthPayload = @context.payload
+      let totalPosts = await db.countPostsByUser(payload.id)
+      let totalLikes = await db.countLikesByUser(payload.id)
+      let followerCount = await db.countFollowers(payload.id)
+      // → 세 쿼리 독립 → 자동 병렬
+
+      @respond 200 {
+        totalPosts: totalPosts
+        totalLikes: totalLikes
+        followerCount: followerCount
+      }
+    }
+
+    @route GET /tags {
+      let tags = await db.getAllTags()
+      @respond 200 tags
+    }
+
+    @route GET /posts/:postId/comments {
+      let postId: int = @path.postId as int
+      let comments = await db.findComments(postId)
+      @respond 200 comments
+    }
+
+    @route POST /posts/:postId/comments {
+      @Auth
+      let postId: int = @path.postId as int
+      let payload: AuthPayload = @context.payload
+      let body = @request.body
+      let comment = await db.createComment({
+        postId: postId
+        author: payload.id
+        content: body.content
+        createdAt: string.from(now())
+      })
+      @respond 201 comment
+    }
+  }
+
+  // ── 외부 공개 API (JSON) ──
+  @route GET /health {
+    @respond 200 {
+      status: "ok"
+      version: VERSION
+      uptime: getUptime()
+    }
+  }
+
+  @route GET /api/v1/public/posts {
+    let page: int = int.from(@request.query.page ?? "1")
+    let posts = await db.findPublicPosts(page, 10)
+    @respond 200 { posts: posts }
+  }
+  // → 변수 미할당 → 외부 API → JSON
+  // → curl, 브라우저, 다른 서비스에서 접근 가능
+
+  // ── 페이지 라우트 ──
+
+  // 정적 페이지 → 빌드 시 HTML 확정
+  @route GET / {
+    @serve HomePage()
+  }
+
+  @route GET /about {
+    @serve AboutPage()
+  }
+
+  // 클라이언트 페이지 → 빈 쉘 + WASM
+  @route GET /counter {
+    @serve CounterPage()
+  }
+
+  @route GET /todo {
+    @serve TodoPage()
+  }
+
+  @route GET /login {
+    @serve LoginPage()
+  }
+
+  // 서버 렌더링 페이지 → SSR + hydration
+  @route GET /dashboard {
+    @Auth
+    @RateLimit max=60
+    @serve DashboardPage()
+  }
+
+  @route GET /blog {
+    @serve BlogPage()
+  }
+
+  @route GET /post/:id {
+    let id: int = @path.id as int
+    @serve PostDetailPage postId={id}
+  }
+
+  // 관리자 페이지
+  @route /admin @hint chunk=separate {
+    @Auth
+    @AdminOnly
+    @RateLimit max=30 window=300
+
+    @route GET / {
+      @serve AdminDashboard()
+    }
+
+    @route GET /users {
+      @serve AdminUsersPage()
+    }
+  }
+
+  // 404 — 와일드카드
+  @route GET * {
+    @serve NotFoundPage()
+  }
+}
+
+// ── 404 페이지 (정적) ──
+define NotFoundPage() -> @Layout title="404" {
+  @div {
+    %class="error-page"
+    @h1 "404"
+    @p "페이지를 찾을 수 없습니다."
+    @a href="/" "홈으로 돌아가기"
+  }
+}
+
+// ── 관리자 페이지 (SSR) ──
+define AdminDashboard() -> @Layout title="Admin" {
+  @Layout.Header subtitle="관리자 대시보드"
+  let sig userCount = await db.countUsers()
+  let sig postCount = await db.countPosts()
+  let sig recentUsers: User[] = await db.recentUsers(limit=10)
+  // → 세 쿼리 독립 → 자동 병렬
+
+  @div {
+    %class="admin-stats"
+    @Card title="Total Users" { @p "{userCount}" }
+    @Card title="Total Posts" { @p "{postCount}" }
+  }
+
+  @Card title="Recent Users" {
+    @table {
+      @thead {
+        @tr {
+          @th "ID"
+          @th "Name"
+          @th "Email"
+          @th "Role"
+          @th "Created"
+        }
+      }
+      @tbody {
+        for user in recentUsers {
+          @tr {
+            @td "{user.id}"
+            @td "{user.name}"
+            @td "{user.email}"
+            @td "{user.role}"
+            @td "{user.createdAt}"
+          }
+        }
+      }
+    }
+  }
+}
+
+define AdminUsersPage() -> @Layout title="Admin - Users" {
+  @Layout.Header subtitle="사용자 관리"
+
+  let sig page: int = 1
+  let sig users: PaginatedResponse<User> = await userApi.fetch("/?page={page}&limit=20")
+
+  @table {
+    @thead {
+      @tr {
+        @th "ID"
+        @th "Name"
+        @th "Email"
+        @th "Role"
+        @th "Actions"
+      }
+    }
+    @tbody {
+      for user in users.items {
+        @tr {
+          @td "{user.id}"
+          @td "{user.name}"
+          @td "{user.email}"
+          @td "{user.role}"
+          @td {
+            @button onClick={
+              await userApi.fetch("/{user.id}", method="DELETE")
+              users = await userApi.fetch("/?page={page}&limit=20")
+            } "삭제"
+          }
+        }
+      }
+    }
+  }
+
+  let totalPages: int = (users.total + users.pageSize - 1) / users.pageSize
+  @Pagination
+    current={page}
+    total={totalPages}
+    onPageChange={(p) -> {
+      page = p
+      users = await userApi.fetch("/?page={p}&limit=20")
+    }}
+}
+
+// =============================================================
+//
+//  7. 마무리 — 이 파일 하나가 증명하는 것
+//
+// =============================================================
+
+// 이 단일 파일에서:
+//
+// [컴파일러가 자동으로]
+//   ✓ 서버 바이너리 + 클라이언트 WASM 분리
+//   ✓ 내부 RPC (authApi, userApi, postApi, api) → 바이너리 직렬화
+//   ✓ 외부 API (/health, /api/v1/public/*) → JSON 유지
+//   ✓ 페이지별 렌더링 전략 자동 판정:
+//       HomePage, AboutPage → 정적 생성
+//       CounterPage, TodoPage, LoginPage → 클라이언트 렌더링
+//       DashboardPage, BlogPage, PostDetailPage → 서버 렌더링
+//       AdminDashboard, AdminUsersPage → 서버 렌더링
+//   ✓ 독립 쿼리 자동 병렬 (dashboard stats, post+comments 등)
+//   ✓ 루프 내 fetch 자동 배칭
+//   ✓ Dead code elimination (사용 안 된 도메인/함수/타입 제거)
+//   ✓ HTTP 메타데이터 컴파일타임 확정
+//   ✓ 미들웨어 없는 라우트는 디스패치 건너뜀
+//   ✓ 라우트 기반 코드 스플리팅 (admin → 별도 청크)
+//
+// [개발자가 한 것]
+//   타입 정의, 도메인 선언, 라우트 작성, 페이지 구성
+//   — SSR/CSR/SSG, 바이너리/JSON, 병렬/순차 키워드 없음
+//   — 최적화 결정은 전부 컴파일러가 코드 패턴에서 추론
+//
+// 성능 목표
+//   [ ] SPA 번들 ≤ 3kb
+//   [ ] 백엔드 rps ≥ drogon
+//   [ ] 바이너리 ≥ Rust
+//   [ ] 프로젝트 도메인이 깊을수록 Rust보다 빠르게
+//   [ ] Zero-overhead: 안 쓰는 건 번들에 없다
+//   [ ] Zero-runtime: 필요 없으면 런타임도 없다

@@ -1,0 +1,583 @@
+// =====================================================
+// 04-server.orv — 서버, 라우팅, 미들웨어
+// =====================================================
+//
+// @server, @route, @respond, @serve, @before, @after,
+// @next, @path, @request, @response, @header, @env,
+// @context, 라우트 그룹 facade, 내부 RPC vs 외부 API.
+
+// -----------------------------------------------------
+// 기본 서버
+// -----------------------------------------------------
+
+@server {
+  @listen 8080
+  @out "서버 시작: 8080"
+
+  @route GET / {
+    @respond 200 { message: "Hello, World!" }
+  }
+}
+
+// -----------------------------------------------------
+// 라우트 기초
+// -----------------------------------------------------
+
+// HTTP 메서드별 라우트
+@server {
+  @listen 3000
+
+  // GET
+  @route GET /api/users {
+    let users = await db.findUsers()
+    @respond 200 { users: users }
+  }
+
+  // POST
+  @route POST /api/users {
+    let body = @request.body
+    let user = await db.createUser(body)
+    @respond 201 { user: user }
+  }
+
+  // PUT
+  @route PUT /api/users/:id {
+    let id: int = @path.id as int
+    let body = @request.body
+    let user = await db.updateUser(id, body)
+    @respond 200 { user: user }
+  }
+
+  // DELETE
+  @route DELETE /api/users/:id {
+    let id: int = @path.id as int
+    await db.deleteUser(id)
+    @respond 204 {}
+  }
+
+  // 와일드카드
+  @route GET * {
+    @respond 404 { error: "Not Found" }
+  }
+}
+
+// -----------------------------------------------------
+// @path — 경로 파라미터
+// -----------------------------------------------------
+
+@route GET /users/:userId/posts/:postId {
+  let userId: int = @path.userId as int
+  let postId: int = @path.postId as int
+  let post = await db.findPost(userId, postId)
+  @respond 200 { post: post }
+}
+
+// 여러 파라미터 조합
+@route GET /api/:version/resource/:id {
+  let ver: string = @path.version
+  let id: int = @path.id as int
+  @out "API {ver}, Resource {id}"
+  @respond 200 { version: ver, id: id }
+}
+
+// -----------------------------------------------------
+// @request / @response — 요청·응답 객체
+// -----------------------------------------------------
+
+@route POST /api/submit {
+  // 요청 정보 접근
+  let method: string = @request.method        // POST
+  let path: string = @request.path            // /api/submit
+  let body = @request.body                    // 파싱된 바디
+  let query = @request.query                  // 쿼리 파라미터
+  let ip: string = @request.ip               // 클라이언트 IP
+
+  @out "Method: {method}"
+  @out "From: {ip}"
+
+  @respond 200 { received: body }
+}
+
+// 쿼리 파라미터
+@route GET /api/search {
+  let q: string = @request.query.q ?? ""
+  let page: int = int.from(@request.query.page ?? "1")
+  let limit: int = int.from(@request.query.limit ?? "20")
+
+  let results = await db.search(q, page, limit)
+  @respond 200 {
+    query: q
+    page: page
+    results: results
+  }
+}
+
+// -----------------------------------------------------
+// @header — 요청 헤더
+// -----------------------------------------------------
+
+@route GET /api/profile {
+  let auth: string? = @header Authorization
+  let contentType: string? = @header Content-Type
+  let userAgent: string = @header User-Agent ?? "unknown"
+
+  @out "User-Agent: {userAgent}"
+
+  when auth {
+    void -> @respond 401 { error: "No authorization header" }
+    _ -> {
+      let user = await getUserFromToken(auth)
+      @respond 200 { user: user }
+    }
+  }
+}
+
+// -----------------------------------------------------
+// @env — 환경 변수
+// -----------------------------------------------------
+
+let dbUrl: string = @env DATABASE_URL
+let secret: string = @env SECRET
+let port: int = int.from(@env PORT ?? "8080")
+let isDev: bool = @env NODE_ENV == "development"
+
+@out "DB: {dbUrl}"
+@out "Port: {port}"
+@out "Dev mode: {isDev}"
+
+// -----------------------------------------------------
+// @respond — 응답 반환
+// -----------------------------------------------------
+
+// JSON 응답
+@route GET /api/status {
+  @respond 200 {
+    status: "ok"
+    uptime: getUptime()
+    version: "1.0.0"
+  }
+}
+
+// 빈 응답
+@route DELETE /api/cache {
+  await cache.flush()
+  @respond 204 {}
+}
+
+// 에러 응답
+@route GET /api/fail {
+  @respond 500 { error: "Something went wrong" }
+}
+
+// 조건부 응답
+@route GET /api/item/:id {
+  let id: int = @path.id as int
+  let item = await db.findItem(id)
+  when item {
+    void -> @respond 404 { error: "Item not found" }
+    _ -> @respond 200 { item: item }
+  }
+}
+
+// -----------------------------------------------------
+// @serve — 정적 파일 / 컴포넌트 서빙
+// -----------------------------------------------------
+
+// 정적 디렉토리 서빙
+@route GET /assets {
+  @serve ./public
+}
+
+// 단일 파일 서빙
+@route GET /favicon.ico {
+  @serve ./public/favicon.ico
+}
+
+// 도메인(페이지) 서빙
+pub define LandingPage() -> @html {
+  @head {
+    @title "Welcome"
+  }
+  @body {
+    @h1 "Landing Page"
+    @p "Welcome to Orv."
+  }
+}
+
+@route GET / {
+  @serve LandingPage()
+}
+
+// -----------------------------------------------------
+// @before / @after — 미들웨어
+// -----------------------------------------------------
+
+// @before: 라우트 핸들러 실행 전에 확장됨
+// @after: 라우트 핸들러 실행 후에 확장됨
+// @next: 다음 핸들러로 진행, 데이터 전달 가능
+
+// 인증 미들웨어
+define Auth() -> @before {
+  let bearer: string? = @header Authorization
+  when bearer {
+    void -> @respond 401 { error: "unauthorized" }
+    _ -> {
+      let token = bearer[7:]
+      let payload = jwt.verify(token, @env SECRET)
+      @next {payload}
+    }
+  }
+}
+
+// Rate limiting 미들웨어
+define RateLimit(max: int, window: int?) -> @before {
+  let ip = @request.ip
+  let key: string = "rate:{ip}:{@request.path}"
+  let count = await redis.incr(key)
+
+  if count == 1 {
+    await redis.expire(key, window ?? 60)
+  }
+
+  if count > max {
+    @respond 429 {
+      error: "Too many requests"
+      retryAfter: window ?? 60
+    }
+  }
+
+  @next
+}
+
+// CORS 미들웨어
+define Cors(origin: string?) -> @before {
+  @response.headers["Access-Control-Allow-Origin"] = origin ?? "*"
+  @response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE"
+  @response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+
+  if @request.method == "OPTIONS" {
+    @respond 204 {}
+  }
+
+  @next
+}
+
+// 로깅 미들웨어 (@after)
+define AccessLog() -> @after {
+  let duration = @response.duration
+  @out "[{@request.method}] {@request.path} → {@response.status} ({duration}ms)"
+  @next
+}
+
+// 에러 핸들링 미들웨어 (@after)
+define ErrorHandler() -> @after {
+  if @response.status >= 500 {
+    @out "[ERROR] {@request.path}: {@response.body}"
+    // 외부 모니터링 전송
+    await monitor.report(@response)
+  }
+  @next
+}
+
+// @context — 미들웨어에서 전달한 데이터 접근
+@route GET /api/me {
+  @Auth
+  // @Auth의 @next {payload}로 전달된 데이터
+  let user = @context.payload
+  @respond 200 { user: user }
+}
+
+// -----------------------------------------------------
+// 미들웨어 조합
+// -----------------------------------------------------
+
+@server {
+  @listen 8080
+
+  // 전역 미들웨어 — 모든 라우트에 적용
+  @Cors origin="https://example.com"
+  @AccessLog
+  @ErrorHandler
+
+  @route GET /api/public {
+    @respond 200 { data: "공개 데이터" }
+  }
+
+  // 특정 라우트에만 미들웨어 추가
+  @route GET /api/private {
+    @Auth
+    @RateLimit max=100
+    @respond 200 { data: "비공개 데이터", user: @context.payload }
+  }
+
+  // 라우트 그룹에 미들웨어 적용
+  @route /admin {
+    @Auth
+    @RateLimit max=30 window=300
+
+    @route GET /users {
+      @respond 200 { users: await db.findUsers() }
+    }
+
+    @route DELETE /users/:id {
+      let id: int = @path.id as int
+      await db.deleteUser(id)
+      @respond 204 {}
+    }
+  }
+}
+
+// -----------------------------------------------------
+// 라우트 그룹 facade — let 바인딩
+// -----------------------------------------------------
+
+// let에 할당 → 내부 RPC → 바이너리 직렬화
+// 변수 미할당 → 외부 API → JSON
+
+// 단일 엔드포인트 RPC
+let getUser = @route GET /api/user/:id {
+  let id: int = @path.id as int
+  @respond 200 { user: await db.findOne(id) }
+}
+
+// 그룹 facade
+let api = @route /api {
+  @route GET /users {
+    @respond 200 { users: await db.findUsers() }
+  }
+  @route GET /posts {
+    @respond 200 { posts: await db.findPosts() }
+  }
+  @route POST /posts {
+    @Auth
+    let body = @request.body
+    let post = await db.createPost(body, @context.payload)
+    @respond 201 { post: post }
+  }
+}
+
+// 클라이언트에서 사용 — .fetch()
+let user = await getUser.fetch(param={ id: 42 })
+@out user.name  // 바이너리로 수신, 자동 디코딩
+
+// 그룹 facade — 상대 경로
+let posts = await api.fetch("/posts")
+@out posts.length
+
+// 컴파일러 검증:
+// api.fetch("/nonexistent") → 컴파일 에러! 해당 경로 없음
+// 응답 타입은 @respond에서 자동 추론
+
+// 외부 API — 변수 미할당, JSON 유지
+@route GET /api/public/health {
+  @respond 200 { status: "ok" }
+}
+// → curl, 브라우저 등 외부 클라이언트가 접근 가능
+
+// -----------------------------------------------------
+// 내부 RPC vs 외부 API 비교
+// -----------------------------------------------------
+
+// 내부 RPC (let 바인딩)
+let internalApi = @route GET /api/internal {
+  @respond 200 { data: "internal" }
+}
+// → 바이너리 직렬화
+// → 필드명 생략, 순서 기반 인코딩
+// → orv 클라이언트만 접근 (.fetch())
+// → 스키마 컴파일타임 고정 — 불일치 불가능
+
+// 외부 API (변수 미할당)
+@route GET /api/external {
+  @respond 200 { data: "external" }
+}
+// → JSON 직렬화
+// → 표준 HTTP
+// → 어디서든 접근 (curl, 브라우저, 다른 서비스)
+
+// -----------------------------------------------------
+// 실전 예시 — 풀스택 서버 구성
+// -----------------------------------------------------
+
+pub define App() -> @server {
+  @listen int.from(@env PORT ?? "8080")
+
+  // 전역 미들웨어
+  @Cors
+  @AccessLog
+  @ErrorHandler
+
+  // 정적 자산
+  @route GET /assets {
+    @serve ./public
+  }
+
+  // 내부 API 그룹
+  let api = @route /api {
+    // 공개 라우트
+    @route POST /auth/login {
+      let body = @request.body
+      let user = await db.findByEmail(body.email)
+      when user {
+        void -> @respond 401 { error: "Invalid credentials" }
+        _ -> {
+          let token = jwt.sign({ id: user.id }, @env SECRET)
+          @respond 200 { token: token, user: user }
+        }
+      }
+    }
+
+    @route POST /auth/register {
+      let body = @request.body
+      let existing = await db.findByEmail(body.email)
+      when existing {
+        void -> {
+          let user = await db.createUser(body)
+          let token = jwt.sign({ id: user.id }, @env SECRET)
+          @respond 201 { token: token, user: user }
+        }
+        _ -> @respond 409 { error: "Email already exists" }
+      }
+    }
+
+    // 보호된 라우트
+    @route /protected {
+      @Auth
+      @RateLimit max=100
+
+      @route GET /me {
+        @respond 200 @context.payload
+      }
+
+      @route GET /posts {
+        let userId: int = @context.payload.id
+        let posts = await db.findPostsByUser(userId)
+        @respond 200 { posts: posts }
+      }
+
+      @route POST /posts {
+        let userId: int = @context.payload.id
+        let body = @request.body
+        let post = await db.createPost({
+          title: body.title
+          content: body.content
+          author: userId
+        })
+        @respond 201 { post: post }
+      }
+    }
+  }
+
+  // 외부 공개 API (JSON)
+  @route GET /health {
+    @respond 200 {
+      status: "ok"
+      version: "1.0.0"
+      uptime: getUptime()
+    }
+  }
+
+  // 페이지 서빙
+  @route GET / {
+    @serve HomePage()
+  }
+
+  @route GET /login {
+    @serve LoginPage()
+  }
+
+  @route GET /dashboard {
+    @Auth
+    @serve DashboardPage()
+  }
+
+  @route GET /user/:id {
+    let id: int = @path.id as int
+    @serve ProfilePage userId={id}
+  }
+}
+
+// -----------------------------------------------------
+// WebSocket — @ws 도메인
+// -----------------------------------------------------
+
+// HTTP @route와 별도의 실시간 통신 도메인
+// sig가 @route에서 반응 안 하므로, 실시간은 @ws로 처리
+
+@ws /chat {
+  // 연결 시
+  @connect {
+    "{@socket.id} is connected"    // void scope → 자동 출력
+    @emit welcome to=@socket.id { msg: "Hello!" }
+  }
+
+  // 채널 리스닝
+  @on message {
+    "{@packet} from {@socket.id}"
+    @emit message @packet          // broadcast — 전체에게 전송
+  }
+
+  // 특정 대상에게 전송
+  @on private-message {
+    let target: string = @packet.to
+    @emit private-message to={target} { from: @socket.id, msg: @packet.msg }
+  }
+
+  // 룸 기반 전송
+  @on join-room {
+    let room: string = @packet.room
+    @socket.join(room)
+    @emit room-update in={room} { user: @socket.id, action: "joined" }
+  }
+
+  @on room-message {
+    let room: string = @packet.room
+    @emit room-message in={room} @packet.msg
+  }
+
+  // 연결 해제 시
+  @disconnect {
+    @emit user-left @socket.id     // broadcast
+  }
+}
+
+// @ws 내 @emit 정리:
+//   @emit channel data                → broadcast (전체)
+//   @emit channel to=id data          → 특정 소켓에게
+//   @emit channel in="room" data      → 룸 내 전체에게
+//   data는 object, string, byte array 등 자유
+//     @emit raw [0xe4, 0x22, 0x00]    → byte array 직접 전송
+
+// @ws 내 빌트인:
+//   @socket.id        → 현재 소켓 식별자
+//   @socket.join(room) → 룸 참가
+//   @socket.leave(room) → 룸 탈퇴
+//   @packet           → 수신 데이터
+
+// @server와 @ws 함께 사용
+pub define FullApp() -> @server {
+  @listen 8080
+
+  @route GET / {
+    @serve HomePage()
+  }
+
+  @route GET /api/users {
+    @respond 200 { users: await db.findUsers() }
+  }
+
+  // WebSocket 엔드포인트
+  @ws /ws {
+    @connect {
+      @emit welcome to=@socket.id { msg: "connected" }
+    }
+    @on ping {
+      @emit pong to=@socket.id { time: now() }
+    }
+    @disconnect {
+      @emit user-disconnected @socket.id
+    }
+  }
+}
+// → 컴파일러가 HTTP 서버 + WebSocket 서버를 함께 생성
+// → @ws 핸들러 코드도 동일하게 DCE, 최적화 적용

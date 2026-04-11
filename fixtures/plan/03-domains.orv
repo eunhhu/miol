@@ -1,0 +1,407 @@
+// =====================================================
+// 03-domains.orv — 도메인 시스템
+// =====================================================
+//
+// orv의 핵심 — define으로 도메인을 선언하고
+// @으로 호출하면 그 자리에 매크로처럼 확장됨.
+// property, token, content, 중첩 도메인, 반환값.
+
+// -----------------------------------------------------
+// 도메인 기초 — 확장(매크로) 개념
+// -----------------------------------------------------
+
+// define으로 선언, @으로 호출
+// 호출 자리에 결과가 그대로 삽입됨 (Rust 매크로와 유사)
+
+// 가장 단순한 도메인 — 값을 반환
+define Pi() -> 3.14159
+@out @Pi           // 3.14159
+@out @Pi * 2       // 6.28318
+
+define AppName() -> "Orv Showcase"
+@out @AppName      // Orv Showcase
+
+// 블록 반환
+define HelloBlock() -> {
+  @out "Hello from domain!"
+}
+@HelloBlock        // Hello from domain!
+
+// void scope 자동 출력 규칙은 도메인에도 적용
+// 마지막 표현식 = return, 그 이전 = @out
+define ShowAndReturn() -> {
+  "이건 출력됨"          // @out
+  "이것도 출력됨"        // @out
+  "이건 반환값"          // return
+}
+@out @ShowAndReturn
+// 출력: 이건 출력됨
+// 출력: 이것도 출력됨
+// 출력: 이건 반환값
+
+// -----------------------------------------------------
+// property — key=value 파라미터
+// -----------------------------------------------------
+
+// property는 반드시 key=value 형태로 전달
+// key 없이 전달한 것은 전부 token으로 처리됨
+
+define Greet(name: string, greeting: string?) -> {
+  @out "{greeting ?? "Hello"}, {name}!"
+}
+
+@Greet name="Alice"                       // Hello, Alice!
+@Greet name="Bob" greeting="안녕"          // 안녕, Bob!
+
+// nullable property
+define Badge(label: string, color: string?) -> {
+  @out "[{color ?? "gray"}] {label}"
+}
+
+@Badge label="admin"                  // [gray] admin
+@Badge label="vip" color="gold"      // [gold] vip
+
+// 여러 property
+define UserCard(
+  name: string
+  age: int
+  role: string?
+) -> {
+  @out "이름: {name}"
+  @out "나이: {age}"
+  @out "역할: {role ?? "member"}"
+}
+
+@UserCard name="Charlie" age=25 role="admin"
+// 이름: Charlie
+// 나이: 25
+// 역할: admin
+
+// -----------------------------------------------------
+// token — 키 없이 전달되는 값
+// -----------------------------------------------------
+
+// token은 항상 배열로 반환됨!
+// string으로 선언해도 실제 타입은 string[]
+
+define Log(label: string?) -> {
+  token {
+    message: string    // message는 string[] 타입
+  }
+  @out "[{label ?? "LOG"}] {message[0]}"
+}
+
+@Log "서버 시작" label="INFO"          // [INFO] 서버 시작
+@Log "기본 로그"                       // [LOG] 기본 로그
+
+// 여러 token 타입
+define Style() -> {
+  token {
+    size: "{uint}px"    // "{uint}px"[] — 패턴 매칭 토큰
+    color: string       // string[] — 나머지 문자열
+  }
+  @out "sizes: {size}"
+  @out "colors: {color}"
+}
+
+@Style 16px 24px red blue 32px
+// sizes: [16px, 24px, 32px]
+// colors: [red, blue]
+
+// token 한 줄 선언 (한 종류만 있을 때)
+define Echo() -> {
+  token msg: string    // msg는 string[]
+  for m in msg {
+    @out m
+  }
+}
+
+@Echo "하나" "둘" "셋"
+// 하나
+// 둘
+// 셋
+
+// token은 optional 가능
+define Maybe() -> {
+  token {
+    value: string?     // 토큰 없어도 됨
+  }
+  when value {
+    void -> @out "토큰 없음"
+    _ -> @out "토큰: {value[0]}"
+  }
+}
+
+@Maybe "있음"     // 토큰: 있음
+@Maybe            // 토큰 없음
+
+// -----------------------------------------------------
+// property + token 혼합
+// -----------------------------------------------------
+
+// 순서 무관 — property, token 섞여도 됨
+// 단, nested block {}만 맨 마지막
+
+define Alert(level: string, dismissable: bool?) -> {
+  token {
+    text: string
+  }
+  @out "[{level}] {text[0]}"
+  if dismissable ?? false {
+    @out "(닫기 가능)"
+  }
+}
+
+// 전부 OK — 순서 자유
+@Alert "경고 메시지" level="warn"
+@Alert level="error" "심각한 오류" dismissable=true
+@Alert level="info" dismissable=false "알림"
+
+// -----------------------------------------------------
+// @content — 호출부 블록 주입
+// -----------------------------------------------------
+
+// @content를 사용하면 호출 시 {} 블록 안의 코드가 삽입됨
+
+define Section(title: string) -> {
+  @out "=== {title} ==="
+  @content
+  @out "=== /{title} ==="
+}
+
+@Section title="Introduction" {
+  @out "이 섹션의 내용입니다."
+  @out "여러 줄도 가능합니다."
+}
+// === Introduction ===
+// 이 섹션의 내용입니다.
+// 여러 줄도 가능합니다.
+// === /Introduction ===
+
+// @content 위치에 따라 실행 시점이 달라짐
+define Wrapper() -> {
+  @out "before content"
+  @content
+  @out "after content"
+}
+
+@Wrapper {
+  @out "inside"
+}
+// before content
+// inside
+// after content
+
+// @content가 없는 도메인에 {} 블록을 주면?
+// → 무시됨 (에러 아님)
+
+// -----------------------------------------------------
+// 중첩 도메인
+// -----------------------------------------------------
+
+// 도메인 안에서 define으로 하위 도메인 선언 가능
+// 외부에서는 Parent.Child로 접근
+
+define Layout(title: string) -> {
+  @out "=== {title} ==="
+  @content
+  @out "=== end ==="
+
+  define Header() -> {
+    @out "[ HEADER: {title} ]"
+  }
+
+  define Footer(copyright: string?) -> {
+    @out "[ FOOTER: {copyright ?? "2026"} ]"
+  }
+}
+
+@Layout title="Home" {
+  @Layout.Header
+  @out "본문 내용"
+  @Layout.Footer copyright="2026 Orv"
+}
+// === Home ===
+// [ HEADER: Home ]
+// 본문 내용
+// [ FOOTER: 2026 Orv ]
+// === end ===
+
+// 깊은 중첩
+define App() -> {
+  define Nav() -> {
+    define Item(label: string) -> {
+      @out "- {label}"
+    }
+  }
+}
+
+@App.Nav.Item label="Home"
+@App.Nav.Item label="About"
+@App.Nav.Item label="Contact"
+
+// -----------------------------------------------------
+// 도메인 반환 타입
+// -----------------------------------------------------
+
+// 도메인은 어떤 타입이든 반환 가능
+
+// 숫자 반환
+define Random() -> 42
+let val: int = @Random
+@out val  // 42
+
+// 문자열 반환
+define Slug(title: string) -> {
+  title.toLowerCase().replace(" ", "-")
+}
+let slug: string = @Slug title="Hello World"
+@out slug  // hello-world
+
+// 다른 도메인을 반환
+define Page(title: string) -> @html {
+  @head {
+    @title "{title}"
+  }
+  @body {
+    @content
+  }
+}
+// → @Page를 호출하면 @html { ... }가 그 자리에 확장됨
+
+// 도메인 타입 확인
+@out Type(@Pi)        // float
+@out Type(@AppName)   // string
+@out Type(@Page)      // Domain
+
+// -----------------------------------------------------
+// pub — 외부 공개
+// -----------------------------------------------------
+
+// pub를 붙이면 다른 파일에서 import 가능
+
+pub define PublicCard(title: string) -> @div {
+  @h2 "{title}"
+  @content
+}
+
+// pub 없으면 현재 파일 스코프에서만 사용 가능
+define PrivateHelper() -> {
+  @out "내부 전용"
+}
+
+// pub struct, pub enum, pub function도 동일
+pub struct ApiResponse<T> {
+  status: int
+  data: T
+  error: string?
+}
+
+pub enum HttpStatus {
+  Ok = 200
+  NotFound = 404
+  ServerError = 500
+}
+
+pub function formatError(msg: string): ApiResponse<void> -> {
+  { status: 500, data: void, error: msg }
+}
+
+// -----------------------------------------------------
+// 도메인 합성
+// -----------------------------------------------------
+
+// 도메인끼리 자유롭게 합성 가능
+
+define Container() -> @div {
+  @content
+}
+
+define Title(text: string) -> @h1 "{text}"
+
+define Subtitle(text: string) -> @p "{text}"
+
+define Hero(
+  title: string
+  subtitle: string
+) -> @Container {
+  @Title text="{title}"
+  @Subtitle text="{subtitle}"
+}
+
+@Hero title="Welcome" subtitle="프로젝트 특화 플랫폼"
+
+// 조건부 합성
+define ConditionalRender(show: bool) -> {
+  if show {
+    @Container {
+      @Title text="보임"
+    }
+  }
+}
+
+@ConditionalRender show=true
+@ConditionalRender show=false  // 아무것도 안 함
+
+// 반복 합성
+define RepeatItem(count: int) -> {
+  for i in 0..count {
+    @Container {
+      @Title text="Item {i}"
+    }
+  }
+}
+
+@RepeatItem count=3
+
+// -----------------------------------------------------
+// 실전 예시 — UI 컴포넌트 시스템
+// -----------------------------------------------------
+
+define Theme() -> {
+  define Colors() -> {
+    define Primary() -> "#1a1a2e"
+    define Secondary() -> "#16213e"
+    define Accent() -> "#0f3460"
+    define Text() -> "#e4e4e4"
+  }
+
+  define Spacing() -> {
+    define Sm() -> "8px"
+    define Md() -> "16px"
+    define Lg() -> "24px"
+    define Xl() -> "32px"
+  }
+}
+
+define Button(
+  label: string
+  variant: string?
+  onClick: Function<void, void>?
+) -> @button onClick={onClick} {
+  %class="btn btn-{variant ?? "default"}"
+  "{label}"
+}
+
+define NavBar(brand: string) -> @nav {
+  @div {
+    @h1 "{brand}"
+  }
+  @div {
+    @content
+  }
+}
+
+define PageLayout(title: string) -> @Page title="{title} — {SITE_NAME}" {
+  @NavBar brand="{SITE_NAME}" {
+    @Button label="Home" onClick={() -> navigate("/")}
+    @Button label="About" onClick={() -> navigate("/about")}
+    @Button label="Dashboard" variant="primary" onClick={() -> navigate("/dashboard")}
+  }
+  @div {
+    @content
+  }
+  @Layout.Footer
+}
+
+const SITE_NAME: string = "Orv"

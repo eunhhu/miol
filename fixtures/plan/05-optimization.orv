@@ -1,0 +1,490 @@
+// =====================================================
+// 05-optimization.orv — 컴파일러 최적화
+// =====================================================
+//
+// orv 컴파일러가 자동으로 수행하는 최적화들.
+// Dead code elimination, 자동 배칭, 자동 병렬,
+// 렌더링 전략 자동 판정, @hint 오버라이드.
+//
+// 개발자는 코드만 작성. 최적화는 컴파일러 몫.
+
+// -----------------------------------------------------
+// 핵심 원칙
+// -----------------------------------------------------
+//
+// 1. 프로젝트 특화 — 범용이 아닌, 이 프로젝트를 위한 최적화
+// 2. 컴파일 타임 — 가능한 모든 결정을 빌드 시 확정
+// 3. Zero-overhead — 안 쓰는 건 번들에 없다
+// 4. Zero-runtime — 필요 없으면 런타임도 없다
+// 5. 자동 + 오버라이드 — 기본은 자동, @hint로 덮어쓰기
+
+// -----------------------------------------------------
+// Dead Code Elimination
+// -----------------------------------------------------
+
+// 엔트리 포인트에서 도달 가능한(reachable) 코드만 번들에 포함
+// 나머지는 전부 제거
+
+// 사용되는 것들
+struct User {
+  id: int
+  name: string
+  email: string
+}
+
+function formatUser(user: User): string -> {
+  "{user.name} <{user.email}>"
+}
+
+// 사용되지 않는 것들 — 번들에서 제거됨
+struct UnusedModel {       // ❌ 제거됨
+  data: string
+}
+
+function unusedHelper(): void -> {   // ❌ 제거됨
+  @out "이건 아무데서도 안 불림"
+}
+
+// 실제 사용
+let user: User = { id: 1, name: "Alice", email: "alice@orv.dev" }
+@out formatUser(user)  // Alice <alice@orv.dev>
+
+// → 컴파일 결과:
+// → User struct, formatUser 함수만 번들에 포함
+// → UnusedModel, unusedHelper 완전 제거
+
+// -----------------------------------------------------
+// 도메인 레벨 DCE
+// -----------------------------------------------------
+
+// @html 관련 도메인을 아예 안 쓰면?
+// → UI 런타임 전체가 번들에서 제거됨
+
+// 예: CLI 도구 — 서버/UI 도메인 없음
+function main() -> {
+  let args = @process.args
+  when args[1] {
+    "greet" -> @out "Hello, {args[2] ?? "world"}!"
+    "calc" -> {
+      let a: int = int.from(args[2])
+      let b: int = int.from(args[3])
+      @out "{a} + {b} = {a + b}"
+    }
+    _ -> @out "Usage: cli [greet|calc] [args...]"
+  }
+}
+
+// → 이 파일에서 @html, @server, @route 없음
+// → DOM 바인딩, HTTP 서버, 라우터 전부 번들에서 제거
+// → 순수 CLI 바이너리만 생성
+
+// -----------------------------------------------------
+// 기능 레벨 DCE
+// -----------------------------------------------------
+
+// sig를 안 쓰면? → 리액티비티 추적기 제거
+// when을 안 쓰면? → 패턴매칭 코드젠 생략
+// async/await 안 쓰면? → 비동기 런타임 제거
+// try/catch 안 쓰면? → 예외 처리 인프라 제거
+
+// 예: sig 없는 정적 페이지
+pub define StaticPage() -> @html {
+  @head { @title "Static" }
+  @body {
+    @h1 "정적 페이지"
+    @p "sig가 없으므로 리액티비티 추적기가 번들에 없음"
+  }
+}
+// → 시그널 시스템 전체 제거, 순수 HTML만 emit
+
+// 예: sig 있는 동적 페이지
+pub define DynamicPage() -> @html {
+  @head { @title "Dynamic" }
+  @body {
+    let sig counter: int = 0
+    @p "{counter}"
+    @button onClick={counter += 1} "+"
+  }
+}
+// → 시그널 시스템 포함, DOM 업데이트 코드 포함
+// → 하지만 @video, @img 등 안 쓴 HTML 도메인의 핸들러는 제거
+
+// -----------------------------------------------------
+// 범용 sig — 도메인이 갱신 방식을 결정
+// -----------------------------------------------------
+
+// sig는 DOM 전용이 아닌 범용 반응형 프리미티브.
+// sig 변수를 사용하는 곳에서 자동 track되어
+// 값 변경 시 해당 도메인의 방식으로 갱신.
+
+// (a) @out — 콘솔 커서 replace
+let sig progress: int = 0
+@out "빌드 진행률: {progress}%"   // "빌드 진행률: 0%"
+progress = 33                     // → 같은 커서 위치로 write → flush → replace
+progress = 66                     // → "빌드 진행률: 66%"
+progress = 100                    // → "빌드 진행률: 100%"
+
+// 여러 sig를 @out에서 사용
+let sig downloaded: int = 0
+let sig total: int = 100
+@out "[{downloaded}/{total}] 다운로드 중..."
+downloaded = 50     // → "[50/100] 다운로드 중..."
+total = 200         // → "[50/200] 다운로드 중..."
+
+// (b) @fs — 파일 자동 rewrite
+let sig state = { count: 0, lastUpdated: string.from(now()) }
+await @fs.write "state.json" state
+state.count = 1                   // → state.json 자동 rewrite
+state.lastUpdated = string.from(now())  // → state.json 자동 rewrite
+
+// (c) @html / DOM — DOM patch (가장 익숙한 패턴)
+pub define LiveCounter() -> @html {
+  @body {
+    let sig n: int = 0
+    @p "{n}"                    // → n 변경 시 이 @p 노드만 patch
+    @button onClick={n += 1} "+"
+  }
+}
+
+// (d) @route — 반응 안 함 (스냅샷)
+// HTTP는 요청/응답 모델이라 sig push 부적합
+// 핸들러 실행 시점의 값만 스냅샷으로 사용
+@route GET /api/status {
+  @respond 200 { progress: progress }
+  // → 호출 시점의 progress 값만 반환, push 없음
+}
+
+// 컴파일러 최적화:
+// → sig를 사용하는 도메인이 없으면 리액티비티 추적기 자체를 제거 (DCE)
+// → @out에서만 sig를 쓰면 콘솔 replace 코드만 포함, DOM patch 코드는 제거
+// → @html에서만 sig를 쓰면 DOM patch 코드만 포함, 콘솔 코드는 제거
+// → 즉 sig를 어디서 쓰느냐에 따라 번들에 포함되는 런타임이 달라짐
+
+// -----------------------------------------------------
+// 자동 배칭
+// -----------------------------------------------------
+
+// 루프 내 동일 fetch → 컴파일러가 단일 batch 요청으로 변환
+// 서버 측 배치 핸들러도 자동 생성
+
+let getUser = @route GET /api/user/:id {
+  let id: int = @path.id as int
+  @respond 200 { user: await db.findUser(id) }
+}
+
+// 개발자가 작성한 코드
+define UserList(ids: int[]) -> @ul {
+  for id in ids {
+    let user = await getUser.fetch(param={ id: id })
+    @li "{user.name}"
+  }
+}
+
+// 컴파일러 내부 변환 (개발자에게 보이지 않음):
+// → for 루프 내 getUser.fetch() 감지
+// → getUserBatch([1, 2, 3, ...]) 단일 요청으로 치환
+// → 서버 측에 자동 배치 핸들러 생성:
+//   @route POST /api/user/batch { ... }
+// → N번의 HTTP 왕복 → 1번으로 줄어듦
+
+// 실제 사용 — 개발자는 루프만 작성하면 됨
+@UserList ids={[1, 2, 3, 4, 5]}
+
+// 배칭 비활성화가 필요하면
+define UserListNoBatch(ids: int[]) -> @ul {
+  for id in ids {
+    let user = await getUser.fetch(param={ id: id }) @hint batch=never
+    @li "{user.name}"
+  }
+}
+
+// -----------------------------------------------------
+// 자동 병렬
+// -----------------------------------------------------
+
+// 같은 스코프 내 독립적인 fetch/쿼리 → 자동 병렬 실행
+// 의존 관계가 있으면 순차 유지
+
+// (a) 독립 — 자동 병렬
+let getDashboard = @route GET /api/dashboard {
+  let users = await db.findUsers()       // 독립
+  let stats = await db.getStats()        // 독립
+  let posts = await db.recentPosts()     // 독립
+  @respond 200 { users, stats, posts }
+}
+// → 컴파일러: users, stats, posts 간 의존 없음
+// → 내부적으로 await (db.findUsers(), db.getStats(), db.recentPosts()) 병렬 실행
+// → 개발자가 순차적으로 작성해도 자동 병렬
+
+// (b) 의존 — 순차 유지
+let getUserPosts = @route GET /api/user/:id/posts {
+  let id: int = @path.id as int
+  let user = await db.findUser(id)               // 1. 먼저 유저 조회
+  let posts = await db.findPostsByUser(user.id)   // 2. 유저 ID로 포스트 조회 (의존)
+  @respond 200 { user, posts }
+}
+// → posts가 user.id에 의존 → 순차 실행 유지
+
+// (c) 혼합 — 가능한 부분만 병렬
+let getFullDashboard = @route GET /api/full-dashboard {
+  let user = await db.currentUser()                    // 1. 먼저
+
+  let posts = await db.findPostsByUser(user.id)        // 2-a. user 의존
+  let followers = await db.findFollowers(user.id)      // 2-b. user 의존 (posts와 독립)
+  let trending = await db.getTrending()                // 2-c. 독립
+
+  @respond 200 { user, posts, followers, trending }
+}
+// → 컴파일러 분석:
+// → user 먼저 (의존 관계의 루트)
+// → posts, followers, trending은 서로 독립 → 병렬 실행
+// → 실제 실행: user → (posts || followers || trending)
+
+// -----------------------------------------------------
+// 렌더링 전략 자동 판정
+// -----------------------------------------------------
+
+// 컴파일러가 코드 패턴을 분석해서 렌더링 전략을 결정
+// SSR, CSR, SSG 키워드가 코드에 없음 — 문법은 동일
+
+// (a) 정적 — sig 0, await 0 → 빌드 시 HTML 확정
+pub define HomePage() -> @html {
+  @head { @title "Home" }
+  @body {
+    @h1 "Welcome"
+    @p "순수 정적 콘텐츠만 있음"
+    @img src="/hero.png" alt="hero"
+  }
+}
+// → 판정: 정적 생성
+// → 빌드 시 HTML 파일로 확정
+// → 런타임 제로, JS/WASM 없음
+
+// (b) 클라이언트 — sig 있지만 서버 데이터 없음
+pub define CounterPage() -> @html {
+  @head { @title "Counter" }
+  @body {
+    let sig count: int = 0
+    @p "count: {count}"
+    @button onClick={count += 1} "+"
+    @button onClick={count -= 1} "-"
+  }
+}
+// → 판정: 클라이언트 렌더링
+// → 빈 HTML 쉘 + WASM 번들
+// → 시그널/DOM 업데이트 런타임 포함
+
+// (c) 서버 — await로 서버 데이터 가져와서 초기 UI 구성
+pub define DashboardPage() -> @html {
+  @head { @title "Dashboard" }
+  @body {
+    let sig data = await getDashboard.fetch()
+    @h1 "Dashboard"
+    @p "Users: {data.users.length}"
+    for user in data.users {
+      @div {
+        @p "{user.name} — {user.email}"
+      }
+    }
+  }
+}
+// → 판정: 서버 렌더링
+// → 서버에서 HTML 생성 + 클라이언트 hydration
+// → 첫 페인트에 데이터가 필요하므로 SSR
+
+// (d) 정적 + 동적 혼합
+pub define BlogPage() -> @html {
+  @head { @title "Blog" }
+  @body {
+    // 정적 영역
+    @h1 "Our Blog"
+    @p "최신 글을 확인하세요."
+
+    // 동적 영역 — sig + await
+    let sig posts = await api.fetch("/posts")
+    for post in posts {
+      @div {
+        @h2 "{post.title}"
+        @p "{post.content[:100]}..."
+      }
+    }
+
+    // 클라이언트 인터랙션
+    let sig page: int = 1
+    @button onClick={page += 1; posts = await api.fetch("/posts?page={page}")} "더 보기"
+  }
+}
+// → 판정: 서버 렌더링 (await 때문에)
+// → 정적 부분은 서버에서 즉시 렌더
+// → sig 부분은 hydration 후 클라이언트에서 관리
+
+// -----------------------------------------------------
+// 번들 분리
+// -----------------------------------------------------
+
+// 단일 .orv 파일에 @server + @html 공존 시 자동으로 두 번들 생성
+// 서버 번들: 네이티브 바이너리 (or server.wasm)
+// 클라이언트 번들: HTML + JS + WASM + CSS
+
+// dist/
+// ├── server                     (서버 바이너리)
+// ├── public/
+// │   ├── index.html             (HTML 쉘)
+// │   ├── app.[hash].js          (JS 브릿지 — WASM 로더 + DOM 바인딩)
+// │   ├── app.[hash].wasm        (클라이언트 로직)
+// │   ├── style.[hash].css       (CSS)
+// │   ├── chunk-home.[hash].wasm (페이지별 청크)
+// │   └── assets/                (정적 파일)
+
+// 핵심 규칙:
+// → 서버 번들에 UI 코드 없음
+// → 클라이언트 번들에 DB/미들웨어 코드 없음
+// → RPC 타입 스키마만 양쪽에 공유
+
+// 코드 스플리팅 — 라우트 기반 자동 분리
+// @route GET /          → chunk-home.[hash].wasm
+// @route GET /about     → chunk-about.[hash].wasm
+// @route GET /dashboard → chunk-dashboard.[hash].wasm
+// 두 페이지가 같은 define 사용 → chunk-shared.[hash].wasm 추출
+
+// -----------------------------------------------------
+// 프로토콜 최적화
+// -----------------------------------------------------
+
+// 내부 RPC (let 바인딩)
+let optimizedRoute = @route GET /api/optimized {
+  @respond 200 { data: await db.getData() }
+}
+// → 바이너리 직렬화
+// → 필드명 없이 순서 기반 인코딩
+// → Content-Type, Content-Length 컴파일타임 확정
+// → 런타임에 MIME 스니핑, 헤더 조립 없음
+
+// 외부 API (변수 미할당)
+@route GET /api/v1/public {
+  @respond 200 { data: "hello" }
+}
+// → JSON 직렬화
+// → 표준 HTTP
+// → 헤더도 컴파일타임에 바이트 배열로 미리 직렬화
+
+// HTTP 메타데이터 자동 결정
+// @respond 200 { "users": users }  → Content-Type: application/json 고정
+// @serve ./public                  → 확장자 → MIME 매핑 테이블 빌드타임 생성
+// @serve ./image.png               → Content-Type: image/png, Content-Length 확정
+// @serve htmlNode                  → Content-Type: text/html; charset=utf-8 고정
+// @respond 204 {}                  → Content-Length: 0, body 인코더 제거
+
+// @before가 없는 라우트 → 미들웨어 디스패치 자체를 건너뜀
+
+// -----------------------------------------------------
+// @hint — 컴파일러 오버라이드
+// -----------------------------------------------------
+
+// 모든 최적화는 자동이지만, @hint로 덮어쓸 수 있음
+
+// 렌더링 전략 강제
+pub define AlwaysSSR() -> @html @hint render=ssr {
+  @body { @h1 "항상 서버 렌더링" }
+}
+
+pub define AlwaysCSR() -> @html @hint render=csr {
+  @body {
+    let sig data = await api.fetch("/data")
+    @p "{data}"
+  }
+}
+// → await 있지만 강제 CSR → 로딩 스피너 후 클라이언트에서 fetch
+
+pub define BuildTimeBlog() -> @html @hint render=ssg {
+  @body {
+    let post = await getPost.fetch(param={ id: 1 })
+    @h1 "{post.title}"
+    @p "{post.content}"
+  }
+}
+// → await 있지만 @hint render=ssg → 빌드 타임에 fetch 실행, 정적 HTML 생성
+
+// 프로토콜 강제
+let jsonForced = @route GET /api/compat @hint protocol=json {
+  @respond 200 { data: "강제 JSON" }
+}
+// → let 바인딩(내부 RPC)이지만 JSON 유지
+
+@route GET /api/binary-public @hint protocol=binary {
+  @respond 200 { data: "강제 바이너리" }
+}
+// → 변수 미할당(외부 API)이지만 바이너리 제공
+
+// 캐시 제어
+let getPost = @route GET /api/post/:id {
+  let id: int = @path.id as int
+  @respond 200 { post: await db.findPost(id) }
+}
+
+let live = await getUser.fetch(param={ id: 1 }) @hint cache=never
+// → 캐시 완전 비활성화, 매번 요청
+
+let immutable = await getPost.fetch(param={ id: 1 }) @hint cache=immutable
+// → 한 번 받으면 영원히 캐시
+
+let timed = await getPost.fetch(param={ id: 2 }) @hint cache=60s
+// → 60초 TTL
+
+// 프리페치
+let eager = await api.fetch("/trending") @hint prefetch=eager
+// → 페이지 로드 시 즉시 프리페치
+
+let lazy = await api.fetch("/analytics") @hint prefetch=never
+// → 프리페치 비활성화 (비용이 큰 API)
+
+// 청킹
+@route GET /admin @hint chunk=separate {
+  @Auth
+  @serve AdminPage()
+}
+// → /admin은 별도 청크로 강제 분리
+// → 메인 번들에 포함되지 않음
+
+// tree-shake 방지
+@hint keep
+let analytics = loadAnalytics()
+// → DCE에서 제외, 항상 번들에 포함
+
+// -----------------------------------------------------
+// @hint 요약 표
+// -----------------------------------------------------
+//
+// @hint render=         페이지(@html)      ssr, csr, ssg
+// @hint protocol=       라우트             json, binary, hybrid
+// @hint cache=          fetch / 쿼리       never, immutable, {N}s
+// @hint prefetch=       fetch              never, eager
+// @hint chunk=          라우트 / 모듈      separate, inline
+// @hint batch=          fetch (루프 내)    never
+// @hint keep            import / 변수      tree-shake 방지
+
+// -----------------------------------------------------
+// 어댑티브 런타임
+// -----------------------------------------------------
+
+// 컴파일러가 emit하는 경량 런타임.
+// 프로덕션에서 관찰 → 파라미터 튜닝만 수행.
+// 코드를 재작성하거나 전략을 근본적으로 바꾸지는 않음.
+
+// 관찰 대상:
+// → 요청/응답 시간, 에러율
+// → 캐시 히트/미스 비율
+// → 페이지별 렌더링 시간
+// → 쿼리 패턴, fetch 호출 빈도
+// → 커넥션 풀 사용률
+
+// 자동 조절 범위:
+// → 동일 파라미터 5초 내 재호출 → 인메모리 캐시 활성화
+// → 캐시 데이터 stale → TTL 단축 or 무효화
+// → /users → /users/42 패턴 반복 → 상위 N개 프리페치
+// → API 응답 시간 증가 → 커넥션 풀 확장, 타임아웃 조절
+// → SSR 응답이 1시간 동안 동일 → SSR+캐시 자동 전환
+
+// 재빌드 필요한 전환 (리포트로 제안만):
+// → CSR ↔ SSR 전환
+// → 코드 수준의 구조 변경

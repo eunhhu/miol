@@ -1,0 +1,453 @@
+// =====================================================
+// 01-basics.orv — 기초 문법
+// =====================================================
+//
+// orv 언어의 가장 기본적인 요소들.
+// 변수, 상수, 출력, 입력, 기본 연산, 문자열.
+
+// -----------------------------------------------------
+// void scope 자동 출력
+// -----------------------------------------------------
+
+// void scope에서 string을 선언하면 자동으로 @out에 얹혀져 출력됨
+"Hello, World!"
+// == @out "Hello, World!"
+
+// 여러 줄도 가능
+"첫 번째 줄"
+"두 번째 줄"
+"세 번째 줄"
+
+// @out을 명시적으로 써도 됨
+@out "이것도 출력"
+
+// -----------------------------------------------------
+// 변수
+// -----------------------------------------------------
+
+// let — 불변 변수
+let name: string = "John"
+let age: int = 30
+let height: float = 1.75
+let isValid: bool = false
+
+@out name      // John
+@out age       // 30
+@out height    // 1.75
+@out isValid   // false
+
+// let mut — 가변 변수
+let mut count: int = 0
+count = 1
+count = 2
+@out count     // 2
+
+// -----------------------------------------------------
+// 소유권 모델
+// -----------------------------------------------------
+
+// GC 없음. 기본은 참조, 명시적으로 move/copy.
+
+let str: string = "hello"
+let str2 = str              // 참조 — str과 같은 데이터를 가리킴
+@out str                    // hello
+@out str2                   // hello (같은 데이터)
+
+// move — 소유권 이동
+let str3 = str.move()
+// 이 시점부터 str, str2 모두 사용 불가 (str을 참조하던 str2도 함께)
+// @out str                 // ❌ 컴파일 에러 — 소유권 이동됨
+// @out str2                // ❌ 컴파일 에러 — 참조 대상이 이동됨
+@out str3                   // hello
+
+// copy — 독립적인 복사본 생성
+let str4 = str3.copy()
+@out str3                   // hello (원본 유지)
+@out str4                   // hello (독립 복사본)
+
+// move 후에도 copy는 새 소유자에서 가능
+let str5 = str3.move()
+let str6 = str5.copy()
+// str3 사용 불가, str5와 str6은 독립
+
+// 함수 인자 전달도 기본 참조
+function printName(user: User) -> {
+  @out user.name   // 참조로 받음, 복사 없음
+}
+
+// 명시적 소유권 이동이 필요한 경우
+function consumeData(data: string) -> {
+  @out "consumed: {data}"
+}
+let msg: string = "important"
+consumeData(msg.move())
+// @out msg  // ❌ 이동됨
+
+// 정리:
+//   let b = a          → 참조 (기본)
+//   let b = a.move()   → 소유권 이동 (원본 + 참조 모두 무효화)
+//   let b = a.copy()   → 독립 복사
+
+// let sig — 반응형 변수
+// 값이 바뀌면 의존하는 곳이 자동으로 갱신됨
+// sig는 DOM 전용이 아님 — 모든 도메인에서 범용으로 동작
+let sig score: int = 0
+@out score     // 0
+score = 100    // 바뀌면 의존하는 곳이 자동 갱신
+
+// sig + @out — 콘솔 반응형
+// @out에서 sig를 사용하면, 값 변경 시 해당 커서 위치로
+// 돌아가서 write → flush → replace
+let sig progress: int = 0
+@out "진행률: {progress}%"   // "진행률: 0%"
+progress = 25                // → 같은 위치에 "진행률: 25%" 로 replace
+progress = 50                // → "진행률: 50%"
+progress = 100               // → "진행률: 100%"
+
+// sig + @fs — 파일 반응형
+let sig config = { port: 8080, debug: false }
+await @fs.write "config.json" config   // 파일에 초기값 기록
+config.port = 3000                     // → config.json 자동 rewrite
+config.debug = true                    // → config.json 자동 rewrite
+
+// sig + DOM — UI 반응형 (03-domains, 06-showcase에서 상세)
+// @p, @div 등 HTML 도메인 내에서 sig를 참조하면
+// 값 변경 시 해당 DOM 노드만 patch
+
+// sig가 반응하지 않는 곳:
+// HTTP @route 핸들러 — 요청/응답 모델이므로 push 부적합
+// 핸들러 실행 시점의 값만 스냅샷으로 사용
+
+// 정리:
+// sig 변경 시 도메인이 갱신 방식을 결정
+//   @out     → 콘솔 커서 replace
+//   @html    → DOM patch
+//   @fs      → 파일 rewrite
+//   @route   → 반응 안 함 (스냅샷 사용)
+
+// void 타입
+let x: void = void
+@out x         // void
+@out Type(x)   // void
+
+// -----------------------------------------------------
+// 상수
+// -----------------------------------------------------
+
+const PI: float = 3.14159
+const MAX_RETRY: int = 3
+const APP_NAME: string = "My App"
+
+@out PI        // 3.14159
+
+// -----------------------------------------------------
+// 원시 타입
+// -----------------------------------------------------
+
+// byte, ubyte, short, ushort, int, uint, long, ulong
+// float, double, bool, string, void
+
+let b: byte = 127
+let ub: ubyte = 255
+let s: short = -32768
+let us: ushort = 65535
+let i: int = 2147483647
+let ui: uint = 4294967295
+let l: long = 9223372036854775807
+let ul: ulong = 18446744073709551615
+let f: float = 3.14
+let d: double = 3.141592653589793
+let flag: bool = true
+let text: string = "hello"
+let nothing: void = void
+
+// 타입 확인
+@out Type(b)       // byte
+@out Type(f)       // float
+@out Type(text)    // string
+@out Type(nothing) // void
+
+// -----------------------------------------------------
+// 타입 캐스팅
+// -----------------------------------------------------
+
+let n: int = 8
+let new_n: short = n as short          // as 키워드
+let fv: float = 3.15
+let new_f: int = int.from(fv)          // .from() 메서드
+let sv: string = string.from(fv)       // "3.15"
+
+@out new_n   // 8
+@out new_f   // 3
+@out sv      // 3.15
+
+// -----------------------------------------------------
+// 문자열
+// -----------------------------------------------------
+
+// 문자열 보간 — 중괄호
+let greeting: string = "Hello, {name}!"
+@out greeting  // Hello, John!
+
+// 여러 변수 보간
+@out "{name}은 {age}살이고 키는 {height}m입니다."
+
+// 문자열 슬라이싱
+let str: string = "Hello World"
+@out str[0:5]     // Hello
+@out str[6:]      // World
+@out str[:5]      // Hello
+
+// 문자열 길이
+@out str.length   // 11
+
+// -----------------------------------------------------
+// 산술 연산
+// -----------------------------------------------------
+
+let a: int = 10
+let b_val: int = 3
+
+@out a + b_val     // 13
+@out a - b_val     // 7
+@out a * b_val     // 30
+@out a / b_val     // 3
+@out a % b_val     // 1
+@out 2 ** 3        // 8 (거듭제곱)
+
+// -----------------------------------------------------
+// 비교 / 논리 연산
+// -----------------------------------------------------
+
+@out 10 > 5        // true
+@out 10 < 5        // false
+@out 10 >= 10      // true
+@out 10 <= 9       // false
+@out 10 == 10      // true
+@out 10 != 5       // true
+
+@out true && false  // false
+@out true || false  // true
+@out !true          // false
+
+// -----------------------------------------------------
+// 입력
+// -----------------------------------------------------
+
+let input: string = @in "값을 입력:"
+@out "입력한 값: {input}"
+
+// -----------------------------------------------------
+// 수학 함수
+// -----------------------------------------------------
+
+let va: int = 10
+let vb: int = 20
+let vc: int = 30
+
+@out max(va, vb, vc)   // 30
+@out min(va, vb, vc)   // 10
+@out sin(30)           // sin(30)
+@out log(10)           // log(10)
+@out 2 ** 3            // 8
+
+// -----------------------------------------------------
+// 시간
+// -----------------------------------------------------
+
+let now_time: Time = now()
+@out "{now_time.year}-{now_time.month}-{now_time.day} {now_time.hour}:{now_time.minute}:{now_time.second}"
+
+let today_time: Time = today()
+@out "{today_time.year}-{today_time.month}-{today_time.day}"
+
+let tmr: Time = tomorrow()
+@out "{tmr.year}-{tmr.month}-{tmr.day}"
+
+let ystr: Time = yesterday()
+@out "{ystr.year}-{ystr.month}-{ystr.day}"
+
+// -----------------------------------------------------
+// 조건문
+// -----------------------------------------------------
+
+let condition: bool = true
+if condition {
+  @out "condition is true"
+}
+
+let num: int = 10
+if num > 5 {
+  @out "num is greater than 5"
+} else if num < 5 {
+  @out "num is less than 5"
+} else {
+  @out "num is equal to 5"
+}
+
+// 삼항 연산자
+num > 5 ? {
+  @out "greater"
+} : {
+  @out "not greater"
+}
+
+// 삼항 + 값 반환 (코드 블록)
+let message: string = num > 5 ? {
+  return "big"
+} : "small"
+@out message  // big
+
+// 한 줄 조건문
+if num > 5 : @out "한 줄 조건문"
+
+// -----------------------------------------------------
+// when (패턴 매칭)
+// -----------------------------------------------------
+
+when num {
+  10 -> @out "num is 10"
+  20 -> @out "num is 20"
+  25..30 -> @out "num is between 25 and 30"
+  !5 -> @out "num is not 5"
+  _ -> {
+    @out "num is something else"
+  }
+}
+
+// vector에 when
+let vec: int[] = [1, 2, 3, 4, 5]
+when vec {
+  in 4 -> @out "Vec contains 4"
+  $.length > 3 -> @out "Vec has more than 3 elements"
+  _ -> @out "Vec does not contain 4"
+}
+
+// object에 when
+let obj = { name: "John", age: 30 }
+when obj {
+  in "name" -> @out "Obj has name"
+  $.name == "John" -> @out "Obj name is John"
+  _ -> @out "Obj does not have name"
+}
+
+// string에 when
+let target: string = "Hello world"
+when target {
+  in "world" -> @out "String has world"
+  $.length > 3 -> @out "String length is greater than 3"
+  _ -> @out "default"
+}
+
+// -----------------------------------------------------
+// 반복문
+// -----------------------------------------------------
+
+// range
+for i in 0..10 {
+  @out "i: {i}"
+}
+
+// vector 순회
+for item in [1, 2, 3, 4, 5] {
+  if item == 1 : continue
+  @out "item: {item}"
+}
+
+// index와 함께
+for (item, index) in ["apple", "banana", "cherry"] {
+  @out "{index}: {item}"
+}
+
+// while
+let mut counter: int = 0
+while counter < 5 {
+  @out "counter: {counter}"
+  counter = counter + 1
+}
+
+// break
+while true {
+  @out "한 번만 실행"
+  break
+}
+
+// -----------------------------------------------------
+// 함수
+// -----------------------------------------------------
+
+// 기본 함수
+function add(a: int, b: int): int -> {
+  return a + b
+}
+@out add(1, 2)  // 3
+
+// 한 줄 함수 (expression body)
+function double(x: int): int -> x * 2
+@out double(5)  // 10
+
+// implicit return — 마지막 표현식이 반환값
+function triple(x: int): int -> {
+  x * 3
+}
+@out triple(5)  // 15
+
+// void scope 규칙 — 함수 내부에서도 적용
+// 마지막이 아닌 표현식은 @out, 마지막은 return
+function showAndReturn(a: int, b: int): string -> {
+  "{a}"         // @out "{a}" — 출력
+  "{b}"         // @out "{b}" — 출력
+  "{a + b}"     // return — 마지막이니까
+}
+let result: string = showAndReturn(3, 7)
+// 출력: 3
+// 출력: 7
+@out result    // 10
+
+// -----------------------------------------------------
+// 비동기
+// -----------------------------------------------------
+
+async function fetchData(): string -> {
+  @out "Fetching data..."
+  await sleep(1000)
+  "data"
+}
+let data: string = await fetchData()
+@out "data: {data}"  // data: data
+
+// -----------------------------------------------------
+// try-catch
+// -----------------------------------------------------
+
+try {
+  let risky: int = int.from("not a number")
+} catch error {
+  @out "에러 발생: {error}"
+}
+
+// -----------------------------------------------------
+// 파일 시스템
+// -----------------------------------------------------
+
+let mut file: File = await @fs.read "test.txt"
+@out "파일 내용: {file.content}"
+
+await @fs.write "test.txt" "Hello, World!" utf-8
+@out "파일 쓰기 완료"
+
+// -----------------------------------------------------
+// HTTP 요청
+// -----------------------------------------------------
+
+let mut response: Response = await @fetch GET "https://api.example.com"
+@out "Status: {response.status}"
+@out "Body: {response.body}"
+
+// -----------------------------------------------------
+// 프로세스 실행
+// -----------------------------------------------------
+
+let mut proc_result: ProcessResult = await @process.run "ls -la"
+@out "Exit code: {proc_result.code}"
+@out "Output: {proc_result.output}"
