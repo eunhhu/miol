@@ -1,8 +1,8 @@
 // =====================================================
-// 06-fullstack-showcase.orv — 풀스택 통합 쇼케이스
+// 07-fullstack-showcase.orv — 풀스택 통합 쇼케이스
 // =====================================================
 //
-// default.md의 비전을 하나의 파일로 증명.
+// plan 문서 전반의 비전을 하나의 파일로 증명.
 // "프로젝트 하나, 파일 하나, 풀서비스 하나"
 //
 // 이 파일 하나가 생성하는 것:
@@ -36,6 +36,16 @@ struct User {
   createdAt: string
 }
 
+struct UserRecord {
+  id: int
+  name: string
+  email: string
+  avatar: string?
+  role: string
+  passwordHash: string
+  createdAt: string
+}
+
 struct Post {
   id: int
   title: string
@@ -46,12 +56,42 @@ struct Post {
   createdAt: string
 }
 
+struct PostRecord {
+  id: int
+  title: string
+  content: string
+  authorId: int
+  tags: string[]
+  likes: int
+  public: bool
+  createdAt: string
+}
+
 struct Comment {
   id: int
   postId: int
   author: User
   content: string
   createdAt: string
+}
+
+struct CommentRecord {
+  id: int
+  postId: int
+  authorId: int
+  content: string
+  createdAt: string
+}
+
+struct FollowerRecord {
+  userId: int
+  followerId: int
+  createdAt: string
+}
+
+struct TagRecord {
+  name: string
+  postCount: int
 }
 
 struct LoginRequest {
@@ -65,6 +105,22 @@ struct RegisterRequest {
   password: string
 }
 
+struct UpdateUserRequest {
+  name: string?
+  avatar: string?
+}
+
+struct CreatePostRequest {
+  title: string
+  content: string
+  tags: string[]?
+  public: bool?
+}
+
+struct CreateCommentRequest {
+  content: string
+}
+
 struct AuthPayload {
   id: int
   role: string
@@ -73,6 +129,12 @@ struct AuthPayload {
 struct DashboardData {
   user: User
   recentPosts: Post[]
+  totalLikes: int
+  followerCount: int
+}
+
+struct DashboardStats {
+  totalPosts: int
   totalLikes: int
   followerCount: int
 }
@@ -94,6 +156,76 @@ enum NotificationType {
 
 pub const SITE_NAME: string = "Orv Showcase"
 pub const VERSION: string = "1.0.0"
+
+// =============================================================
+//
+//  1-1. 변환 헬퍼
+//
+// =============================================================
+
+function toPublicUser(record: UserRecord): User -> {
+  {
+    id: record.id
+    name: record.name
+    email: record.email
+    avatar: record.avatar
+    role: record.role
+    createdAt: record.createdAt
+  }
+}
+
+function loadPublicUser(userId: int): User -> {
+  let record = await @db.find UserRecord { @where id=userId }
+  toPublicUser(record)
+}
+
+function toPublicUsers(records: UserRecord[]): User[] -> {
+  let mut users: User[] = []
+  for record in records {
+    users.push(toPublicUser(record))
+  }
+  users
+}
+
+function toPublicPost(record: PostRecord): Post -> {
+  let author = await loadPublicUser(record.authorId)
+  {
+    id: record.id
+    title: record.title
+    content: record.content
+    author: author
+    tags: record.tags
+    likes: record.likes
+    createdAt: record.createdAt
+  }
+}
+
+function toPublicPosts(records: PostRecord[]): Post[] -> {
+  let mut posts: Post[] = []
+  for record in records {
+    posts.push(await toPublicPost(record))
+  }
+  posts
+}
+
+function toPublicComment(record: CommentRecord): Comment -> {
+  let author = await loadPublicUser(record.authorId)
+  {
+    id: record.id
+    postId: record.postId
+    author: author
+    content: record.content
+    createdAt: record.createdAt
+  }
+}
+
+function toPublicComments(records: CommentRecord[]): Comment[] -> {
+  let mut comments: Comment[] = []
+  for record in records {
+    comments.push(await toPublicComment(record))
+  }
+  comments
+}
 
 // =============================================================
 //
@@ -325,15 +457,16 @@ define Pagination(
 let authApi = @route /api/auth {
   @route POST /login {
     let body: LoginRequest = @body
-    let user = await @db.find User { @where email=body.email }
+    let userRecord = await @db.find UserRecord { @where email=body.email }
 
-    when user {
+    when userRecord {
       void -> @respond 401 { error: "Invalid credentials" }
       _ -> {
-        let valid: bool = await hash.verify(body.password, user.passwordHash)
+        let valid: bool = await hash.verify(body.password, userRecord.passwordHash)
         if !valid {
           @respond 401 { error: "Invalid credentials" }
         }
+        let user = toPublicUser(userRecord)
         let token = jwt.sign(
           { id: user.id, role: user.role },
           @env.SECRET
@@ -345,20 +478,22 @@ let authApi = @route /api/auth {
 
   @route POST /register {
     let body: RegisterRequest = @body
-    let existing = await @db.find User { @where email=body.email }
+    let existing = await @db.find UserRecord { @where email=body.email }
 
     when existing {
       void -> {
         let passwordHash = await hash.create(body.password)
-        let user = await @db.create User {
+        let userRecord = await @db.create UserRecord {
           %data={
             name: body.name
             email: body.email
+            avatar: void
             passwordHash: passwordHash
             role: "member"
             createdAt: string.from(now())
           }
         }
+        let user = toPublicUser(userRecord)
         let token = jwt.sign(
           { id: user.id, role: user.role },
           @env.SECRET
@@ -382,11 +517,12 @@ let userApi = @route /api/users {
   @route GET / {
     let page: int = int.from(@query.page ?? "1")
     let limit: int = int.from(@query.limit ?? "20")
-    let users = await @db.find User {
+    let userRecords = await @db.find UserRecord {
       @skip ((page - 1) * limit)
       @limit limit
     }
-    let total = await @db.count User
+    let users = toPublicUsers(userRecords)
+    let total = await @db.count UserRecord
     // → users와 total은 독립 → 자동 병렬 실행
 
     @respond 200 {
@@ -398,12 +534,19 @@ let userApi = @route /api/users {
     }
   }
 
+  @route GET /me {
+    @Auth
+    let payload: AuthPayload = @context.payload
+    let userRecord = await @db.find UserRecord { @where id=payload.id }
+    @respond 200 toPublicUser(userRecord)
+  }
+
   @route GET /:id {
     let id: int = @param.id as int
-    let user = await @db.find User { @where id=id }
-    when user {
+    let userRecord = await @db.find UserRecord { @where id=id }
+    when userRecord {
       void -> @respond 404 { error: "User not found" }
-      _ -> @respond 200 { user: user }
+      _ -> @respond 200 toPublicUser(userRecord)
     }
   }
 
@@ -414,12 +557,26 @@ let userApi = @route /api/users {
     if payload.id != id && payload.role != "admin" {
       @respond 403 { error: "Cannot edit other users" }
     }
-    let body = @body
-    let user = await @db.update User {
+    let body: UpdateUserRequest = @body
+    let userRecord = await @db.update UserRecord {
       @where id=id
-      %data=body
+      %data={
+        name: body.name
+        avatar: body.avatar
+      }
     }
-    @respond 200 { user: user }
+    @respond 200 toPublicUser(userRecord)
+  }
+
+  @route DELETE /:id {
+    @Auth
+    let id: int = @param.id as int
+    let payload: AuthPayload = @context.payload
+    if payload.role != "admin" {
+      @respond 403 { error: "Admin access required" }
+    }
+    await @db.delete UserRecord { @where id=id }
+    @respond 204 {}
   }
 }
 
@@ -430,18 +587,22 @@ let postApi = @route /api/posts {
     let limit: int = int.from(@query.limit ?? "20")
     let tag: string? = @query.tag
 
-    let posts = when tag {
-      void -> await @db.find Post {
+    let postRecords = when tag {
+      void -> await @db.find PostRecord {
         @skip ((page - 1) * limit)
         @limit limit
       }
-      _ -> await @db.find Post {
+      _ -> await @db.find PostRecord {
         @where tags_contains=tag
         @skip ((page - 1) * limit)
         @limit limit
       }
     }
-    let total = await @db.count Post { @where tags_contains=tag }
+    let posts = await toPublicPosts(postRecords)
+    let total = when tag {
+      void -> await @db.count PostRecord
+      _ -> await @db.count PostRecord { @where tags_contains=tag }
+    }
 
     @respond 200 {
       items: posts
@@ -454,57 +615,84 @@ let postApi = @route /api/posts {
 
   @route GET /:id {
     let id: int = @param.id as int
-    let post = await @db.find Post { @where id=id }
-    let comments = await @db.find Comment { @where postId=id }
-    // → post와 comments는 독립 → 자동 병렬
-
-    when post {
+    let postRecord = await @db.find PostRecord { @where id=id }
+    when postRecord {
       void -> @respond 404 { error: "Post not found" }
-      _ -> @respond 200 { post: post, comments: comments }
+      _ -> @respond 200 await toPublicPost(postRecord)
     }
   }
 
   @route POST / {
     @Auth
     let payload: AuthPayload = @context.payload
-    let body = @body
-    let post = await @db.create Post {
+    let body: CreatePostRequest = @body
+    let postRecord = await @db.create PostRecord {
       %data={
         title: body.title
         content: body.content
-        author: payload.id
+        authorId: payload.id
         tags: body.tags ?? []
         likes: 0
+        public: body.public ?? true
         createdAt: string.from(now())
       }
     }
-    @respond 201 { post: post }
+    @respond 201 await toPublicPost(postRecord)
   }
 
   @route POST /:id/like {
     @Auth
     let id: int = @param.id as int
-    await @db.update Post {
+    await @db.update PostRecord {
       @where id=id
       %inc={ likes: 1 }
     }
     @respond 200 { liked: true }
   }
 
+  @route GET /:id/comments {
+    let id: int = @param.id as int
+    let commentRecords = await @db.find CommentRecord { @where postId=id }
+    @respond 200 await toPublicComments(commentRecords)
+  }
+
   @route POST /:id/comments {
     @Auth
     let id: int = @param.id as int
     let payload: AuthPayload = @context.payload
-    let body = @body
-    let comment = await @db.create Comment {
+    let body: CreateCommentRequest = @body
+    let commentRecord = await @db.create CommentRecord {
       %data={
         postId: id
-        author: payload.id
+        authorId: payload.id
         content: body.content
         createdAt: string.from(now())
       }
     }
-    @respond 201 { comment: comment }
+    @respond 201 await toPublicComment(commentRecord)
+  }
+}
+
+let appApi = @route /api {
+  @route GET /stats {
+    @Auth
+    let payload: AuthPayload = @context.payload
+    let totalPosts = await @db.count PostRecord { @where authorId=payload.id }
+    let totalLikes = await @db.sum PostRecord { @where authorId=payload.id; @field likes }
+    let followerCount = await @db.count FollowerRecord { @where userId=payload.id }
+    // → 세 쿼리 독립 → 자동 병렬
+
+    @respond 200 {
+      totalPosts: totalPosts
+      totalLikes: totalLikes
+      followerCount: followerCount
+    }
+  }
+
+  @route GET /tags {
+    let tagRecords = await @db.find TagRecord
+    let tags = tagRecords.map((tag) -> tag.name)
+    @respond 200 tags
   }
 }
 
@@ -647,7 +835,7 @@ pub define TodoPage() -> @Layout title="Todo" {
     @ul {
       for todo in filtered {
         @li {
-          class=todo.done ? "done" : ""
+          class={todo.done ? "done" : ""}
           @input type="checkbox" checked={todo.done} onChange={
             todos = todos.map(t -> t.id == todo.id ? { ...t, done: !t.done } : t)
           }
@@ -673,8 +861,8 @@ pub define DashboardPage() -> @Layout title="Dashboard" {
 
   // 서버에서 데이터 fetch — 독립 쿼리 자동 병렬
   let sig user: User = await userApi.fetch("/me")
-  let sig recentPosts: Post[] = await postApi.fetch("/?limit=5")
-  let sig stats = await api.fetch("/stats")
+  let sig recentPosts: PaginatedResponse<Post> = await postApi.fetch("/?limit=5")
+  let sig stats: DashboardStats = await appApi.fetch("/stats")
 
   @div {
     class="dashboard-header"
@@ -697,10 +885,10 @@ pub define DashboardPage() -> @Layout title="Dashboard" {
   }
 
   @Card title="Recent Posts" {
-    for post in recentPosts {
+    for post in recentPosts.items {
       @PostCard post={post}
     }
-    if recentPosts.length == 0 {
+    if recentPosts.items.length == 0 {
       @EmptyState title="아직 포스트가 없습니다"
     }
   }
@@ -717,7 +905,7 @@ pub define BlogPage() -> @Layout title="Blog" {
   let sig data: PaginatedResponse<Post> = await postApi.fetch("/?page={page}&tag={tag ?? ""}")
 
   // 태그 필터
-  let sig tags: string[] = await api.fetch("/tags")
+  let sig tags: string[] = await appApi.fetch("/tags")
   @div {
     class="tag-filter"
     @button onClick={tag = void; page = 1; data = await postApi.fetch("/?page=1")} "전체"
@@ -754,7 +942,7 @@ pub define BlogPage() -> @Layout title="Blog" {
 
 pub define PostDetailPage(postId: int) -> @Layout title="Post" {
   let sig post: Post = await postApi.fetch("/{postId}")
-  let sig comments: Comment[] = await api.fetch("/posts/{postId}/comments")
+  let sig comments: Comment[] = await postApi.fetch("/{postId}/comments")
   // → post와 comments 독립 → 자동 병렬
 
   @article {
@@ -809,7 +997,7 @@ pub define PostDetailPage(postId: int) -> @Layout title="Post" {
       @textarea value="{newComment}" onInput={(e) -> newComment = e.target.value} placeholder="댓글 작성..."
       @button onClick={
         if newComment.length > 0 {
-          let c = await api.fetch("/posts/{postId}/comments", method="POST", body={ content: newComment })
+          let c = await postApi.fetch("/{postId}/comments", method="POST", body={ content: newComment })
           comments = comments.concat([c])
           newComment = ""
         }
@@ -869,6 +1057,57 @@ pub define LoginPage() -> @Layout title="Login" {
 }
 // → 판정: 클라이언트 렌더링
 
+pub define RegisterPage() -> @Layout title="Register" {
+  @Layout.Header subtitle="새 계정 만들기"
+
+  let sig name: string = ""
+  let sig email: string = ""
+  let sig password: string = ""
+  let sig error: string? = void
+  let sig loading: bool = false
+
+  @Card title="Register" {
+    if error != void {
+      @Notification type=NotificationType.Error "{error}"
+    }
+
+    @form onSubmit={(e) -> {
+      e.preventDefault()
+      loading = true
+      error = void
+      try {
+        let res = await authApi.fetch("/register", method="POST", body={
+          name: name
+          email: email
+          password: password
+        })
+        localStorage.set("token", res.token)
+        navigate("/dashboard")
+      } catch err {
+        error = "회원가입 실패: 입력값을 다시 확인하세요."
+      }
+      loading = false
+    }} {
+      @div {
+        @label "이름"
+        @input type="text" value="{name}" onInput={(e) -> name = e.target.value}
+      }
+      @div {
+        @label "이메일"
+        @input type="email" value="{email}" onInput={(e) -> email = e.target.value}
+      }
+      @div {
+        @label "비밀번호"
+        @input type="password" value="{password}" onInput={(e) -> password = e.target.value}
+      }
+      @button type="submit" disabled={loading} {
+        if loading { "가입 중..." } else { "회원가입" }
+      }
+    }
+  }
+}
+// → 판정: 클라이언트 렌더링
+
 // =============================================================
 //
 //  6. 서버 — 모든 것을 하나로
@@ -893,54 +1132,12 @@ pub define LoginPage() -> @Layout title="Login" {
   }
 
   // ── 내부 API (let 바인딩 → 바이너리 RPC) ──
-  // authApi, userApi, postApi는 위에서 let으로 선언됨
+  // authApi, userApi, postApi, appApi는 위에서 let으로 선언됨
   // → 내부 RPC 자동 적용
   // → .fetch()로만 접근, 바이너리 직렬화
 
   // ── 추가 내부 API ──
-  let api = @route /api {
-    @route GET /stats {
-      @Auth
-      let payload: AuthPayload = @context.payload
-      let totalPosts = await @db.count Post { @where author=payload.id }
-      let totalLikes = await @db.sum Post { @where author=payload.id; @field likes }
-      let followerCount = await @db.count Follower { @where user=payload.id }
-      // → 세 쿼리 독립 → 자동 병렬
-
-      @respond 200 {
-        totalPosts: totalPosts
-        totalLikes: totalLikes
-        followerCount: followerCount
-      }
-    }
-
-    @route GET /tags {
-      let tags = await @db.find Tag
-      @respond 200 tags
-    }
-
-    @route GET /posts/:postId/comments {
-      let postId: int = @param.postId as int
-      let comments = await @db.find Comment { @where postId=postId }
-      @respond 200 comments
-    }
-
-    @route POST /posts/:postId/comments {
-      @Auth
-      let postId: int = @param.postId as int
-      let payload: AuthPayload = @context.payload
-      let body = @body
-      let comment = await @db.create Comment {
-        %data={
-          postId: postId
-          author: payload.id
-          content: body.content
-          createdAt: string.from(now())
-        }
-      }
-      @respond 201 comment
-    }
-  }
+  // appApi는 위에서 선언되어 페이지와 서버가 동일 계약을 공유함
 
   // ── 외부 공개 API (JSON) ──
   @route GET /health {
@@ -953,11 +1150,12 @@ pub define LoginPage() -> @Layout title="Login" {
 
   @route GET /api/v1/public/posts {
     let page: int = int.from(@query.page ?? "1")
-    let posts = await @db.find Post {
+    let postRecords = await @db.find PostRecord {
       @where public=true
       @skip ((page - 1) * 10)
       @limit 10
     }
+    let posts = await toPublicPosts(postRecords)
     @respond 200 { posts: posts }
   }
   // → 변수 미할당 → 외부 API → JSON
@@ -985,6 +1183,10 @@ pub define LoginPage() -> @Layout title="Login" {
 
   @route GET /login {
     @serve @LoginPage
+  }
+
+  @route GET /register {
+    @serve @RegisterPage
   }
 
   // 서버 렌더링 페이지 → SSR + hydration
@@ -1037,12 +1239,13 @@ define NotFoundPage() -> @Layout title="404" {
 // ── 관리자 페이지 (SSR) ──
 define AdminDashboard() -> @Layout title="Admin" {
   @Layout.Header subtitle="관리자 대시보드"
-  let sig userCount = await @db.count User
-  let sig postCount = await @db.count Post
-  let sig recentUsers: User[] = await @db.find User {
+  let sig userCount = await @db.count UserRecord
+  let sig postCount = await @db.count PostRecord
+  let sig recentUserRecords: UserRecord[] = await @db.find UserRecord {
     @order createdAt=desc
     @limit 10
   }
+  let sig recentUsers: User[] = toPublicUsers(recentUserRecords)
   // → 세 쿼리 독립 → 자동 병렬
 
   @div {
@@ -1131,11 +1334,11 @@ define AdminUsersPage() -> @Layout title="Admin - Users" {
 //
 // [컴파일러가 자동으로]
 //   ✓ 서버 바이너리 + 클라이언트 WASM 분리
-//   ✓ 내부 RPC (authApi, userApi, postApi, api) → 바이너리 직렬화
+//   ✓ 내부 RPC (authApi, userApi, postApi, appApi) → 바이너리 직렬화
 //   ✓ 외부 API (/health, /api/v1/public/*) → JSON 유지
 //   ✓ 페이지별 렌더링 전략 자동 판정:
 //       HomePage, AboutPage → 정적 생성
-//       CounterPage, TodoPage, LoginPage → 클라이언트 렌더링
+//       CounterPage, TodoPage, LoginPage, RegisterPage → 클라이언트 렌더링
 //       DashboardPage, BlogPage, PostDetailPage → 서버 렌더링
 //       AdminDashboard, AdminUsersPage → 서버 렌더링
 //   ✓ 독립 쿼리 자동 병렬 (dashboard stats, post+comments 등)

@@ -1,5 +1,5 @@
 // =====================================================
-// 05-optimization.orv — 컴파일러 최적화
+// 06-optimization.orv — 컴파일러 최적화
 // =====================================================
 //
 // orv 컴파일러가 자동으로 수행하는 최적화들.
@@ -169,7 +169,7 @@ pub define LiveCounter() -> @html {
 
 let getUser = @route GET /api/user/:id {
   let id: int = @param.id as int
-  @respond 200 { user: await @db.find User { @where id=id } }
+  @respond 200 await @db.find User { @where id=id }
 }
 
 // 개발자가 작성한 코드
@@ -207,9 +207,9 @@ define UserListNoBatch(ids: int[]) -> @ul {
 
 // (a) 독립 — 자동 병렬
 let getDashboard = @route GET /api/dashboard {
-  let users = await @db.find Users                       // 독립
+  let users = await @db.find User                        // 독립
   let stats = await @db.find Stats                       // 독립
-  let posts = await @db.find Posts { @limit 10 }         // 독립
+  let posts = await @db.find Post { @limit 10 }          // 독립
   @respond 200 { users, stats, posts }
 }
 // → 컴파일러: users, stats, posts 간 의존 없음
@@ -220,7 +220,7 @@ let getDashboard = @route GET /api/dashboard {
 let getUserPosts = @route GET /api/user/:id/posts {
   let id: int = @param.id as int
   let user = await @db.find User { @where id=id }                // 1. 먼저 유저 조회
-  let posts = await @db.find Posts { @where author=user.id }     // 2. 유저 ID로 포스트 조회 (의존)
+  let posts = await @db.find Post { @where author=user.id }      // 2. 유저 ID로 포스트 조회 (의존)
   @respond 200 { user, posts }
 }
 // → posts가 user.id에 의존 → 순차 실행 유지
@@ -229,8 +229,8 @@ let getUserPosts = @route GET /api/user/:id/posts {
 let getFullDashboard = @route GET /api/full-dashboard {
   let user = await @db.find User { @where id=@context.payload.id }    // 1. 먼저
 
-  let posts = await @db.find Posts { @where author=user.id }          // 2-a. user 의존
-  let followers = await @db.find Followers { @where user=user.id }    // 2-b. user 의존 (posts와 독립)
+  let posts = await @db.find Post { @where author=user.id }           // 2-a. user 의존
+  let followers = await @db.find Follower { @where user=user.id }     // 2-b. user 의존 (posts와 독립)
   let trending = await @db.find Trending                              // 2-c. 독립
 
   @respond 200 { user, posts, followers, trending }
@@ -419,7 +419,7 @@ let jsonForced = @route GET /api/compat @hint protocol=json {
 // 캐시 제어
 let getPost = @route GET /api/post/:id {
   let id: int = @param.id as int
-  @respond 200 { post: await @db.find Post { @where id=id } }
+  @respond 200 await @db.find Post { @where id=id }
 }
 
 let live = await getUser.fetch(param={ id: 1 }) @hint cache=never
