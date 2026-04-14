@@ -29,29 +29,34 @@
 
   // GET
   @route GET /api/users {
-    let users = await db.findUsers()
+    let users = await @db.find User
     @respond 200 { users: users }
   }
 
   // POST
   @route POST /api/users {
-    let body = @request.body
-    let user = await db.createUser(body)
+    let body = @body
+    let user = await @db.create User data=body
     @respond 201 { user: user }
   }
 
   // PUT
   @route PUT /api/users/:id {
-    let id: int = @path.id as int
-    let body = @request.body
-    let user = await db.updateUser(id, body)
+    let id: int = @param.id as int
+    let body = @body
+    let user = await @db.update User {
+      @where id=id
+      %data=body
+    }
     @respond 200 { user: user }
   }
 
   // DELETE
   @route DELETE /api/users/:id {
-    let id: int = @path.id as int
-    await db.deleteUser(id)
+    let id: int = @param.id as int
+    await @db.delete User {
+      @where id=id
+    }
     @respond 204 {}
   }
 
@@ -66,16 +71,18 @@
 // -----------------------------------------------------
 
 @route GET /users/:userId/posts/:postId {
-  let userId: int = @path.userId as int
-  let postId: int = @path.postId as int
-  let post = await db.findPost(userId, postId)
+  let userId: int = @param.userId as int
+  let postId: int = @param.postId as int
+  let post = await @db.find Post {
+    @where id=postId
+  }
   @respond 200 { post: post }
 }
 
 // 여러 파라미터 조합
 @route GET /api/:version/resource/:id {
-  let ver: string = @path.version
-  let id: int = @path.id as int
+  let ver: string = @param.version
+  let id: int = @param.id as int
   @out "API {ver}, Resource {id}"
   @respond 200 { version: ver, id: id }
 }
@@ -88,9 +95,11 @@
   // 요청 정보 접근
   let method: string = @request.method        // POST
   let path: string = @request.path            // /api/submit
-  let body = @request.body                    // 파싱된 바디
-  let query = @request.query                  // 쿼리 파라미터
-  let ip: string = @request.ip               // 클라이언트 IP
+  let body = @body                            // 파싱된 바디
+  let query = @query                          // 쿼리 파라미터
+  let params = @param                         // 경로 파라미터
+  let headers = @header                       // 헤더
+  let ip: string = @request.ip                // 클라이언트 IP
 
   @out "Method: {method}"
   @out "From: {ip}"
@@ -100,11 +109,15 @@
 
 // 쿼리 파라미터
 @route GET /api/search {
-  let q: string = @request.query.q ?? ""
-  let page: int = int.from(@request.query.page ?? "1")
-  let limit: int = int.from(@request.query.limit ?? "20")
+  let q: string = @query.q ?? ""
+  let page: int = int.from(@query.page ?? "1")
+  let limit: int = int.from(@query.limit ?? "20")
 
-  let results = await db.search(q, page, limit)
+  let results = await @db.find Post {
+    @where title_contains=q
+    @skip ((page - 1) * limit)
+    @limit limit
+  }
   @respond 200 {
     query: q
     page: page
@@ -117,9 +130,9 @@
 // -----------------------------------------------------
 
 @route GET /api/profile {
-  let auth: string? = @header Authorization
-  let contentType: string? = @header Content-Type
-  let userAgent: string = @header User-Agent ?? "unknown"
+  let auth: string? = @header.Authorization
+  let contentType: string? = @header["Content-Type"]
+  let userAgent: string = @header["User-Agent"] ?? "unknown"
 
   @out "User-Agent: {userAgent}"
 
@@ -136,10 +149,10 @@
 // @env — 환경 변수
 // -----------------------------------------------------
 
-let dbUrl: string = @env DATABASE_URL
-let secret: string = @env SECRET
-let port: int = int.from(@env PORT ?? "8080")
-let isDev: bool = @env NODE_ENV == "development"
+let dbUrl: string = @env.DATABASE_URL
+let secret: string = @env.SECRET
+let port: int = int.from(@env.PORT ?? "8080")
+let isDev: bool = @env.NODE_ENV == "development"
 
 @out "DB: {dbUrl}"
 @out "Port: {port}"
@@ -171,8 +184,8 @@ let isDev: bool = @env NODE_ENV == "development"
 
 // 조건부 응답
 @route GET /api/item/:id {
-  let id: int = @path.id as int
-  let item = await db.findItem(id)
+  let id: int = @param.id as int
+  let item = await @db.find Item { @where id=id }
   when item {
     void -> @respond 404 { error: "Item not found" }
     _ -> @respond 200 { item: item }
@@ -205,7 +218,7 @@ pub define LandingPage() -> @html {
 }
 
 @route GET / {
-  @serve LandingPage()
+  @serve @LandingPage
 }
 
 // -----------------------------------------------------
@@ -218,12 +231,12 @@ pub define LandingPage() -> @html {
 
 // 인증 미들웨어
 define Auth() -> @before {
-  let bearer: string? = @header Authorization
+  let bearer: string? = @header.Authorization
   when bearer {
     void -> @respond 401 { error: "unauthorized" }
     _ -> {
       let token = bearer[7:]
-      let payload = jwt.verify(token, @env SECRET)
+      let payload = jwt.verify(token, @env.SECRET)
       @next {payload}
     }
   }
@@ -316,12 +329,12 @@ define ErrorHandler() -> @after {
     @RateLimit max=30 window=300
 
     @route GET /users {
-      @respond 200 { users: await db.findUsers() }
+      @respond 200 { users: await @db.find Users }
     }
 
     @route DELETE /users/:id {
-      let id: int = @path.id as int
-      await db.deleteUser(id)
+      let id: int = @param.id as int
+      await @db.delete User { @where id=id }
       @respond 204 {}
     }
   }
@@ -336,22 +349,26 @@ define ErrorHandler() -> @after {
 
 // 단일 엔드포인트 RPC
 let getUser = @route GET /api/user/:id {
-  let id: int = @path.id as int
-  @respond 200 { user: await db.findOne(id) }
+  let id: int = @param.id as int
+  @respond 200 { user: await @db.find User { @where id=id } }
 }
 
 // 그룹 facade
 let api = @route /api {
   @route GET /users {
-    @respond 200 { users: await db.findUsers() }
+    @respond 200 { users: await @db.find Users }
   }
   @route GET /posts {
-    @respond 200 { posts: await db.findPosts() }
+    @respond 200 { posts: await @db.find Posts }
   }
   @route POST /posts {
     @Auth
-    let body = @request.body
-    let post = await db.createPost(body, @context.payload)
+    let post = await @db.create Post { 
+      %data={
+        ...@body
+        author: @context.payload
+      }
+    }
     @respond 201 { post: post }
   }
 }
@@ -400,7 +417,7 @@ let internalApi = @route GET /api/internal {
 // -----------------------------------------------------
 
 pub define App() -> @server {
-  @listen int.from(@env PORT ?? "8080")
+  @listen int.from(@env.PORT ?? "8080")
 
   // 전역 미들웨어
   @Cors
@@ -416,24 +433,24 @@ pub define App() -> @server {
   let api = @route /api {
     // 공개 라우트
     @route POST /auth/login {
-      let body = @request.body
-      let user = await db.findByEmail(body.email)
+      let body = @body
+      let user = await @db.find Users { @where email=body.email }
       when user {
         void -> @respond 401 { error: "Invalid credentials" }
         _ -> {
-          let token = jwt.sign({ id: user.id }, @env SECRET)
+          let token = jwt.sign({ id: user.id }, @env.SECRET)
           @respond 200 { token: token, user: user }
         }
       }
     }
 
     @route POST /auth/register {
-      let body = @request.body
-      let existing = await db.findByEmail(body.email)
+      let body = @body
+      let existing = await @db.find Users { @where email=body.email }
       when existing {
         void -> {
-          let user = await db.createUser(body)
-          let token = jwt.sign({ id: user.id }, @env SECRET)
+          let user = await @db.create Users { %data=body }
+          let token = jwt.sign({ id: user.id }, @env.SECRET)
           @respond 201 { token: token, user: user }
         }
         _ -> @respond 409 { error: "Email already exists" }
@@ -451,18 +468,20 @@ pub define App() -> @server {
 
       @route GET /posts {
         let userId: int = @context.payload.id
-        let posts = await db.findPostsByUser(userId)
+        let posts = await @db.find Posts { @where author=userId }
         @respond 200 { posts: posts }
       }
 
       @route POST /posts {
         let userId: int = @context.payload.id
-        let body = @request.body
-        let post = await db.createPost({
-          title: body.title
-          content: body.content
-          author: userId
-        })
+        let body = @body
+        let post = await @db.create Posts { 
+          %data={
+            title: body.title,
+            content: body.content,
+            author: userId
+          }
+        }
         @respond 201 { post: post }
       }
     }
@@ -479,21 +498,21 @@ pub define App() -> @server {
 
   // 페이지 서빙
   @route GET / {
-    @serve HomePage()
+    @serve @HomePage
   }
 
   @route GET /login {
-    @serve LoginPage()
+    @serve @LoginPage
   }
 
   @route GET /dashboard {
     @Auth
-    @serve DashboardPage()
+    @serve @DashboardPage
   }
 
   @route GET /user/:id {
-    let id: int = @path.id as int
-    @serve ProfilePage userId={id}
+    let id: int = @param.id as int
+    @serve @ProfilePage userId=id
   }
 }
 
@@ -520,19 +539,19 @@ pub define App() -> @server {
   // 특정 대상에게 전송
   @on private-message {
     let target: string = @packet.to
-    @emit private-message to={target} { from: @socket.id, msg: @packet.msg }
+    @emit private-message to=target { from: @socket.id, msg: @packet.msg }
   }
 
   // 룸 기반 전송
   @on join-room {
     let room: string = @packet.room
     @socket.join(room)
-    @emit room-update in={room} { user: @socket.id, action: "joined" }
+    @emit room-update in=room { user: @socket.id, action: "joined" }
   }
 
   @on room-message {
     let room: string = @packet.room
-    @emit room-message in={room} @packet.msg
+    @emit room-message in=room @packet.msg
   }
 
   // 연결 해제 시
@@ -554,16 +573,96 @@ pub define App() -> @server {
 //   @socket.leave(room) → 룸 탈퇴
 //   @packet           → 수신 데이터
 
+// -----------------------------------------------------
+// WebSocket client facade — let 바인딩
+// -----------------------------------------------------
+
+// HTTP @route를 let에 바인딩하면 .fetch() facade가 되듯,
+// @ws도 let에 바인딩하면 클라이언트 facade가 됨.
+// 서버에 정의된 채널 스키마를 컴파일타임에 공유하므로
+// 존재하지 않는 채널/잘못된 페이로드는 컴파일 에러.
+
+let chat = @ws /chat {
+  @connect {
+    @emit welcome to=@socket.id { msg: "Hello!" }
+  }
+  @on message {
+    @emit message @packet
+  }
+  @on private-message {
+    let target: string = @packet.to
+    @emit private-message to=target { from: @socket.id, msg: @packet.msg }
+  }
+  @on join-room {
+    let room: string = @packet.room
+    @socket.join(room)
+    @emit room-update in=room { user: @socket.id, action: "joined" }
+  }
+  @disconnect {
+    @emit user-left @socket.id
+  }
+}
+
+// 클라이언트에서 사용
+// @connect — 연결 수립, Socket 핸들 반환
+let myWS = await @chat.connect   // Domain socket
+
+// @emit channel data — 서버로 전송
+@myWS.emit message { text: "안녕" }
+@myWS.emit private-message { to: "user-42", msg: "hi" }
+@myWS.emit join-room { room: "lobby" }
+
+// @on channel { handler } — 서버 브로드캐스트 수신
+@myWS.on message {
+  @out "수신: {@packet}"
+}
+
+@myWS.on room-update {
+  @out "{@packet.user} {@packet.action}"
+}
+
+// @off channel — 리스너 해제
+@myWS.off message
+
+// @close — 연결 종료
+await @myWS.close
+
+// sig와 함께 사용 — DOM 자동 반응
+let sig messages: string[] = []
+@myWS.on message {
+  messages = messages.concat([@packet.text])
+  // → @html 내에서 messages를 참조하면 DOM 자동 patch
+}
+
+// 컴파일러 검증:
+//   @myWS.emit wrong-channel ...    → 컴파일 에러, 채널 없음
+//   @myWS.emit message { bad: 1 }   → 컴파일 에러, 페이로드 스키마 불일치
+//   @myWS.on pong { ... }            → 서버가 emit 안 하는 채널이면 경고
+
+// 바이너리 프로토콜 (let 바인딩 → 내부 RPC와 동일 원칙)
+// → 채널명도 컴파일타임 정수 ID로 치환
+// → 페이로드는 순서 기반 바이너리 직렬화
+// → JSON 오버헤드 없음
+
+// 외부 공개 WebSocket (변수 미할당)
+@ws /public-feed {
+  @on subscribe {
+    @emit feed in=@packet.topic { data: "public event" }
+  }
+}
+// → 표준 WebSocket 프레임 + JSON 페이로드
+// → 브라우저 WebSocket API, 다른 언어 클라이언트에서 접근 가능
+
 // @server와 @ws 함께 사용
 pub define FullApp() -> @server {
   @listen 8080
 
   @route GET / {
-    @serve HomePage()
+    @serve @HomePage
   }
 
   @route GET /api/users {
-    @respond 200 { users: await db.findUsers() }
+    @respond 200 { users: await @db.find User }
   }
 
   // WebSocket 엔드포인트

@@ -1,0 +1,892 @@
+// =====================================================
+// 04-web.orv — 웹 프런트엔드
+// =====================================================
+//
+// HTML 태그 도메인, 속성 문법, 브라우저 API,
+// DOM API, Media API, Storage, SPA 라우팅,
+// 디자인 토큰, sig 기반 반응형 UI.
+//
+// 서버는 05-server.orv 참고. 여기선 브라우저 런타임에
+// 컴파일되는 프런트엔드 코드만 다룸.
+
+// -----------------------------------------------------
+// @html — 루트 도메인
+// -----------------------------------------------------
+
+// @html은 HTML 문서 전체를 표현하는 루트 도메인
+// 내부에 @head, @body를 포함
+
+pub define HelloPage() -> @html {
+  @head {
+    @title "Hello"
+    @meta charset="utf-8"
+    @meta name="viewport" content="width=device-width, initial-scale=1.0"
+  }
+  @body {
+    @h1 "Hello, Orv!"
+    @p "웹 프런트엔드 도메인 데모"
+  }
+}
+
+// @html은 페이지(@serve) 혹은 컴포넌트(도메인) 어디에나 반환 가능
+//
+// 번들 규모는 "실제로 쓴 기능"에 따라 달라짐:
+//   sig 0, await 0, 이벤트 0, Web API 0 → 순수 정적 HTML (JS/WASM 없음)
+//   이벤트 핸들러만 있음 → 최소 이벤트 바인딩 코드만 포함
+//   sig 사용 → 반응형 DOM patch 런타임 포함
+//   Web API 사용 → 해당 API 바인딩만 포함 (쓰지 않은 건 DCE로 제거)
+// 즉 "sig 없음 = 런타임 없음"이 아니라,
+// 안 쓴 기능의 런타임이 번들에 없다는 뜻.
+
+// -----------------------------------------------------
+// @head — 메타데이터
+// -----------------------------------------------------
+
+define MetaTags(title: string, description: string?) -> @head {
+  @title "{title}"
+  @meta charset="utf-8"
+  @meta name="viewport" content="width=device-width, initial-scale=1.0"
+  if description != void {
+    @meta name="description" content="{description}"
+  }
+  @link rel="icon" href="/favicon.ico"
+  @link rel="stylesheet" href="/style.css"
+}
+
+// @script — 외부 스크립트
+@script src="/app.js" defer
+@script type="module" src="/main.js"
+
+// 인라인 스크립트 (도메인 내에서 거의 사용 안 함 — sig로 대체)
+@script {
+  "console.log('inline script — 보통 불필요')"
+}
+
+// -----------------------------------------------------
+// @body — 본문
+// -----------------------------------------------------
+
+define SimpleBody() -> @body {
+  @h1 "페이지 제목"
+  @p "문단 텍스트"
+}
+
+// -----------------------------------------------------
+// 텍스트 / 헤딩 태그
+// -----------------------------------------------------
+
+// @h1 ~ @h6, @p, @span, @strong, @em, @small, @mark
+@h1 "가장 큰 헤딩"
+@h2 "두 번째 헤딩"
+@h3 "세 번째"
+@h4 "네 번째"
+@h5 "다섯 번째"
+@h6 "가장 작은 헤딩"
+
+@p "문단 텍스트."
+@p {
+  "문단 안에 "
+  @strong "강조"
+  "나 "
+  @em "기울임"
+  "도 넣을 수 있음."
+}
+
+@span "인라인 텍스트"
+@small "작은 텍스트"
+@mark "하이라이트된 텍스트"
+@code "inline code"
+@pre "  preformatted\n  text"
+
+// -----------------------------------------------------
+// 링크 / 네비게이션
+// -----------------------------------------------------
+
+@a href="/" "홈으로"
+@a href="https://orv.dev" target="_blank" rel="noopener" "외부 링크"
+
+// @nav — 네비게이션 영역
+define MainNav() -> @nav {
+  class="main-nav"
+  @a href="/" "Home"
+  @a href="/about" "About"
+  @a href="/blog" "Blog"
+}
+
+// -----------------------------------------------------
+// 블록 태그
+// -----------------------------------------------------
+
+// @div, @section, @article, @aside, @header, @footer, @main
+@div {
+  class="container"
+  @p "일반 블록 컨테이너"
+}
+
+@section {
+  @h2 "섹션"
+  @p "의미 있는 구획"
+}
+
+@article {
+  @h2 "기사 제목"
+  @p "독립적으로 배포 가능한 콘텐츠"
+}
+
+@aside {
+  @p "부가 정보"
+}
+
+@header {
+  @h1 "페이지 헤더"
+}
+
+@footer {
+  @p "© 2026 Example"
+}
+
+@main {
+  @h1 "메인 콘텐츠"
+}
+
+// -----------------------------------------------------
+// 리스트
+// -----------------------------------------------------
+
+// @ul — 순서 없는 리스트
+@ul {
+  @li "첫 번째"
+  @li "두 번째"
+  @li "세 번째"
+}
+
+// @ol — 순서 있는 리스트
+@ol {
+  @li "하나"
+  @li "둘"
+  @li "셋"
+}
+
+// @dl — 정의 리스트
+@dl {
+  @dt "용어"
+  @dd "정의"
+  @dt "다른 용어"
+  @dd "다른 정의"
+}
+
+// -----------------------------------------------------
+// 폼 — @form, @input, @label, @button, @textarea, @select
+// -----------------------------------------------------
+
+// HTML 속성은 전부 key=value 형태로 통일
+// boolean 속성(disabled, checked, required 등)은 값 없이 적어도 됨
+
+define LoginForm() -> @form onSubmit={(e) -> {
+  e.preventDefault()
+  @out "로그인 시도"
+}} {
+  @div {
+    @label for="email" "이메일"
+    @input
+      type=email
+      id=email
+      name=email
+      placeholder="you@example.com"
+      required
+  }
+
+  @div {
+    @label for="password" "비밀번호"
+    @input
+      type=password
+      id=password
+      name=password
+      minLength=8
+      required
+  }
+
+  @div {
+    @label {
+      @input type=checkbox name=remember
+      "로그인 유지"
+    }
+  }
+
+  @button type=submit "로그인"
+}
+
+// @textarea — 여러 줄 입력
+@textarea
+  name=content
+  rows=5
+  cols=40
+  placeholder="내용을 입력하세요..."
+
+// @select / @option — 드롭다운
+@select name=country {
+  @option value="" disabled selected "선택..."
+  @option value="kr" "한국"
+  @option value="us" "미국"
+  @option value="jp" "일본"
+}
+
+// radio 그룹
+@div {
+  @label {
+    @input type=radio name=plan value=free
+    "무료"
+  }
+  @label {
+    @input type=radio name=plan value=pro checked
+    "프로"
+  }
+  @label {
+    @input type=radio name=plan value=team
+    "팀"
+  }
+}
+
+// file input
+@input type=file accept="image/*" onChange={(e) -> {
+  let file = e.target.files[0]
+  @out "선택된 파일: {file.name}, {file.size}바이트"
+}}
+
+// range, color, date 등
+@input type=range min=0 max=100 step=1 value=50
+@input type=color value="#1a1a2e"
+@input type=date
+@input type=datetime-local
+@input type=time
+@input type=month
+@input type=week
+
+// -----------------------------------------------------
+// 테이블
+// -----------------------------------------------------
+
+define UserTable(users: User[]) -> @table {
+  @thead {
+    @tr {
+      @th "ID"
+      @th "이름"
+      @th "이메일"
+      @th "역할"
+    }
+  }
+  @tbody {
+    for user in users {
+      @tr {
+        @td "{user.id}"
+        @td "{user.name}"
+        @td "{user.email}"
+        @td "{user.role}"
+      }
+    }
+  }
+  @tfoot {
+    @tr {
+      @td colspan=4 "총 {users.length}명"
+    }
+  }
+}
+
+// -----------------------------------------------------
+// 특수 미디어 태그
+// -----------------------------------------------------
+
+// @img — 이미지
+@img src="/hero.png" alt="히어로 이미지"
+@img src="/logo.svg" alt="로고" width=120 height=40 loading=lazy
+
+// @picture + @source — 반응형 이미지
+@picture {
+  @source srcset="/hero.avif" type="image/avif"
+  @source srcset="/hero.webp" type="image/webp"
+  @img src="/hero.jpg" alt="히어로" loading=lazy
+}
+
+// @video — 비디오
+@video src="/intro.mp4" controls width=640 height=360 {
+  @source src="/intro.webm" type="video/webm"
+  @source src="/intro.mp4" type="video/mp4"
+  @track kind=subtitles src="/intro-ko.vtt" srcLang=ko label="한국어"
+  @track kind=subtitles src="/intro-en.vtt" srcLang=en label="English"
+  "이 브라우저는 video를 지원하지 않습니다."
+}
+
+// @video — sig로 제어
+define PlayerDemo() -> @div {
+  let sig playing: bool = false
+  let sig muted: bool = false
+  let sig volume: float = 1.0
+
+  @video
+    src="/clip.mp4"
+    controls={false}
+    muted={muted}
+    volume={volume}
+    onPlay={playing = true}
+    onPause={playing = false}
+
+  @div {
+    class="video-controls"
+    @button onClick={
+      playing = !playing
+      if playing {
+        await @video.play()
+      } else {
+        @video.pause()
+      }
+    } { if playing { "⏸" } else { "▶" } }
+
+    @button onClick={muted = !muted} {
+      if muted { "🔇" } else { "🔊" }
+    }
+
+    @input
+      type=range
+      min=0 max=1 step=0.01
+      value={volume}
+      onInput={(e) -> volume = float.from(e.target.value)}
+  }
+}
+
+// @audio — 오디오
+@audio src="/podcast.mp3" controls preload=metadata {
+  @source src="/podcast.ogg" type="audio/ogg"
+  @source src="/podcast.mp3" type="audio/mpeg"
+}
+
+// @canvas — 캔버스 (2D / WebGL)
+define DrawingCanvas(width: int, height: int) -> @canvas
+  id="draw"
+  width={width}
+  height={height}
+  onMount={(el) -> {
+    let ctx = el.getContext("2d")
+    ctx.fillStyle = "#1a1a2e"
+    ctx.fillRect(0, 0, width, height)
+    ctx.fillStyle = "#fff"
+    ctx.font = "24px sans-serif"
+    ctx.fillText("Orv Canvas", 20, 40)
+  }}
+
+// WebGL 예시
+define WebGLCanvas() -> @canvas onMount={(el) -> {
+  let gl = el.getContext("webgl2")
+  when gl {
+    void -> @out "WebGL2 미지원"
+    _ -> {
+      gl.clearColor(0.1, 0.1, 0.18, 1.0)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+    }
+  }
+}}
+
+// @iframe — 외부 문서 임베드
+@iframe src="https://example.com" width=600 height=400 sandbox="allow-scripts"
+
+// @svg — SVG (네임스페이스 자동 처리)
+@svg viewBox="0 0 100 100" width=100 height=100 {
+  @circle cx=50 cy=50 r=40 fill="#1a1a2e"
+  @path d="M20,20 L80,80" stroke="#fff" strokeWidth=2
+  @text x=50 y=55 textAnchor="middle" fill="#fff" "orv"
+}
+
+// -----------------------------------------------------
+// 속성 문법
+// -----------------------------------------------------
+
+// 모든 속성은 key=value 형태로 통일
+// 1. 리터럴 문자열: type=email, href="/home"
+// 2. 표현식: value={count}, onClick={() -> ...}
+// 3. Boolean: disabled, required, checked, readonly, autofocus
+//    → 값 없이 적으면 true, 명시적 값은 {bool}
+
+@input type=email placeholder="이메일" required disabled
+@input type=text value={name} onInput={(e) -> name = e.target.value}
+@input type=checkbox checked={isAgreed} onChange={(e) -> isAgreed = e.target.checked}
+
+// 이벤트 핸들러 — on으로 시작하는 속성
+// 마우스: onClick, onDblClick, onMouseDown, onMouseUp, onMouseMove, onMouseEnter, onMouseLeave
+// 키보드: onKeyDown, onKeyUp, onKeyPress
+// 입력: onChange, onInput, onFocus, onBlur, onSubmit
+// 드래그: onDragStart, onDragOver, onDrop
+// 터치: onTouchStart, onTouchMove, onTouchEnd
+// 미디어: onPlay, onPause, onEnded, onTimeUpdate, onVolumeChange
+// 생명주기: onMount, onUnmount
+
+@button
+  onClick={() -> @out "클릭"}
+  onMouseEnter={() -> @out "hover"}
+  onMouseLeave={() -> @out "leave"}
+  "Hover me"
+
+@input
+  type=text
+  onKeyDown={(e) -> if e.key == "Enter" : submit()}
+  onFocus={() -> @out "focus"}
+  onBlur={() -> @out "blur"}
+
+// -----------------------------------------------------
+// class, style — 스타일링
+// -----------------------------------------------------
+
+// HTML class 속성은 class로
+// (% 접두는 prop 정의 영역과 구분하기 위함 — 03-domains 참조)
+
+@div {
+  class="card card-primary"
+  @p "기본 스타일"
+}
+
+// 조건부 클래스
+let active: bool = true
+@button {
+  class={active ? "btn btn-active" : "btn"}
+  "토글"
+}
+
+// 여러 클래스 배열
+let classes: string[] = ["btn", active ? "active" : "", "large"]
+@button {
+  class={classes.filter(c -> c.length > 0).join(" ")}
+  "버튼"
+}
+
+// 인라인 스타일 — style은 object
+@div {
+  style={
+    backgroundColor: "#1a1a2e"
+    color: "#fff"
+    padding: "16px"
+    borderRadius: "8px"
+  }
+  @p "인라인 스타일"
+}
+
+// sig와 결합한 동적 스타일
+let sig progress: int = 0
+@div {
+  class="progress-bar"
+  style={
+    width: "{progress}%"
+    transition: "width 0.3s"
+  }
+}
+
+// -----------------------------------------------------
+// @design — 디자인 토큰
+// -----------------------------------------------------
+
+// CSS 파일이 필요 없는 이유: 디자인 토큰을 @design 도메인으로 선언하고
+// 컴파일러가 컴파일타임에 CSS 변수 / 번들 CSS로 emit
+
+@design {
+  @colors {
+    primary: "#1a1a2e"
+    secondary: "#16213e"
+    accent: "#0f3460"
+    text: "#e4e4e4"
+    background: "#0a0a14"
+    error: "#ef4444"
+    success: "#10b981"
+  }
+
+  @spacing {
+    xs: "4px"
+    sm: "8px"
+    md: "16px"
+    lg: "24px"
+    xl: "32px"
+  }
+
+  @typography {
+    fontFamily: "Inter, sans-serif"
+    fontSize: {
+      sm: "14px"
+      md: "16px"
+      lg: "18px"
+      xl: "24px"
+    }
+    lineHeight: 1.6
+  }
+
+  @breakpoints {
+    mobile: "640px"
+    tablet: "768px"
+    desktop: "1024px"
+  }
+}
+
+// 사용 — @design.colors.primary 같은 경로로 참조
+@div {
+  style={
+    backgroundColor: @design.colors.primary
+    padding: @design.spacing.md
+    fontFamily: @design.typography.fontFamily
+  }
+  @p "토큰 기반 스타일"
+}
+
+// -----------------------------------------------------
+// sig + DOM — 반응형 UI
+// -----------------------------------------------------
+
+// sig 변수를 @html 도메인 내에서 참조하면 DOM patch가 자동 적용
+// 값 변경 시 해당 노드만 갱신, 재렌더 없음
+
+pub define Counter() -> @html {
+  @head { @title "Counter" }
+  @body {
+    let sig count: int = 0
+
+    @h1 "Counter"
+    @p "현재 값: {count}"      // count 변경 시 이 텍스트만 patch
+    @button onClick={count += 1} "+"
+    @button onClick={count -= 1} "-"
+    @button onClick={count = 0} "Reset"
+  }
+}
+
+// 조건부 렌더링
+pub define Toggle() -> @div {
+  let sig open: bool = false
+
+  @button onClick={open = !open} {
+    if open { "닫기" } else { "열기" }
+  }
+
+  if open {
+    @div {
+      class="panel"
+      @p "패널 내용"
+    }
+  }
+}
+
+// 리스트 렌더링
+pub define TodoList() -> @div {
+  struct Todo { id: int, text: string, done: bool }
+
+  let sig todos: Todo[] = []
+  let sig input: string = ""
+  let sig nextId: int = 1
+
+  @input
+    value={input}
+    onInput={(e) -> input = e.target.value}
+    placeholder="할 일 입력"
+
+  @button onClick={
+    if input.length > 0 {
+      todos = todos.concat([{ id: nextId, text: input, done: false }])
+      nextId += 1
+      input = ""
+    }
+  } "추가"
+
+  @ul {
+    for todo in todos {
+      @li {
+        class={todo.done ? "done" : ""}
+        @input
+          type=checkbox
+          checked={todo.done}
+          onChange={
+            todos = todos.map(t -> t.id == todo.id ? { ...t, done: !t.done } : t)
+          }
+        @span "{todo.text}"
+        @button onClick={
+          todos = todos.filter(t -> t.id != todo.id)
+        } "×"
+      }
+    }
+  }
+}
+
+// -----------------------------------------------------
+// @this — 현재 DOM 노드
+// -----------------------------------------------------
+
+// 이벤트 핸들러 내에서 현재 요소 참조
+@button onClick={@this.remove()} "나를 제거"
+
+@input onFocus={@this.select()} value="전체 선택됨"
+
+// ref 패턴 — onMount로 DOM 핸들 확보
+let sig input_ref: Element? = void
+@input onMount={(el) -> input_ref = el}
+@button onClick={input_ref?.focus()} "입력창에 포커스"
+
+// -----------------------------------------------------
+// 브라우저 API — window, document
+// -----------------------------------------------------
+
+// window — 전역 객체
+@out window.innerWidth
+@out window.innerHeight
+@out window.devicePixelRatio
+@out window.location.href
+
+window.scrollTo(0, 0)
+window.open("https://orv.dev", "_blank")
+window.alert("알림")
+let confirmed: bool = window.confirm("확인?")
+let answer: string? = window.prompt("이름?")
+
+// document — 문서 객체
+@out document.title
+document.title = "새 제목"
+
+let el: Element? = document.querySelector("#main")
+let els: Element[] = document.querySelectorAll(".card")
+let byId: Element? = document.getElementById("root")
+
+// 메타 정보 런타임 변경
+document.querySelector("meta[name=description]")?.setAttribute("content", "새 설명")
+
+// -----------------------------------------------------
+// navigator — 브라우저 정보 / 기능
+// -----------------------------------------------------
+
+@out navigator.userAgent
+@out navigator.language          // "ko-KR"
+@out navigator.languages         // ["ko-KR", "ko", "en"]
+@out navigator.onLine            // true/false
+@out navigator.platform
+@out navigator.hardwareConcurrency
+
+// clipboard
+await navigator.clipboard.writeText("복사할 텍스트")
+let pasted: string = await navigator.clipboard.readText()
+
+// geolocation
+let pos = await navigator.geolocation.getCurrentPosition()
+@out "위도: {pos.coords.latitude}, 경도: {pos.coords.longitude}"
+
+// share API
+if navigator.share != void {
+  await navigator.share({
+    title: "공유 제목"
+    text: "공유 내용"
+    url: "https://orv.dev"
+  })
+}
+
+// -----------------------------------------------------
+// location / history — SPA 라우팅
+// -----------------------------------------------------
+
+// location
+@out location.pathname      // "/about"
+@out location.search        // "?tab=info"
+@out location.hash          // "#section1"
+@out location.origin        // "https://example.com"
+
+// history
+history.pushState({}, "", "/new-path")
+history.replaceState({}, "", "/replace")
+history.back()
+history.forward()
+history.go(-2)
+
+// navigate() — orv 표준 (pushState + 라우터 연동)
+// 클라이언트 사이드 내비게이션, 페이지 새로고침 없음
+navigate("/about")
+navigate("/post/42")
+navigate("/blog?page=2")
+
+// 뒤로/앞으로 구독
+window.onPopState = (e) -> {
+  @out "경로 변경: {location.pathname}"
+}
+
+// -----------------------------------------------------
+// Storage — localStorage, sessionStorage, cookie
+// -----------------------------------------------------
+
+// localStorage — 영구 저장
+localStorage.set("token", "eyJhbGciOi...")
+let token: string? = localStorage.get("token")
+localStorage.remove("token")
+localStorage.clear()
+
+// 객체 저장 — 자동 직렬화 (orv가 내부적으로 처리)
+localStorage.set("user", { id: 1, name: "Alice" })
+let user: User? = localStorage.get("user")
+
+// sessionStorage — 탭 닫으면 소멸
+sessionStorage.set("draft", "작성 중...")
+let draft: string? = sessionStorage.get("draft")
+
+// cookie
+document.cookie.set("theme", "dark", { maxAge: 86400, path: "/", secure: true })
+let theme: string? = document.cookie.get("theme")
+document.cookie.remove("theme")
+
+// -----------------------------------------------------
+// Media API — getUserMedia, MediaRecorder
+// -----------------------------------------------------
+
+// 카메라 / 마이크 스트림
+let stream = await navigator.mediaDevices.getUserMedia({
+  video: true
+  audio: true
+})
+
+define CameraView() -> @video
+  autoplay
+  muted
+  onMount={(el) -> el.srcObject = stream}
+
+// 녹화
+let recorder = MediaRecorder(stream, { mimeType: "video/webm" })
+let sig chunks: Blob[] = []
+
+recorder.onDataAvailable = (e) -> {
+  chunks = chunks.concat([e.data])
+}
+
+recorder.start()
+// ... 잠시 후
+recorder.stop()
+
+recorder.onStop = () -> {
+  let blob = Blob(chunks, { type: "video/webm" })
+  let url = URL.createObjectURL(blob)
+  // url을 @video src 로 연결하거나 다운로드 트리거
+}
+
+// 화면 공유
+let screen = await navigator.mediaDevices.getDisplayMedia({ video: true })
+
+// 기기 열거
+let devices = await navigator.mediaDevices.enumerateDevices()
+for device in devices {
+  @out "{device.kind}: {device.label}"
+}
+
+// -----------------------------------------------------
+// 기타 Web API
+// -----------------------------------------------------
+
+// Notification
+if Notification.permission == "granted" {
+  Notification("새 메시지", {
+    body: "안녕하세요"
+    icon: "/icon.png"
+  })
+} else if Notification.permission != "denied" {
+  await Notification.requestPermission()
+}
+
+// IntersectionObserver
+let observer = IntersectionObserver((entries) -> {
+  for entry in entries {
+    if entry.isIntersecting {
+      @out "{entry.target} 화면에 보임"
+    }
+  }
+}, { threshold: 0.5 })
+
+define LazyImage(src: string) -> @img
+  src="/placeholder.png"
+  dataSrc={src}
+  onMount={(el) -> observer.observe(el)}
+
+// ResizeObserver
+let resizeObs = ResizeObserver((entries) -> {
+  for entry in entries {
+    @out "크기 변경: {entry.contentRect.width} x {entry.contentRect.height}"
+  }
+})
+
+// RequestAnimationFrame
+function animate() -> {
+  // ... 프레임별 업데이트
+  requestAnimationFrame(animate)
+}
+requestAnimationFrame(animate)
+
+// setTimeout / setInterval
+let timer = setTimeout(() -> @out "1초 후", 1000)
+clearTimeout(timer)
+
+let interval = setInterval(() -> @out "매초", 1000)
+clearInterval(interval)
+
+// -----------------------------------------------------
+// 실전 예시 — 전체 페이지 구성
+// -----------------------------------------------------
+
+pub define AppShell() -> @html {
+  @MetaTags title="Orv Web" description="orv 웹 프런트엔드 쇼케이스"
+
+  @body {
+    @MainNav
+
+    @main {
+      class="container"
+      @content
+    }
+
+    @footer {
+      class="site-footer"
+      @p "© 2026 Orv"
+    }
+  }
+}
+
+pub define LandingPage() -> @AppShell {
+  @section {
+    class="hero"
+    @h1 "Orv로 만드는 웹"
+    @p "서버부터 브라우저까지 하나의 언어."
+    @a href="/signup" class="btn btn-primary" "시작하기"
+  }
+
+  @section {
+    class="features"
+    @FeatureCard title="Zero-runtime" icon="⚡" {
+      @p "sig 없는 페이지는 순수 HTML."
+    }
+    @FeatureCard title="통합 API" icon="🔗" {
+      @p "서버 라우트와 클라이언트가 같은 타입을 공유."
+    }
+    @FeatureCard title="Web API 풀 액세스" icon="🌐" {
+      @p "window, navigator, MediaRecorder 등 전부 지원."
+    }
+  }
+}
+
+define FeatureCard(title: string, icon: string?) -> @article {
+  class="feature-card"
+  if icon != void {
+    @span class="icon" "{icon}"
+  }
+  @h3 "{title}"
+  @div class="body" {
+    @content
+  }
+}
+
+// 이 파일에서 증명하는 것:
+//
+// ✓ HTML 전체를 도메인으로 다룸 — @html, @head, @body, 일반/특수 태그
+// ✓ 속성은 전부 key=value, boolean 속성은 값 없이
+// ✓ class, style, @design 으로 CSS 없이 스타일링
+// ✓ sig + DOM patch — 재렌더 없는 세밀한 반응성
+// ✓ window, document, navigator, location, history 전체 접근
+// ✓ Media API, Storage, Notification, Observer 등 Web API 네이티브
+// ✓ SPA 라우팅은 navigate() 로 통합
+// ✓ @img, @video, @audio, @canvas, @svg, @iframe 특수 태그 지원
+//
+// 컴파일러 (사용한 기능만큼만 번들에 포함):
+//   sig/await/이벤트/Web API 모두 없음 → 순수 HTML 파일 emit (JS/WASM 0kb)
+//   이벤트 핸들러만 있음            → 최소 이벤트 바인딩 코드만 포함
+//   sig 사용                        → 반응형 DOM patch 런타임 포함
+//   Media/Storage/Observer 등        → 사용한 API의 바인딩만 포함
+//   쓰지 않은 기능은 전부 DCE로 제거 — "안 쓰면 없다"

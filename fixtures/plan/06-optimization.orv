@@ -168,8 +168,8 @@ pub define LiveCounter() -> @html {
 // 서버 측 배치 핸들러도 자동 생성
 
 let getUser = @route GET /api/user/:id {
-  let id: int = @path.id as int
-  @respond 200 { user: await db.findUser(id) }
+  let id: int = @param.id as int
+  @respond 200 { user: await @db.find User { @where id=id } }
 }
 
 // 개발자가 작성한 코드
@@ -207,31 +207,31 @@ define UserListNoBatch(ids: int[]) -> @ul {
 
 // (a) 독립 — 자동 병렬
 let getDashboard = @route GET /api/dashboard {
-  let users = await db.findUsers()       // 독립
-  let stats = await db.getStats()        // 독립
-  let posts = await db.recentPosts()     // 독립
+  let users = await @db.find Users                       // 독립
+  let stats = await @db.find Stats                       // 독립
+  let posts = await @db.find Posts { @limit 10 }         // 독립
   @respond 200 { users, stats, posts }
 }
 // → 컴파일러: users, stats, posts 간 의존 없음
-// → 내부적으로 await (db.findUsers(), db.getStats(), db.recentPosts()) 병렬 실행
+// → 세 쿼리 서로 독립 → 내부적으로 병렬 실행
 // → 개발자가 순차적으로 작성해도 자동 병렬
 
 // (b) 의존 — 순차 유지
 let getUserPosts = @route GET /api/user/:id/posts {
-  let id: int = @path.id as int
-  let user = await db.findUser(id)               // 1. 먼저 유저 조회
-  let posts = await db.findPostsByUser(user.id)   // 2. 유저 ID로 포스트 조회 (의존)
+  let id: int = @param.id as int
+  let user = await @db.find User { @where id=id }                // 1. 먼저 유저 조회
+  let posts = await @db.find Posts { @where author=user.id }     // 2. 유저 ID로 포스트 조회 (의존)
   @respond 200 { user, posts }
 }
 // → posts가 user.id에 의존 → 순차 실행 유지
 
 // (c) 혼합 — 가능한 부분만 병렬
 let getFullDashboard = @route GET /api/full-dashboard {
-  let user = await db.currentUser()                    // 1. 먼저
+  let user = await @db.find User { @where id=@context.payload.id }    // 1. 먼저
 
-  let posts = await db.findPostsByUser(user.id)        // 2-a. user 의존
-  let followers = await db.findFollowers(user.id)      // 2-b. user 의존 (posts와 독립)
-  let trending = await db.getTrending()                // 2-c. 독립
+  let posts = await @db.find Posts { @where author=user.id }          // 2-a. user 의존
+  let followers = await @db.find Followers { @where user=user.id }    // 2-b. user 의존 (posts와 독립)
+  let trending = await @db.find Trending                              // 2-c. 독립
 
   @respond 200 { user, posts, followers, trending }
 }
@@ -353,7 +353,7 @@ pub define BlogPage() -> @html {
 
 // 내부 RPC (let 바인딩)
 let optimizedRoute = @route GET /api/optimized {
-  @respond 200 { data: await db.getData() }
+  @respond 200 { data: await @db.find Data }
 }
 // → 바이너리 직렬화
 // → 필드명 없이 순서 기반 인코딩
@@ -418,8 +418,8 @@ let jsonForced = @route GET /api/compat @hint protocol=json {
 
 // 캐시 제어
 let getPost = @route GET /api/post/:id {
-  let id: int = @path.id as int
-  @respond 200 { post: await db.findPost(id) }
+  let id: int = @param.id as int
+  @respond 200 { post: await @db.find Post { @where id=id } }
 }
 
 let live = await getUser.fetch(param={ id: 1 }) @hint cache=never
@@ -441,7 +441,7 @@ let lazy = await api.fetch("/analytics") @hint prefetch=never
 // 청킹
 @route GET /admin @hint chunk=separate {
   @Auth
-  @serve AdminPage()
+  @serve @AdminPage
 }
 // → /admin은 별도 청크로 강제 분리
 // → 메인 번들에 포함되지 않음

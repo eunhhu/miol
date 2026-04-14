@@ -40,7 +40,7 @@ let slug: string = slugify("Hello World")
 //   struct InternalCache { ... }    ← user.orv 내부에서만 사용
 
 // 표준 라이브러리 — 별도 import 없이 사용 가능
-// db, jwt, hash, crypto 등은 orv 표준 라이브러리에 내장 (bun처럼)
+// jwt, hash, crypto 등은 orv 표준 라이브러리에 내장 (bun처럼)
 // orv-db: orv 프로젝트에 최적화된 자체 DB (redis/SQL 대신)
 //   → elixir가 redis 대신 자체 인메모리 DB를 쓰는 것과 같은 철학
 //   → 프로젝트 특화 최적화가 가능하도록 설계

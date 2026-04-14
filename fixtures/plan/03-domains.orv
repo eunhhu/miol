@@ -105,8 +105,8 @@ define Style() -> {
 }
 
 @Style 16px 24px red blue 32px
-// sizes: [16px, 24px, 32px]
-// colors: [red, blue]
+// sizes: ["16px", "24px", "32px"]
+// colors: ["red", "blue"]
 
 // token 한 줄 선언 (한 종류만 있을 때)
 define Echo() -> {
@@ -127,7 +127,7 @@ define Maybe() -> {
     value: string?     // 토큰 없어도 됨
   }
   when value {
-    void -> @out "토큰 없음"
+    $.length == 0 -> @out "토큰 없음"
     _ -> @out "토큰: {value[0]}"
   }
 }
@@ -201,6 +201,7 @@ define Wrapper() -> {
 
 // 도메인 안에서 define으로 하위 도메인 선언 가능
 // 외부에서는 Parent.Child로 접근
+// 혹은 해당 도메인 스코프 내에서는 Child만 사용 가능
 
 define Layout(title: string) -> {
   @out "=== {title} ==="
@@ -217,15 +218,17 @@ define Layout(title: string) -> {
 }
 
 @Layout title="Home" {
-  @Layout.Header
+  @Header
   @out "본문 내용"
-  @Layout.Footer copyright="2026 Orv"
+  @Footer copyright="2026 Orv"
 }
 // === Home ===
 // [ HEADER: Home ]
 // 본문 내용
 // [ FOOTER: 2026 Orv ]
 // === end ===
+
+@Layout.Header // @Layout 외부에서의 Header 호출
 
 // 깊은 중첩
 define App() -> {
@@ -239,6 +242,14 @@ define App() -> {
 @App.Nav.Item label="Home"
 @App.Nav.Item label="About"
 @App.Nav.Item label="Contact"
+
+@App {
+  @Nav {
+    @Item label="Home"
+    @Item label="About"
+    @Item label="Contact"
+  }
+}
 
 // -----------------------------------------------------
 // 도메인 반환 타입
@@ -272,7 +283,7 @@ define Page(title: string) -> @html {
 // 도메인 타입 확인
 @out Type(@Pi)        // float
 @out Type(@AppName)   // string
-@out Type(@Page)      // Domain
+@out Type(@Page)      // Html
 
 // -----------------------------------------------------
 // pub — 외부 공개
@@ -379,7 +390,7 @@ define Button(
   variant: string?
   onClick: Function<void, void>?
 ) -> @button onClick={onClick} {
-  %class="btn btn-{variant ?? "default"}"
+  class="btn btn-{variant ?? "default"}"
   "{label}"
 }
 

@@ -174,6 +174,11 @@ let nothing: void = void
 let n: int = 8
 let new_n: short = n as short          // as 키워드
 let fv: float = 3.15
+
+// -----------------------------------------------------
+// 타입 변환
+// -----------------------------------------------------
+
 let new_f: int = int.from(fv)          // .from() 메서드
 let sv: string = string.from(fv)       // "3.15"
 
@@ -231,6 +236,17 @@ let b_val: int = 3
 @out !true          // false
 
 // -----------------------------------------------------
+// 비트 연산자
+// -----------------------------------------------------
+
+@out 5 & 3    // 1 (AND)
+@out 5 | 3    // 7 (OR)
+@out 5 ^ 3    // 6 (XOR)
+@out ~5       // -6 (NOT)
+@out 5 << 1   // 10 (LEFT SHIFT)
+@out 5 >> 1   // 2 (RIGHT SHIFT)
+
+// -----------------------------------------------------
 // 입력
 // -----------------------------------------------------
 
@@ -248,7 +264,10 @@ let vc: int = 30
 @out max(va, vb, vc)   // 30
 @out min(va, vb, vc)   // 10
 @out sin(30)           // sin(30)
+@out cos(30)           // cos(30)
+@out tan(30)           // tan(30)
 @out log(10)           // log(10)
+@out abs(-5)           // 5
 @out 2 ** 3            // 8
 
 // -----------------------------------------------------
@@ -430,10 +449,10 @@ try {
 // 파일 시스템
 // -----------------------------------------------------
 
-let mut file: File = await @fs.read "test.txt"
+let mut file: File = await @fs.read test.txt
 @out "파일 내용: {file.content}"
 
-await @fs.write "test.txt" "Hello, World!" utf-8
+await @fs.write ./test.txt "Hello, World!" utf-8
 @out "파일 쓰기 완료"
 
 // -----------------------------------------------------
