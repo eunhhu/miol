@@ -335,3 +335,222 @@ let counter = makeCounter()
 @out counter()  // 1
 @out counter()  // 2
 @out counter()  // 3
+
+// -----------------------------------------------------
+// 스키마 검증 — 타입이 곧 validator
+// -----------------------------------------------------
+
+// 타입 선언이 그대로 런타임 검증 스키마가 됨.
+// 리터럴 제약을 타입 시그니처에 붙이면 컴파일타임 체크 + 런타임 validator 자동 생성.
+
+// (a) 길이 / 범위 제약 — (min..max)
+let short: string(3..50) = "hi"          // ❌ 컴파일 에러 — 길이 < 3
+let ok_name: string(3..50) = "Alice"     // ✓
+let age: int(0..120) = 25                // ✓
+let bad_age: int(0..120) = 200           // ❌ 범위 초과
+
+// 단일 범위 — 개수만 제한
+let pin: string(4) = "1234"              // 정확히 4자
+let tiny: int(0..=9) = 5                 // 0~9 (inclusive end)
+
+// (b) 키워드 인자 — (key=value, ...)
+let code: string(min=4, max=10) = "abcd"
+let port: int(min=1024, max=65535) = 8080
+let username: string(min=3, max=20, pattern="^[a-z0-9_]+$") = "alice"
+
+// (c) 조합 제약 — 토큰 + 키워드 혼합
+let unique_tag: string(unique, min=1, max=20)   // unique — 컬렉션 내 중복 불가
+let trimmed: string(trim, min=1)                // trim — 양끝 공백 자동 제거
+let normalized: string(lower, trim)              // 소문자 + trim 변환
+
+// (d) 컬렉션 제약
+let tags: string[](0..10) = ["a", "b", "c"]      // 배열 길이
+let uniqueTags: string[](unique, 1..5) = ["x"]   // 중복 불가, 최소 1개
+let scores: int[](min=3) = [100, 90, 80]         // 최소 3개
+
+// (e) 패턴 타입 — 기존 리터럴 타입 활용
+type Email = "{string}@{string}.{string}"
+type URL = "{string}://{string}"
+type UUID = "{string(36)}"
+type IPByte = int(0..255)
+type IPv4 = "{IPByte}.{IPByte}.{IPByte}.{IPByte}"
+type ISODate = "{int(4)}-{int(2)}-{int(2)}"
+
+let email: Email = "user@orv.dev"                // ✓
+let bad_email: Email = "not an email"            // ❌
+
+let ip: IPv4 = "192.168.0.1"                     // ✓
+let bad_ip: IPv4 = "999.999.999.999"             // ❌
+
+// 내장 스키마 타입 (표준)
+let e: Email = "a@b.c"        // 내장 email validator
+let u: URL = "https://orv.dev"
+let id: UUID = "550e8400-e29b-41d4-a716-446655440000"
+let d: ISODate = "2026-04-14"
+let ip: IPv4 = "192.168.0.1"
+
+// -----------------------------------------------------
+// struct에서 스키마 표현
+// -----------------------------------------------------
+
+struct User {
+  name: string(min=1, max=50)
+  email: "{string}@{string}.{string}"
+  age: int(0..120)
+  role: "admin" | "member" | "guest"
+  tags: string[](unique, 0..10)
+  bio: string(max=500)?                    // nullable + 길이 제한
+  createdAt: ISODate
+}
+
+// 중첩 struct도 동일
+struct Address {
+  street: string(min=1)
+  city: string(min=1)
+  zip: string(pattern="^\\d{5}$")
+  country: string(2)                       // 정확히 2자 (ISO code)
+}
+
+struct Profile {
+  user: User
+  address: Address?
+  preferences: Map<string, string>(max=20)
+}
+
+// -----------------------------------------------------
+// 검증 메서드 — 타입 이름으로 직접 호출
+// -----------------------------------------------------
+
+// 자동 생성되는 정적 메서드:
+//   .validate(unknown): bool            — 통과 여부만
+//   .parse(unknown): T                  — 성공 시 T, 실패 시 throw
+//   .safeParse(unknown): Result<T>      — 성공/에러 객체
+//   .errors(unknown): ValidationError[] — 모든 필드 에러 수집
+//   .is(unknown): bool                  — 타입 가드 (when에서 narrowing)
+
+let input: unknown = { name: "John", email: "user@example.com", age: 18, role: "member", tags: ["a"] }
+
+// 1) validate — 통과 여부
+let isValid: bool = User.validate(input)
+@out isValid  // true
+
+// 2) parse — 성공 시 타입 반환, 실패 시 throw
+try {
+  let user: User = User.parse(input)
+  @out "valid: {user.name}"
+} catch err: Error<ValidationError[]> {
+  for e in err.value {
+    @out "{e.path}: {e.message}"
+  }
+}
+
+// 3) safeParse — 에러 객체로 처리 (throw 없음)
+let result: Result<User> = User.safeParse(input)
+when result.ok {
+  true -> @out "✓ {result.value.name}"
+  false -> @out "✗ {result.error.length}개 에러"
+}
+
+// 4) errors — 필드별 에러 전체 수집
+let bad: unknown = { name: "", email: "no-at", age: 999, role: "hacker", tags: ["a", "a"] }
+let errs: ValidationError[] = User.errors(bad)
+for e in errs {
+  @out "[{e.path}] {e.code}: {e.message}"
+}
+// [name]   too_short: 길이가 1 이상이어야 함
+// [email]  pattern_mismatch: email 형식이 아님
+// [age]    out_of_range: 0..120 범위 초과
+// [role]   invalid_enum: "admin" | "member" | "guest" 중 하나여야 함
+// [tags]   duplicate: unique 제약 위반
+
+// 5) is — type guard
+when input {
+  User.is -> {
+    // 이 블록 안에서 input은 User로 narrowing됨
+    @out input.name
+  }
+  _ -> @out "User가 아님"
+}
+
+// -----------------------------------------------------
+// 변환 (transform) 제약
+// -----------------------------------------------------
+
+// 변환은 parse 시 자동 적용 — validate만 통과시키는 게 아니라 정규화된 값 반환
+struct SignupForm {
+  email: string(trim, lower)               // 공백 제거 + 소문자
+  username: string(trim, min=3, max=20)
+  password: string(min=8)
+}
+
+let raw: unknown = { email: "  USER@ORV.DEV  ", username: " alice ", password: "12345678" }
+let form: SignupForm = SignupForm.parse(raw)
+@out form.email      // "user@orv.dev"      (trim + lower 적용됨)
+@out form.username   // "alice"              (trim 적용됨)
+
+// -----------------------------------------------------
+// where — 커스텀 predicate
+// -----------------------------------------------------
+
+// 제약 문법으로 표현 불가한 건 where로 해결
+type EvenInt = int where $ % 2 == 0
+type StrongPassword = string(min=8) where
+  $.contains(r"[A-Z]") &&
+  $.contains(r"[0-9]") &&
+  $.contains(r"[^a-zA-Z0-9]")
+
+struct Registration {
+  email: email
+  password: StrongPassword
+  age: int where $ >= 13              // 인라인 where
+}
+
+let r: Result<Registration> = Registration.safeParse(input)
+
+// -----------------------------------------------------
+// ValidationError — 표준 에러 타입
+// -----------------------------------------------------
+
+// 내장 struct (import 없이 사용 가능)
+// struct ValidationError {
+//   path: string           // "user.address.zip"
+//   code: string           // "too_short" | "pattern_mismatch" | "out_of_range" | ...
+//   message: string        // 사람이 읽을 수 있는 메시지
+//   expected: string?      // 기대값 설명
+//   actual: unknown?       // 실제 값
+// }
+
+// 서버 라우트에서 자연스럽게 사용
+// @route POST /api/signup {
+//   let body: unknown = @body
+//   let result = SignupForm.safeParse(body)
+//   when result.ok {
+//     true -> {
+//       let form: SignupForm = result.value
+//       @respond 201 { user: await createUser(form) }
+//     }
+//     false -> @respond 400 { errors: result.error }
+//   }
+// }
+
+// -----------------------------------------------------
+// 제약 요약
+// -----------------------------------------------------
+//
+// 타입 뒤 ( ... ) 안에 제약 나열:
+//   (N)               정확히 N (길이/값)
+//   (N..M)            범위 N <= x < M
+//   (N..=M)           inclusive 범위 N <= x <= M
+//   (min=N, max=M)    키워드 인자
+//   (pattern="...")   정규식 패턴
+//   (unique)          컬렉션 중복 불가 토큰
+//   (trim, lower, upper)   문자열 변환 토큰
+//   (nonempty)        빈 값 불가 토큰
+//
+// 토큰/키워드/범위는 자유롭게 조합 가능:
+//   string(trim, min=3, max=20, pattern="^[a-z0-9]+$")
+//
+// 이 모든 제약은:
+//   - 컴파일타임 — 리터럴은 컴파일 에러로 잡힘
+//   - 런타임 — parse/validate로 외부 데이터 검증
+//   - DCE — 사용하지 않은 검증 코드는 번들에 포함 안 됨
