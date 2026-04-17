@@ -5,8 +5,9 @@
 //! 함수/제어 흐름/도메인/struct는 다음 커밋에서 추가된다.
 
 use crate::ast::{
-    BinaryOp, Block, ConstStmt, Expr, ExprKind, Ident, LetKind, LetStmt, Pattern, Program, Stmt,
-    StringSegment, TypeRef, TypeRefKind, UnaryOp, WhenArm,
+    BinaryOp, Block, ConstStmt, Expr, ExprKind, FunctionBody, FunctionStmt, Ident, LetKind,
+    LetStmt, Param, Pattern, Program, ReturnStmt, Stmt, StringSegment, TypeRef, TypeRefKind,
+    UnaryOp, WhenArm,
 };
 use crate::lexer::lex;
 use crate::token::{Keyword, Token, TokenKind};
@@ -129,6 +130,10 @@ impl Parser {
             TokenKind::Keyword(Keyword::Const) => {
                 self.parse_const().map(|s| Stmt::Const(Box::new(s)))
             }
+            TokenKind::Keyword(Keyword::Function) => self
+                .parse_function()
+                .map(|s| Stmt::Function(Box::new(s))),
+            TokenKind::Keyword(Keyword::Return) => self.parse_return().map(Stmt::Return),
             _ => {
                 // `ident = expr` 대입을 표현식 스테이트먼트로 인식.
                 // Pratt 파서가 식별자를 먼저 먹은 뒤 `=`를 만나면 대입으로 전환.
@@ -258,6 +263,12 @@ impl Parser {
         let mut lhs = self.parse_prefix()?;
 
         loop {
+            // 후위 연산자 — 함수 호출 `(args)`.
+            if matches!(self.peek_kind(), TokenKind::LParen) && 30 >= min_bp {
+                lhs = self.finish_call(lhs)?;
+                continue;
+            }
+
             let Some((op, lbp, rbp)) = self.peek_binop() else {
                 break;
             };
@@ -277,6 +288,30 @@ impl Parser {
             };
         }
         Some(lhs)
+    }
+
+    /// `callee` 다음에 `(` 가 확인된 상태에서 호출식을 완성한다.
+    fn finish_call(&mut self, callee: Expr) -> Option<Expr> {
+        self.advance(); // `(`
+        let mut args = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            let arg = self.parse_expr()?;
+            args.push(arg);
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+        let span = callee.span.join(rparen.span);
+        Some(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span,
+        })
     }
 
     fn parse_prefix(&mut self) -> Option<Expr> {
@@ -378,6 +413,92 @@ impl Parser {
             kind,
             span: tok.span,
         })
+    }
+
+    fn parse_function(&mut self) -> Option<FunctionStmt> {
+        let fn_tok = self.advance(); // `function`
+        let name = self.parse_ident("function name")?;
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let mut params = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            let pname = self.parse_ident("parameter name")?;
+            let ty = if self.eat(&TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let span = pname.span;
+            params.push(Param {
+                name: pname,
+                ty,
+                span,
+            });
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let return_ty = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Arrow, "`->`")?;
+        let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
+            FunctionBody::Block(self.parse_block()?)
+        } else {
+            FunctionBody::Expr(self.parse_expr()?)
+        };
+        let end_span = match &body {
+            FunctionBody::Block(b) => b.span,
+            FunctionBody::Expr(e) => e.span,
+        };
+        Some(FunctionStmt {
+            name,
+            params,
+            return_ty,
+            body,
+            span: fn_tok.span.join(end_span),
+        })
+    }
+
+    fn parse_return(&mut self) -> Option<ReturnStmt> {
+        let ret_tok = self.advance(); // `return`
+        // return 뒤에 표현식이 올 수 있으면 파싱
+        let (value, span) = if self.is_expr_start() {
+            let expr = self.parse_expr()?;
+            let span = ret_tok.span.join(expr.span);
+            (Some(expr), span)
+        } else {
+            (None, ret_tok.span)
+        };
+        Some(ReturnStmt { value, span })
+    }
+
+    /// 현재 토큰이 표현식 시작으로 쓰일 수 있는지.
+    fn is_expr_start(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Integer(_)
+                | TokenKind::Float(_)
+                | TokenKind::String(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Keyword(Keyword::Void)
+                | TokenKind::Keyword(Keyword::If)
+                | TokenKind::Keyword(Keyword::When)
+                | TokenKind::Ident(_)
+                | TokenKind::Regex { .. }
+                | TokenKind::At(_)
+                | TokenKind::Dollar
+                | TokenKind::LParen
+                | TokenKind::LBrace
+                | TokenKind::Bang
+                | TokenKind::Minus
+                | TokenKind::Tilde
+        )
     }
 
     fn parse_block(&mut self) -> Option<Block> {

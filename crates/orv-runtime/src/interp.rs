@@ -5,8 +5,10 @@
 //! 이후 커밋에서 HIR 기반 정식 실행 경로로 교체된다.
 
 use orv_syntax::ast::{
-    BinaryOp, Block, Expr, ExprKind, Pattern, Program, Stmt, StringSegment, UnaryOp,
+    BinaryOp, Block, Expr, ExprKind, FunctionBody, FunctionStmt, Pattern, Program, Stmt,
+    StringSegment, UnaryOp,
 };
+use std::rc::Rc;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
@@ -39,6 +41,8 @@ pub enum Value {
     Bool(bool),
     /// void (값 없음).
     Void,
+    /// 함수 — 선언 AST에 대한 참조.
+    Function(Rc<FunctionStmt>),
 }
 
 impl fmt::Display for Value {
@@ -49,6 +53,21 @@ impl fmt::Display for Value {
             Self::Str(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
             Self::Void => write!(f, "void"),
+            Self::Function(func) => write!(f, "<function {}>", func.name.name),
+        }
+    }
+}
+
+/// 제어 흐름 신호 — return 문에서 사용.
+enum ControlFlow {
+    Normal(Value),
+    Return(Value),
+}
+
+impl ControlFlow {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Normal(v) | Self::Return(v) => v,
         }
     }
 }
@@ -77,6 +96,9 @@ pub fn run_with_writer<W: Write>(
 struct Interp<'w, W: Write> {
     env: HashMap<String, Value>,
     writer: &'w mut W,
+    /// 함수 본문 평가 중 `return` 문이 실행되면 해당 값을 담아 상위로 전파한다.
+    /// 상위 호출자(call_function)가 소비해 초기화한다.
+    pending_return: Option<Value>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -84,6 +106,7 @@ impl<'w, W: Write> Interp<'w, W> {
         Self {
             env: HashMap::new(),
             writer,
+            pending_return: None,
         }
     }
 
@@ -106,10 +129,20 @@ impl<'w, W: Write> Interp<'w, W> {
                 let v = self.eval(&c.init)?;
                 self.env.insert(c.name.name.clone(), v);
             }
+            Stmt::Function(f) => {
+                let name = f.name.name.clone();
+                self.env
+                    .insert(name, Value::Function(Rc::new((**f).clone())));
+            }
+            Stmt::Return(_) => {
+                return Err(RuntimeError {
+                    message: "`return` outside of a function".into(),
+                });
+            }
             Stmt::Expr(e) => {
                 let v = self.eval(e)?;
                 // SPEC §12.2 — void scope에서 마지막이 아닌 표현식은 자동 출력.
-                // 대입/블록/if/when/@out 호출은 제외 — 부수효과가 있는 문장.
+                // 대입/블록/if/when/호출/@out 호출은 제외.
                 if !is_last
                     && matches!(
                         &v,
@@ -219,10 +252,65 @@ impl<'w, W: Write> Interp<'w, W> {
                 self.env.insert(target.name.clone(), v.clone());
                 Ok(v)
             }
+            ExprKind::Call { callee, args } => {
+                let callee_value = self.eval(callee)?;
+                let Value::Function(func) = callee_value else {
+                    return Err(RuntimeError {
+                        message: format!("value is not callable: {callee_value}"),
+                    });
+                };
+                let mut evaluated = Vec::with_capacity(args.len());
+                for a in args {
+                    evaluated.push(self.eval(a)?);
+                }
+                self.call_function(&func, evaluated)
+            }
         }
     }
 
-    fn eval_block(&mut self, block: &Block) -> Result<Value, RuntimeError> {
+    fn call_function(
+        &mut self,
+        func: &FunctionStmt,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        if args.len() != func.params.len() {
+            return Err(RuntimeError {
+                message: format!(
+                    "function `{}` expects {} arguments, got {}",
+                    func.name.name,
+                    func.params.len(),
+                    args.len()
+                ),
+            });
+        }
+        // 함수 스코프 — 현재 환경을 저장/복원하여 간단 샌드박스.
+        let saved = std::mem::take(&mut self.env);
+        // 호출자의 함수 정의를 유지해 재귀 호출이 가능하도록 함수들을 복사.
+        for (k, v) in &saved {
+            if matches!(v, Value::Function(_)) {
+                self.env.insert(k.clone(), v.clone());
+            }
+        }
+        for (p, v) in func.params.iter().zip(args.into_iter()) {
+            self.env.insert(p.name.name.clone(), v);
+        }
+        // 이 호출 경계까지 pending_return 전파를 잠시 격리.
+        let saved_return = self.pending_return.take();
+        let result_value = match &func.body {
+            FunctionBody::Block(b) => {
+                let ctl = self.eval_block_ctl(b)?;
+                // return이 발생했으면 pending_return도 클리어.
+                self.pending_return = None;
+                ctl.into_value()
+            }
+            FunctionBody::Expr(e) => self.eval(e)?,
+        };
+        self.pending_return = saved_return;
+        self.env = saved;
+        Ok(result_value)
+    }
+
+    fn eval_block_ctl(&mut self, block: &Block) -> Result<ControlFlow, RuntimeError> {
         let last = block.stmts.len().saturating_sub(1);
         let mut final_value = Value::Void;
         for (i, s) in block.stmts.iter().enumerate() {
@@ -236,15 +324,35 @@ impl<'w, W: Write> Interp<'w, W> {
                     let v = self.eval(&c.init)?;
                     self.env.insert(c.name.name.clone(), v);
                 }
+                Stmt::Function(f) => {
+                    self.env
+                        .insert(f.name.name.clone(), Value::Function(Rc::new((**f).clone())));
+                }
+                Stmt::Return(r) => {
+                    let v = match &r.value {
+                        Some(e) => self.eval(e)?,
+                        None => Value::Void,
+                    };
+                    // 상위 블록/호출에 전파.
+                    self.pending_return = Some(v.clone());
+                    return Ok(ControlFlow::Return(v));
+                }
                 Stmt::Expr(e) => {
                     let v = self.eval(e)?;
+                    if let Some(ret) = self.pending_return.clone() {
+                        return Ok(ControlFlow::Return(ret));
+                    }
                     if is_last {
                         final_value = v;
                     }
                 }
             }
         }
-        Ok(final_value)
+        Ok(ControlFlow::Normal(final_value))
+    }
+
+    fn eval_block(&mut self, block: &Block) -> Result<Value, RuntimeError> {
+        Ok(self.eval_block_ctl(block)?.into_value())
     }
 
     fn pattern_matches(&mut self, pat: &Pattern, value: &Value) -> Result<bool, RuntimeError> {
@@ -295,7 +403,8 @@ impl<'w, W: Write> Interp<'w, W> {
 }
 
 /// void-scope 자동 출력을 피해야 하는 표현식인지.
-/// 부수효과 전용 문법(@out 호출, 대입, 제어 흐름 블록)은 자동 출력 제외.
+/// 부수효과 전용 문법(@out 호출, 대입, 제어 흐름 블록, 함수 호출)은
+/// 자동 출력 제외.
 fn has_side_effect(expr: &Expr) -> bool {
     matches!(
         &expr.kind,
@@ -304,6 +413,7 @@ fn has_side_effect(expr: &Expr) -> bool {
             | ExprKind::Block(_)
             | ExprKind::If { .. }
             | ExprKind::When { .. }
+            | ExprKind::Call { .. }
     )
 }
 
@@ -365,6 +475,7 @@ fn is_truthy(v: &Value) -> bool {
         Value::Int(n) => *n != 0,
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
+        Value::Function(_) => true,
     }
 }
 
@@ -375,6 +486,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Void, Value::Void) => true,
+        (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -605,6 +717,72 @@ mod tests {
             "#,
         ).unwrap();
         assert_eq!(out, "2\n");
+    }
+
+    // ── 함수 선언 / 호출 ──
+
+    #[test]
+    fn function_call_basic() {
+        let out = run_str(
+            r#"
+            function add(a: int, b: int): int -> {
+              a + b
+            }
+            @out add(2, 3)
+            "#,
+        ).unwrap();
+        assert_eq!(out, "5\n");
+    }
+
+    #[test]
+    fn function_expression_body() {
+        let out = run_str(
+            r#"
+            function double(x: int): int -> x * 2
+            @out double(7)
+            "#,
+        ).unwrap();
+        assert_eq!(out, "14\n");
+    }
+
+    #[test]
+    fn function_with_explicit_return() {
+        let out = run_str(
+            r#"
+            function abs(x: int): int -> {
+              if x < 0 { return -x }
+              x
+            }
+            @out abs(-4)
+            @out abs(9)
+            "#,
+        ).unwrap();
+        assert_eq!(out, "4\n9\n");
+    }
+
+    #[test]
+    fn recursive_function() {
+        let out = run_str(
+            r#"
+            function fact(n: int): int -> {
+              if n <= 1 { return 1 }
+              n * fact(n - 1)
+            }
+            @out fact(5)
+            "#,
+        ).unwrap();
+        assert_eq!(out, "120\n");
+    }
+
+    #[test]
+    fn function_arity_mismatch() {
+        let err = run_str(
+            r#"
+            function f(a: int, b: int): int -> a + b
+            @out f(1)
+            "#,
+        ).unwrap_err();
+        assert!(err.message.contains("expects 2 arguments"));
     }
 
     #[test]

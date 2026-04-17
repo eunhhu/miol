@@ -21,6 +21,10 @@ pub enum Stmt {
     Let(Box<LetStmt>),
     /// `const` 상수 선언.
     Const(Box<ConstStmt>),
+    /// `function` 선언.
+    Function(Box<FunctionStmt>),
+    /// `return` 문.
+    Return(ReturnStmt),
     /// 표현식 스테이트먼트 (void scope 자동 출력 포함).
     Expr(Expr),
 }
@@ -32,9 +36,55 @@ impl Stmt {
         match self {
             Self::Let(s) => s.span,
             Self::Const(s) => s.span,
+            Self::Function(s) => s.span,
+            Self::Return(s) => s.span,
             Self::Expr(e) => e.span,
         }
     }
+}
+
+/// 함수 선언 (SPEC §5).
+#[derive(Clone, Debug)]
+pub struct FunctionStmt {
+    /// 함수 이름.
+    pub name: Ident,
+    /// 파라미터 목록.
+    pub params: Vec<Param>,
+    /// 반환 타입 (선택).
+    pub return_ty: Option<TypeRef>,
+    /// 본문 — `{ ... }` 블록 또는 단일 표현식.
+    pub body: FunctionBody,
+    /// 전체 범위.
+    pub span: Span,
+}
+
+/// 함수 파라미터.
+#[derive(Clone, Debug)]
+pub struct Param {
+    /// 파라미터 이름.
+    pub name: Ident,
+    /// 타입 어노테이션 (선택 — MVP에서는 필수이나 누락 허용).
+    pub ty: Option<TypeRef>,
+    /// 소스 위치.
+    pub span: Span,
+}
+
+/// 함수 본문 변형.
+#[derive(Clone, Debug)]
+pub enum FunctionBody {
+    /// 블록 본문 `{ ... }`.
+    Block(Block),
+    /// 단일 표현식 본문 (`-> expr`, 블록 아님).
+    Expr(Expr),
+}
+
+/// `return expr` 혹은 `return`.
+#[derive(Clone, Debug)]
+pub struct ReturnStmt {
+    /// 반환 값 (없으면 void).
+    pub value: Option<Expr>,
+    /// 소스 위치.
+    pub span: Span,
 }
 
 /// `let` 바인딩. `mut`/`sig` 여부는 바인딩 종류로 구분.
@@ -183,6 +233,13 @@ pub enum ExprKind {
         target: Ident,
         /// 우변.
         value: Box<Expr>,
+    },
+    /// 함수 호출 `callee(args)`.
+    Call {
+        /// 호출 대상 표현식.
+        callee: Box<Expr>,
+        /// 인자 목록.
+        args: Vec<Expr>,
     },
 }
 
