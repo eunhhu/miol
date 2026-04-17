@@ -1,0 +1,834 @@
+// =====================================================
+// 08-superapp-simulation.orv — 슈퍼앱 시나리오 시뮬레이션
+// =====================================================
+//
+// 하나의 orv 워크스페이스로 16종 슈퍼앱을 조립할 수 있는지를
+// 고수준 스펙으로 증명하는 시나리오. 실제 구현 코드가 아닌
+// "이 모양의 코드가 컴파일된다"는 설계 도식.
+//
+// 이 파일이 참조하는 확장 스펙:
+//   §3.6 WeakRef / 순환 참조
+//   §3.7 스레드 안전 소유권
+//   §3.8 아레나 할당자
+//   §8.3 vault / oauth / smtp / imap / audit / ffi
+//   §10.11 @gpu
+//   §10.12 @media
+//   §10.13 @offline
+//   §10.14 @push
+//   §10.15 @textbuffer
+//   §11.8 @db 트랜잭션 / 인덱스 / 샤딩 / 마이그레이션
+//   §11.15 @upload / @storage
+//   §11.16 @net (raw TCP/UDP/TUN)
+//   §11.17 @mail 서버
+//   §11.18 @cron / @job
+//   §11.19 @plugin
+//   §11.20 @sync (CRDT)
+//   §13.9 증분 컴파일
+//   §13.10 WASM 타겟 프로파일
+//   §15.4 워크스페이스
+//
+// 워크스페이스 구조 가정:
+//   superapp/
+//     orv.toml                         # [workspace]
+//     shared/models/                   # 공통 타입
+//     apps/web/                        # 통합 웹 쉘
+//     services/discord/                # 실시간 커뮤니케이션
+//     services/drive/                  # 파일 저장
+//     services/notion/                 # 문서 협업
+//     services/editor/                 # VSCode-류 에디터
+//     services/docs/                   # Google Docs-류
+//     services/youtube/                # 비디오 스트리밍
+//     services/spotify/                # 오디오 스트리밍
+//     services/calendar/               # 스케줄러
+//     services/vpn/                    # VPN 프록시 (FFI)
+//     services/mail/                   # SMTP/IMAP 서버
+//     services/payments/               # 결제
+//     services/sns/                    # X/Thread-류 SNS
+//     services/figma/                  # 벡터 협업 캔버스
+//     services/photoshop/              # 래스터 편집
+//     services/krunker/                # 3D FPS 게임
+
+import shared_models.*
+
+// =============================================================
+// 1. Discord — 실시간 커뮤니케이션
+// =============================================================
+
+// 음성/영상/화면공유/텍스트 채팅
+pub define DiscordApp() -> @server {
+  @listen 7000
+
+  let chat = @ws /ws/chat {
+    @connect { @socket.join("guild:{@query.guildId}") }
+    @on message {
+      audit.log "chat.message" { user: @socket.userId, room: @packet.room }
+      @emit message in=@packet.room @packet
+    }
+  }
+
+  // WebRTC SFU — 대규모 음성 채널용 피어 포워딩
+  let voice = @webrtc /rtc/voice sfu=true {
+    @signal {
+      @on offer { @signal to=@data.target @data }
+      @on answer { @signal to=@data.target @data }
+      @on ice-candidate { @signal to=@data.target @data }
+    }
+    @on track {
+      // SFU — 수신 트랙을 방 내 다른 피어들에게 포워딩
+      for peer in roomPeers(@data.room) {
+        if peer != @peer.id {
+          @forward track to=peer
+        }
+      }
+    }
+  }
+
+  // 파일 첨부
+  @upload POST /api/files chunked size=5mb resumable {
+    @Auth
+    @on complete {
+      let file = await @storage.merge(@upload.id, target="attachments/{@upload.id}")
+      @respond 201 { fileId: @upload.id, url: await @storage.signedUrl(file.path) }
+    }
+  }
+
+  // 스크린 공유 — 클라이언트에서 @media.screen() 후 @webrtc에 연결
+}
+
+pub define DiscordClient() -> @html {
+  let sig voiceStream: MediaStream? = void
+  let sig screenStream: MediaStream? = void
+  let chat = await discordChat.connect()
+
+  @button onClick={
+    voiceStream = await @media.camera({ audio: true, video: true })
+    let pc = @peer.create()
+    for track in voiceStream.tracks { pc.addTrack(track) }
+  } "음성 참여"
+
+  @button onClick={
+    screenStream = await @media.screen({ audio: true })
+  } "화면 공유"
+
+  if voiceStream != void {
+    @video src={voiceStream} autoplay muted
+  }
+}
+
+// =============================================================
+// 2. Drive — 대용량 파일 저장
+// =============================================================
+
+pub define DriveApp() -> @server {
+  @listen 7010
+
+  @storage.backend s3 {
+    endpoint: @env.S3_ENDPOINT
+    bucket: "orv-drive"
+    credentials: vault.get("s3/drive")
+  }
+
+  // 업로드 — resumable chunks
+  @upload POST /api/files chunked size=10mb resumable {
+    @Auth
+    @on chunk {
+      await @storage.putChunk(@upload.id, @chunk.index, @chunk.data)
+    }
+    @on complete {
+      let file = await @storage.merge(@upload.id, target="files/{@upload.id}")
+      await @db.transaction {
+        await @db.create FileMeta %data={
+          id: @upload.id
+          ownerId: @context.payload.id
+          size: file.size
+          contentType: file.contentType
+        }
+        audit.log "drive.upload" { file: @upload.id, size: file.size }
+      }
+      @respond 201 { id: @upload.id }
+    }
+  }
+
+  // Range 스트리밍 다운로드
+  @route GET /api/files/:id/download {
+    @Auth
+    @storage.stream("files/{@param.id}")   // HTTP Range 자동 처리
+  }
+
+  // 썸네일 / 프리뷰 — 백그라운드 Job
+  @job makeThumbnail priority=low retries=2 (fileId: string) -> {
+    @media.pipeline {
+      @decode auto
+      @scale 320 180
+      @encode webp
+      @store "thumbnails/{fileId}.webp"
+    }
+  }
+}
+
+// =============================================================
+// 3. Notion + Google Docs — 블록/문서 실시간 협업
+// =============================================================
+
+@sync struct NotionDoc {
+  title: string
+  blocks: Block[] @crdt movetree
+  comments: Comment[]
+}
+
+@sync struct GDoc {
+  body: string
+  cursors: Map<string, { line: int, col: int }>
+  suggestions: Suggestion[]
+}
+
+pub define NotionServer() -> @server {
+  @listen 7020
+  @sync /doc/:id {
+    @Auth
+    let doc = await @sync.open(NotionDoc, @param.id)
+    @session join=doc
+  }
+}
+
+pub define NotionEditor(docId: string) -> @html {
+  let doc = await @sync.connect(NotionDoc, "/doc/{docId}")
+  let buf = @textbuffer.shared(doc=doc.title)
+
+  // 오프라인 편집 — 로컬 저장 + 재연결 시 플러시
+  @offline {
+    @sync.buffer doc=doc
+  }
+
+  @h1 contentEditable=true onInput={(e) -> buf.setContent(e.target.textContent)}
+  @ul {
+    for block in doc.blocks.walk() {
+      @li "{block.text}"
+    }
+  }
+
+  @button onClick={
+    doc.blocks.append({ kind: "text", text: "새 블록" })
+  } "+"
+}
+
+// =============================================================
+// 4. VSCode-류 에디터
+// =============================================================
+
+pub define Editor(file: string) -> @html {
+  let source = await @fs.read(file)
+  let buf: @textbuffer = @textbuffer.loadFrom(source)
+
+  // LSP 연결 — 장기 실행 프로세스
+  let lsp = await @process.spawn("orv-analyzer", args=["--stdio"])
+
+  lsp.onNotification("textDocument/publishDiagnostics", (params) -> {
+    highlightDiagnostics(params.diagnostics)
+  })
+
+  // 플러그인 시스템
+  for ext in await @plugin.discover("./.orv/extensions") {
+    let p = await @plugin.load(ext.path)
+    await p.activate()
+  }
+
+  @canvas onMount={(el) -> {
+    let ctx = @gpu.context(el)
+    let pipeline = @gpu.render {
+      vertex: file="shaders/text.vert.wgsl"
+      fragment: file="shaders/text.frag.wgsl"
+    }
+    loop {
+      ctx.begin()
+      pipeline.draw(textGeometry(buf))
+      ctx.present()
+      await @frame.next()
+    }
+  }}
+}
+
+// =============================================================
+// 5. YouTube — 비디오 스트리밍
+// =============================================================
+
+pub define YoutubeServer() -> @server {
+  @listen 7030
+
+  // 업로드 + 트랜스코딩 Job
+  @upload POST /api/videos chunked size=100mb resumable {
+    @Auth
+    @on complete {
+      await @db.create VideoMeta %data={
+        id: @upload.id
+        uploaderId: @context.payload.id
+        status: "processing"
+      }
+      await @job.transcode.enqueue({ videoId: @upload.id })
+      @respond 202 { id: @upload.id, status: "processing" }
+    }
+  }
+
+  @job transcode priority=low retries=3 (payload: { videoId: string }) -> {
+    @media.pipeline {
+      @decode auto
+      @fork [
+        { @scale 640 360;   @encode h264 bitrate=600k;  @package hls variant=360p }
+        { @scale 1280 720;  @encode h264 bitrate=2500k; @package hls variant=720p }
+        { @scale 1920 1080; @encode h264 bitrate=5000k; @package hls variant=1080p }
+      ]
+      @store "cdn://videos/{payload.videoId}/"
+    }
+    await @db.update VideoMeta { @where id=payload.videoId; %data={ status: "ready" } }
+  }
+
+  // 어댑티브 스트리밍
+  @media.stream /watch/:id {
+    let meta = await @db.find VideoMeta { @where id=@param.id }
+    @manifest hls source="cdn://videos/{meta.id}/"
+  }
+
+  // 검색 — FTS 인덱스
+  @index fulltext VideoMeta fields=[title, description] lang=multi
+  @route GET /api/search {
+    let hits = await @db.search VideoMeta {
+      @match title=@query.q
+      @rank bm25
+      @limit 20
+    }
+    @respond 200 hits
+  }
+}
+
+// =============================================================
+// 6. Spotify — 오디오 스트리밍
+// =============================================================
+
+pub define SpotifyClient() -> @html {
+  let player = @media.player src="/stream/{trackId}" {
+    @on qualitychange { @out "비트레이트 {@packet.bitrate}" }
+  }
+
+  // 오프라인 다운로드
+  @button onClick={
+    let bytes = await @fetch GET "/download/{trackId}"
+    let store: @offline.store<Blob> = @offline.store("tracks")
+    await store.put(trackId, bytes)
+  } "다운로드"
+
+  // Audio Worklet — 이퀄라이저
+  @media.audio.worklet "eq" {
+    @process (input, output) -> {
+      // 주파수 필터 계수 적용
+      for (sample, i) in input { output[i] = applyFilter(sample) }
+    }
+  }
+
+  // 추천 — 벡터 검색
+  let similar = await @db.search Track {
+    @near embedding=currentEmbedding k=50
+  }
+}
+
+// =============================================================
+// 7. Calendar — 스케줄러
+// =============================================================
+
+pub define CalendarApp() -> @server {
+  @listen 7040
+
+  @route POST /api/events { @Auth; @respond 201 await @db.create Event %data=@body }
+
+  // 시간 기반 알림
+  @cron "* * * * *" {
+    let due = await @db.find Reminder { @where scheduledAt <= now() }
+    for r in due {
+      await @push.send { to: r.userId, title: r.title, data: { eventId: r.eventId } }
+      await @db.delete Reminder { @where id=r.id }
+    }
+  }
+
+  // iCal 피드
+  @route GET /api/calendar/:userId.ics {
+    let events = await @db.find Event { @where userId=@param.userId }
+    @respond 200 ical.format(events)
+  }
+}
+
+// =============================================================
+// 8. VPN Proxy — raw socket + TUN
+// =============================================================
+
+pub define VpnServer() -> @server {
+  @listen 7050
+
+  // 클라이언트 인증 + 세션 발급
+  @route POST /api/session {
+    @Auth
+    let key = crypto.generateKey()
+    let session = await @db.create VpnSession %data={
+      userId: @context.payload.id
+      key: key
+      expiresAt: now() + 24h
+    }
+    @respond 200 { sessionId: session.id, key: key }
+  }
+
+  // QUIC 터널 — WebTransport 기반
+  @wt /tunnel {
+    @connect {
+      let session = await @db.find VpnSession { @where id=@query.sessionId }
+      if session == void { @close }
+    }
+
+    @datagram packets {
+      @recv {
+        // FFI — TUN 인터페이스에 패킷 주입
+        @unsafe {
+          let packet = crypto.decrypt(@data, session.key)
+          @net.tun.write(tun, packet)
+        }
+      }
+    }
+  }
+
+  // 서버측 TUN 초기화
+  let tun = @unsafe { await @net.tun.create(name="orv0", ipv4="10.8.0.1/24") }
+  spawn {
+    for await packet in tun.read() {
+      let encrypted = crypto.encrypt(packet, sessionKey)
+      await tunnelDatagram.send(encrypted)
+    }
+  }
+}
+
+// =============================================================
+// 9. Mail — SMTP/IMAP 서버
+// =============================================================
+
+pub define MailServer() -> @server {
+  @listen 7060
+
+  @mail.smtp port=25 {
+    @on message {
+      let verified = await @mail.verify.dkim(@message)
+        && @mail.verify.spf(@message)
+        && @mail.verify.dmarc(@message)
+      if !verified { @reject 550 "Authentication failed" }
+      let score = await spamScore(@message)
+      let box = score > 0.8 ? "spam" : "inbox"
+      await @db.create Mail %data={
+        mailbox: box
+        from: @message.from
+        to: @message.to
+        subject: @message.subject
+        body: @message.body
+        receivedAt: now()
+      }
+    }
+  }
+
+  @mail.imap port=993 tls {
+    @Auth
+    // 메일박스 API 자동 노출 — LIST, FETCH, IDLE 등
+  }
+
+  // 웹 UI
+  @route GET /inbox {
+    @Auth
+    @serve @Inbox
+  }
+
+  @index fulltext Mail fields=[subject, body] lang=multi
+}
+
+// =============================================================
+// 10. Payment — 결제
+// =============================================================
+
+pub define PaymentService() -> @server {
+  @listen 7070
+
+  @route POST /api/charge {
+    @Auth
+    @RateLimit max=10 window=60
+    let body: { amount: int, cardToken: string } = @body
+
+    await @db.transaction @hint isolation=serializable {
+      let account = await @db.find Account { @where userId=@context.payload.id }
+      if account.balance < body.amount {
+        throw { code: "insufficient_funds" }
+      }
+      let signKey = await vault.get("payment/sign-key")
+      let signature = await vault.hsm(slot=0).sign(
+        hash.sha256("{account.id}:{body.amount}"),
+        keyId="payment"
+      )
+      await @db.update Account {
+        @where id=account.id
+        %inc={ balance: -body.amount }
+      }
+      await @db.create Transaction %data={
+        accountId: account.id
+        amount: body.amount
+        cardToken: body.cardToken
+        signature: signature
+      }
+      audit.log "payment.charged" {
+        actor: @context.payload.id
+        amount: body.amount
+        ip: @request.ip
+      }
+    }
+    @respond 200 { ok: true }
+  }
+
+  // 정산 배치
+  @cron "0 4 * * *" {
+    @job settleDaily.enqueue({ date: today().isoString() })
+  }
+
+  @job settleDaily priority=high retries=5 (payload: { date: string }) -> {
+    await @db.transaction {
+      let txs = await @db.find Transaction { @where settledAt=void }
+      for tx in txs {
+        await settleToBank(tx)
+        await @db.update Transaction { @where id=tx.id; %data={ settledAt: now() } }
+      }
+    }
+  }
+}
+
+// =============================================================
+// 11. X / Thread — 소셜 네트워크
+// =============================================================
+
+pub define SnsServer() -> @server {
+  @listen 7080
+
+  @db.schema Post {
+    @shard key=authorId count=32
+    @replica count=2 strategy=async
+    @partition by=createdAt interval=1mo
+  }
+
+  @index fulltext Post fields=[content] lang=multi
+  @index vector Post field=embedding dim=768 metric=cosine
+
+  let api = @route /api {
+    @route GET /feed {
+      @Auth
+      let userId: int = @context.payload.id
+      let following = await session.get("following:{userId}")   // 캐시된 팬아웃
+        ?? await @db.find Follow { @where followerId=userId }
+
+      let posts = await @db.find Post {
+        @where authorId in=following.map(f -> f.authorId)
+        @order createdAt=desc
+        @limit 30
+      }
+      @respond 200 posts
+    }
+
+    @route POST /post {
+      @Auth
+      let post = await @db.create Post %data={
+        ...@body
+        authorId: @context.payload.id
+        createdAt: string.from(now())
+      }
+      // 팔로워들에게 push
+      let followers = await @db.find Follow { @where authorId=post.authorId }
+      for f in followers {
+        await @push.send { to: f.followerId, title: "새 글", data: { postId: post.id } }
+      }
+      @respond 201 post
+    }
+
+    @route GET /search {
+      let hits = await @db.search Post {
+        @match content=@query.q
+        @rank bm25
+        @limit 20
+      }
+      @respond 200 hits
+    }
+  }
+
+  // 실시간 알림
+  @ws /ws/notifications {
+    @connect { @socket.join("user:{@query.userId}") }
+  }
+}
+
+// =============================================================
+// 12. Figma — 벡터 협업 캔버스
+// =============================================================
+
+@sync struct FigmaDoc {
+  nodes: VectorNode[] @crdt movetree
+  cursors: Map<string, { x: float, y: float }>
+}
+
+pub define FigmaServer() -> @server {
+  @listen 7090
+  @sync /doc/:id {
+    @Auth
+    let doc = await @sync.open(FigmaDoc, @param.id)
+    @session join=doc
+  }
+}
+
+pub define FigmaEditor(docId: string) -> @html {
+  let doc = await @sync.connect(FigmaDoc, "/doc/{docId}")
+  let arena: Arena<VectorNode> = Arena()
+
+  @canvas onMount={(el) -> {
+    let ctx = @gpu.context(el)
+    let pipeline = @gpu.render {
+      vertex: file="shaders/path.vert.wgsl"
+      fragment: file="shaders/path.frag.wgsl"
+      targets: [{ format: "rgba8unorm" }]
+    }
+
+    loop {
+      ctx.begin()
+      for node in doc.nodes.walk() {
+        pipeline.draw(node.tessellate())   // 베지어 → 삼각형
+      }
+      // 다른 사용자 커서
+      for (userId, pos) in doc.cursors {
+        pipeline.drawCursor(pos)
+      }
+      ctx.present()
+      await @frame.next()
+    }
+  }} onPointerMove={(e) -> {
+    doc.cursors.set(myUserId, { x: e.x, y: e.y })
+  }}
+
+  @button onClick={
+    let node = arena.alloc({ kind: "rect", x: 10, y: 10, w: 100, h: 100 })
+    doc.nodes.append(node)
+  } "사각형 추가"
+}
+
+// =============================================================
+// 13. Photoshop — 래스터 편집 (WebGPU 컴퓨트)
+// =============================================================
+
+pub define PhotoshopEditor() -> @html {
+  let sig layers: Arena<Layer> = Arena()
+  let sig activeTool: string = "brush"
+
+  // GPU 블러 필터 — 컴퓨트 셰이더 (파일 참조 권장)
+  let pipeline = @gpu.compute file="shaders/blur.wgsl" workgroup=(16, 16, 1)
+
+  @canvas onMount={(el) -> {
+    let ctx = @gpu.context(el)
+    loop {
+      ctx.begin()
+      for layer in layers.items() {
+        ctx.compose(layer.texture, blendMode=layer.blend)
+      }
+      ctx.present()
+      await @frame.next()
+    }
+  }}
+
+  @button onClick={
+    let active = layers.active()
+    let result = await pipeline.dispatch {
+      input: active.texture
+      uniforms: { radius: 4.0 }
+      size: (active.width, active.height, 1)
+    }
+    active.texture = result
+  } "블러 적용"
+
+  // PSD 파일 열기
+  @input type="file" onChange={(e) -> {
+    let blob = e.target.files[0]
+    let parsed = await codec.psd.parse(blob)
+    for raster in parsed.layers {
+      layers.alloc({ kind: "raster", texture: @gpu.textureFrom(raster) })
+    }
+  }}
+}
+
+// =============================================================
+// 14. Krunker — 3D FPS 웹게임
+// =============================================================
+
+pub define KrunkerServer() -> @server {
+  @listen 7100
+
+  // 권위 서버 게임 루프 — 고정 tick
+  let tickRate = 60
+  let worldState: Mutex<WorldState> = Mutex(initialWorld())
+
+  @cron @hint interval="{1000/tickRate}ms" {
+    let mut guard = worldState.lock()
+    guard.tick()
+    // 모든 플레이어에 데이터그램으로 상태 전송
+    for player in guard.players {
+      @wt /game.datagram.state.send
+        to=player.session
+        { tick: guard.tick, snapshot: guard.snapshot(for=player) }
+    }
+  }
+
+  @wt /game {
+    @connect { registerPlayer(@session.id) }
+    @datagram input {
+      @recv {
+        let mut guard = worldState.lock()
+        guard.applyInput(@session.id, @data)
+      }
+    }
+    @disconnect { unregisterPlayer(@session.id) }
+  }
+}
+
+pub define KrunkerClient() -> @html {
+  let session = await krunkerWT.connect()
+
+  // 에셋 스트리밍
+  @job loadAssets priority=high (manifest: string[]) -> {
+    for url in manifest {
+      let blob = await @fetch GET url
+      @offline.store("assets").put(url, blob)
+    }
+  }
+
+  @canvas onMount={(el) -> {
+    let ctx = @gpu.context(el)
+    let scene = @gpu.render {
+      vertex: file="shaders/mesh.vert.wgsl"
+      fragment: file="shaders/mesh.frag.wgsl"
+    }
+    loop {
+      ctx.begin()
+      scene.draw(worldMesh, camera.uniforms())
+      ctx.present()
+      await @frame.next()
+    }
+  }} onPointerMove={(e) -> {
+    camera.rotate(e.movementX, e.movementY)
+    @session.datagram.input.send({ look: camera.direction })
+  }}
+}
+
+// =============================================================
+// 15. Google Super App — 통합 쉘
+// =============================================================
+
+pub define SuperApp() -> @server {
+  @listen int.from(@env.PORT ?? "8080")
+
+  // 전역 미들웨어
+  @Cors
+  @AccessLog
+  @ErrorHandler
+
+  // OAuth 로그인
+  let google = oauth.provider {
+    issuer: "https://accounts.google.com"
+    clientId: @env.GOOGLE_CLIENT_ID
+    clientSecret: vault.get("oauth/google")
+    scopes: ["openid", "email", "profile"]
+  }
+
+  @route GET /auth/start { @redirect google.authorizeUrl(state=crypto.uuid()) }
+  @route GET /auth/callback {
+    let session = await google.exchange(@query.code, @query.state)
+    await @db.upsert User { @where email=session.idToken.claims.email; %data={...session.idToken.claims} }
+    localStorage.set("token", session.accessToken)
+    @redirect "/"
+  }
+
+  // 통합 검색
+  @route GET /api/search {
+    let q = @query.q
+    // 여러 서비스 병렬 검색 — 컴파일러가 자동 병렬화 (§13.4)
+    let (videos, posts, mails, docs) = await (
+      @db.search VideoMeta { @match title=q @limit 5 }
+      @db.search Post { @match content=q @limit 5 }
+      @db.search Mail { @match subject=q @limit 5 }
+      @db.search NotionDoc { @match body=q @limit 5 }
+    )
+    @respond 200 { videos, posts, mails, docs }
+  }
+
+  // 통합 Push 구독
+  @route POST /api/push/subscribe {
+    @Auth
+    await @db.create PushSubscription %data={
+      userId: @context.payload.id
+      endpoint: @body.endpoint
+      keys: @body.keys
+    }
+    @respond 201 {}
+  }
+
+  // 페이지 라우트 — 각 앱이 개별 WASM 청크로 lazy load
+  @route GET /         { @serve @HomePage }
+  @route GET /chat     @hint chunk=separate { @serve @DiscordClient }
+  @route GET /drive    @hint chunk=separate { @serve @DrivePage }
+  @route GET /notion   @hint chunk=separate { @serve @NotionEditor }
+  @route GET /docs     @hint chunk=separate { @serve @DocsPage }
+  @route GET /editor   @hint chunk=separate { @serve @Editor }
+  @route GET /videos   @hint chunk=separate { @serve @YoutubeClient }
+  @route GET /music    @hint chunk=separate { @serve @SpotifyClient }
+  @route GET /calendar @hint chunk=separate { @serve @CalendarClient }
+  @route GET /mail     @hint chunk=separate { @serve @Inbox }
+  @route GET /pay      @hint chunk=separate { @serve @PaymentPage }
+  @route GET /sns      @hint chunk=separate { @serve @SnsFeed }
+  @route GET /design   @hint chunk=separate { @serve @FigmaEditor }
+  @route GET /photo    @hint chunk=separate { @serve @PhotoshopEditor }
+  @route GET /game     @hint chunk=separate { @serve @KrunkerClient }
+}
+
+// =============================================================
+// 컴파일러가 이 워크스페이스로 자동 수행하는 것
+// =============================================================
+//
+// [빌드 출력]
+//   - 각 크레이트별 독립 서버 바이너리 (superapp-discord, superapp-drive, ...)
+//   - apps/web은 공통 쉘 + 앱별 lazy WASM 청크
+//   - WebGPU 셰이더는 별도 청크, Audio Worklet은 별도 worklet.js
+//   - baseline + modern + performance WASM 프로파일 동시 emit
+//
+// [증분 빌드]
+//   - shared/models 변경 시: 시그니처 변경된 타입을 import한 크레이트만 재컴파일
+//   - 시그니처 미변경 본문 변경: 해당 크레이트만 HIR 재생성
+//   - 1M LOC 초기 빌드 20분 → 단일 파일 변경 <1s
+//
+// [자동 최적화]
+//   - DCE: 사용 안 된 도메인/함수/스키마 필드 제거
+//   - Auto-parallelization: /api/search의 4개 쿼리 병렬 실행
+//   - Auto-batching: 팔로워 push 발송 배치화
+//   - 쿼리 플랜: FTS/벡터 인덱스 자동 선택
+//   - 프로토콜: @route=QUIC, @wt=H3 datagram, 내부 RPC=바이너리
+//   - 코드 스플리팅: @hint chunk=separate로 앱별 분리
+//
+// [자동 안전성]
+//   - RC 순환 감지: WeakRef 누락 경로 경고
+//   - spawn 경계: Atomic RC 자동 승격
+//   - FFI: @unsafe 블록 밖에서는 호출 금지
+//   - vault: 시크릿 스코프 위반 컴파일 에러
+//   - @plugin: WASM 샌드박스 + capability 검증
+//   - @transaction: 격리 수준 컴파일타임 선택
+//   - audit.log: 변조 불가 해시 체인
+//
+// [성능 목표 매칭]
+//   - 정적 랜딩: 0 byte JS
+//   - 대화형 페이지: ≤30 KB 초기 번들
+//   - Figma/Photoshop: ≤200 KB 쉘 + 스트리밍 셰이더
+//   - Krunker: ≤1 MB 쉘 + 에셋 스트리밍
+//   - 백엔드 RPS: ≥ drogon, 내부 RPC 바이너리 직렬화
+//
+// [증명하는 것]
+//   "하나의 orv 워크스페이스로 16종 슈퍼앱을 조립할 수 있다."
+//   모든 구성요소가 언어 프리미티브 또는 표준 라이브러리로 커버되며,
+//   외부 런타임 의존성 없이 컴파일러가 최적 번들/바이너리를 생성한다.
