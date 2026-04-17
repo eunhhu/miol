@@ -240,13 +240,32 @@ impl Parser {
             span: name.span,
             kind: TypeRefKind::Named(name),
         };
-        // nullable 접미사 `?`
-        while self.eat(&TokenKind::Question) {
-            let span = ty.span; // 간략 — `?` 위치까지 포함하려면 별도 추적 필요
-            ty = TypeRef {
-                span,
-                kind: TypeRefKind::Nullable(Box::new(ty)),
-            };
+        // 접미사 — `?` (nullable), `[]` (array). 순서/반복 자유.
+        loop {
+            if self.eat(&TokenKind::Question) {
+                let span = ty.span;
+                ty = TypeRef {
+                    span,
+                    kind: TypeRefKind::Nullable(Box::new(ty)),
+                };
+            } else if matches!(self.peek_kind(), TokenKind::LBracket) {
+                // `[` 다음에 `]`가 바로 오는 경우만 타입 `T[]`로 소비한다.
+                // 인덱싱과 구분하기 위해 안쪽이 비어 있어야 한다.
+                let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+                if matches!(next, Some(TokenKind::RBracket)) {
+                    self.advance(); // `[`
+                    self.advance(); // `]`
+                    let span = ty.span;
+                    ty = TypeRef {
+                        span,
+                        kind: TypeRefKind::Array(Box::new(ty)),
+                    };
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         Some(ty)
     }
@@ -266,6 +285,35 @@ impl Parser {
             // 후위 연산자 — 함수 호출 `(args)`.
             if matches!(self.peek_kind(), TokenKind::LParen) && 30 >= min_bp {
                 lhs = self.finish_call(lhs)?;
+                continue;
+            }
+            // 후위 연산자 — 인덱스 `[idx]`.
+            if matches!(self.peek_kind(), TokenKind::LBracket) && 30 >= min_bp {
+                self.advance();
+                let idx = self.parse_expr()?;
+                let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+                let span = lhs.span.join(rbracket.span);
+                lhs = Expr {
+                    kind: ExprKind::Index {
+                        target: Box::new(lhs),
+                        index: Box::new(idx),
+                    },
+                    span,
+                };
+                continue;
+            }
+            // 후위 연산자 — 필드 `.field`.
+            if matches!(self.peek_kind(), TokenKind::Dot) && 30 >= min_bp {
+                self.advance();
+                let field = self.parse_ident("field name")?;
+                let span = lhs.span.join(field.span);
+                lhs = Expr {
+                    kind: ExprKind::Field {
+                        target: Box::new(lhs),
+                        field,
+                    },
+                    span,
+                };
                 continue;
             }
 
@@ -308,6 +356,25 @@ impl Parser {
             };
         }
         Some(lhs)
+    }
+
+    fn parse_array_literal(&mut self) -> Option<Expr> {
+        let lbracket = self.advance(); // `[`
+        let mut elems = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBracket | TokenKind::Eof) {
+            let e = self.parse_expr()?;
+            elems.push(e);
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+        Some(Expr {
+            kind: ExprKind::Array(elems),
+            span: lbracket.span.join(rbracket.span),
+        })
     }
 
     /// `callee` 다음에 `(` 가 확인된 상태에서 호출식을 완성한다.
@@ -408,6 +475,7 @@ impl Parser {
                     span,
                 });
             }
+            TokenKind::LBracket => return self.parse_array_literal(),
             TokenKind::LBrace => return self.parse_block_expr(),
             TokenKind::Keyword(Keyword::If) => return self.parse_if(),
             TokenKind::Keyword(Keyword::When) => return self.parse_when(),

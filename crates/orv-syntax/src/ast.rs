@@ -151,6 +151,8 @@ pub enum TypeRefKind {
     Named(Ident),
     /// nullable (`T?`).
     Nullable(Box<TypeRef>),
+    /// 배열 (`T[]`).
+    Array(Box<TypeRef>),
 }
 
 /// 표현식.
@@ -269,6 +271,22 @@ pub enum ExprKind {
         end: Box<Expr>,
         /// inclusive 여부.
         inclusive: bool,
+    },
+    /// 배열 리터럴 `[a, b, c]`.
+    Array(Vec<Expr>),
+    /// 인덱스 접근 `target[index]`.
+    Index {
+        /// 대상 표현식.
+        target: Box<Expr>,
+        /// 인덱스 표현식.
+        index: Box<Expr>,
+    },
+    /// 필드/속성 접근 `target.field`.
+    Field {
+        /// 대상 표현식.
+        target: Box<Expr>,
+        /// 필드 이름.
+        field: Ident,
     },
 }
 

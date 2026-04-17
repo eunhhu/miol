@@ -43,6 +43,8 @@ pub enum Value {
     Void,
     /// 함수 — 선언 AST에 대한 참조.
     Function(Rc<FunctionStmt>),
+    /// 배열.
+    Array(Vec<Value>),
 }
 
 impl fmt::Display for Value {
@@ -54,6 +56,16 @@ impl fmt::Display for Value {
             Self::Bool(v) => write!(f, "{v}"),
             Self::Void => write!(f, "void"),
             Self::Function(func) => write!(f, "<function {}>", func.name.name),
+            Self::Array(items) => {
+                write!(f, "[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -292,6 +304,58 @@ impl<'w, W: Write> Interp<'w, W> {
                 Err(RuntimeError {
                     message: "range expression can only be used in `for ... in` or `when` patterns".into(),
                 })
+            }
+            ExprKind::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for e in items {
+                    values.push(self.eval(e)?);
+                }
+                Ok(Value::Array(values))
+            }
+            ExprKind::Index { target, index } => {
+                let t = self.eval(target)?;
+                let i = self.eval(index)?;
+                let Value::Int(idx) = i else {
+                    return Err(RuntimeError {
+                        message: "index must be an integer".into(),
+                    });
+                };
+                match t {
+                    Value::Array(items) => {
+                        let n = i64::try_from(items.len()).unwrap_or(i64::MAX);
+                        let actual = if idx < 0 { idx + n } else { idx };
+                        if actual < 0 || actual >= n {
+                            return Err(RuntimeError {
+                                message: format!("index {idx} out of bounds for length {n}"),
+                            });
+                        }
+                        Ok(items[actual as usize].clone())
+                    }
+                    Value::Str(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+                        let actual = if idx < 0 { idx + n } else { idx };
+                        if actual < 0 || actual >= n {
+                            return Err(RuntimeError {
+                                message: format!("index {idx} out of bounds for length {n}"),
+                            });
+                        }
+                        Ok(Value::Str(chars[actual as usize].to_string()))
+                    }
+                    other => Err(RuntimeError {
+                        message: format!("cannot index into {other}"),
+                    }),
+                }
+            }
+            ExprKind::Field { target, field } => {
+                let t = self.eval(target)?;
+                match (&t, field.name.as_str()) {
+                    (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
+                    (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
+                    _ => Err(RuntimeError {
+                        message: format!("no field `{}` on {t}", field.name),
+                    }),
+                }
             }
             ExprKind::While { cond, body } => {
                 loop {
@@ -578,6 +642,7 @@ fn is_truthy(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
         Value::Function(_) => true,
+        Value::Array(a) => !a.is_empty(),
     }
 }
 
@@ -589,6 +654,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Void, Value::Void) => true,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
+        }
         _ => false,
     }
 }
@@ -874,6 +942,76 @@ mod tests {
             "#,
         ).unwrap();
         assert_eq!(out, "120\n");
+    }
+
+    // ── 배열 / 인덱싱 / 필드 ──
+
+    #[test]
+    fn array_literal_and_length() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [10, 20, 30]
+            @out xs.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn array_index_access() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [100, 200, 300]
+            @out xs[0]
+            @out xs[2]
+            @out xs[-1]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "100\n300\n300\n");
+    }
+
+    #[test]
+    fn array_out_of_bounds_errors() {
+        let err = run_str(
+            r#"
+            let xs: int[] = [1, 2]
+            @out xs[5]
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("out of bounds"));
+    }
+
+    #[test]
+    fn string_length_and_index() {
+        let out = run_str(
+            r#"
+            let s: string = "Orv"
+            @out s.length
+            @out s[0]
+            @out s[2]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\nO\nv\n");
+    }
+
+    #[test]
+    fn for_iterates_and_sums_array_via_index() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [5, 10, 15, 20]
+            let mut total: int = 0
+            for i in 0..xs.length {
+              total = total + xs[i]
+            }
+            @out total
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "50\n");
     }
 
     // ── 루프 ──
