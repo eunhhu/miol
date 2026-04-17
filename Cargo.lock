@@ -785,6 +785,8 @@ dependencies = [
 name = "orv-hir"
 version = "0.1.0"
 dependencies = [
+ "orv-diagnostics",
+ "orv-resolve",
  "pretty_assertions",
 ]
 

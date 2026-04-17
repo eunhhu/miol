@@ -9,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+orv-diagnostics = { workspace = true }
+orv-resolve = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
