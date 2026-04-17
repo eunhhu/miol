@@ -12,6 +12,8 @@
 //   - 내부 RPC + 외부 JSON API
 //   - 미들웨어 체인
 //   - 페이지별 최적 렌더링 전략
+//   - 실시간 통신 (WebSocket + WebTransport)
+//   - P2P 영상통화 시그널링 (WebRTC)
 //
 // 그리고 컴파일러가 알아서:
 //   - 안 쓰는 코드 제거 (DCE)
@@ -20,6 +22,7 @@
 //   - 내부 RPC 바이너리 직렬화
 //   - HTTP 메타데이터 컴파일타임 확정
 //   - 페이지별 SSG/CSR/SSR 자동 판정
+//   - @route QUIC(H3) 기본, H2 자동 폴백
 
 // =============================================================
 //
@@ -260,9 +263,9 @@ define AdminOnly() -> @before {
 define RateLimit(max: int, window: int?) -> @before {
   let ip = @request.ip
   let key: string = "rate:{ip}:{@request.path}"
-  let count = await redis.incr(key)
+  let count = await session.incr(key)
   if count == 1 {
-    await redis.expire(key, window ?? 60)
+    await session.expire(key, window ?? 60)
   }
   if count > max {
     @respond 429 {
@@ -1131,10 +1134,10 @@ pub define RegisterPage() -> @Layout title="Register" {
     @serve ./public/favicon.ico
   }
 
-  // ── 내부 API (let 바인딩 → 바이너리 RPC) ──
+  // ── API (let 바인딩 → 외부 표준 + 내부 바이너리 RPC 하이브리드) ──
   // authApi, userApi, postApi, appApi는 위에서 let으로 선언됨
-  // → 내부 RPC 자동 적용
-  // → .fetch()로만 접근, 바이너리 직렬화
+  // → 외부: 표준 HTTP(QUIC/H2) + JSON 그대로 노출
+  // → 내부: 바이너리 직렬화 + .fetch() facade 추가
 
   // ── 추가 내부 API ──
   // appApi는 위에서 선언되어 페이지와 서버가 동일 계약을 공유함
@@ -1158,8 +1161,95 @@ pub define RegisterPage() -> @Layout title="Register" {
     let posts = await toPublicPosts(postRecords)
     @respond 200 { posts: posts }
   }
-  // → 변수 미할당 → 외부 API → JSON
+  // → 미할당 → 외부 표준만 (JSON)
   // → curl, 브라우저, 다른 서비스에서 접근 가능
+
+  // ── 실시간 통신 ──
+
+  // WebSocket — 블로그 댓글 실시간 알림
+  let commentNotifications = @ws /ws/comments {
+    @connect {
+      let postId: string = @query.postId
+      @socket.join("post:{postId}")
+      @emit joined to=@socket.id { room: "post:{postId}" }
+    }
+
+    @on new-comment {
+      let room: string = @packet.room
+      @emit new-comment in=room {
+        comment: @packet.comment
+        author: @packet.author
+      }
+    }
+
+    @disconnect {
+      @emit user-left @socket.id
+    }
+  }
+
+  // WebTransport — 실시간 협업 편집
+  let collabEditor = @wt /wt/collab {
+    @stream bidi document {
+      @recv {
+        let patch = @data
+        applyDocumentPatch(@session.id, patch)
+        @send { ack: true, version: getDocVersion() }
+      }
+    }
+
+    @datagram cursor {
+      @recv {
+        @datagram cursor {
+          from: @session.id
+          x: @data.x
+          y: @data.y
+          selection: @data.selection
+        }
+      }
+    }
+
+    @disconnect {
+      broadcastUserLeft(@session.id)
+    }
+  }
+
+  // WebRTC — 영상통화 시그널링
+  let videoCall = @webrtc /rtc/call {
+    @signal {
+      @on offer {
+        @signal to=@data.target {
+          type: "offer"
+          from: @peer.id
+          sdp: @data.sdp
+        }
+      }
+      @on answer {
+        @signal to=@data.target {
+          type: "answer"
+          from: @peer.id
+          sdp: @data.sdp
+        }
+      }
+      @on ice-candidate {
+        @signal to=@data.target {
+          type: "ice-candidate"
+          from: @peer.id
+          candidate: @data.candidate
+        }
+      }
+    }
+
+    @connect {
+      @signal to=@peer.id {
+        type: "peers"
+        peers: getConnectedPeers()
+      }
+    }
+
+    @disconnect {
+      @signal { type: "peer-left", peer: @peer.id }
+    }
+  }
 
   // ── 페이지 라우트 ──
 
@@ -1334,8 +1424,8 @@ define AdminUsersPage() -> @Layout title="Admin - Users" {
 //
 // [컴파일러가 자동으로]
 //   ✓ 서버 바이너리 + 클라이언트 WASM 분리
-//   ✓ 내부 RPC (authApi, userApi, postApi, appApi) → 바이너리 직렬화
-//   ✓ 외부 API (/health, /api/v1/public/*) → JSON 유지
+//   ✓ let 바인딩 API → 외부 표준 + 내부 바이너리 RPC (하이브리드)
+//   ✓ 미할당 API (/health, /api/v1/public/*) → 외부 표준만
 //   ✓ 페이지별 렌더링 전략 자동 판정:
 //       HomePage, AboutPage → 정적 생성
 //       CounterPage, TodoPage, LoginPage, RegisterPage → 클라이언트 렌더링
@@ -1347,9 +1437,12 @@ define AdminUsersPage() -> @Layout title="Admin - Users" {
 //   ✓ HTTP 메타데이터 컴파일타임 확정
 //   ✓ 미들웨어 없는 라우트는 디스패치 건너뜀
 //   ✓ 라우트 기반 코드 스플리팅 (admin → 별도 청크)
+//   ✓ @route QUIC(H3) 기본, H2 자동 폴백
+//   ✓ WebSocket/WebTransport/WebRTC 프로토콜 최적화
+//   ✓ let 바인딩 = 외부 표준 + 내부 바이너리 (하이브리드)
 //
 // [개발자가 한 것]
-//   타입 정의, 도메인 선언, 라우트 작성, 페이지 구성
+//   타입 정의, 도메인 선언, 라우트 작성, 페이지 구성, 실시간 통신 설정
 //   — SSR/CSR/SSG, 바이너리/JSON, 병렬/순차 키워드 없음
 //   — 최적화 결정은 전부 컴파일러가 코드 패턴에서 추론
 //

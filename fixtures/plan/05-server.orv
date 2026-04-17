@@ -288,10 +288,10 @@ define Auth() -> @before {
 define RateLimit(max: int, window: int?) -> @before {
   let ip = @request.ip
   let key: string = "rate:{ip}:{@request.path}"
-  let count = await redis.incr(key)
+  let count = await session.incr(key)
 
   if count == 1 {
-    await redis.expire(key, window ?? 60)
+    await session.expire(key, window ?? 60)
   }
 
   if count > max {
@@ -438,22 +438,21 @@ let posts = await api.fetch("/posts")
 // 내부 RPC vs 외부 API 비교
 // -----------------------------------------------------
 
-// 내부 RPC (let 바인딩)
+// let 바인딩 — 외부 표준 + 내부 RPC facade (하이브리드)
 let internalApi = @route GET /api/internal {
   @respond 200 { data: "internal" }
 }
-// → 바이너리 직렬화
-// → 필드명 생략, 순서 기반 인코딩
-// → orv 클라이언트만 접근 (.fetch())
-// → 스키마 컴파일타임 고정 — 불일치 불가능
+// → 외부: 표준 HTTP (JSON), curl/브라우저/다른 서비스에서 접근 가능
+// → 내부: 바이너리 직렬화, 필드명 생략, 순서 기반 인코딩 (.fetch())
+// → 내부 사용 시 스키마 컴파일타임 고정 — 불일치 불가능
 
-// 외부 API (변수 미할당)
+// 미할당 — 외부 표준만
 @route GET /api/external {
   @respond 200 { data: "external" }
 }
-// → JSON 직렬화
-// → 표준 HTTP
+// → JSON 직렬화, 표준 HTTP
 // → 어디서든 접근 (curl, 브라우저, 다른 서비스)
+// → 내부에서 .fetch()로 호출 불가 (facade 없음)
 
 // -----------------------------------------------------
 // 실전 예시 — 풀스택 서버 구성
@@ -544,7 +543,7 @@ pub define App() -> @server {
     @serve @HomePage
   }
 
-  @route GET /login {
+  let loginRoute = @route GET /login {
     @serve @LoginPage
   }
 
@@ -648,7 +647,7 @@ let chat = @ws /chat {
 
 // 클라이언트에서 사용
 // @connect — 연결 수립, Socket 핸들 반환
-let myWS = await @chat.connect   // Domain socket
+let myWS = await chat.connect()   // Domain socket
 
 // @emit channel data — 서버로 전송
 @myWS.emit message { text: "안녕" }
@@ -682,18 +681,17 @@ let sig messages: string[] = []
 //   @myWS.emit message { bad: 1 }   → 컴파일 에러, 페이로드 스키마 불일치
 //   @myWS.on pong { ... }            → 서버가 emit 안 하는 채널이면 경고
 
-// 바이너리 프로토콜 (let 바인딩 → 내부 RPC와 동일 원칙)
-// → 채널명도 컴파일타임 정수 ID로 치환
-// → 페이로드는 순서 기반 바이너리 직렬화
-// → JSON 오버헤드 없음
+// let 바인딩 시 내부 통신 최적화 (외부 표준은 그대로 유지):
+// → 내부: 채널명 컴파일타임 정수 ID로 치환, 순서 기반 바이너리 직렬화
+// → 외부: 표준 WebSocket 프레임 + JSON 페이로드 그대로 노출
 
-// 외부 공개 WebSocket (변수 미할당)
+// 미할당 — 외부 표준만
 @ws /public-feed {
   @on subscribe {
     @emit feed in=@packet.topic { data: "public event" }
   }
 }
-// → 표준 WebSocket 프레임 + JSON 페이로드
+// → 표준 WebSocket + JSON만 노출
 // → 브라우저 WebSocket API, 다른 언어 클라이언트에서 접근 가능
 
 // @server와 @ws 함께 사용
@@ -723,3 +721,395 @@ pub define FullApp() -> @server {
 }
 // → 컴파일러가 HTTP 서버 + WebSocket 서버를 함께 생성
 // → @ws 핸들러 코드도 동일하게 DCE, 최적화 적용
+
+// =====================================================
+// 전송 프로토콜 비교
+// =====================================================
+//
+//  도메인     | 전송 계층         | 방향           | 신뢰성   | 주 용도
+// ------------|------------------|----------------|----------|-------------------
+//  @route     | QUIC(H3)/H2 폴백  | 요청-응답      | 신뢰     | REST API, 페이지 서빙
+//  @ws        | WebSocket         | 양방향 메시지   | 신뢰     | 실시간 채팅, 알림
+//  @wt        | WebTransport(H3)  | 스트림/데이터그램| 선택     | 게임, 미디어, 저지연
+//  @webrtc    | WebRTC            | P2P            | 선택     | 미디어, P2P 데이터
+//
+// @route 프로토콜: QUIC(H3) 기본, 외부 H3 미지원 시 H2 폴백
+//
+// let 바인딩 규칙 (모든 도메인 공통):
+//   @protocol ... (미할당)         → 외부 표준 프로토콜 노출
+//   let binding = @protocol ...   → 외부 표준 + 내부 바이너리 RPC facade 추가 (하이브리드)
+//   외부 지원은 항상 기본. let 바인딩은 내부 facade를 "추가"하는 것.
+//
+// 공통 규칙:
+//   let binding = @protocol ...   → 내부 RPC, 바이너리 직렬화, 컴파일타임 타입 검증
+//   @protocol ... (미할당)         → 외부 공개, 표준 프로토콜 유지
+
+// -----------------------------------------------------
+// WebTransport — @wt
+// -----------------------------------------------------
+
+// QUIC 기반 HTTP/3 전송. 브라우저에서 접근 가능.
+// 스트림(stream)과 데이터그램(datagram) 두 가지 채널 제공.
+//   stream — 신뢰성 있는 순서 보장 전송 (bidi/uni)
+//   datagram — 비신뢰성 비순서 전송 (저지연 실시간)
+
+@wt /game {
+  @connect {
+    @out "[WT] {@session.id} connected"
+    @stream bidi sync to=@session.id {
+      // 초기 상태 전송
+      @send { state: getGameState() }
+    }
+  }
+
+  // 양방향 스트림 — 신뢰성 필요한 데이터 (인벤토리, 채팅)
+  @stream bidi inventory {
+    @recv {
+      let action = @data
+      let result = await updateInventory(@session.id, action)
+      @send { updated: result }
+    }
+  }
+
+  // 단방향 스트림 — 서버→클라이언트 (리플레이, 로그)
+  @stream uni replay {
+    let events = await getReplayEvents()
+    for event in events {
+      @send event
+    }
+  }
+
+  // 데이터그램 — 비신뢰성 저지연 (위치, 커서, 틱)
+  @datagram position {
+    @recv {
+      broadcastPosition(@session.id, @data)
+    }
+  }
+
+  @datagram cursor {
+    @recv {
+      @datagram cursor to=@data.target {
+        from: @session.id
+        x: @data.x
+        y: @data.y
+      }
+    }
+  }
+
+  @disconnect {
+    @out "[WT] {@session.id} disconnected"
+  }
+}
+
+// @wt 내 빌트인:
+//   @session.id              → 세션 식별자
+//   @stream bidi <name>      → 양방향 신뢰 스트림 선언
+//   @stream uni <name>       → 단방향(서버→클라) 신뢰 스트림 선언
+//   @datagram <name>         → 데이터그램 채널 선언
+//   @send data               → 스트림/데이터그램으로 전송
+//   @recv { handler }        → 수신 핸들러
+//   @datagram <name> to=id data → 특정 세션에 데이터그램 전송
+//   @data                    → 수신된 데이터
+
+// WebTransport client facade — let 바인딩
+let game = @wt /game {
+  @stream bidi inventory {
+    @recv {
+      @send { updated: await updateInventory(@session.id, @data) }
+    }
+  }
+  @stream uni replay {
+    let events = await getReplayEvents()
+    for event in events {
+      @send event
+    }
+  }
+  @datagram position {
+    @recv {
+      broadcastPosition(@session.id, @data)
+    }
+  }
+  @datagram cursor {
+    @recv {
+      @datagram cursor to=@data.target {
+        from: @session.id
+        x: @data.x
+        y: @data.y
+      }
+    }
+  }
+}
+
+// 클라이언트에서 사용
+let session = await game.connect()
+
+// 스트림 사용 — 신뢰 전송
+let inventoryStream = await @session.stream.inventory
+@inventoryStream.send { action: "equip", item: "sword" }
+@inventoryStream.recv {
+  @out "인벤토리 업데이트: {@data.updated}"
+}
+
+// 리플레이 수신 (uni — 읽기 전용)
+@session.stream.replay.recv {
+  @out "리플레이: {@data}"
+}
+
+// 데이터그램 사용 — 저지연
+@session.datagram.position.send { x: 100.0, y: 200.0 }
+@session.datagram.cursor.recv {
+  @out "커서 from {@data.from}: ({@data.x}, {@data.y})"
+}
+
+await @session.close
+
+// 컴파일러 검증:
+//   @session.stream.nonexistent     → 컴파일 에러, 스트림 없음
+//   @session.datagram.position.send { bad: 1 }  → 스키마 불일치
+//   @session.stream.replay.send ... → 컴파일 에러, uni 스트림에 send 불가
+
+// 미할당 — 외부 표준만 (WebTransport API)
+@wt /public-stream {
+  @datagram feed {
+    @recv {
+      @datagram feed @data   // broadcast
+    }
+  }
+}
+// → 브라우저 WebTransport API에서 접근 가능
+
+// -----------------------------------------------------
+// WebRTC — @webrtc
+// -----------------------------------------------------
+
+// P2P 통신. 서버 역할은 시그널링(offer/answer/ICE 교환).
+// 실제 데이터/미디어 전송은 피어 간 직접 이루어진다.
+
+// 시그널링 서버
+@webrtc /call {
+  @signal {
+    // offer/answer/ICE candidate 중계
+    @on offer {
+      let target: string = @data.target
+      @signal to=target {
+        type: "offer"
+        from: @peer.id
+        sdp: @data.sdp
+      }
+    }
+
+    @on answer {
+      let target: string = @data.target
+      @signal to=target {
+        type: "answer"
+        from: @peer.id
+        sdp: @data.sdp
+      }
+    }
+
+    @on ice-candidate {
+      let target: string = @data.target
+      @signal to=target {
+        type: "ice-candidate"
+        from: @peer.id
+        candidate: @data.candidate
+      }
+    }
+  }
+
+  @connect {
+    @out "[WebRTC] {@peer.id} joined"
+    // 현재 접속 중인 피어 목록 전달
+    @signal to=@peer.id {
+      type: "peers"
+      peers: getConnectedPeers()
+    }
+  }
+
+  @disconnect {
+    @out "[WebRTC] {@peer.id} left"
+    // 나머지 피어에게 알림
+    @signal {
+      type: "peer-left"
+      peer: @peer.id
+    }
+  }
+}
+
+// @webrtc 내 빌트인:
+//   @peer.id                     → 피어 식별자
+//   @signal { ... }              → 시그널링 메시지 정의
+//   @signal to=id data           → 특정 피어에 시그널 전송
+//   @signal data                 → 전체 broadcast
+//   @on <type> { handler }       → 시그널 타입별 핸들러
+//   @data                        → 수신된 시그널 데이터
+
+// WebRTC client facade — let 바인딩
+let callSignal = @webrtc /call {
+  @signal {
+    @on offer {
+      @signal to=@data.target {
+        type: "offer", from: @peer.id, sdp: @data.sdp
+      }
+    }
+    @on answer {
+      @signal to=@data.target {
+        type: "answer", from: @peer.id, sdp: @data.sdp
+      }
+    }
+    @on ice-candidate {
+      @signal to=@data.target {
+        type: "ice-candidate", from: @peer.id, candidate: @data.candidate
+      }
+    }
+  }
+}
+
+// 클라이언트에서 사용
+let signaling = await callSignal.connect()
+
+// 피어 연결 생성
+let pc = @peer.create()
+
+// 미디어 트랙 추가
+let localStream = await @media.getUserMedia { video: true, audio: true }
+for track in localStream.tracks {
+  @pc.addTrack track
+}
+
+// offer 생성 및 전송
+let offer = await @pc.createOffer()
+await @pc.setLocalDescription(offer)
+@signaling.signal {
+  type: "offer"
+  target: targetPeerId
+  sdp: offer.sdp
+}
+
+// answer 수신 처리
+@signaling.on answer {
+  await @pc.setRemoteDescription(@data.sdp)
+}
+
+// ICE candidate 교환
+@pc.onIceCandidate {
+  @signaling.signal {
+    type: "ice-candidate"
+    target: targetPeerId
+    candidate: @candidate
+  }
+}
+
+@signaling.on ice-candidate {
+  await @pc.addIceCandidate(@data.candidate)
+}
+
+// 원격 트랙 수신
+@pc.onTrack {
+  @out "원격 트랙 수신: {@track.kind}"
+  // @html 내에서 사용:
+  // @video src=@track
+}
+
+// DataChannel — P2P 데이터 전송
+let dc = @pc.createDataChannel "chat"
+@dc.send { text: "P2P 메시지" }
+@dc.onMessage {
+  @out "P2P 수신: {@data.text}"
+}
+
+// 연결 종료
+await @pc.close()
+await @signaling.close()
+
+// 컴파일러 검증:
+//   시그널링 채널 타입은 컴파일타임에 검증
+//   @signaling.signal { type: "unknown" ... } → 컴파일 에러
+//   let 바인딩 시 시그널링은 바이너리, 미디어/데이터는 WebRTC 표준
+
+// 미할당 — 외부 표준만 (WebRTC 시그널링)
+@webrtc /public-room {
+  @signal {
+    @on offer {
+      @signal to=@data.target {
+        type: "offer", from: @peer.id, sdp: @data.sdp
+      }
+    }
+    @on answer {
+      @signal to=@data.target {
+        type: "answer", from: @peer.id, sdp: @data.sdp
+      }
+    }
+    @on ice-candidate {
+      @signal to=@data.target {
+        type: "ice-candidate", from: @peer.id, candidate: @data.candidate
+      }
+    }
+  }
+}
+// → 표준 WebRTC 시그널링, 외부 클라이언트에서 접근 가능
+
+// -----------------------------------------------------
+// @server 통합 — 모든 전송 프로토콜
+// -----------------------------------------------------
+
+pub define MultiTransportApp() -> @server {
+  @listen 8080
+
+  // HTTP — REST API
+  @route GET /api/status {
+    @respond 200 { status: "ok" }
+  }
+
+  // WebSocket — 양방향 메시지
+  @ws /ws/chat {
+    @connect {
+      @emit welcome to=@socket.id { msg: "connected" }
+    }
+    @on message {
+      @emit message @packet
+    }
+    @disconnect {
+      @emit user-left @socket.id
+    }
+  }
+
+  // WebTransport — 저지연 스트림/데이터그램
+  @wt /wt/game {
+    @stream bidi commands {
+      @recv {
+        let result = processCommand(@data)
+        @send { result: result }
+      }
+    }
+    @datagram position {
+      @recv {
+        broadcastPosition(@session.id, @data)
+      }
+    }
+  }
+
+  // WebRTC — P2P 시그널링
+  @webrtc /rtc/call {
+    @signal {
+      @on offer {
+        @signal to=@data.target {
+          type: "offer", from: @peer.id, sdp: @data.sdp
+        }
+      }
+      @on answer {
+        @signal to=@data.target {
+          type: "answer", from: @peer.id, sdp: @data.sdp
+        }
+      }
+      @on ice-candidate {
+        @signal to=@data.target {
+          type: "ice-candidate", from: @peer.id, candidate: @data.candidate
+        }
+      }
+    }
+  }
+}
+// → 컴파일러가 모든 전송 프로토콜 핸들러를 단일 서버 바이너리로 통합
+// → 각 프로토콜별 DCE, 바이너리 직렬화, 타입 검증 동일 적용
+// → 사용하지 않는 프로토콜은 바이너리에 포함되지 않음 (zero-overhead)
