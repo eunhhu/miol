@@ -723,7 +723,6 @@ dependencies = [
  "orv-diagnostics",
  "orv-hir",
  "orv-resolve",
- "orv-span",
  "orv-syntax",
  "pretty_assertions",
 ]
@@ -739,7 +738,6 @@ dependencies = [
  "orv-core",
  "orv-diagnostics",
  "orv-runtime",
- "orv-span",
  "orv-syntax",
  "serde_json",
  "tracing",
@@ -756,7 +754,6 @@ dependencies = [
  "orv-hir",
  "orv-project",
  "orv-runtime",
- "orv-span",
  "orv-syntax",
  "pretty_assertions",
  "serde",
@@ -770,7 +767,6 @@ version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
  "orv-macros",
- "orv-span",
  "pretty_assertions",
  "serde",
  "thiserror",
@@ -782,7 +778,6 @@ name = "orv-diagnostics"
 version = "0.1.0"
 dependencies = [
  "codespan-reporting 0.11.1",
- "orv-span",
  "pretty_assertions",
 ]
 
@@ -817,7 +812,6 @@ name = "orv-resolve"
 version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
- "orv-span",
  "orv-syntax",
  "pretty_assertions",
 ]
@@ -834,18 +828,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "orv-span"
-version = "0.1.0"
-dependencies = [
- "pretty_assertions",
-]
-
-[[package]]
 name = "orv-syntax"
 version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
- "orv-span",
  "pretty_assertions",
 ]
 

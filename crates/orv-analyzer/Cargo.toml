@@ -12,7 +12,6 @@ rust-version.workspace = true
 orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
 orv-resolve = { workspace = true }
-orv-span = { workspace = true }
 orv-syntax = { workspace = true }
 
 [dev-dependencies]

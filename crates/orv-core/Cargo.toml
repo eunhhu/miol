@@ -10,7 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 orv-macros = { workspace = true }
-orv-span = { workspace = true }
 orv-diagnostics = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

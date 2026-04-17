@@ -7,17 +7,16 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 authors = ["eunhhu"]
-edition = "2024"
+edition = "2021"
 license = "MIT"
 repository = "https://github.com/eunhhu/orv"
-rust-version = "1.88.0"
+rust-version = "1.86.0"
 
 [workspace.dependencies]
 # Internal crates
 orv-core = { path = "crates/orv-core" }
 orv-macros = { path = "crates/orv-macros" }
 orv-cli = { path = "crates/orv-cli" }
-orv-span = { path = "crates/orv-span" }
 orv-diagnostics = { path = "crates/orv-diagnostics" }
 orv-syntax = { path = "crates/orv-syntax" }
 orv-resolve = { path = "crates/orv-resolve" }
