@@ -9,7 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
+orv-syntax = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
