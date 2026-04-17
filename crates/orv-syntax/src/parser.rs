@@ -324,6 +324,7 @@ impl Parser {
                     span,
                 });
             }
+            TokenKind::At(_) => return self.parse_domain_call(),
             _ => {
                 self.error(format!(
                     "expected expression, found {}",
@@ -336,6 +337,62 @@ impl Parser {
             kind,
             span: tok.span,
         })
+    }
+
+    /// `@name arg1 arg2 ...` 형태의 도메인 호출을 파싱한다.
+    ///
+    /// MVP 규칙: `@name` 바로 다음에 오는 **원자(prefix) 표현식 하나**를
+    /// 인자로 수집한다. 복수 인자와 `key=value` property, `{}` 본문은
+    /// 이후 커밋에서 SPEC §9.3/§9.4에 따라 확장한다. 이 규칙은 fixture
+    /// 01~04의 `@out "..."` 패턴을 정확히 처리한다.
+    fn parse_domain_call(&mut self) -> Option<Expr> {
+        let at_tok = self.advance();
+        let TokenKind::At(name) = &at_tok.kind else {
+            unreachable!("parse_domain_call called on non-@ token");
+        };
+        let name_ident = Ident {
+            name: name.clone(),
+            span: at_tok.span,
+        };
+
+        let mut args = Vec::new();
+        let mut end_span = at_tok.span;
+        if self.is_domain_arg_start() {
+            if let Some(arg) = self.parse_prefix() {
+                end_span = arg.span;
+                args.push(arg);
+            }
+        }
+
+        Some(Expr {
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args,
+            },
+            span: at_tok.span.join(end_span),
+        })
+    }
+
+    /// 현재 토큰이 도메인 인자로 쓰일 수 있는 시작 토큰인지.
+    /// `let`/`const`/`}`/`)`/이항 연산자/EOF/다른 스테이트먼트 시작은
+    /// 인자로 간주되지 않는다.
+    fn is_domain_arg_start(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Integer(_)
+                | TokenKind::Float(_)
+                | TokenKind::String(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Keyword(Keyword::Void)
+                | TokenKind::Ident(_)
+                | TokenKind::Regex { .. }
+                | TokenKind::At(_)
+                | TokenKind::LParen
+                | TokenKind::Bang
+                | TokenKind::Minus
+                | TokenKind::Tilde
+        )
     }
 
     /// 현재 토큰이 이항 연산자면 `(op, lbp, rbp)` 반환.
@@ -653,5 +710,81 @@ mod tests {
     fn unclosed_paren_reports_error() {
         let r = parse_str("(1 + 2");
         assert!(!r.diagnostics.is_empty());
+    }
+
+    // ── 도메인 호출 ──
+
+    fn domain_of(stmt: &Stmt) -> (&Ident, &[Expr]) {
+        let Stmt::Expr(e) = stmt else {
+            panic!("expected expr stmt");
+        };
+        let ExprKind::Domain { name, args } = &e.kind else {
+            panic!("expected domain call, got {:?}", e.kind);
+        };
+        (name, args)
+    }
+
+    #[test]
+    fn domain_call_with_string() {
+        let r = parse_str(r#"@out "Hello""#);
+        assert!(r.diagnostics.is_empty());
+        let (name, args) = domain_of(&r.program.items[0]);
+        assert_eq!(name.name, "out");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::String(ref v) if v == "Hello"));
+    }
+
+    #[test]
+    fn domain_call_with_ident() {
+        let r = parse_str(
+            r#"
+            let name: string = "Alice"
+            @out name
+            "#,
+        );
+        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.program.items.len(), 2);
+        let (name, args) = domain_of(&r.program.items[1]);
+        assert_eq!(name.name, "out");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::Ident(ref id) if id.name == "name"));
+    }
+
+    #[test]
+    fn domain_call_without_args() {
+        let r = parse_str("@in");
+        assert!(r.diagnostics.is_empty());
+        let (name, args) = domain_of(&r.program.items[0]);
+        assert_eq!(name.name, "in");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn consecutive_domain_calls() {
+        let r = parse_str(
+            r#"
+            @out "first"
+            @out "second"
+            @out 42
+            "#,
+        );
+        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.program.items.len(), 3);
+    }
+
+    #[test]
+    fn domain_does_not_swallow_let() {
+        let r = parse_str(
+            r#"
+            @out "hi"
+            let x = 1
+            "#,
+        );
+        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.program.items.len(), 2);
+        let (name, args) = domain_of(&r.program.items[0]);
+        assert_eq!(name.name, "out");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(r.program.items[1], Stmt::Let(_)));
     }
 }
