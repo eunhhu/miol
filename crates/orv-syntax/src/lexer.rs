@@ -19,7 +19,16 @@ pub struct LexResult {
 /// 소스 문자열과 파일 ID를 받아 토큰화한다.
 #[must_use]
 pub fn lex(source: &str, file: FileId) -> LexResult {
-    let mut lx = Lexer::new(source, file);
+    lex_with_base_offset(source, file, 0)
+}
+
+/// [`lex`] 의 확장형 — 모든 토큰/진단 스팬에 `base_offset` 을 더해 기록한다.
+///
+/// 문자열 보간의 `{expr}` 내부 재-lex 처럼 부분 버퍼를 렉싱할 때, 결과
+/// 스팬이 원본 소스 좌표를 가리키도록 하려면 이 함수를 직접 호출한다.
+#[must_use]
+pub fn lex_with_base_offset(source: &str, file: FileId, base_offset: u32) -> LexResult {
+    let mut lx = Lexer::new(source, file, base_offset);
     lx.run();
     LexResult {
         tokens: lx.tokens,
@@ -32,20 +41,25 @@ struct Lexer<'src> {
     file: FileId,
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
+    base_offset: u32,
 }
 
 impl<'src> Lexer<'src> {
-    fn new(source: &'src str, file: FileId) -> Self {
+    fn new(source: &'src str, file: FileId, base_offset: u32) -> Self {
         Self {
             cursor: Cursor::new(source),
             file,
             tokens: Vec::new(),
             diagnostics: Vec::new(),
+            base_offset,
         }
     }
 
     fn span(&self, start: u32, end: u32) -> Span {
-        Span::new(self.file, ByteRange::new(start, end))
+        Span::new(
+            self.file,
+            ByteRange::new(start + self.base_offset, end + self.base_offset),
+        )
     }
 
     fn push(&mut self, kind: TokenKind, start: u32, end: u32) {

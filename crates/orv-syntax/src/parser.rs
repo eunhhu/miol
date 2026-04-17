@@ -9,7 +9,7 @@ use crate::ast::{
     LetKind, LetStmt, ObjectField, Param, Pattern, Program, ReturnStmt, Stmt, StringSegment,
     StructField, StructStmt, TypeRef, TypeRefKind, UnaryOp, WhenArm,
 };
-use crate::lexer::lex;
+use crate::lexer::lex_with_base_offset;
 use crate::token::{Keyword, Token, TokenKind};
 use orv_diagnostics::{ByteRange, Diagnostic, FileId, Span};
 
@@ -999,12 +999,17 @@ impl Parser {
     fn parse_string_segments(&mut self, raw: &str, span: Span) -> Vec<StringSegment> {
         let mut segments = Vec::new();
         let mut literal = String::new();
-        let mut chars = raw.chars().peekable();
-        while let Some(c) = chars.next() {
+        // `raw` 는 문자열 리터럴의 양 끝 `"` 를 뺀 원문. 그래서 `raw` 내에서
+        // 인덱스 `i` 는 원본 소스의 `span.range.start + 1 + i` 에 해당한다.
+        // 보간 `{expr}` 내부를 재-lex 할 때 이 절대 오프셋을 base 로 넘겨
+        // 생성되는 모든 토큰 스팬이 원본 좌표를 가리키도록 한다.
+        let content_base: u32 = span.range.start + 1;
+        let mut chars = raw.char_indices().peekable();
+        while let Some((idx, c)) = chars.next() {
             match c {
                 '\\' => {
                     // 이스케이프 해제
-                    match chars.next() {
+                    match chars.next().map(|(_, c)| c) {
                         Some('n') => literal.push('\n'),
                         Some('t') => literal.push('\t'),
                         Some('r') => literal.push('\r'),
@@ -1019,6 +1024,7 @@ impl Parser {
                         }
                         None => literal.push('\\'),
                     }
+                    let _ = idx;
                 }
                 '{' => {
                     // 보간 시작
@@ -1026,9 +1032,10 @@ impl Parser {
                         segments.push(StringSegment::Str(std::mem::take(&mut literal)));
                     }
                     // `{...}` 내부 원문 수집 (중첩 `{}` 미지원 MVP — 1단계만)
+                    let inner_start = idx + 1; // `{` 다음 바이트.
                     let mut inner = String::new();
                     let mut depth = 1u32;
-                    for ic in chars.by_ref() {
+                    for (_, ic) in chars.by_ref() {
                         if ic == '{' {
                             depth += 1;
                             inner.push(ic);
@@ -1049,8 +1056,12 @@ impl Parser {
                         );
                         break;
                     }
-                    // 내부를 별도 렉서+파서로 돌려 표현식 추출
-                    let inner_lex = lex(&inner, span.file);
+                    // 내부를 별도 렉서+파서로 돌리되, 생성되는 스팬이 원본
+                    // 소스 좌표를 가리키도록 base offset 을 넘긴다. 그렇지
+                    // 않으면 resolver 의 Span-기반 이름 테이블이 서로 다른
+                    // interpolation 사이트에서 충돌한다.
+                    let base = content_base + u32::try_from(inner_start).unwrap_or(0);
+                    let inner_lex = lex_with_base_offset(&inner, span.file, base);
                     for d in inner_lex.diagnostics {
                         self.diagnostics.push(d);
                     }
