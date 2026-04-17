@@ -119,8 +119,9 @@ pub enum ExprKind {
     Integer(String),
     /// 부동소수점 리터럴.
     Float(String),
-    /// 문자열 리터럴 (보간/이스케이프 미해석 원문).
-    String(String),
+    /// 문자열 리터럴 — 보간 세그먼트 목록.
+    /// 보간이 없는 단순 문자열도 `[Str(literal)]` 한 세그먼트로 표현된다.
+    String(Vec<StringSegment>),
     /// `true`.
     True,
     /// `false`.
@@ -169,6 +170,15 @@ pub enum UnaryOp {
     Neg,
     /// `~` 비트 반전.
     BitNot,
+}
+
+/// 문자열 리터럴의 구성 세그먼트.
+#[derive(Clone, Debug)]
+pub enum StringSegment {
+    /// 리터럴 문자열 조각 (이스케이프 해제된 최종 값).
+    Str(String),
+    /// `{expr}` 보간 부분 — 내부 표현식 그대로.
+    Interp(Expr),
 }
 
 /// 이항 연산자.

@@ -5,9 +5,10 @@
 //! 함수/제어 흐름/도메인/struct는 다음 커밋에서 추가된다.
 
 use crate::ast::{
-    BinaryOp, ConstStmt, Expr, ExprKind, Ident, LetKind, LetStmt, Program, Stmt, TypeRef,
-    TypeRefKind, UnaryOp,
+    BinaryOp, ConstStmt, Expr, ExprKind, Ident, LetKind, LetStmt, Program, Stmt, StringSegment,
+    TypeRef, TypeRefKind, UnaryOp,
 };
+use crate::lexer::lex;
 use crate::token::{Keyword, Token, TokenKind};
 use orv_diagnostics::{ByteRange, Diagnostic, FileId, Span};
 
@@ -291,8 +292,13 @@ impl Parser {
                 ExprKind::Float(s.clone())
             }
             TokenKind::String(s) => {
-                self.advance();
-                ExprKind::String(s.clone())
+                let raw = s.clone();
+                let str_tok = self.advance();
+                let segments = self.parse_string_segments(&raw, str_tok.span);
+                return Some(Expr {
+                    kind: ExprKind::String(segments),
+                    span: str_tok.span,
+                });
             }
             TokenKind::True => {
                 self.advance();
@@ -339,12 +345,12 @@ impl Parser {
         })
     }
 
-    /// `@name arg1 arg2 ...` 형태의 도메인 호출을 파싱한다.
+    /// `@name arg` 형태의 도메인 호출을 파싱한다.
     ///
-    /// MVP 규칙: `@name` 바로 다음에 오는 **원자(prefix) 표현식 하나**를
-    /// 인자로 수집한다. 복수 인자와 `key=value` property, `{}` 본문은
-    /// 이후 커밋에서 SPEC §9.3/§9.4에 따라 확장한다. 이 규칙은 fixture
-    /// 01~04의 `@out "..."` 패턴을 정확히 처리한다.
+    /// MVP 규칙: `@name` 다음 인자가 올 수 있으면 **하나의 완전한
+    /// 표현식**(연산자 전부 결합)을 인자로 받는다. 복수 인자/
+    /// `key=value` property/`{}` 본문은 이후 커밋에서 SPEC §9.3~§9.5에
+    /// 따라 확장한다.
     fn parse_domain_call(&mut self) -> Option<Expr> {
         let at_tok = self.advance();
         let TokenKind::At(name) = &at_tok.kind else {
@@ -358,7 +364,7 @@ impl Parser {
         let mut args = Vec::new();
         let mut end_span = at_tok.span;
         if self.is_domain_arg_start() {
-            if let Some(arg) = self.parse_prefix() {
+            if let Some(arg) = self.parse_expr() {
                 end_span = arg.span;
                 args.push(arg);
             }
@@ -371,6 +377,101 @@ impl Parser {
             },
             span: at_tok.span.join(end_span),
         })
+    }
+
+    /// 문자열 원문(따옴표 제외)을 보간 세그먼트로 쪼갠다.
+    ///
+    /// SPEC §2.4 규칙:
+    /// - `{expr}`은 보간, 중괄호 내부는 orv 표현식
+    /// - `\{`, `\}`, `\n`, `\t`, `\\`, `\"`는 이스케이프
+    /// - 중괄호가 짝이 안 맞으면 진단 수집 후 리터럴로 처리
+    fn parse_string_segments(&mut self, raw: &str, span: Span) -> Vec<StringSegment> {
+        let mut segments = Vec::new();
+        let mut literal = String::new();
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    // 이스케이프 해제
+                    match chars.next() {
+                        Some('n') => literal.push('\n'),
+                        Some('t') => literal.push('\t'),
+                        Some('r') => literal.push('\r'),
+                        Some('\\') => literal.push('\\'),
+                        Some('"') => literal.push('"'),
+                        Some('{') => literal.push('{'),
+                        Some('}') => literal.push('}'),
+                        Some(other) => {
+                            // 알 수 없는 이스케이프는 그대로 보존(에러 대신 관용 처리)
+                            literal.push('\\');
+                            literal.push(other);
+                        }
+                        None => literal.push('\\'),
+                    }
+                }
+                '{' => {
+                    // 보간 시작
+                    if !literal.is_empty() {
+                        segments.push(StringSegment::Str(std::mem::take(&mut literal)));
+                    }
+                    // `{...}` 내부 원문 수집 (중첩 `{}` 미지원 MVP — 1단계만)
+                    let mut inner = String::new();
+                    let mut depth = 1u32;
+                    for ic in chars.by_ref() {
+                        if ic == '{' {
+                            depth += 1;
+                            inner.push(ic);
+                        } else if ic == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            inner.push(ic);
+                        } else {
+                            inner.push(ic);
+                        }
+                    }
+                    if depth != 0 {
+                        self.diagnostics.push(
+                            Diagnostic::error("unterminated `{` in string interpolation")
+                                .with_primary(span, ""),
+                        );
+                        break;
+                    }
+                    // 내부를 별도 렉서+파서로 돌려 표현식 추출
+                    let inner_lex = lex(&inner, span.file);
+                    for d in inner_lex.diagnostics {
+                        self.diagnostics.push(d);
+                    }
+                    let mut sub = Parser::new(inner_lex.tokens, span.file);
+                    match sub.parse_expr() {
+                        Some(expr) => segments.push(StringSegment::Interp(expr)),
+                        None => {
+                            self.diagnostics.push(
+                                Diagnostic::error("invalid expression inside `{...}`")
+                                    .with_primary(span, ""),
+                            );
+                        }
+                    }
+                    for d in sub.diagnostics {
+                        self.diagnostics.push(d);
+                    }
+                }
+                '}' => {
+                    // 짝이 없는 `}` — 이스케이프를 권장
+                    self.diagnostics.push(
+                        Diagnostic::error("unexpected `}` in string; use `\\}` to escape")
+                            .with_primary(span, ""),
+                    );
+                    literal.push('}');
+                }
+                other => literal.push(other),
+            }
+        }
+        if !literal.is_empty() || segments.is_empty() {
+            segments.push(StringSegment::Str(literal));
+        }
+        segments
     }
 
     /// 현재 토큰이 도메인 인자로 쓰일 수 있는 시작 토큰인지.
@@ -460,6 +561,16 @@ mod tests {
         parse(lx.tokens, FileId(0))
     }
 
+    /// 단일 리터럴 세그먼트 문자열인지 검사하고 내용 반환.
+    fn plain_string(expr: &Expr) -> Option<&str> {
+        let ExprKind::String(segs) = &expr.kind else { return None };
+        if segs.len() != 1 {
+            return None;
+        }
+        let StringSegment::Str(s) = &segs[0] else { return None };
+        Some(s)
+    }
+
     #[test]
     fn empty_program() {
         let r = parse_str("");
@@ -478,7 +589,7 @@ mod tests {
         assert_eq!(s.kind, LetKind::Immutable);
         assert_eq!(s.name.name, "name");
         assert!(s.ty.is_some());
-        assert!(matches!(s.init.kind, ExprKind::String(ref v) if v == "Alice"));
+        assert_eq!(plain_string(&s.init), Some("Alice"));
     }
 
     #[test]
@@ -559,7 +670,7 @@ mod tests {
         let Stmt::Expr(e) = &r.program.items[0] else {
             panic!();
         };
-        assert!(matches!(e.kind, ExprKind::String(ref v) if v == "Hello, World!"));
+        assert_eq!(plain_string(e), Some("Hello, World!"));
     }
 
     #[test]
@@ -731,7 +842,7 @@ mod tests {
         let (name, args) = domain_of(&r.program.items[0]);
         assert_eq!(name.name, "out");
         assert_eq!(args.len(), 1);
-        assert!(matches!(args[0].kind, ExprKind::String(ref v) if v == "Hello"));
+        assert_eq!(plain_string(&args[0]), Some("Hello"));
     }
 
     #[test]
@@ -770,6 +881,63 @@ mod tests {
         );
         assert!(r.diagnostics.is_empty());
         assert_eq!(r.program.items.len(), 3);
+    }
+
+    // ── 문자열 보간 ──
+
+    fn segments_of(expr: &Expr) -> &[StringSegment] {
+        let ExprKind::String(s) = &expr.kind else {
+            panic!("expected string literal, got {:?}", expr.kind);
+        };
+        s
+    }
+
+    #[test]
+    fn string_plain_single_segment() {
+        let r = parse_str(r#""hello""#);
+        assert!(r.diagnostics.is_empty());
+        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let segs = segments_of(e);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], StringSegment::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    fn string_interpolation_basic() {
+        let r = parse_str(r#""Hello, {name}!""#);
+        assert!(r.diagnostics.is_empty());
+        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let segs = segments_of(e);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], StringSegment::Str(s) if s == "Hello, "));
+        assert!(matches!(&segs[1], StringSegment::Interp(_)));
+        assert!(matches!(&segs[2], StringSegment::Str(s) if s == "!"));
+    }
+
+    #[test]
+    fn string_interpolation_with_expression() {
+        // {a + b}
+        let r = parse_str(r#""sum: {a + b}""#);
+        assert!(r.diagnostics.is_empty());
+        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let segs = segments_of(e);
+        assert_eq!(segs.len(), 2);
+        let StringSegment::Interp(inner) = &segs[1] else { panic!() };
+        assert!(matches!(inner.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+    }
+
+    #[test]
+    fn string_escapes() {
+        let r = parse_str(r#""a\tb\nc\{d\}e""#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        assert_eq!(plain_string(e), Some("a\tb\nc{d}e"));
+    }
+
+    #[test]
+    fn string_unterminated_interp_reports_error() {
+        let r = parse_str(r#""hello {name""#);
+        assert!(!r.diagnostics.is_empty());
     }
 
     #[test]

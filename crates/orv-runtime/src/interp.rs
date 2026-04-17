@@ -4,7 +4,7 @@
 //! 범위: 리터럴 표현식, 단순 `let` 바인딩, 이항/단항 연산, `@out` 호출.
 //! 이후 커밋에서 HIR 기반 정식 실행 경로로 교체된다.
 
-use orv_syntax::ast::{BinaryOp, Expr, ExprKind, Program, Stmt, UnaryOp};
+use orv_syntax::ast::{BinaryOp, Expr, ExprKind, Program, Stmt, StringSegment, UnaryOp};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
@@ -134,7 +134,19 @@ impl<'w, W: Write> Interp<'w, W> {
                 .map_err(|_| RuntimeError {
                     message: format!("invalid float literal `{s}`"),
                 }),
-            ExprKind::String(s) => Ok(Value::Str(s.clone())),
+            ExprKind::String(segments) => {
+                let mut out = String::new();
+                for seg in segments {
+                    match seg {
+                        StringSegment::Str(lit) => out.push_str(lit),
+                        StringSegment::Interp(e) => {
+                            let v = self.eval(e)?;
+                            out.push_str(&value_to_display(&v));
+                        }
+                    }
+                }
+                Ok(Value::Str(out))
+            }
             ExprKind::True => Ok(Value::Bool(true)),
             ExprKind::False => Ok(Value::Bool(false)),
             ExprKind::Void => Ok(Value::Void),
@@ -225,6 +237,14 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError>
     }
 }
 
+/// 문자열 보간에 쓰일 값의 사용자 표시.
+fn value_to_display(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        _ => format!("{v}"),
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -311,5 +331,39 @@ mod tests {
     fn undefined_variable_errors() {
         let err = run_str("@out missing").unwrap_err();
         assert!(err.message.contains("undefined"));
+    }
+
+    #[test]
+    fn string_interpolation() {
+        let out = run_str(
+            r#"
+            let name: string = "Alice"
+            @out "Hello, {name}!"
+            "#,
+        ).unwrap();
+        assert_eq!(out, "Hello, Alice!\n");
+    }
+
+    #[test]
+    fn string_interp_with_arithmetic() {
+        let out = run_str(
+            r#"
+            let x: int = 7
+            @out "answer: {x * 6}"
+            "#,
+        ).unwrap();
+        assert_eq!(out, "answer: 42\n");
+    }
+
+    #[test]
+    fn string_escapes_runtime() {
+        let out = run_str(r#"@out "a\tb\nc""#).unwrap();
+        assert_eq!(out, "a\tb\nc\n");
+    }
+
+    #[test]
+    fn brace_escape_preserved_in_output() {
+        let out = run_str(r#"@out "literal \{42\}""#).unwrap();
+        assert_eq!(out, "literal {42}\n");
     }
 }
