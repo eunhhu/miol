@@ -641,12 +641,10 @@ impl<'w, W: Write> Interp<'w, W> {
         }
         // 함수 스코프 — 현재 환경을 저장/복원하여 간단 샌드박스.
         let saved = std::mem::take(&mut self.env);
-        // 호출자의 함수 정의를 유지해 재귀 호출이 가능하도록 함수들을 복사.
-        for (k, v) in &saved {
-            if matches!(v, Value::Function(_)) {
-                self.env.insert(k.clone(), v.clone());
-            }
-        }
+        // 함수는 선언된 전역 스코프 전체를 볼 수 있다. 호출자 환경을
+        // 복사한 뒤 파라미터로 오버레이 — 본문에서 값을 바꿔도 호출자
+        // 환경에는 새지 않는다 (self.env = saved로 복원).
+        self.env = saved.clone();
         for (p, v) in func.params.iter().zip(args.into_iter()) {
             self.env.insert(p.name.name.clone(), v);
         }
