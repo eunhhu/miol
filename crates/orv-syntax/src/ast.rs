@@ -316,6 +316,13 @@ pub enum ExprKind {
         /// 필드 이름.
         field: Ident,
     },
+    /// 람다 리터럴 `(params) -> body`.
+    Lambda {
+        /// 파라미터 목록.
+        params: Vec<Param>,
+        /// 본문 — 블록 또는 단일 표현식.
+        body: Box<FunctionBody>,
+    },
 }
 
 /// 중괄호 블록 — 문장 목록 + 블록 값을 결정하는 여부.

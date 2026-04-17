@@ -394,6 +394,81 @@ impl Parser {
         })
     }
 
+    /// `(` 뒤가 람다의 파라미터 목록처럼 보이는지 — `()` 또는
+    /// `(ident ... ) ->` 패턴.
+    fn looks_like_lambda(&self) -> bool {
+        // 빈 파라미터 `() ->`
+        let after = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+        if matches!(after, Some(TokenKind::RParen)) {
+            return matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Arrow)
+            );
+        }
+        // `(ident ...)` 탐색 — 중첩 괄호 없이 매칭되는 `)` 이후 `->` 여부.
+        if !matches!(after, Some(TokenKind::Ident(_))) {
+            return false;
+        }
+        let mut depth = 1i32;
+        let mut i = self.pos + 1;
+        while let Some(tok) = self.tokens.get(i) {
+            match &tok.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1).map(|t| &t.kind),
+                            Some(TokenKind::Arrow)
+                        );
+                    }
+                }
+                TokenKind::Eof | TokenKind::LBrace | TokenKind::RBrace => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn parse_lambda(&mut self) -> Option<Expr> {
+        let lparen = self.advance(); // `(`
+        let mut params = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            let name = self.parse_ident("parameter name")?;
+            let ty = if self.eat(&TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let span = name.span;
+            params.push(Param { name, ty, span });
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        self.expect(&TokenKind::Arrow, "`->`")?;
+        let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
+            FunctionBody::Block(self.parse_block()?)
+        } else {
+            FunctionBody::Expr(self.parse_expr()?)
+        };
+        let end_span = match &body {
+            FunctionBody::Block(b) => b.span,
+            FunctionBody::Expr(e) => e.span,
+        };
+        Some(Expr {
+            kind: ExprKind::Lambda {
+                params,
+                body: Box::new(body),
+            },
+            span: lparen.span.join(end_span),
+        })
+    }
+
     fn parse_array_literal(&mut self) -> Option<Expr> {
         let lbracket = self.advance(); // `[`
         let mut elems = Vec::new();
@@ -502,6 +577,11 @@ impl Parser {
                 })
             }
             TokenKind::LParen => {
+                // 람다 리터럴 vs 괄호 표현식 구분:
+                //   `()` 또는 `(ident [:, ])` 패턴은 람다로 시도.
+                if self.looks_like_lambda() {
+                    return self.parse_lambda();
+                }
                 let lparen = self.advance();
                 let inner = self.parse_expr()?;
                 let rparen = self.expect(&TokenKind::RParen, "`)`")?;

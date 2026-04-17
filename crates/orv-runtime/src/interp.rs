@@ -5,7 +5,7 @@
 //! 이후 커밋에서 HIR 기반 정식 실행 경로로 교체된다.
 
 use orv_syntax::ast::{
-    BinaryOp, Block, Expr, ExprKind, FunctionBody, FunctionStmt, Pattern, Program, Stmt,
+    BinaryOp, Block, Expr, ExprKind, FunctionBody, FunctionStmt, Param, Pattern, Program, Stmt,
     StringSegment, UnaryOp,
 };
 use std::rc::Rc;
@@ -43,10 +43,30 @@ pub enum Value {
     Void,
     /// 함수 — 선언 AST에 대한 참조.
     Function(Rc<FunctionStmt>),
+    /// 람다 — 파라미터와 본문 + 캡처 환경.
+    Lambda(Rc<LambdaValue>),
+    /// 바인딩된 내장 메서드 — `arr.map`처럼 receiver에 붙은 함수.
+    BoundMethod {
+        /// 수신자 값.
+        receiver: Box<Value>,
+        /// 메서드 이름.
+        method: String,
+    },
     /// 배열.
     Array(Vec<Value>),
     /// 오브젝트 — 필드 이름 순서 유지.
     Object(Vec<(String, Value)>),
+}
+
+/// 람다 값 — 파라미터 + 본문 + 캡처된 환경 스냅샷.
+#[derive(Clone, Debug)]
+pub struct LambdaValue {
+    /// 파라미터.
+    pub params: Vec<Param>,
+    /// 본문.
+    pub body: FunctionBody,
+    /// 선언 시점의 환경 스냅샷(클로저).
+    pub env: HashMap<String, Value>,
 }
 
 impl fmt::Display for Value {
@@ -58,6 +78,8 @@ impl fmt::Display for Value {
             Self::Bool(v) => write!(f, "{v}"),
             Self::Void => write!(f, "void"),
             Self::Function(func) => write!(f, "<function {}>", func.name.name),
+            Self::Lambda(_) => write!(f, "<lambda>"),
+            Self::BoundMethod { method, .. } => write!(f, "<method {method}>"),
             Self::Array(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {
@@ -373,9 +395,22 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             ExprKind::Field { target, field } => {
                 let t = self.eval(target)?;
-                match (&t, field.name.as_str()) {
+                let name = field.name.as_str();
+                match (&t, name) {
                     (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
                     (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
+                    (Value::Array(_), "map" | "filter" | "reduce" | "push" | "concat" | "join") => {
+                        Ok(Value::BoundMethod {
+                            receiver: Box::new(t),
+                            method: name.to_string(),
+                        })
+                    }
+                    (Value::Str(_), "toLowerCase" | "toUpperCase" | "contains" | "replace") => {
+                        Ok(Value::BoundMethod {
+                            receiver: Box::new(t),
+                            method: name.to_string(),
+                        })
+                    }
                     (Value::Object(fields), _) => fields
                         .iter()
                         .find(|(k, _)| k == &field.name)
@@ -388,6 +423,11 @@ impl<'w, W: Write> Interp<'w, W> {
                     }),
                 }
             }
+            ExprKind::Lambda { params, body } => Ok(Value::Lambda(Rc::new(LambdaValue {
+                params: params.clone(),
+                body: (**body).clone(),
+                env: self.env.clone(),
+            }))),
             ExprKind::While { cond, body } => {
                 loop {
                     let c = self.eval(cond)?;
@@ -419,17 +459,173 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             ExprKind::Call { callee, args } => {
                 let callee_value = self.eval(callee)?;
-                let Value::Function(func) = callee_value else {
-                    return Err(RuntimeError {
-                        message: format!("value is not callable: {callee_value}"),
-                    });
-                };
                 let mut evaluated = Vec::with_capacity(args.len());
                 for a in args {
                     evaluated.push(self.eval(a)?);
                 }
-                self.call_function(&func, evaluated)
+                self.call_value(callee_value, evaluated)
             }
+        }
+    }
+
+    fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        match callee {
+            Value::Function(func) => self.call_function(&func, args),
+            Value::Lambda(lam) => self.call_lambda(&lam, args),
+            Value::BoundMethod { receiver, method } => {
+                self.call_method(*receiver, &method, args)
+            }
+            other => Err(RuntimeError {
+                message: format!("value is not callable: {other}"),
+            }),
+        }
+    }
+
+    fn call_lambda(&mut self, lam: &LambdaValue, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        if args.len() != lam.params.len() {
+            return Err(RuntimeError {
+                message: format!(
+                    "lambda expects {} arguments, got {}",
+                    lam.params.len(),
+                    args.len()
+                ),
+            });
+        }
+        let saved = std::mem::replace(&mut self.env, lam.env.clone());
+        for (p, v) in lam.params.iter().zip(args.into_iter()) {
+            self.env.insert(p.name.name.clone(), v);
+        }
+        let saved_return = self.pending_return.take();
+        let result = match &lam.body {
+            FunctionBody::Block(b) => {
+                let ctl = self.eval_block_ctl(b)?;
+                self.pending_return = None;
+                ctl.into_value()
+            }
+            FunctionBody::Expr(e) => self.eval(e)?,
+        };
+        self.pending_return = saved_return;
+        self.env = saved;
+        Ok(result)
+    }
+
+    fn call_method(
+        &mut self,
+        receiver: Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        match (receiver, method) {
+            // ── 배열 메서드 ──
+            (Value::Array(items), "map") => {
+                let fn_val = args
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| RuntimeError {
+                        message: "map expects a function".into(),
+                    })?;
+                let mut out = Vec::with_capacity(items.len());
+                for v in items {
+                    let r = self.call_value(fn_val.clone(), vec![v])?;
+                    out.push(r);
+                }
+                Ok(Value::Array(out))
+            }
+            (Value::Array(items), "filter") => {
+                let fn_val = args
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| RuntimeError {
+                        message: "filter expects a function".into(),
+                    })?;
+                let mut out = Vec::new();
+                for v in items {
+                    let r = self.call_value(fn_val.clone(), vec![v.clone()])?;
+                    if is_truthy(&r) {
+                        out.push(v);
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            (Value::Array(items), "reduce") => {
+                // reduce(init, fn)
+                let mut iter = args.into_iter();
+                let init = iter.next().ok_or_else(|| RuntimeError {
+                    message: "reduce expects initial value and function".into(),
+                })?;
+                let fn_val = iter.next().ok_or_else(|| RuntimeError {
+                    message: "reduce expects initial value and function".into(),
+                })?;
+                let mut acc = init;
+                for v in items {
+                    acc = self.call_value(fn_val.clone(), vec![acc, v])?;
+                }
+                Ok(acc)
+            }
+            (Value::Array(mut items), "push") => {
+                for a in args {
+                    items.push(a);
+                }
+                Ok(Value::Array(items))
+            }
+            (Value::Array(a), "concat") => {
+                let mut out = a;
+                for arg in args {
+                    if let Value::Array(b) = arg {
+                        out.extend(b);
+                    } else {
+                        return Err(RuntimeError {
+                            message: "concat expects array argument".into(),
+                        });
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            (Value::Array(items), "join") => {
+                let sep = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => String::new(),
+                };
+                let parts: Vec<String> = items.iter().map(|v| format!("{v}")).collect();
+                Ok(Value::Str(parts.join(&sep)))
+            }
+            // ── 문자열 메서드 ──
+            (Value::Str(s), "toLowerCase") => Ok(Value::Str(s.to_lowercase())),
+            (Value::Str(s), "toUpperCase") => Ok(Value::Str(s.to_uppercase())),
+            (Value::Str(s), "contains") => {
+                let needle = match args.into_iter().next() {
+                    Some(Value::Str(v)) => v,
+                    _ => {
+                        return Err(RuntimeError {
+                            message: "contains expects string argument".into(),
+                        })
+                    }
+                };
+                Ok(Value::Bool(s.contains(&needle)))
+            }
+            (Value::Str(s), "replace") => {
+                let mut it = args.into_iter();
+                let from = match it.next() {
+                    Some(Value::Str(v)) => v,
+                    _ => {
+                        return Err(RuntimeError {
+                            message: "replace expects (from, to) strings".into(),
+                        })
+                    }
+                };
+                let to = match it.next() {
+                    Some(Value::Str(v)) => v,
+                    _ => {
+                        return Err(RuntimeError {
+                            message: "replace expects (from, to) strings".into(),
+                        })
+                    }
+                };
+                Ok(Value::Str(s.replace(&from, &to)))
+            }
+            (recv, m) => Err(RuntimeError {
+                message: format!("no method `{m}` on {recv}"),
+            }),
         }
     }
 
@@ -675,7 +871,7 @@ fn is_truthy(v: &Value) -> bool {
         Value::Int(n) => *n != 0,
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
-        Value::Function(_) => true,
+        Value::Function(_) | Value::Lambda(_) | Value::BoundMethod { .. } => true,
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
     }
@@ -689,6 +885,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Void, Value::Void) => true,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+        (Value::Lambda(a), Value::Lambda(b)) => Rc::ptr_eq(a, b),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
         }
@@ -983,6 +1180,125 @@ mod tests {
             "#,
         ).unwrap();
         assert_eq!(out, "120\n");
+    }
+
+    // ── 람다 / 배열·문자열 메서드 ──
+
+    #[test]
+    fn lambda_literal_call() {
+        let out = run_str(
+            r#"
+            let double = (x) -> x * 2
+            @out double(5)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "10\n");
+    }
+
+    #[test]
+    fn array_map_doubles() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [1, 2, 3]
+            @out xs.map((x) -> x * 10)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "[10, 20, 30]\n");
+    }
+
+    #[test]
+    fn array_filter_evens() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [1, 2, 3, 4, 5]
+            @out xs.filter((x) -> x % 2 == 0)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "[2, 4]\n");
+    }
+
+    #[test]
+    fn array_reduce_sum() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [1, 2, 3, 4, 5]
+            @out xs.reduce(0, (acc, x) -> acc + x)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "15\n");
+    }
+
+    #[test]
+    fn array_concat_and_push() {
+        let out = run_str(
+            r#"
+            let a: int[] = [1, 2]
+            let b: int[] = [3, 4]
+            @out a.concat(b).push(5)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "[1, 2, 3, 4, 5]\n");
+    }
+
+    #[test]
+    fn array_join() {
+        let out = run_str(
+            r#"
+            let parts: int[] = [1, 2, 3]
+            @out parts.join(", ")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "1, 2, 3\n");
+    }
+
+    #[test]
+    fn string_methods() {
+        let out = run_str(
+            r#"
+            let s: string = "Hello, Orv"
+            @out s.toLowerCase()
+            @out s.toUpperCase()
+            @out s.contains("Orv")
+            @out s.replace("Orv", "World")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "hello, orv\nHELLO, ORV\ntrue\nHello, World\n");
+    }
+
+    #[test]
+    fn lambda_closure_captures_env() {
+        let out = run_str(
+            r#"
+            let base: int = 100
+            let addBase = (x) -> x + base
+            @out addBase(5)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "105\n");
+    }
+
+    #[test]
+    fn chained_array_pipeline() {
+        let out = run_str(
+            r#"
+            let xs: int[] = [1, 2, 3, 4, 5]
+            let result: int = xs
+              .filter((x) -> x % 2 == 1)
+              .map((x) -> x * 10)
+              .reduce(0, (acc, x) -> acc + x)
+            @out result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "90\n");
     }
 
     // ── struct / 객체 리터럴 ──
