@@ -241,6 +241,35 @@ pub enum ExprKind {
         /// 인자 목록.
         args: Vec<Expr>,
     },
+    /// `for binding in iter { body }` 루프.
+    For {
+        /// 루프 변수 이름.
+        var: Ident,
+        /// 반복 대상 표현식.
+        iter: Box<Expr>,
+        /// 본문 블록.
+        body: Block,
+    },
+    /// `while cond { body }` 루프.
+    While {
+        /// 조건.
+        cond: Box<Expr>,
+        /// 본문 블록.
+        body: Block,
+    },
+    /// `break` — 가장 가까운 루프 종료.
+    Break,
+    /// `continue` — 루프 다음 반복으로.
+    Continue,
+    /// 범위 표현식 `a..b` 또는 `a..=b`. 현재는 정수 범위만 사용.
+    Range {
+        /// 시작 값.
+        start: Box<Expr>,
+        /// 끝 값.
+        end: Box<Expr>,
+        /// inclusive 여부.
+        inclusive: bool,
+    },
 }
 
 /// 중괄호 블록 — 문장 목록 + 블록 값을 결정하는 여부.

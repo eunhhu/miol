@@ -269,6 +269,26 @@ impl Parser {
                 continue;
             }
 
+            // 범위 연산자 `..`, `..=` — 특수 AST 노드 Range로.
+            // bp는 비교 연산자와 산술 사이에 둔다 (SPEC §2.5).
+            if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq)
+                && 15 >= min_bp
+            {
+                let inclusive = matches!(self.peek_kind(), TokenKind::DotDotEq);
+                self.advance();
+                let rhs = self.parse_expr_bp(16)?;
+                let span = lhs.span.join(rhs.span);
+                lhs = Expr {
+                    kind: ExprKind::Range {
+                        start: Box::new(lhs),
+                        end: Box::new(rhs),
+                        inclusive,
+                    },
+                    span,
+                };
+                continue;
+            }
+
             let Some((op, lbp, rbp)) = self.peek_binop() else {
                 break;
             };
@@ -391,6 +411,22 @@ impl Parser {
             TokenKind::LBrace => return self.parse_block_expr(),
             TokenKind::Keyword(Keyword::If) => return self.parse_if(),
             TokenKind::Keyword(Keyword::When) => return self.parse_when(),
+            TokenKind::Keyword(Keyword::For) => return self.parse_for(),
+            TokenKind::Keyword(Keyword::While) => return self.parse_while(),
+            TokenKind::Keyword(Keyword::Break) => {
+                let t = self.advance();
+                return Some(Expr {
+                    kind: ExprKind::Break,
+                    span: t.span,
+                });
+            }
+            TokenKind::Keyword(Keyword::Continue) => {
+                let t = self.advance();
+                return Some(Expr {
+                    kind: ExprKind::Continue,
+                    span: t.span,
+                });
+            }
             TokenKind::At(_) => return self.parse_domain_call(),
             TokenKind::Dollar => {
                 // `$`는 when 가드 내 현재 값 참조(SPEC §4.10, §6.3).
@@ -593,6 +629,37 @@ impl Parser {
         })
     }
 
+    fn parse_for(&mut self) -> Option<Expr> {
+        let for_tok = self.advance(); // `for`
+        let var = self.parse_ident("loop variable")?;
+        self.expect(&TokenKind::Keyword(Keyword::In), "`in`")?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        let span = for_tok.span.join(body.span);
+        Some(Expr {
+            kind: ExprKind::For {
+                var,
+                iter: Box::new(iter),
+                body,
+            },
+            span,
+        })
+    }
+
+    fn parse_while(&mut self) -> Option<Expr> {
+        let while_tok = self.advance(); // `while`
+        let cond = self.parse_expr()?;
+        let body = self.parse_block()?;
+        let span = while_tok.span.join(body.span);
+        Some(Expr {
+            kind: ExprKind::While {
+                cond: Box::new(cond),
+                body,
+            },
+            span,
+        })
+    }
+
     fn parse_pattern(&mut self) -> Option<Pattern> {
         // `_` 와일드카드
         if matches!(self.peek_kind(), TokenKind::Ident(n) if n == "_") {
@@ -607,13 +674,16 @@ impl Parser {
         {
             return Some(Pattern::Guard(first));
         }
-        if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq) {
-            let inclusive = matches!(self.peek_kind(), TokenKind::DotDotEq);
-            self.advance();
-            let end = self.parse_expr()?;
+        // Range 표현식은 Pattern::Range로 재분류.
+        if let ExprKind::Range {
+            start,
+            end,
+            inclusive,
+        } = first.kind
+        {
             return Some(Pattern::Range {
-                start: first,
-                end,
+                start: *start,
+                end: *end,
                 inclusive,
             });
         }

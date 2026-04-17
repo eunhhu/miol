@@ -72,6 +72,17 @@ impl ControlFlow {
     }
 }
 
+/// 루프 탈출 신호.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopSignal {
+    /// 정상 진행.
+    None,
+    /// 다음 반복으로.
+    Continue,
+    /// 루프 종료.
+    Break,
+}
+
 /// 프로그램을 stdout에 실행한다.
 ///
 /// # Errors
@@ -99,6 +110,8 @@ struct Interp<'w, W: Write> {
     /// 함수 본문 평가 중 `return` 문이 실행되면 해당 값을 담아 상위로 전파한다.
     /// 상위 호출자(call_function)가 소비해 초기화한다.
     pending_return: Option<Value>,
+    /// 루프 본문 평가 중 break/continue 시그널. 루프 밖에서는 None.
+    loop_signal: LoopSignal,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -107,6 +120,7 @@ impl<'w, W: Write> Interp<'w, W> {
             env: HashMap::new(),
             writer,
             pending_return: None,
+            loop_signal: LoopSignal::None,
         }
     }
 
@@ -252,6 +266,62 @@ impl<'w, W: Write> Interp<'w, W> {
                 self.env.insert(target.name.clone(), v.clone());
                 Ok(v)
             }
+            ExprKind::For { var, iter, body } => {
+                let (lo, hi, incl) = self.interpret_range(iter)?;
+                let mut i = lo;
+                while if incl { i <= hi } else { i < hi } {
+                    self.env.insert(var.name.clone(), Value::Int(i));
+                    self.eval_block(body)?;
+                    match self.loop_signal {
+                        LoopSignal::Break => {
+                            self.loop_signal = LoopSignal::None;
+                            break;
+                        }
+                        LoopSignal::Continue => self.loop_signal = LoopSignal::None,
+                        LoopSignal::None => {}
+                    }
+                    if self.pending_return.is_some() {
+                        break;
+                    }
+                    i += 1;
+                }
+                Ok(Value::Void)
+            }
+            ExprKind::Range { .. } => {
+                // 범위는 값으로 평가되지 않는다. for의 iter 또는 when 패턴에서만 소비.
+                Err(RuntimeError {
+                    message: "range expression can only be used in `for ... in` or `when` patterns".into(),
+                })
+            }
+            ExprKind::While { cond, body } => {
+                loop {
+                    let c = self.eval(cond)?;
+                    if !is_truthy(&c) {
+                        break;
+                    }
+                    self.eval_block(body)?;
+                    match self.loop_signal {
+                        LoopSignal::Break => {
+                            self.loop_signal = LoopSignal::None;
+                            break;
+                        }
+                        LoopSignal::Continue => self.loop_signal = LoopSignal::None,
+                        LoopSignal::None => {}
+                    }
+                    if self.pending_return.is_some() {
+                        break;
+                    }
+                }
+                Ok(Value::Void)
+            }
+            ExprKind::Break => {
+                self.loop_signal = LoopSignal::Break;
+                Ok(Value::Void)
+            }
+            ExprKind::Continue => {
+                self.loop_signal = LoopSignal::Continue;
+                Ok(Value::Void)
+            }
             ExprKind::Call { callee, args } => {
                 let callee_value = self.eval(callee)?;
                 let Value::Function(func) = callee_value else {
@@ -342,6 +412,10 @@ impl<'w, W: Write> Interp<'w, W> {
                     if let Some(ret) = self.pending_return.clone() {
                         return Ok(ControlFlow::Return(ret));
                     }
+                    // break/continue가 설정됐다면 블록 실행을 멈춘다.
+                    if self.loop_signal != LoopSignal::None {
+                        return Ok(ControlFlow::Normal(Value::Void));
+                    }
                     if is_last {
                         final_value = v;
                     }
@@ -353,6 +427,34 @@ impl<'w, W: Write> Interp<'w, W> {
 
     fn eval_block(&mut self, block: &Block) -> Result<Value, RuntimeError> {
         Ok(self.eval_block_ctl(block)?.into_value())
+    }
+
+    /// iter 표현식에서 `start..end` / `start..=end`를 해석.
+    /// MVP: range 리터럴(이항 연산 `..`/`..=`)만 지원. AST에는 별도 타입이 없어
+    /// 표현식 경로로 `start`와 `end`를 찾아 런타임에 평가한다.
+    fn interpret_range(&mut self, expr: &Expr) -> Result<(i64, i64, bool), RuntimeError> {
+        // `a..b`/`a..=b`는 AST에서 이항 연산이 아니라 범위 토큰이므로,
+        // Pattern의 Range처럼 처리되지 않는다. MVP에서는 파서가 Range를
+        // 표현식으로 노출하지 않으므로 여기서는 단일 이항 연산을 가정하지
+        // 않고, `iter`가 실제로는 Binary {op: Range...} 같은 형태가 아니다.
+        // 대안: iter 식이 이항 비교/산술이 아니라 범위라면, ExprKind에 Range를
+        // 추가해야 한다. 여기서는 그 추가가 되어있다고 가정하지 않고,
+        // expr의 kind를 직접 확인한다.
+        if let ExprKind::Range { start, end, inclusive } = &expr.kind {
+            let s = self.eval(start)?;
+            let e = self.eval(end)?;
+            match (s, e) {
+                (Value::Int(a), Value::Int(b)) => return Ok((a, b, *inclusive)),
+                _ => {
+                    return Err(RuntimeError {
+                        message: "for loop range must be integer".into(),
+                    });
+                }
+            }
+        }
+        Err(RuntimeError {
+            message: "for loop requires a range expression (a..b or a..=b)".into(),
+        })
     }
 
     fn pattern_matches(&mut self, pat: &Pattern, value: &Value) -> Result<bool, RuntimeError> {
@@ -772,6 +874,86 @@ mod tests {
             "#,
         ).unwrap();
         assert_eq!(out, "120\n");
+    }
+
+    // ── 루프 ──
+
+    #[test]
+    fn for_range_exclusive() {
+        let out = run_str(
+            r#"
+            for i in 0..3 {
+              @out i
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "0\n1\n2\n");
+    }
+
+    #[test]
+    fn for_range_inclusive() {
+        let out = run_str(
+            r#"
+            for i in 1..=3 {
+              @out i
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "1\n2\n3\n");
+    }
+
+    #[test]
+    fn while_with_counter() {
+        let out = run_str(
+            r#"
+            let mut n: int = 0
+            while n < 3 {
+              @out n
+              n = n + 1
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "0\n1\n2\n");
+    }
+
+    #[test]
+    fn break_exits_loop() {
+        let out = run_str(
+            r#"
+            for i in 0..10 {
+              if i == 2 { break }
+              @out i
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "0\n1\n");
+    }
+
+    #[test]
+    fn continue_skips_iteration() {
+        let out = run_str(
+            r#"
+            for i in 0..5 {
+              if i == 2 { continue }
+              @out i
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "0\n1\n3\n4\n");
+    }
+
+    #[test]
+    fn nested_for_loops() {
+        let out = run_str(
+            r#"
+            for i in 0..2 {
+              for j in 0..2 {
+                @out "{i},{j}"
+              }
+            }
+            "#,
+        ).unwrap();
+        assert_eq!(out, "0,0\n0,1\n1,0\n1,1\n");
     }
 
     #[test]
