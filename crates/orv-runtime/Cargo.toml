@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+orv-analyzer = { workspace = true }
+orv-resolve = { workspace = true }
 pretty_assertions = { workspace = true }
 
 [lints]

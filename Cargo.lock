@@ -737,6 +737,7 @@ dependencies = [
  "orv-compiler",
  "orv-core",
  "orv-diagnostics",
+ "orv-resolve",
  "orv-runtime",
  "orv-syntax",
  "serde_json",
@@ -822,8 +823,10 @@ dependencies = [
 name = "orv-runtime"
 version = "0.1.0"
 dependencies = [
+ "orv-analyzer",
  "orv-diagnostics",
  "orv-hir",
+ "orv-resolve",
  "orv-syntax",
  "pretty_assertions",
  "serde",

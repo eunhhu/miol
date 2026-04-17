@@ -61,8 +61,11 @@ fn cmd_run(path: &PathBuf) -> anyhow::Result<()> {
     let pr = orv_syntax::parse(lx.tokens, file_id);
     report_diagnostics(&pr.diagnostics, path)?;
 
-    orv_runtime::run(&pr.program)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = orv_resolve::resolve(&pr.program);
+    report_diagnostics(&resolved.diagnostics, path)?;
+
+    let hir = orv_analyzer::lower(&pr.program, &resolved);
+    orv_runtime::run(&hir).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 

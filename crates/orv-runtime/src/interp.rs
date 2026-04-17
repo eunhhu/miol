@@ -1,28 +1,38 @@
-//! 최소 tree-walking 인터프리터.
+//! tree-walking 인터프리터 — HIR 버전.
 //!
-//! 타입체크/HIR 경로가 아직 구현되지 않아, AST에서 바로 실행한다.
-//! 범위: 리터럴 표현식, 단순 `let` 바인딩, 이항/단항 연산, `@out` 호출.
-//! 이후 커밋에서 HIR 기반 정식 실행 경로로 교체된다.
+//! SPEC §0 에서 채택한 V8 Ignition 모델의 "영구 dev-loop 실행 경로" 다.
+//! [`orv_analyzer::lower`] 가 만든 [`HirProgram`] 을 직접 평가한다. 타입
+//! 검사는 아직 붙지 않았으므로 런타임에서 값 타입을 확인해 에러를 낸다.
+//!
+//! # 환경 모델
+//! 환경은 `HashMap<NameId, Value>` 다. [`orv_resolve`] 가 모든 식별자에
+//! 유일한 `NameId` 를 부여하므로 문자열 기반 조회가 사라진다. `$` 가드는
+//! 스코프 바인딩이 아니므로 별도 슬롯 [`Interp::dollar`] 로 관리한다.
+//!
+//! # 함수 호출 규칙 (커밋 21 의 동작을 유지)
+//! 호출 시점의 환경 전체를 복제해 파라미터로 오버레이한 뒤, 호출이 끝나면
+//! 원본으로 복원한다. 이렇게 하면 함수 본문이 전역 선언을 볼 수 있으면서도
+//! 본문에서 생긴 로컬은 호출자에 새지 않는다. 정밀한 capture 분석은 이후
+//! 최적화로 미룬다.
 
-use orv_syntax::ast::{
-    BinaryOp, Block, Expr, ExprKind, FunctionBody, FunctionStmt, Param, Pattern, Program, Stmt,
-    StringSegment, UnaryOp,
+use orv_hir::{
+    BinaryOp, HirBlock, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt, HirParam,
+    HirPattern, HirProgram, HirStmt, HirStringSegment, NameId, UnaryOp,
 };
-use std::rc::Rc;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
+use std::rc::Rc;
 
 /// 런타임 에러.
 ///
-/// 기본 빌드는 `Self { message }` 패턴을 유지하되, `thrown` 필드에 사용자
-/// `throw` 값이 담긴 경우 try/catch가 잡아낼 수 있다. `Default::default()`로
-/// 기본값(thrown=None)을 간결히 쓸 수 있도록 Default를 구현한다.
+/// `thrown` 필드에 사용자 `throw` 값이 담긴 경우 try/catch 가 잡아낼 수
+/// 있다. `native` 에러는 인터프리터 내부 오류로 catch 되지 않는다.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeError {
     /// 사람이 읽을 메시지.
     pub message: String,
-    /// `throw`로 발생한 사용자 에러면 그 값, 아니면 None (인터프리터 내부 에러).
+    /// `throw` 로 발생한 사용자 에러면 그 값, 아니면 None.
     pub thrown: Option<Value>,
 }
 
@@ -35,7 +45,7 @@ impl RuntimeError {
         }
     }
 
-    /// `throw` 문으로 발생한 사용자 에러 — try/catch로 처리 가능.
+    /// `throw` 문으로 발생한 사용자 에러 — try/catch 로 처리 가능.
     pub(crate) fn thrown(value: Value) -> Self {
         Self {
             message: format!("{value}"),
@@ -68,11 +78,12 @@ pub enum Value {
     Bool(bool),
     /// void (값 없음).
     Void,
-    /// 함수 — 선언 AST에 대한 참조.
-    Function(Rc<FunctionStmt>),
+    /// 사용자 정의 함수.
+    Function(Rc<HirFunctionStmt>),
     /// 람다 — 파라미터와 본문 + 캡처 환경.
     Lambda(Rc<LambdaValue>),
-    /// 바인딩된 내장 메서드 — `arr.map`처럼 receiver에 붙은 함수.
+    /// 바인딩된 내장 메서드 — `arr.map` 처럼 receiver 에 붙은 함수. 메서드
+    /// 이름은 값 타입 기반 dispatch 이므로 `NameId` 가 아닌 문자열을 유지.
     BoundMethod {
         /// 수신자 값.
         receiver: Box<Value>,
@@ -81,7 +92,7 @@ pub enum Value {
     },
     /// 배열.
     Array(Vec<Value>),
-    /// 오브젝트 — 필드 이름 순서 유지.
+    /// 오브젝트 — 필드 이름 순서 유지. 필드명은 구조체 멤버이므로 문자열.
     Object(Vec<(String, Value)>),
 }
 
@@ -89,11 +100,11 @@ pub enum Value {
 #[derive(Clone, Debug)]
 pub struct LambdaValue {
     /// 파라미터.
-    pub params: Vec<Param>,
+    pub params: Vec<HirParam>,
     /// 본문.
-    pub body: FunctionBody,
+    pub body: HirFunctionBody,
     /// 선언 시점의 환경 스냅샷(클로저).
-    pub env: HashMap<String, Value>,
+    pub env: HashMap<NameId, Value>,
 }
 
 impl fmt::Display for Value {
@@ -148,43 +159,36 @@ impl ControlFlow {
 /// 루프 탈출 신호.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoopSignal {
-    /// 정상 진행.
     None,
-    /// 다음 반복으로.
     Continue,
-    /// 루프 종료.
     Break,
 }
 
-/// 프로그램을 stdout에 실행한다.
+/// HIR 프로그램을 stdout 에 실행한다.
 ///
 /// # Errors
-/// 실행 중 정의되지 않은 식별자, 타입 불일치 등이 발생하면 반환한다.
-pub fn run(program: &Program) -> Result<(), RuntimeError> {
+/// 실행 중 타입 불일치, 인덱스 초과, 메서드 미지원 등이 발생하면 반환한다.
+pub fn run(program: &HirProgram) -> Result<(), RuntimeError> {
     let mut stdout = std::io::stdout().lock();
     run_with_writer(program, &mut stdout)
 }
 
-/// 테스트 가능한 버전 — 임의의 `Write`에 출력한다.
+/// 테스트 가능한 버전 — 임의의 `Write` 에 출력한다.
 ///
 /// # Errors
-/// `run`과 동일.
-pub fn run_with_writer<W: Write>(
-    program: &Program,
-    writer: &mut W,
-) -> Result<(), RuntimeError> {
+/// `run` 과 동일.
+pub fn run_with_writer<W: Write>(program: &HirProgram, writer: &mut W) -> Result<(), RuntimeError> {
     let mut interp = Interp::new(writer);
     interp.run(program)
 }
 
 struct Interp<'w, W: Write> {
-    env: HashMap<String, Value>,
+    env: HashMap<NameId, Value>,
     writer: &'w mut W,
-    /// 함수 본문 평가 중 `return` 문이 실행되면 해당 값을 담아 상위로 전파한다.
-    /// 상위 호출자(call_function)가 소비해 초기화한다.
     pending_return: Option<Value>,
-    /// 루프 본문 평가 중 break/continue 시그널. 루프 밖에서는 None.
     loop_signal: LoopSignal,
+    /// when 가드의 `$` — 스코프 바인딩이 아니므로 별도 슬롯에 보관한다.
+    dollar: Option<Value>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -194,10 +198,11 @@ impl<'w, W: Write> Interp<'w, W> {
             writer,
             pending_return: None,
             loop_signal: LoopSignal::None,
+            dollar: None,
         }
     }
 
-    fn run(&mut self, program: &Program) -> Result<(), RuntimeError> {
+    fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         let last_idx = program.items.len().saturating_sub(1);
         for (idx, stmt) in program.items.iter().enumerate() {
             let is_last = idx == last_idx;
@@ -206,32 +211,29 @@ impl<'w, W: Write> Interp<'w, W> {
         Ok(())
     }
 
-    fn exec_stmt(&mut self, stmt: &Stmt, is_last: bool) -> Result<(), RuntimeError> {
+    fn exec_stmt(&mut self, stmt: &HirStmt, is_last: bool) -> Result<(), RuntimeError> {
         match stmt {
-            Stmt::Let(l) => {
+            HirStmt::Let(l) => {
                 let v = self.eval(&l.init)?;
-                self.env.insert(l.name.name.clone(), v);
+                self.env.insert(l.name.id, v);
             }
-            Stmt::Const(c) => {
+            HirStmt::Const(c) => {
                 let v = self.eval(&c.init)?;
-                self.env.insert(c.name.name.clone(), v);
+                self.env.insert(c.name.id, v);
             }
-            Stmt::Function(f) => {
-                let name = f.name.name.clone();
+            HirStmt::Function(f) => {
                 self.env
-                    .insert(name, Value::Function(Rc::new((**f).clone())));
+                    .insert(f.name.id, Value::Function(Rc::new((**f).clone())));
             }
-            Stmt::Struct(_) => {
-                // MVP: 타입 검사가 아직 없으므로 struct 선언은 파서 단계에서
-                // 필드 목록만 기록하고 런타임은 noop. 이후 HIR 단계에서 활용.
+            HirStmt::Struct(_) => {
+                // MVP: 타입 정보만 필요하며 런타임은 noop. 이후 커밋에서 확장.
             }
-            Stmt::Return(_) => {
+            HirStmt::Return(_) => {
                 return Err(RuntimeError::native("`return` outside of a function"));
             }
-            Stmt::Expr(e) => {
+            HirStmt::Expr(e) => {
                 let v = self.eval(e)?;
-                // SPEC §12.2 — void scope에서 마지막이 아닌 표현식은 자동 출력.
-                // 대입/블록/if/when/호출/@out 호출은 제외.
+                // SPEC §12.2 — void scope 에서 마지막이 아닌 표현식은 자동 출력.
                 if !is_last
                     && matches!(
                         &v,
@@ -246,24 +248,24 @@ impl<'w, W: Write> Interp<'w, W> {
         Ok(())
     }
 
-    fn eval(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
+    fn eval(&mut self, expr: &HirExpr) -> Result<Value, RuntimeError> {
         match &expr.kind {
-            ExprKind::Integer(s) => s
+            HirExprKind::Integer(s) => s
                 .replace('_', "")
                 .parse::<i64>()
                 .map(Value::Int)
                 .map_err(|_| RuntimeError::native(format!("invalid integer literal `{s}`"))),
-            ExprKind::Float(s) => s
+            HirExprKind::Float(s) => s
                 .replace('_', "")
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| RuntimeError::native(format!("invalid float literal `{s}`"))),
-            ExprKind::String(segments) => {
+            HirExprKind::String(segments) => {
                 let mut out = String::new();
                 for seg in segments {
                     match seg {
-                        StringSegment::Str(lit) => out.push_str(lit),
-                        StringSegment::Interp(e) => {
+                        HirStringSegment::Str(lit) => out.push_str(lit),
+                        HirStringSegment::Interp(e) => {
                             let v = self.eval(e)?;
                             out.push_str(&value_to_display(&v));
                         }
@@ -271,23 +273,22 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Str(out))
             }
-            ExprKind::True => Ok(Value::Bool(true)),
-            ExprKind::False => Ok(Value::Bool(false)),
-            ExprKind::Void => Ok(Value::Void),
-            ExprKind::Ident(id) => self.env.get(&id.name).cloned().ok_or_else(|| RuntimeError::native(format!("undefined variable `{}`", id.name))),
-            ExprKind::Paren(inner) => self.eval(inner),
-            ExprKind::Unary { op, expr } => {
+            HirExprKind::True => Ok(Value::Bool(true)),
+            HirExprKind::False => Ok(Value::Bool(false)),
+            HirExprKind::Void => Ok(Value::Void),
+            HirExprKind::Ident(id) => self.lookup(id.id, &id.name),
+            HirExprKind::Paren(inner) => self.eval(inner),
+            HirExprKind::Unary { op, expr } => {
                 let v = self.eval(expr)?;
                 apply_unary(*op, v)
             }
-            ExprKind::Binary { op, lhs, rhs } => {
+            HirExprKind::Binary { op, lhs, rhs } => {
                 let l = self.eval(lhs)?;
                 let r = self.eval(rhs)?;
                 apply_binary(*op, l, r)
             }
-            ExprKind::Domain { name, args } => {
-                if name.name == "out" {
-                    // @out arg → 인자 평가 후 한 줄로 출력
+            HirExprKind::Domain { name, args, .. } => {
+                if name == "out" {
                     if let Some(a) = args.first() {
                         let v = self.eval(a)?;
                         self.println(&v)?;
@@ -296,11 +297,13 @@ impl<'w, W: Write> Interp<'w, W> {
                     }
                     Ok(Value::Void)
                 } else {
-                    Err(RuntimeError::native(format!("unsupported domain `@{}` in MVP interpreter", name.name)))
+                    Err(RuntimeError::native(format!(
+                        "unsupported domain `@{name}` in MVP interpreter"
+                    )))
                 }
             }
-            ExprKind::Block(b) => self.eval_block(b),
-            ExprKind::If {
+            HirExprKind::Block(b) => self.eval_block(b),
+            HirExprKind::If {
                 cond,
                 then,
                 else_branch,
@@ -314,7 +317,7 @@ impl<'w, W: Write> Interp<'w, W> {
                     Ok(Value::Void)
                 }
             }
-            ExprKind::When { scrutinee, arms } => {
+            HirExprKind::When { scrutinee, arms } => {
                 let value = self.eval(scrutinee)?;
                 for arm in arms {
                     if self.pattern_matches(&arm.pattern, &value)? {
@@ -323,19 +326,23 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Void)
             }
-            ExprKind::Assign { target, value } => {
-                if !self.env.contains_key(&target.name) {
-                    return Err(RuntimeError::native(format!("cannot assign to undefined `{}`", target.name)));
+            HirExprKind::Assign { target, value } => {
+                if !self.env.contains_key(&target.id) {
+                    // resolve 가 허용한 참조만 여기까지 오지만, 방어적 체크.
+                    return Err(RuntimeError::native(format!(
+                        "cannot assign to undefined `{}`",
+                        target.name
+                    )));
                 }
                 let v = self.eval(value)?;
-                self.env.insert(target.name.clone(), v.clone());
+                self.env.insert(target.id, v.clone());
                 Ok(v)
             }
-            ExprKind::For { var, iter, body } => {
+            HirExprKind::For { var, iter, body } => {
                 let (lo, hi, incl) = self.interpret_range(iter)?;
                 let mut i = lo;
                 while if incl { i <= hi } else { i < hi } {
-                    self.env.insert(var.name.clone(), Value::Int(i));
+                    self.env.insert(var.id, Value::Int(i));
                     self.eval_block(body)?;
                     match self.loop_signal {
                         LoopSignal::Break => {
@@ -352,26 +359,25 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Void)
             }
-            ExprKind::Range { .. } => {
-                // 범위는 값으로 평가되지 않는다. for의 iter 또는 when 패턴에서만 소비.
-                Err(RuntimeError::native("range expression can only be used in `for ... in` or `when` patterns"))
-            }
-            ExprKind::Array(items) => {
+            HirExprKind::Range { .. } => Err(RuntimeError::native(
+                "range expression can only be used in `for ... in` or `when` patterns",
+            )),
+            HirExprKind::Array(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for e in items {
                     values.push(self.eval(e)?);
                 }
                 Ok(Value::Array(values))
             }
-            ExprKind::Object(fields) => {
+            HirExprKind::Object(fields) => {
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
                     let v = self.eval(&f.value)?;
-                    out.push((f.name.name.clone(), v));
+                    out.push((f.name.clone(), v));
                 }
                 Ok(Value::Object(out))
             }
-            ExprKind::Index { target, index } => {
+            HirExprKind::Index { target, index } => {
                 let t = self.eval(target)?;
                 let i = self.eval(index)?;
                 let Value::Int(idx) = i else {
@@ -382,7 +388,9 @@ impl<'w, W: Write> Interp<'w, W> {
                         let n = i64::try_from(items.len()).unwrap_or(i64::MAX);
                         let actual = if idx < 0 { idx + n } else { idx };
                         if actual < 0 || actual >= n {
-                            return Err(RuntimeError::native(format!("index {idx} out of bounds for length {n}")));
+                            return Err(RuntimeError::native(format!(
+                                "index {idx} out of bounds for length {n}"
+                            )));
                         }
                         Ok(items[actual as usize].clone())
                     }
@@ -391,16 +399,18 @@ impl<'w, W: Write> Interp<'w, W> {
                         let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
                         let actual = if idx < 0 { idx + n } else { idx };
                         if actual < 0 || actual >= n {
-                            return Err(RuntimeError::native(format!("index {idx} out of bounds for length {n}")));
+                            return Err(RuntimeError::native(format!(
+                                "index {idx} out of bounds for length {n}"
+                            )));
                         }
                         Ok(Value::Str(chars[actual as usize].to_string()))
                     }
                     other => Err(RuntimeError::native(format!("cannot index into {other}"))),
                 }
             }
-            ExprKind::Field { target, field } => {
+            HirExprKind::Field { target, field, .. } => {
                 let t = self.eval(target)?;
-                let name = field.name.as_str();
+                let name = field.as_str();
                 match (&t, name) {
                     (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
                     (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
@@ -418,22 +428,24 @@ impl<'w, W: Write> Interp<'w, W> {
                     }
                     (Value::Object(fields), _) => fields
                         .iter()
-                        .find(|(k, _)| k == &field.name)
+                        .find(|(k, _)| k == field)
                         .map(|(_, v)| v.clone())
-                        .ok_or_else(|| RuntimeError::native(format!("no field `{}` on object", field.name))),
-                    _ => Err(RuntimeError::native(format!("no field `{}` on {t}", field.name))),
+                        .ok_or_else(|| {
+                            RuntimeError::native(format!("no field `{field}` on object"))
+                        }),
+                    _ => Err(RuntimeError::native(format!("no field `{field}` on {t}"))),
                 }
             }
-            ExprKind::Lambda { params, body } => Ok(Value::Lambda(Rc::new(LambdaValue {
+            HirExprKind::Lambda { params, body } => Ok(Value::Lambda(Rc::new(LambdaValue {
                 params: params.clone(),
                 body: (**body).clone(),
                 env: self.env.clone(),
             }))),
-            ExprKind::Throw(inner) => {
+            HirExprKind::Throw(inner) => {
                 let v = self.eval(inner)?;
                 Err(RuntimeError::thrown(v))
             }
-            ExprKind::Try { try_block, catch } => match self.eval_block(try_block) {
+            HirExprKind::Try { try_block, catch } => match self.eval_block(try_block) {
                 Ok(v) => Ok(v),
                 Err(e) if e.thrown.is_some() => {
                     let Some(clause) = catch else {
@@ -441,13 +453,13 @@ impl<'w, W: Write> Interp<'w, W> {
                     };
                     let thrown = e.thrown.clone().unwrap();
                     if let Some(name) = &clause.binding {
-                        self.env.insert(name.name.clone(), thrown);
+                        self.env.insert(name.id, thrown);
                     }
                     self.eval_block(&clause.body)
                 }
                 Err(e) => Err(e),
             },
-            ExprKind::While { cond, body } => {
+            HirExprKind::While { cond, body } => {
                 loop {
                     let c = self.eval(cond)?;
                     if !is_truthy(&c) {
@@ -468,15 +480,15 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Void)
             }
-            ExprKind::Break => {
+            HirExprKind::Break => {
                 self.loop_signal = LoopSignal::Break;
                 Ok(Value::Void)
             }
-            ExprKind::Continue => {
+            HirExprKind::Continue => {
                 self.loop_signal = LoopSignal::Continue;
                 Ok(Value::Void)
             }
-            ExprKind::Call { callee, args } => {
+            HirExprKind::Call { callee, args } => {
                 let callee_value = self.eval(callee)?;
                 let mut evaluated = Vec::with_capacity(args.len());
                 for a in args {
@@ -487,37 +499,51 @@ impl<'w, W: Write> Interp<'w, W> {
         }
     }
 
+    fn lookup(&self, id: NameId, debug_name: &str) -> Result<Value, RuntimeError> {
+        // `$` 가드는 스코프 바인딩이 아니므로 NameId 가 없다. resolver 는 이를
+        // 건너뛰므로 `Ident("$")` 가 여기 도달할 수 있다.
+        if debug_name == "$" {
+            if let Some(v) = &self.dollar {
+                return Ok(v.clone());
+            }
+            return Err(RuntimeError::native("`$` used outside of a when guard"));
+        }
+        self.env.get(&id).cloned().ok_or_else(|| {
+            RuntimeError::native(format!("undefined variable `{debug_name}`"))
+        })
+    }
+
     fn call_value(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError> {
         match callee {
             Value::Function(func) => self.call_function(&func, args),
             Value::Lambda(lam) => self.call_lambda(&lam, args),
-            Value::BoundMethod { receiver, method } => {
-                self.call_method(*receiver, &method, args)
-            }
-            other => Err(RuntimeError::native(format!("value is not callable: {other}"))),
+            Value::BoundMethod { receiver, method } => self.call_method(*receiver, &method, args),
+            other => Err(RuntimeError::native(format!(
+                "value is not callable: {other}"
+            ))),
         }
     }
 
     fn call_lambda(&mut self, lam: &LambdaValue, args: Vec<Value>) -> Result<Value, RuntimeError> {
         if args.len() != lam.params.len() {
             return Err(RuntimeError::native(format!(
-                    "lambda expects {} arguments, got {}",
-                    lam.params.len(),
-                    args.len()
-                )));
+                "lambda expects {} arguments, got {}",
+                lam.params.len(),
+                args.len()
+            )));
         }
         let saved = std::mem::replace(&mut self.env, lam.env.clone());
         for (p, v) in lam.params.iter().zip(args.into_iter()) {
-            self.env.insert(p.name.name.clone(), v);
+            self.env.insert(p.name.id, v);
         }
         let saved_return = self.pending_return.take();
         let result = match &lam.body {
-            FunctionBody::Block(b) => {
+            HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
                 self.pending_return = None;
                 ctl.into_value()
             }
-            FunctionBody::Expr(e) => self.eval(e)?,
+            HirFunctionBody::Expr(e) => self.eval(e)?,
         };
         self.pending_return = saved_return;
         self.env = saved;
@@ -559,10 +585,13 @@ impl<'w, W: Write> Interp<'w, W> {
                 Ok(Value::Array(out))
             }
             (Value::Array(items), "reduce") => {
-                // reduce(init, fn)
                 let mut iter = args.into_iter();
-                let init = iter.next().ok_or_else(|| RuntimeError::native("reduce expects initial value and function"))?;
-                let fn_val = iter.next().ok_or_else(|| RuntimeError::native("reduce expects initial value and function"))?;
+                let init = iter.next().ok_or_else(|| {
+                    RuntimeError::native("reduce expects initial value and function")
+                })?;
+                let fn_val = iter.next().ok_or_else(|| {
+                    RuntimeError::native("reduce expects initial value and function")
+                })?;
                 let mut acc = init;
                 for v in items {
                     acc = self.call_value(fn_val.clone(), vec![acc, v])?;
@@ -600,9 +629,7 @@ impl<'w, W: Write> Interp<'w, W> {
             (Value::Str(s), "contains") => {
                 let needle = match args.into_iter().next() {
                     Some(Value::Str(v)) => v,
-                    _ => {
-                        return Err(RuntimeError::native("contains expects string argument"))
-                    }
+                    _ => return Err(RuntimeError::native("contains expects string argument")),
                 };
                 Ok(Value::Bool(s.contains(&needle)))
             }
@@ -610,15 +637,11 @@ impl<'w, W: Write> Interp<'w, W> {
                 let mut it = args.into_iter();
                 let from = match it.next() {
                     Some(Value::Str(v)) => v,
-                    _ => {
-                        return Err(RuntimeError::native("replace expects (from, to) strings"))
-                    }
+                    _ => return Err(RuntimeError::native("replace expects (from, to) strings")),
                 };
                 let to = match it.next() {
                     Some(Value::Str(v)) => v,
-                    _ => {
-                        return Err(RuntimeError::native("replace expects (from, to) strings"))
-                    }
+                    _ => return Err(RuntimeError::native("replace expects (from, to) strings")),
                 };
                 Ok(Value::Str(s.replace(&from, &to)))
             }
@@ -628,78 +651,70 @@ impl<'w, W: Write> Interp<'w, W> {
 
     fn call_function(
         &mut self,
-        func: &FunctionStmt,
+        func: &HirFunctionStmt,
         args: Vec<Value>,
     ) -> Result<Value, RuntimeError> {
         if args.len() != func.params.len() {
             return Err(RuntimeError::native(format!(
-                    "function `{}` expects {} arguments, got {}",
-                    func.name.name,
-                    func.params.len(),
-                    args.len()
-                )));
+                "function `{}` expects {} arguments, got {}",
+                func.name.name,
+                func.params.len(),
+                args.len()
+            )));
         }
-        // 함수 스코프 — 현재 환경을 저장/복원하여 간단 샌드박스.
+        // 함수 호출 스코프 — 커밋 21 에서 확립한 동작: 호출자 환경 전체를
+        // 복제해 파라미터로 오버레이하고, 호출 종료 시 원본으로 복원.
         let saved = std::mem::take(&mut self.env);
-        // 함수는 선언된 전역 스코프 전체를 볼 수 있다. 호출자 환경을
-        // 복사한 뒤 파라미터로 오버레이 — 본문에서 값을 바꿔도 호출자
-        // 환경에는 새지 않는다 (self.env = saved로 복원).
         self.env = saved.clone();
         for (p, v) in func.params.iter().zip(args.into_iter()) {
-            self.env.insert(p.name.name.clone(), v);
+            self.env.insert(p.name.id, v);
         }
-        // 이 호출 경계까지 pending_return 전파를 잠시 격리.
         let saved_return = self.pending_return.take();
         let result_value = match &func.body {
-            FunctionBody::Block(b) => {
+            HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
-                // return이 발생했으면 pending_return도 클리어.
                 self.pending_return = None;
                 ctl.into_value()
             }
-            FunctionBody::Expr(e) => self.eval(e)?,
+            HirFunctionBody::Expr(e) => self.eval(e)?,
         };
         self.pending_return = saved_return;
         self.env = saved;
         Ok(result_value)
     }
 
-    fn eval_block_ctl(&mut self, block: &Block) -> Result<ControlFlow, RuntimeError> {
+    fn eval_block_ctl(&mut self, block: &HirBlock) -> Result<ControlFlow, RuntimeError> {
         let last = block.stmts.len().saturating_sub(1);
         let mut final_value = Value::Void;
         for (i, s) in block.stmts.iter().enumerate() {
             let is_last = i == last;
             match s {
-                Stmt::Let(l) => {
+                HirStmt::Let(l) => {
                     let v = self.eval(&l.init)?;
-                    self.env.insert(l.name.name.clone(), v);
+                    self.env.insert(l.name.id, v);
                 }
-                Stmt::Const(c) => {
+                HirStmt::Const(c) => {
                     let v = self.eval(&c.init)?;
-                    self.env.insert(c.name.name.clone(), v);
+                    self.env.insert(c.name.id, v);
                 }
-                Stmt::Function(f) => {
+                HirStmt::Function(f) => {
                     self.env
-                        .insert(f.name.name.clone(), Value::Function(Rc::new((**f).clone())));
+                        .insert(f.name.id, Value::Function(Rc::new((**f).clone())));
                 }
-                Stmt::Struct(_) => {
-                    // noop — 타입 정보 기록만 필요하며 MVP에서는 생략.
-                }
-                Stmt::Return(r) => {
+                HirStmt::Struct(_) => {}
+                HirStmt::Return(r) => {
                     let v = match &r.value {
                         Some(e) => self.eval(e)?,
                         None => Value::Void,
                     };
-                    // 상위 블록/호출에 전파.
                     self.pending_return = Some(v.clone());
                     return Ok(ControlFlow::Return(v));
                 }
-                Stmt::Expr(e) => {
+                HirStmt::Expr(e) => {
                     let v = self.eval(e)?;
                     if let Some(ret) = self.pending_return.clone() {
                         return Ok(ControlFlow::Return(ret));
                     }
-                    // break/continue가 설정됐다면 블록 실행을 멈춘다.
                     if self.loop_signal != LoopSignal::None {
                         return Ok(ControlFlow::Normal(Value::Void));
                     }
@@ -712,42 +727,41 @@ impl<'w, W: Write> Interp<'w, W> {
         Ok(ControlFlow::Normal(final_value))
     }
 
-    fn eval_block(&mut self, block: &Block) -> Result<Value, RuntimeError> {
+    fn eval_block(&mut self, block: &HirBlock) -> Result<Value, RuntimeError> {
         Ok(self.eval_block_ctl(block)?.into_value())
     }
 
-    /// iter 표현식에서 `start..end` / `start..=end`를 해석.
-    /// MVP: range 리터럴(이항 연산 `..`/`..=`)만 지원. AST에는 별도 타입이 없어
-    /// 표현식 경로로 `start`와 `end`를 찾아 런타임에 평가한다.
-    fn interpret_range(&mut self, expr: &Expr) -> Result<(i64, i64, bool), RuntimeError> {
-        // `a..b`/`a..=b`는 AST에서 이항 연산이 아니라 범위 토큰이므로,
-        // Pattern의 Range처럼 처리되지 않는다. MVP에서는 파서가 Range를
-        // 표현식으로 노출하지 않으므로 여기서는 단일 이항 연산을 가정하지
-        // 않고, `iter`가 실제로는 Binary {op: Range...} 같은 형태가 아니다.
-        // 대안: iter 식이 이항 비교/산술이 아니라 범위라면, ExprKind에 Range를
-        // 추가해야 한다. 여기서는 그 추가가 되어있다고 가정하지 않고,
-        // expr의 kind를 직접 확인한다.
-        if let ExprKind::Range { start, end, inclusive } = &expr.kind {
+    fn interpret_range(&mut self, expr: &HirExpr) -> Result<(i64, i64, bool), RuntimeError> {
+        if let HirExprKind::Range {
+            start,
+            end,
+            inclusive,
+        } = &expr.kind
+        {
             let s = self.eval(start)?;
             let e = self.eval(end)?;
             match (s, e) {
                 (Value::Int(a), Value::Int(b)) => return Ok((a, b, *inclusive)),
-                _ => {
-                    return Err(RuntimeError::native("for loop range must be integer"));
-                }
+                _ => return Err(RuntimeError::native("for loop range must be integer")),
             }
         }
-        Err(RuntimeError::native("for loop requires a range expression (a..b or a..=b)"))
+        Err(RuntimeError::native(
+            "for loop requires a range expression (a..b or a..=b)",
+        ))
     }
 
-    fn pattern_matches(&mut self, pat: &Pattern, value: &Value) -> Result<bool, RuntimeError> {
+    fn pattern_matches(
+        &mut self,
+        pat: &HirPattern,
+        value: &Value,
+    ) -> Result<bool, RuntimeError> {
         Ok(match pat {
-            Pattern::Wildcard => true,
-            Pattern::Literal(lit) => {
+            HirPattern::Wildcard => true,
+            HirPattern::Literal(lit) => {
                 let expected = self.eval(lit)?;
                 values_equal(&expected, value)
             }
-            Pattern::Range {
+            HirPattern::Range {
                 start,
                 end,
                 inclusive,
@@ -765,16 +779,11 @@ impl<'w, W: Write> Interp<'w, W> {
                     _ => false,
                 }
             }
-            Pattern::Guard(expr) => {
-                // `$`는 현재 값(value)으로 치환해 평가. MVP: 단순히 일시적
-                // 바인딩으로 `$`를 환경에 주입하여 expr 평가.
-                let previous = self.env.insert("$".to_string(), value.clone());
+            HirPattern::Guard(expr) => {
+                // `$` 슬롯에 현재값을 바인딩하고 평가, 끝나면 복원.
+                let previous = self.dollar.replace(value.clone());
                 let result = self.eval(expr)?;
-                if let Some(p) = previous {
-                    self.env.insert("$".to_string(), p);
-                } else {
-                    self.env.remove("$");
-                }
+                self.dollar = previous;
                 is_truthy(&result)
             }
         })
@@ -786,17 +795,15 @@ impl<'w, W: Write> Interp<'w, W> {
 }
 
 /// void-scope 자동 출력을 피해야 하는 표현식인지.
-/// 부수효과 전용 문법(@out 호출, 대입, 제어 흐름 블록, 함수 호출)은
-/// 자동 출력 제외.
-fn has_side_effect(expr: &Expr) -> bool {
+fn has_side_effect(expr: &HirExpr) -> bool {
     matches!(
         &expr.kind,
-        ExprKind::Domain { .. }
-            | ExprKind::Assign { .. }
-            | ExprKind::Block(_)
-            | ExprKind::If { .. }
-            | ExprKind::When { .. }
-            | ExprKind::Call { .. }
+        HirExprKind::Domain { .. }
+            | HirExprKind::Assign { .. }
+            | HirExprKind::Block(_)
+            | HirExprKind::If { .. }
+            | HirExprKind::When { .. }
+            | HirExprKind::Call { .. }
     )
 }
 
@@ -806,7 +813,9 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value, RuntimeError> {
         (UnaryOp::Neg, Value::Int(i)) => Ok(Value::Int(-i)),
         (UnaryOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
         (UnaryOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
-        (op, v) => Err(RuntimeError::native(format!("unsupported unary `{op:?}` on {v}"))),
+        (op, v) => Err(RuntimeError::native(format!(
+            "unsupported unary `{op:?}` on {v}"
+        ))),
     }
 }
 
@@ -835,11 +844,12 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError>
         (Ge, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
         (And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
         (Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
-        (op, l, r) => Err(RuntimeError::native(format!("unsupported binary `{op:?}` on {l} and {r}"))),
+        (op, l, r) => Err(RuntimeError::native(format!(
+            "unsupported binary `{op:?}` on {l} and {r}"
+        ))),
     }
 }
 
-/// 문자열 보간에 쓰일 값의 사용자 표시.
 fn value_to_display(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
@@ -885,7 +895,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orv_analyzer::lower;
     use orv_diagnostics::FileId;
+    use orv_resolve::resolve;
     use orv_syntax::{lex, parse};
 
     fn run_str(src: &str) -> Result<String, RuntimeError> {
@@ -893,8 +905,15 @@ mod tests {
         assert!(lx.diagnostics.is_empty(), "lex errors: {:?}", lx.diagnostics);
         let pr = parse(lx.tokens, FileId(0));
         assert!(pr.diagnostics.is_empty(), "parse errors: {:?}", pr.diagnostics);
+        let resolved = resolve(&pr.program);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "resolve errors: {:?}",
+            resolved.diagnostics
+        );
+        let hir = lower(&pr.program, &resolved);
         let mut buf = Vec::new();
-        run_with_writer(&pr.program, &mut buf)?;
+        run_with_writer(&hir, &mut buf)?;
         Ok(String::from_utf8(buf).unwrap())
     }
 
@@ -906,10 +925,12 @@ mod tests {
 
     #[test]
     fn void_scope_autooutput_string() {
-        // 마지막이 아닌 문자열은 자동 출력
-        let out = run_str(r#""first"
+        let out = run_str(
+            r#""first"
 "second"
-@out "third""#).unwrap();
+@out "third""#,
+        )
+        .unwrap();
         assert_eq!(out, "first\nsecond\nthird\n");
     }
 
@@ -920,7 +941,8 @@ mod tests {
             let name: string = "Alice"
             @out name
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "Alice\n");
     }
 
@@ -931,7 +953,8 @@ mod tests {
             let n: int = 1 + 2 * 3
             @out n
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "7\n");
     }
 
@@ -943,7 +966,8 @@ mod tests {
             let b: string = "World"
             @out a + b
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "Hello, World\n");
     }
 
@@ -954,19 +978,14 @@ mod tests {
     }
 
     #[test]
-    fn undefined_variable_errors() {
-        let err = run_str("@out missing").unwrap_err();
-        assert!(err.message.contains("undefined"));
-    }
-
-    #[test]
     fn string_interpolation() {
         let out = run_str(
             r#"
             let name: string = "Alice"
             @out "Hello, {name}!"
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "Hello, Alice!\n");
     }
 
@@ -977,7 +996,8 @@ mod tests {
             let x: int = 7
             @out "answer: {x * 6}"
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "answer: 42\n");
     }
 
@@ -1004,7 +1024,8 @@ mod tests {
               @out "non-positive"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "positive\n");
     }
 
@@ -1019,7 +1040,8 @@ mod tests {
               @out "non-positive"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "non-positive\n");
     }
 
@@ -1036,7 +1058,8 @@ mod tests {
               @out "zero"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "zero\n");
     }
 
@@ -1051,7 +1074,8 @@ mod tests {
               _ -> @out "many"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "two\n");
     }
 
@@ -1065,7 +1089,8 @@ mod tests {
               _ -> @out "other"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "other\n");
     }
 
@@ -1079,7 +1104,8 @@ mod tests {
               _ -> @out "big"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "digit\n");
     }
 
@@ -1093,7 +1119,8 @@ mod tests {
               _ -> @out "le5"
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "gt5\n");
     }
 
@@ -1106,11 +1133,10 @@ mod tests {
             count = count + 1
             @out count
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "2\n");
     }
-
-    // ── 함수 선언 / 호출 ──
 
     #[test]
     fn function_call_basic() {
@@ -1121,7 +1147,8 @@ mod tests {
             }
             @out add(2, 3)
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "5\n");
     }
 
@@ -1132,7 +1159,8 @@ mod tests {
             function double(x: int): int -> x * 2
             @out double(7)
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "14\n");
     }
 
@@ -1147,7 +1175,8 @@ mod tests {
             @out abs(-4)
             @out abs(9)
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "4\n9\n");
     }
 
@@ -1161,11 +1190,10 @@ mod tests {
             }
             @out fact(5)
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "120\n");
     }
-
-    // ── throw / try / catch ──
 
     #[test]
     fn try_catch_string_error() {
@@ -1232,8 +1260,6 @@ mod tests {
         .unwrap();
         assert_eq!(out, "caught code 500\n");
     }
-
-    // ── 람다 / 배열·문자열 메서드 ──
 
     #[test]
     fn lambda_literal_call() {
@@ -1352,8 +1378,6 @@ mod tests {
         assert_eq!(out, "90\n");
     }
 
-    // ── struct / 객체 리터럴 ──
-
     #[test]
     fn struct_decl_and_object_field_access() {
         let out = run_str(
@@ -1407,8 +1431,6 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("no field"));
     }
-
-    // ── 배열 / 인덱싱 / 필드 ──
 
     #[test]
     fn array_literal_and_length() {
@@ -1478,8 +1500,6 @@ mod tests {
         assert_eq!(out, "50\n");
     }
 
-    // ── 루프 ──
-
     #[test]
     fn for_range_exclusive() {
         let out = run_str(
@@ -1488,7 +1508,8 @@ mod tests {
               @out i
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "0\n1\n2\n");
     }
 
@@ -1500,7 +1521,8 @@ mod tests {
               @out i
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "1\n2\n3\n");
     }
 
@@ -1514,7 +1536,8 @@ mod tests {
               n = n + 1
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "0\n1\n2\n");
     }
 
@@ -1527,7 +1550,8 @@ mod tests {
               @out i
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "0\n1\n");
     }
 
@@ -1540,7 +1564,8 @@ mod tests {
               @out i
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "0\n1\n3\n4\n");
     }
 
@@ -1554,7 +1579,8 @@ mod tests {
               }
             }
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "0,0\n0,1\n1,0\n1,1\n");
     }
 
@@ -1565,20 +1591,21 @@ mod tests {
             function f(a: int, b: int): int -> a + b
             @out f(1)
             "#,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(err.message.contains("expects 2 arguments"));
     }
 
     #[test]
     fn block_value_from_last_expr() {
-        // if 표현식 값 사용
         let out = run_str(
             r#"
             let n: int = 5
             let label: string = if n > 0 { "plus" } else { "neg" }
             @out label
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out, "plus\n");
     }
 }
