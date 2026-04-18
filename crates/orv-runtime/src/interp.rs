@@ -24,6 +24,40 @@ use std::fmt;
 use std::io::Write;
 use std::rc::Rc;
 
+/// HTTP 요청 컨텍스트 — `@param`/`@query`/`@header`/`@body`/`@request` 가
+/// 조회하는 키-값 저장소.
+///
+/// C5 에서 tokio/hyper 가 실제 요청을 파싱해 채운다. 테스트는 수동으로
+/// 채워서 [`run_handler_with_request`] 로 주입한다.
+#[derive(Clone, Debug)]
+pub struct RequestCtx {
+    /// HTTP 메서드.
+    pub method: String,
+    /// 요청 경로 (매칭된 원본).
+    pub path: String,
+    /// 경로 매개변수 (`:id` → `"42"`).
+    pub params: HashMap<String, String>,
+    /// 쿼리 매개변수.
+    pub query: HashMap<String, String>,
+    /// 요청 헤더.
+    pub headers: HashMap<String, String>,
+    /// 파싱된 body. MVP 는 JSON 파싱 전 원문 문자열이거나 void.
+    pub body: Value,
+}
+
+impl Default for RequestCtx {
+    fn default() -> Self {
+        Self {
+            method: String::new(),
+            path: String::new(),
+            params: HashMap::new(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: Value::Void,
+        }
+    }
+}
+
 /// 런타임 에러.
 ///
 /// `thrown` 필드에 사용자 `throw` 값이 담긴 경우 try/catch 가 잡아낼 수
@@ -182,6 +216,23 @@ pub fn run_with_writer<W: Write>(program: &HirProgram, writer: &mut W) -> Result
     interp.run(program)
 }
 
+/// 요청 컨텍스트를 주입한 상태에서 단일 표현식(보통 `@route` handler 의
+/// HIR 노드나 그 block)을 평가한다. C5 의 HTTP 런타임이 요청마다 호출하는
+/// 기본 진입점이며, C3 에서는 request-state 도메인 동작을 검증하기 위한
+/// 테스트 인터페이스이기도 하다.
+///
+/// # Errors
+/// 평가 중 타입 불일치, 미지원 도메인 등.
+pub fn run_handler_with_request<W: Write>(
+    handler: &HirExpr,
+    request: RequestCtx,
+    writer: &mut W,
+) -> Result<Value, RuntimeError> {
+    let mut interp = Interp::new(writer);
+    interp.request = Some(request);
+    interp.eval(handler)
+}
+
 struct Interp<'w, W: Write> {
     env: HashMap<NameId, Value>,
     writer: &'w mut W,
@@ -194,6 +245,11 @@ struct Interp<'w, W: Write> {
     /// `take()` 해 격리 — HTML body 안에서 호출된 함수의 `@out` 은 stdout
     /// 으로 나간다.
     html_buffer: Option<String>,
+    /// 현재 처리 중인 HTTP 요청. `@param`/`@query`/`@header`/`@body`/
+    /// `@request` 가 이 컨텍스트를 읽는다. `html_buffer` 와 달리 함수 호출
+    /// 경계에서 격리하지 않는다 — 요청 전체 수명 동안 유효하며 handler 가
+    /// 부른 함수 안에서도 접근 가능해야 한다.
+    request: Option<RequestCtx>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -205,6 +261,7 @@ impl<'w, W: Write> Interp<'w, W> {
             loop_signal: LoopSignal::None,
             dollar: None,
             html_buffer: None,
+            request: None,
         }
     }
 
@@ -324,15 +381,19 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             HirExprKind::Domain { name, args, .. } => {
                 // HTML 렌더 모드에서는 임의 이름의 도메인이 태그로 해석된다.
-                // 일반 모드에서는 아직 지원하지 않는 도메인이므로 에러.
                 if self.html_buffer.is_some() {
                     self.render_tag(name, args)?;
-                    Ok(Value::Void)
-                } else {
-                    Err(RuntimeError::native(format!(
-                        "unsupported domain `@{name}` in MVP interpreter"
-                    )))
+                    return Ok(Value::Void);
                 }
+                // 요청 컨텍스트가 있다면 request-state 도메인을 해석한다.
+                if self.request.is_some() {
+                    if let Some(v) = self.eval_request_domain(name)? {
+                        return Ok(v);
+                    }
+                }
+                Err(RuntimeError::native(format!(
+                    "unsupported domain `@{name}` in MVP interpreter"
+                )))
             }
             HirExprKind::Block(b) => self.eval_block(b),
             HirExprKind::If {
@@ -827,6 +888,34 @@ impl<'w, W: Write> Interp<'w, W> {
                 is_truthy(&result)
             }
         })
+    }
+
+    /// 요청 컨텍스트가 있을 때 request-state 도메인 (`@param`, `@query`,
+    /// `@header`, `@body`, `@request`) 을 평가한다. 맵 성격은 `Value::Object`
+    /// 로 노출되어 기존 `.field` 접근 경로로 조회된다. 지원하지 않는 이름은
+    /// `None` 을 돌려 상위가 unsupported domain 에러로 보고하게 한다.
+    fn eval_request_domain(&self, name: &str) -> Result<Option<Value>, RuntimeError> {
+        let Some(ctx) = &self.request else {
+            return Ok(None);
+        };
+        let map_to_object = |m: &HashMap<String, String>| -> Value {
+            Value::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+                    .collect(),
+            )
+        };
+        Ok(Some(match name {
+            "param" => map_to_object(&ctx.params),
+            "query" => map_to_object(&ctx.query),
+            "header" => map_to_object(&ctx.headers),
+            "body" => ctx.body.clone(),
+            "request" => Value::Object(vec![
+                ("method".into(), Value::Str(ctx.method.clone())),
+                ("path".into(), Value::Str(ctx.path.clone())),
+            ]),
+            _ => return Ok(None),
+        }))
     }
 
     /// HTML 모드에서 `@tag ...` 도메인 호출 하나를 현재 버퍼에 렌더한다.
@@ -1697,6 +1786,105 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "<html><p>hello world</p></html>\n");
+    }
+
+    // ── request-state 도메인 (@param/@query/@header/@body/@request) ──
+
+    fn eval_handler_src(src: &str, ctx: RequestCtx) -> Result<String, RuntimeError> {
+        let lx = lex(src, FileId(0));
+        assert!(lx.diagnostics.is_empty(), "lex errors: {:?}", lx.diagnostics);
+        let pr = parse(lx.tokens, FileId(0));
+        assert!(pr.diagnostics.is_empty(), "parse errors: {:?}", pr.diagnostics);
+        let resolved = resolve(&pr.program);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "resolve errors: {:?}",
+            resolved.diagnostics
+        );
+        let hir = lower(&pr.program, &resolved);
+        // 단일 표현식 프로그램을 가정 — 그 표현식을 handler 처럼 평가한다.
+        let orv_hir::HirStmt::Expr(expr) = &hir.items[0] else {
+            panic!("expected expr stmt");
+        };
+        let mut buf = Vec::new();
+        let _ = run_handler_with_request(expr, ctx, &mut buf)?;
+        Ok(String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn request_param_field_access() {
+        let ctx = RequestCtx {
+            method: "GET".into(),
+            path: "/users/42".into(),
+            params: [("id".into(), "42".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @param.id"#, ctx).unwrap();
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn request_query_field_access() {
+        let ctx = RequestCtx {
+            query: [("page".into(), "2".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @query.page"#, ctx).unwrap();
+        assert_eq!(out, "2\n");
+    }
+
+    #[test]
+    fn request_header_field_access() {
+        let ctx = RequestCtx {
+            headers: [("Authorization".into(), "Bearer x".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @header.Authorization"#, ctx).unwrap();
+        assert_eq!(out, "Bearer x\n");
+    }
+
+    #[test]
+    fn request_body_returns_value() {
+        let ctx = RequestCtx {
+            body: Value::Str("raw body".into()),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @body"#, ctx).unwrap();
+        assert_eq!(out, "raw body\n");
+    }
+
+    #[test]
+    fn request_meta_method_and_path() {
+        let ctx = RequestCtx {
+            method: "POST".into(),
+            path: "/items".into(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"@out "{@request.method} {@request.path}""#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "POST /items\n");
+    }
+
+    #[test]
+    fn request_missing_param_is_void() {
+        // 없는 키 조회 → Value::Void. `??` 로 대체값 사용 가능.
+        let ctx = RequestCtx::default();
+        // @out 은 void 를 빈 줄로 출력.
+        let out = eval_handler_src(r#"@out @param.missing"#, ctx).unwrap_err();
+        // MVP: 객체에 없는 필드는 기존 Field 평가가 "no field" 에러로 처리.
+        assert!(out.message.contains("no field"));
+    }
+
+    #[test]
+    fn request_domain_without_context_is_unsupported() {
+        // request ctx 가 없으면 `@param` 등은 unsupported 에러.
+        let err = run_str(r#"@out @param.id"#).unwrap_err();
+        assert!(err.message.contains("unsupported domain"));
     }
 
     #[test]

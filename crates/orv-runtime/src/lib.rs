@@ -7,4 +7,4 @@
 
 pub mod interp;
 
-pub use interp::{run, run_with_writer, RuntimeError, Value};
+pub use interp::{run, run_handler_with_request, run_with_writer, RequestCtx, RuntimeError, Value};
