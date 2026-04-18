@@ -972,6 +972,12 @@ impl Parser {
             span: at_tok.span,
         };
 
+        // `@route` 는 `METHOD PATH BLOCK` 3-인자로 고정 파싱한다. 일반
+        // 도메인의 1-인자 규약을 건드리지 않기 위해 이름 기준으로 분기.
+        if name_ident.name == "route" {
+            return self.parse_route_call(name_ident);
+        }
+
         let mut args = Vec::new();
         let mut end_span = at_tok.span;
         if self.is_domain_arg_start() {
@@ -987,6 +993,91 @@ impl Parser {
                 args,
             },
             span: at_tok.span.join(end_span),
+        })
+    }
+
+    /// `@route METHOD PATH { body }` 를 `Domain { args: [Ident, String, Block] }`
+    /// 형태로 파싱한다. HIR 로 낮출 때 전용 variant 로 분해된다.
+    ///
+    /// path 합성은 토큰 원문을 차례로 이어붙인다. 소스 문자열이 파서에
+    /// 없으므로 각 토큰을 [`token_source_repr`] 로 재구성한다. SPEC 상 path
+    /// 에는 공백이 없으므로 이 방식이 충분하다.
+    fn parse_route_call(&mut self, name_ident: Ident) -> Option<Expr> {
+        let start_span = name_ident.span;
+
+        // method — ident 또는 `*`.
+        let method_expr = match self.peek_kind().clone() {
+            TokenKind::Ident(m) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::Ident(Ident {
+                        name: m,
+                        span: tok.span,
+                    }),
+                    span: tok.span,
+                }
+            }
+            TokenKind::Star => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::Ident(Ident {
+                        name: "*".to_string(),
+                        span: tok.span,
+                    }),
+                    span: tok.span,
+                }
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error("expected HTTP method after `@route`")
+                        .with_primary(self.peek().span, ""),
+                );
+                return None;
+            }
+        };
+
+        // path — `/` 또는 `*` 로 시작하는 토큰을 `{` 만날 때까지 이어 붙임.
+        let path_start = self.peek().span;
+        let mut path_end = path_start;
+        let mut path_text = String::new();
+        if !matches!(
+            self.peek_kind(),
+            TokenKind::Slash | TokenKind::Star
+        ) {
+            self.diagnostics.push(
+                Diagnostic::error("expected path starting with `/` or `*` after HTTP method")
+                    .with_primary(self.peek().span, ""),
+            );
+            return None;
+        }
+        while !matches!(
+            self.peek_kind(),
+            TokenKind::LBrace | TokenKind::Eof
+        ) {
+            let tok = self.advance();
+            path_end = tok.span;
+            path_text.push_str(&token_source_repr(&tok.kind));
+        }
+        let path_span = path_start.join(path_end);
+        let path_expr = Expr {
+            kind: ExprKind::String(vec![StringSegment::Str(path_text)]),
+            span: path_span,
+        };
+
+        // body — `{ ... }` 블록.
+        let block = self.parse_block()?;
+        let block_span = block.span;
+        let block_expr = Expr {
+            kind: ExprKind::Block(block),
+            span: block_span,
+        };
+
+        Some(Expr {
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args: vec![method_expr, path_expr, block_expr],
+            },
+            span: start_span.join(block_span),
         })
     }
 
@@ -1184,6 +1275,27 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Keyword(kw) => format!("keyword `{kw:?}`").to_lowercase(),
         TokenKind::Eof => "end of file".into(),
         other => format!("`{other:?}`"),
+    }
+}
+
+/// `@route` 경로 합성용 — 각 토큰을 소스에 실제로 적힌 문자열로 복원한다.
+/// 공백이 없다고 가정되는 path 영역에서만 쓰이므로 완벽한 round-trip 은
+/// 필요 없다. 경로에 실제 등장할 수 있는 토큰만 처리.
+fn token_source_repr(kind: &TokenKind) -> String {
+    match kind {
+        TokenKind::Slash => "/".into(),
+        TokenKind::Star => "*".into(),
+        TokenKind::Colon => ":".into(),
+        TokenKind::Dot => ".".into(),
+        TokenKind::Minus => "-".into(),
+        TokenKind::Ident(name) => name.clone(),
+        TokenKind::Integer(s) | TokenKind::Float(s) => s.clone(),
+        TokenKind::True => "true".into(),
+        TokenKind::False => "false".into(),
+        // path 에 등장하지 않아야 하는 토큰들이 여기로 떨어지면 빈 문자열을
+        // 반환한다 — 상위 호출자가 `{`/`Eof` 를 만나기 전에 멈추므로 실제로
+        // 도달할 일은 없다.
+        _ => String::new(),
     }
 }
 
@@ -1592,5 +1704,84 @@ mod tests {
         assert_eq!(name.name, "out");
         assert_eq!(args.len(), 1);
         assert!(matches!(r.program.items[1], Stmt::Let(_)));
+    }
+
+    fn route_args(stmt: &Stmt) -> &Vec<Expr> {
+        let Stmt::Expr(e) = stmt else {
+            panic!("expected expr stmt, got {stmt:?}");
+        };
+        let ExprKind::Domain { name, args } = &e.kind else {
+            panic!("expected domain");
+        };
+        assert_eq!(name.name, "route");
+        args
+    }
+
+    fn route_method_and_path(stmt: &Stmt) -> (String, String) {
+        let args = route_args(stmt);
+        assert_eq!(args.len(), 3, "@route expects 3 args (method, path, body)");
+        let method = match &args[0].kind {
+            ExprKind::Ident(id) => id.name.clone(),
+            other => panic!("expected method ident, got {other:?}"),
+        };
+        let path = plain_string(&args[1])
+            .expect("path must be plain string literal")
+            .to_string();
+        assert!(
+            matches!(args[2].kind, ExprKind::Block(_)),
+            "body must be block, got {:?}",
+            args[2].kind
+        );
+        (method, path)
+    }
+
+    #[test]
+    fn route_get_static_path() {
+        let r = parse_str(r#"@route GET /api/users { @out "list" }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (method, path) = route_method_and_path(&r.program.items[0]);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/api/users");
+    }
+
+    #[test]
+    fn route_with_param() {
+        let r = parse_str(r#"@route POST /users/:id { @out "create" }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (method, path) = route_method_and_path(&r.program.items[0]);
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/users/:id");
+    }
+
+    #[test]
+    fn route_with_multiple_params() {
+        let r = parse_str(
+            r#"@route DELETE /api/v1/users/:userId/posts/:postId { @out "x" }"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (method, path) = route_method_and_path(&r.program.items[0]);
+        assert_eq!(method, "DELETE");
+        assert_eq!(path, "/api/v1/users/:userId/posts/:postId");
+    }
+
+    #[test]
+    fn route_wildcard() {
+        let r = parse_str(r#"@route GET * { @out "fallback" }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (method, path) = route_method_and_path(&r.program.items[0]);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "*");
+    }
+
+    #[test]
+    fn route_preserves_existing_single_arg_domains() {
+        // `@out x` 와 `@html { ... }` 는 기존 동작 유지 — route 전용
+        // 파싱이 다른 도메인에 누수되면 안 된다.
+        let r = parse_str(r#"
+            @out "hi"
+            @out @html { @p "x" }
+        "#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert_eq!(r.program.items.len(), 2);
     }
 }
