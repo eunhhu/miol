@@ -16,8 +16,8 @@
 //! 최적화로 미룬다.
 
 use orv_hir::{
-    BinaryOp, HirBlock, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt, HirHtmlNode,
-    HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, NameId, UnaryOp,
+    BinaryOp, HirBlock, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt, HirParam,
+    HirPattern, HirProgram, HirStmt, HirStringSegment, NameId, UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -189,6 +189,11 @@ struct Interp<'w, W: Write> {
     loop_signal: LoopSignal,
     /// when 가드의 `$` — 스코프 바인딩이 아니므로 별도 슬롯에 보관한다.
     dollar: Option<Value>,
+    /// HTML 렌더 모드 버퍼. `Some` 이면 `@tag` 도메인 호출과 자동 출력이
+    /// stdout 대신 이 버퍼에 쌓인다. 함수/람다 호출 경계에서는 잠시
+    /// `take()` 해 격리 — HTML body 안에서 호출된 함수의 `@out` 은 stdout
+    /// 으로 나간다.
+    html_buffer: Option<String>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -199,6 +204,7 @@ impl<'w, W: Write> Interp<'w, W> {
             pending_return: None,
             loop_signal: LoopSignal::None,
             dollar: None,
+            html_buffer: None,
         }
     }
 
@@ -287,14 +293,17 @@ impl<'w, W: Write> Interp<'w, W> {
                 let r = self.eval(rhs)?;
                 apply_binary(*op, l, r)
             }
-            HirExprKind::Html(nodes) => {
-                // `<html>` 루트로 감싸는 SPEC §10.1 규약.
-                let mut rendered = String::from("<html>");
-                for node in nodes {
-                    self.render_html_node(node, &mut rendered)?;
-                }
-                rendered.push_str("</html>");
-                Ok(Value::Str(rendered))
+            HirExprKind::Html(block) => {
+                // HTML 렌더 모드 진입. 기존 버퍼(중첩 @html 허용)를 잠시 치워
+                // 새 버퍼로 바꾸고, 블록을 평가한 뒤 결과를 `<html>...</html>`
+                // 로 감싼다. 블록의 반환 값은 버려진다 — 태그가 버퍼에
+                // 누적된 것만 HTML 이다.
+                let saved = self.html_buffer.replace(String::new());
+                let block_result = self.eval_block(block);
+                let rendered = self.html_buffer.take().unwrap_or_default();
+                self.html_buffer = saved;
+                block_result?;
+                Ok(Value::Str(format!("<html>{rendered}</html>")))
             }
             HirExprKind::Out(arg) => {
                 let v = self.eval(arg)?;
@@ -307,9 +316,18 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Void)
             }
-            HirExprKind::Domain { name, .. } => Err(RuntimeError::native(format!(
-                "unsupported domain `@{name}` in MVP interpreter"
-            ))),
+            HirExprKind::Domain { name, args, .. } => {
+                // HTML 렌더 모드에서는 임의 이름의 도메인이 태그로 해석된다.
+                // 일반 모드에서는 아직 지원하지 않는 도메인이므로 에러.
+                if self.html_buffer.is_some() {
+                    self.render_tag(name, args)?;
+                    Ok(Value::Void)
+                } else {
+                    Err(RuntimeError::native(format!(
+                        "unsupported domain `@{name}` in MVP interpreter"
+                    )))
+                }
+            }
             HirExprKind::Block(b) => self.eval_block(b),
             HirExprKind::If {
                 cond,
@@ -545,6 +563,10 @@ impl<'w, W: Write> Interp<'w, W> {
             self.env.insert(p.name.id, v);
         }
         let saved_return = self.pending_return.take();
+        // HTML 렌더 모드는 호출 경계에서 격리한다. 호출된 람다 본문의
+        // `@tag` 는 호출자의 HTML 에 섞이지 않고 기본 모드(태그 미지원)로
+        // 평가된다.
+        let saved_html = self.html_buffer.take();
         let result = match &lam.body {
             HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
@@ -553,6 +575,7 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             HirFunctionBody::Expr(e) => self.eval(e)?,
         };
+        self.html_buffer = saved_html;
         self.pending_return = saved_return;
         self.env = saved;
         Ok(result)
@@ -678,6 +701,8 @@ impl<'w, W: Write> Interp<'w, W> {
             self.env.insert(p.name.id, v);
         }
         let saved_return = self.pending_return.take();
+        // call_lambda 와 동일한 이유로 HTML 렌더 모드를 격리.
+        let saved_html = self.html_buffer.take();
         let result_value = match &func.body {
             HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
@@ -686,6 +711,7 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             HirFunctionBody::Expr(e) => self.eval(e)?,
         };
+        self.html_buffer = saved_html;
         self.pending_return = saved_return;
         self.env = saved;
         Ok(result_value)
@@ -797,29 +823,43 @@ impl<'w, W: Write> Interp<'w, W> {
         })
     }
 
-    fn render_html_node(
-        &mut self,
-        node: &HirHtmlNode,
-        out: &mut String,
-    ) -> Result<(), RuntimeError> {
-        match node {
-            HirHtmlNode::Element { name, children, .. } => {
-                out.push('<');
-                out.push_str(name);
-                out.push('>');
-                for child in children {
-                    self.render_html_node(child, out)?;
+    /// HTML 모드에서 `@tag ...` 도메인 호출 하나를 현재 버퍼에 렌더한다.
+    ///
+    /// - `@tag { ... }` — block 인자면 블록 본문을 HTML 모드로 재귀 평가.
+    ///   태그 사이에 자식 태그/텍스트가 누적된다.
+    /// - `@tag expr` — expr 을 평가해 텍스트 콘텐츠로 넣는다.
+    /// - `@tag` — 빈 태그.
+    fn render_tag(&mut self, name: &str, args: &[HirExpr]) -> Result<(), RuntimeError> {
+        self.html_push(&format!("<{name}>"));
+        if let Some(arg) = args.first() {
+            match &arg.kind {
+                HirExprKind::Block(inner) => {
+                    self.eval_block(inner)?;
                 }
-                out.push_str("</");
-                out.push_str(name);
-                out.push('>');
-            }
-            HirHtmlNode::Text(expr) => {
-                let v = self.eval(expr)?;
-                out.push_str(&value_to_display(&v));
+                _ => {
+                    let v = self.eval(arg)?;
+                    self.html_push_value(&v);
+                }
             }
         }
+        self.html_push(&format!("</{name}>"));
         Ok(())
+    }
+
+    /// 현재 HTML 버퍼에 문자열을 붙인다. 버퍼가 없으면 noop (방어적).
+    fn html_push(&mut self, s: &str) {
+        if let Some(buf) = self.html_buffer.as_mut() {
+            buf.push_str(s);
+        }
+    }
+
+    /// 값을 문자열로 변환해 HTML 버퍼에 붙인다. void 는 무시.
+    fn html_push_value(&mut self, v: &Value) {
+        if matches!(v, Value::Void) {
+            return;
+        }
+        let s = value_to_display(v);
+        self.html_push(&s);
     }
 
     fn println(&mut self, v: &Value) -> Result<(), RuntimeError> {
@@ -1649,6 +1689,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "<html><p>hello world</p></html>\n");
+    }
+
+    #[test]
+    fn html_for_loop_produces_list() {
+        // HTML 전용 제어 흐름 없이 기존 `for` 가 그대로 동작해야 한다.
+        let out = run_str(r#"@out @html { for i in 0..3 { @li "{i}" } }"#).unwrap();
+        assert_eq!(out, "<html><li>0</li><li>1</li><li>2</li></html>\n");
+    }
+
+    #[test]
+    fn html_if_inside_for() {
+        let out = run_str(
+            r#"@out @html {
+              for i in 0..3 {
+                @span i
+                if i == 0 { @div "first" }
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "<html><span>0</span><div>first</div><span>1</span><span>2</span></html>\n"
+        );
+    }
+
+    #[test]
+    fn html_function_call_isolates_render_mode() {
+        // 함수 본문의 `@out` 은 stdout 으로, HTML 버퍼에 섞이면 안 된다.
+        let out = run_str(
+            r#"
+            function log(msg: string) -> @out "[log] {msg}"
+            let page: string = @html {
+              log("rendering")
+              @p "content"
+            }
+            @out page
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "[log] rendering\n<html><p>content</p></html>\n");
     }
 
     #[test]

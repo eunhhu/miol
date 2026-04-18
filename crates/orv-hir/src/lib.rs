@@ -265,10 +265,12 @@ pub enum HirExprKind {
     Out(Box<HirExpr>),
     /// `@html { ... }` — HTML 문서 트리 루트.
     ///
-    /// 본문은 태그 트리 [`HirHtmlNode`] 로 lower 된다. 런타임은 이 트리를
-    /// 문자열로 렌더하여 `<html>...</html>` 래퍼를 씌운 결과를 반환한다.
-    /// 속성, 이벤트 바인딩, `sig` 반응성은 이번 단계 범위 밖.
-    Html(Vec<HirHtmlNode>),
+    /// 본문은 평범한 HIR 블록이다. 런타임은 이 블록을 "HTML 렌더 모드" 로
+    /// 평가하며, 그 동안 도메인 호출(`@p`, `@head` 등)과 평가 결과 문자열은
+    /// 태그/텍스트로 버퍼에 누적된다. `for`/`if`/`let`/함수 호출 같은 기존
+    /// 문법은 그대로 동작 — HTML 전용 문법을 새로 학습할 필요 없음.
+    /// 결과는 `<html>...</html>` 래퍼를 씌운 `Value::Str`.
+    Html(HirBlock),
     /// 아직 전용 variant 로 분해되지 않은 도메인 호출.
     ///
     /// 도메인이 정식 variant 를 받으면 lowering 이 이쪽에 떨어뜨리지 않고
@@ -507,26 +509,6 @@ pub enum BinaryOp {
     Shr,
     /// `??`.
     Coalesce,
-}
-
-/// `@html` 트리의 노드.
-///
-/// 요소는 태그 이름과 자식 목록을 가진다. 자식은 또 다른 요소이거나
-/// 런타임에 문자열로 평가될 텍스트 표현식이다. 속성/이벤트/조건부 생성은
-/// 이번 단계 범위 밖이며, 필요해질 때 variant 를 확장한다.
-#[derive(Clone, Debug)]
-pub enum HirHtmlNode {
-    /// `<name> children </name>` 형태의 태그.
-    Element {
-        /// 태그 이름 (`head`, `body`, `p` 등).
-        name: String,
-        /// 태그 이름 스팬.
-        name_span: Span,
-        /// 자식 노드.
-        children: Vec<HirHtmlNode>,
-    },
-    /// 임의 표현식을 평가해 텍스트 콘텐츠로 흘린다.
-    Text(HirExpr),
 }
 
 /// HIR 타입 슬롯.

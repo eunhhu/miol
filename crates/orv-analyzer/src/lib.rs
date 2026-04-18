@@ -300,7 +300,7 @@ impl<'a> Lowerer<'a> {
             return hir::HirExprKind::Out(Box::new(arg));
         }
         if name.name == "html" {
-            return hir::HirExprKind::Html(self.lower_html_body(args));
+            return hir::HirExprKind::Html(self.lower_html_body(origin, args));
         }
         hir::HirExprKind::Domain {
             name: name.name.clone(),
@@ -309,56 +309,24 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `@html` body 를 태그 트리 노드 리스트로 변환한다.
+    /// `@html` body 를 평범한 HIR 블록으로 내린다.
     ///
-    /// body 는 파서가 `@html { ... }` 로부터 넘긴 인자 목록이다. 정상
-    /// 사용이면 `args == [Block(...)]` 이며 그 Block 의 각 stmt 가 자식
-    /// 노드가 된다. 관용 규칙: args 가 비어 있거나 Block 이 아니면 빈
-    /// 트리로 스텁한다.
-    fn lower_html_body(&self, args: &[ast::Expr]) -> Vec<hir::HirHtmlNode> {
+    /// `args == [Block]` 이면 그대로 lowering. 관용 규칙: body 가 없거나
+    /// block 이 아니면 단일 표현식을 stmt 하나로 감싼 합성 블록을 만든다.
+    /// 런타임은 이 블록을 HTML 렌더 모드로 평가한다.
+    fn lower_html_body(&self, origin: &ast::Expr, args: &[ast::Expr]) -> hir::HirBlock {
         let Some(first) = args.first() else {
-            return Vec::new();
+            return hir::HirBlock {
+                stmts: Vec::new(),
+                span: origin.span,
+            };
         };
-        let ast::ExprKind::Block(block) = &first.kind else {
-            // 본문이 블록이 아니면 그 자체를 단일 텍스트 노드로 취급한다.
-            return vec![hir::HirHtmlNode::Text(self.expr(first))];
-        };
-        block
-            .stmts
-            .iter()
-            .filter_map(|stmt| self.html_node_from_stmt(stmt))
-            .collect()
-    }
-
-    fn html_node_from_stmt(&self, stmt: &ast::Stmt) -> Option<hir::HirHtmlNode> {
-        match stmt {
-            ast::Stmt::Expr(e) => Some(self.html_node_from_expr(e)),
-            _ => None, // let/const/function 등은 HTML body 에서는 무시.
+        if let ast::ExprKind::Block(block) = &first.kind {
+            return self.block(block);
         }
-    }
-
-    fn html_node_from_expr(&self, expr: &ast::Expr) -> hir::HirHtmlNode {
-        match &expr.kind {
-            ast::ExprKind::Domain { name, args } => {
-                // 자식 태그. body 는 또 다른 Block 또는 단일 텍스트 표현식.
-                let children = match args.first() {
-                    Some(arg) => match &arg.kind {
-                        ast::ExprKind::Block(block) => block
-                            .stmts
-                            .iter()
-                            .filter_map(|s| self.html_node_from_stmt(s))
-                            .collect(),
-                        _ => vec![hir::HirHtmlNode::Text(self.expr(arg))],
-                    },
-                    None => Vec::new(),
-                };
-                hir::HirHtmlNode::Element {
-                    name: name.name.clone(),
-                    name_span: name.span,
-                    children,
-                }
-            }
-            _ => hir::HirHtmlNode::Text(self.expr(expr)),
+        hir::HirBlock {
+            stmts: vec![hir::HirStmt::Expr(self.expr(first))],
+            span: first.span,
         }
     }
 
@@ -500,21 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn html_domain_lowers_to_element_tree() {
+    fn html_domain_lowers_to_block() {
         let prog = lower_src(r#"@html { @p "hi" }"#);
         let hir::HirStmt::Expr(expr) = &prog.items[0] else {
             panic!("expected expr");
         };
-        let hir::HirExprKind::Html(nodes) = &expr.kind else {
+        let hir::HirExprKind::Html(block) = &expr.kind else {
             panic!("expected Html, got {:?}", expr.kind);
         };
-        assert_eq!(nodes.len(), 1);
-        let hir::HirHtmlNode::Element { name, children, .. } = &nodes[0] else {
-            panic!("expected Element");
-        };
-        assert_eq!(name, "p");
-        assert_eq!(children.len(), 1);
-        assert!(matches!(children[0], hir::HirHtmlNode::Text(_)));
+        // body 는 평범한 HIR 블록 — 내부는 기존 Domain/For/If 등 모든 문법.
+        assert_eq!(block.stmts.len(), 1);
+        assert!(matches!(&block.stmts[0], hir::HirStmt::Expr(_)));
     }
 
     #[test]
@@ -523,18 +487,27 @@ mod tests {
         let hir::HirStmt::Expr(expr) = &prog.items[0] else {
             panic!("expected expr");
         };
-        let hir::HirExprKind::Html(nodes) = &expr.kind else {
+        let hir::HirExprKind::Html(block) = &expr.kind else {
             panic!("expected Html");
         };
-        assert_eq!(nodes.len(), 2);
-        let names: Vec<&str> = nodes
-            .iter()
-            .filter_map(|n| match n {
-                hir::HirHtmlNode::Element { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(names, vec!["head", "body"]);
+        assert_eq!(block.stmts.len(), 2);
+    }
+
+    #[test]
+    fn html_domain_allows_for_loop() {
+        let prog = lower_src(r#"@html { for i in 0..3 { @li "{i}" } }"#);
+        let hir::HirStmt::Expr(expr) = &prog.items[0] else {
+            panic!("expected expr");
+        };
+        let hir::HirExprKind::Html(block) = &expr.kind else {
+            panic!("expected Html");
+        };
+        // body 의 for 는 HirExprKind::For 로 그대로 lowering — HTML 전용
+        // variant 없이 기존 제어 흐름을 그대로 사용한다.
+        let hir::HirStmt::Expr(stmt_expr) = &block.stmts[0] else {
+            panic!("expected expr stmt");
+        };
+        assert!(matches!(stmt_expr.kind, hir::HirExprKind::For { .. }));
     }
 
     #[test]
