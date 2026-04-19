@@ -23,15 +23,24 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use orv_hir::{HirExpr, HirExprKind};
+use orv_hir::{HirExpr, HirExprKind, HirProgram};
 use tokio::net::TcpListener;
 
-use crate::interp::{run_handler_with_request, RequestCtx, ResponseCtx, RuntimeError, Value};
+use crate::interp::{run_handler_with_request, run_with_writer, RequestCtx, ResponseCtx, RuntimeError, Value};
+
+/// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
+///
+/// hyper 자체는 body 크기 상한이 없어, 악의적 거대 POST 한 번에 메모리를 전부
+/// 할당해 버리는 DoS 벡터가 된다. `http_body_util::Limited` 로 래핑해 수집
+/// 단계에서 방지한다. 1MB 는 작은 JSON 페이로드/폼 입력을 통과시키면서
+/// 멀티파트 파일 업로드는 막는 선. 파일 업로드는 SPEC §11 의 별도 경로로
+/// 다룬다.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// `@server` 가 수집한 단일 라우트 — handler HIR 의 스냅샷.
 ///
@@ -66,12 +75,26 @@ pub(crate) fn run_server(
     //    variant 만 넣기로 계약했으므로 그 외는 에러.
     let entries = collect_routes(routes)?;
 
-    // 3) body_stmts 는 C5b MVP 에서는 무시한다 (@out "boot" 같은 기타 문장).
-    //    SPEC §11.1 예제의 `@out "서버 시작..."` 은 서버 기동 직전 stdout 에
-    //    찍히는 게 자연스럽지만, Interp 동기 실행 경로와 엮이면 복잡해진다.
-    //    후속 커밋에서 Interp 가 Server arm 에 진입하기 전에 body_stmts 를
-    //    순회하도록 바꾼다. 여기서는 차차 확장을 위해 인자로만 받는다.
-    let _ = body_stmts;
+    // 3) body_stmts 평가 — SPEC §11.1 예제의 `@out "서버 시작: 8080"` 같은
+    //    기타 문장은 서버가 수락을 시작하기 직전에 실행한다. `@server` 블록을
+    //    들어가는 즉시 해당 문장들을 **새 Interp + 공용 stdout** 으로 돌려
+    //    사용자에게 기대한 부팅 메시지를 보여준다.
+    //
+    //    별도 Interp 를 쓰는 이유: 현재 run_server 에는 상위 Interp 참조가 없고,
+    //    body_stmts 는 @route handler 와 독립된 초기화 영역이라 최상위 프로그램
+    //    실행 환경과 엮지 않아도 된다. 공용 env 가 필요해지는 순간(예:
+    //    server-level let 바인딩)이 오면 Interp 참조를 전달하도록 서명을 확장.
+    if !body_stmts.is_empty() {
+        let boot_program = HirProgram {
+            items: body_stmts.to_vec(),
+            // server expr 의 정확한 span 을 모르더라도 body_stmts 는 stmt 별
+            // 고유 span 을 가진다. 프로그램 래퍼 span 은 진단 출력 전용이므로
+            // 첫 stmt 의 span 을 그대로 사용.
+            span: body_stmts[0].span(),
+        };
+        let mut stdout = std::io::stdout().lock();
+        run_with_writer(&boot_program, &mut stdout)?;
+    }
 
     // 4) tokio current_thread 런타임 생성. 전용 런타임이라 스레드 이동 제약이
     //    없고, `!Send` HIR 값(Rc 기반 Value)도 요청 핸들러 안에서 그대로 사용
@@ -197,7 +220,12 @@ async fn serve_loop(
             let routes = Arc::clone(&routes);
             async move { Ok::<_, Infallible>(handle_request(req, routes).await) }
         });
+        // MVP: keep-alive 차단. `serve_connection().await` 는 연결이 닫힐 때
+        // 까지 반환하지 않아서, 직렬 accept 루프에서 keep-alive 한 클라이언트가
+        // 뒤따르는 모든 요청을 굶길 수 있다. C6 이후 `LocalSet + spawn_local`
+        // 도입하며 함께 다시 켠다.
         if let Err(e) = hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
             .serve_connection(io, service)
             .await
         {
@@ -212,7 +240,11 @@ async fn handle_request(
 ) -> Response<Full<Bytes>> {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
-    let path = uri.path().to_string();
+    // hyper 는 요청 경로의 trailing `/` 를 그대로 보존한다. curl 사용자가 흔히
+    // `/users/42/` 로 쳐도 `/users/:id` 매치 대상이 되도록 정규화한다. 루트
+    // `/` 자체는 예외 — 빈 문자열이 되면 매칭 규칙이 무의미해진다.
+    let path_raw = uri.path().to_string();
+    let path = normalize_path(&path_raw);
     let query = uri.query().map(parse_query).unwrap_or_default();
     let headers: HashMap<String, String> = req
         .headers()
@@ -223,18 +255,33 @@ async fn handle_request(
     // body 수집. MVP 는 raw string. JSON 자동 파싱은 SPEC §11.5 에 맞추어
     // Content-Type 이 application/json 이면 Value::Object/Array 로 풀고
     // 그 외는 Str. 바디 없음/빈 바디는 Value::Void.
-    let body_bytes = match req.collect().await {
+    //
+    // `Limited` 로 크기 상한을 걸어 거대 POST 의 메모리 폭주를 차단. 초과 시
+    // 413 응답.
+    let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
+    let body_bytes = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
+            // `Limited` 의 제한 초과 에러도 이 경로로 내려온다. hyper 1.x 는
+            // 래퍼 에러 타입을 Box 로 감싸기 때문에 문자열 매칭으로 구분한다.
+            let msg = format!("{e}");
+            if msg.contains("length limit exceeded") {
+                return plain_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+                );
+            }
             return plain_response(
                 StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {e}"),
+                format!("failed to read request body: {msg}"),
             );
         }
     };
+    // Content-Type 의 media type 은 RFC 7231 §3.1.1.1 에서 case-insensitive.
+    // `APPLICATION/JSON` 도 동일하게 JSON 경로로 흘러야 한다.
     let is_json = headers
         .get("content-type")
-        .map(|ct| ct.starts_with("application/json"))
+        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
         .unwrap_or(false);
     let body_value = if body_bytes.is_empty() {
         Value::Void
@@ -367,15 +414,36 @@ pub(crate) fn parse_query(raw: &str) -> HashMap<String, String> {
     out
 }
 
+/// 요청 경로의 trailing `/` 를 제거한다 (단 `/` 자체는 그대로 유지).
+///
+/// hyper 는 경로를 원문 그대로 전달해 `/users/42` 와 `/users/42/` 가 다른
+/// 값이 된다. 대부분의 사용자는 두 형태를 동치로 기대하므로 여기서 정규화해
+/// 라우트 매처가 동일하게 처리하도록 돕는다.
+pub(crate) fn normalize_path(path: &str) -> String {
+    if path == "/" {
+        return path.to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 라우트 패턴(`/users/:id`) 과 실제 경로(`/users/42`) 를 segment 단위로 비교.
 ///
-/// 매칭되면 `:param` 자리의 값을 맵으로 반환. 패턴이나 실제 경로의 segment
-/// 수가 다르면 `None`. 정적 segment 가 달라도 `None`. 빈 segment (연속 `//`)
-/// 는 보존한다.
+/// 매칭되면 `:param` 자리의 값을 맵으로 반환. 빈 segment(`//` 연속)는 분할
+/// 그대로 보존한다.
 ///
-/// MVP 는 `*` wildcard / catchall 미지원 — SPEC §11.2 의 `@route GET *` 같은
-/// 패턴은 method 쪽이 `*` 로 처리되지, path 쪽은 아니다.
+/// 특수 패턴:
+/// - `*` (catchall) — 패턴 전체가 단일 `"*"` 면 어떤 경로든 매치. SPEC §11.2
+///   의 `@route GET * { @respond 404 ... }` 구문을 지원하기 위한 규칙.
+///   params 는 비어 있다. 세그먼트 수준 wildcard(`/a/*`)는 이번 범위 밖.
 pub(crate) fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
+    if pattern == "*" {
+        return Some(HashMap::new());
+    }
     let pat_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
     if pat_parts.len() != path_parts.len() {
@@ -429,6 +497,14 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
 }
 
 /// `serde_json::Value` → orv [`Value`]. 요청 body JSON 파싱 경로에서만 사용.
+///
+/// 숫자 매핑 규칙:
+/// - `i64` 범위면 `Value::Int`.
+/// - `f64` 로 표현 가능한 부동소수점이면 `Value::Float`.
+/// - `u64::MAX` 쪽으로 i64 상한을 넘는 큰 정수는 **precision 손실을 피하려고
+///   원문 문자열을 `Value::Str`** 로 보존한다. 사용자가 명시적으로 처리하도록
+///   미는 선택 — 조용히 f64 로 몰아서 `9999999999999999999` → `1e19` 가 되는
+///   경우를 막는다.
 fn json_to_value(j: serde_json::Value) -> Value {
     use serde_json::Value as J;
     match j {
@@ -437,10 +513,12 @@ fn json_to_value(j: serde_json::Value) -> Value {
         J::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
+            } else if n.is_f64() {
+                // 명시적으로 소수점이 있는 표기면 float 로 받는다.
+                n.as_f64().map(Value::Float).unwrap_or(Value::Void)
             } else {
-                Value::Void
+                // i64 를 넘는 정수(u64 상단)는 원문을 보존.
+                Value::Str(n.to_string())
             }
         }
         J::String(s) => Value::Str(s),
@@ -495,6 +573,28 @@ mod tests {
     }
 
     #[test]
+    fn match_route_catchall_star_matches_any_path() {
+        // SPEC §11.2: `@route GET *` 은 어느 경로든 잡는다. 매처 단에서 path
+        // 가 "*" 면 params 없이 success.
+        assert_eq!(match_route("*", "/").unwrap().len(), 0);
+        assert_eq!(match_route("*", "/some/deep/path").unwrap().len(), 0);
+        assert_eq!(match_route("*", "/users/42/things/99").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn normalize_path_strips_trailing_slash() {
+        assert_eq!(normalize_path("/users/42/"), "/users/42");
+        assert_eq!(normalize_path("/users/42"), "/users/42");
+    }
+
+    #[test]
+    fn normalize_path_preserves_root() {
+        // `/` 자체는 빈 문자열이 되면 의미가 무너지므로 예외.
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("///"), "/");
+    }
+
+    #[test]
     fn parse_query_basic() {
         let q = parse_query("a=1&b=hello");
         assert_eq!(q.get("a"), Some(&"1".to_string()));
@@ -540,6 +640,37 @@ mod tests {
         let j = value_to_json(&v);
         assert_eq!(j[0]["n"], serde_json::json!(1));
         assert_eq!(j[1]["n"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn json_to_value_preserves_big_integers_as_string() {
+        // 9_999_999_999_999_999_999 는 i64::MAX(9_223_372_036_854_775_807)를
+        // 넘고, f64 로 몰면 표현이 어긋난다. 원문 그대로 Value::Str 로 보존.
+        let j: serde_json::Value =
+            serde_json::from_str("9999999999999999999").expect("parse");
+        match json_to_value(j) {
+            Value::Str(s) => assert_eq!(s, "9999999999999999999"),
+            other => panic!("expected Str for big int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_value_int_within_i64_range() {
+        let j: serde_json::Value = serde_json::from_str("42").expect("parse");
+        match json_to_value(j) {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("expected Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_value_float_with_decimal() {
+        // `1.5` 는 float — i64 가 아니므로 Float 로 떨어진다.
+        let j: serde_json::Value = serde_json::from_str("1.5").expect("parse");
+        match json_to_value(j) {
+            Value::Float(f) => assert!((f - 1.5).abs() < f64::EPSILON),
+            other => panic!("expected Float, got {other:?}"),
+        }
     }
 
     // --- 통합: 실제 hyper 서버에 HTTP 요청을 쏴서 응답 검증 ---
@@ -708,5 +839,149 @@ mod tests {
         assert!(body.is_empty(), "204 should have empty body, got {body:?}");
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_is_normalized_and_matched() {
+        // 회귀: `/users/42/` 가 `/users/:id` 매처에 잡혀야 한다.
+        let routes = extract_server_routes(
+            r#"@server {
+                @listen 0
+                @route GET /users/:id { @respond 200 { id: @param.id } }
+            }"#,
+        );
+        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+
+        let (status, _, body) = send_request(addr, "GET", "/users/42/", None).await;
+        assert_eq!(status, 200, "trailing-slash path should match");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["id"], serde_json::json!("42"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn catchall_star_route_matches_unknown_paths() {
+        // SPEC §11.2: `@route GET *` 은 어느 경로도 잡는다. 앞선 구체 route 가
+        // 먼저 매치되면 그쪽이 이긴다 — 선언 순서 규칙.
+        let routes = extract_server_routes(
+            r#"@server {
+                @listen 0
+                @route GET /ping { @respond 200 { hit: "ping" } }
+                @route GET * { @respond 404 { err: "not found" } }
+            }"#,
+        );
+        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+
+        let (status, _, body) = send_request(addr, "GET", "/ping", None).await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["hit"], serde_json::json!("ping"));
+
+        let (status2, _, body2) = send_request(addr, "GET", "/whatever", None).await;
+        assert_eq!(status2, 404, "catchall route should respond 404");
+        let json2: serde_json::Value = serde_json::from_slice(&body2).expect("json");
+        assert_eq!(json2["err"], serde_json::json!("not found"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn content_type_is_case_insensitive() {
+        // `APPLICATION/JSON` 도 JSON 경로로 파싱되어 `@body.x` 가 동작해야 한다.
+        let routes = extract_server_routes(
+            r#"@server {
+                @listen 0
+                @route POST /m { @respond 200 { x: @body.x } }
+            }"#,
+        );
+        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+
+        // 일반 send_request 는 소문자 content-type 을 붙이므로 저수준 커스텀
+        // 헤더로 보낸다.
+        use hyper::client::conn::http1 as client_http1;
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/m")
+            .header("host", "localhost")
+            .header("content-type", "APPLICATION/JSON")
+            .body(Full::new(Bytes::from(r#"{"x":7}"#)))
+            .expect("build req");
+        let resp = sender.send_request(req).await.expect("send");
+        let status = resp.status().as_u16();
+        let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(status, 200);
+        assert_eq!(json["x"], serde_json::json!(7));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        // MAX_BODY_BYTES = 1 MiB. 이를 살짝 넘기는 바디로 413 을 확인한다.
+        let routes = extract_server_routes(
+            r#"@server {
+                @listen 0
+                @route POST /upload { @respond 200 {} }
+            }"#,
+        );
+        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+
+        let big = "a".repeat(MAX_BODY_BYTES + 1024);
+        let (status, _, _) = send_request(addr, "POST", "/upload", Some(big)).await;
+        assert_eq!(status, 413, "expected 413 Payload Too Large");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn boot_stmts_run_before_accept() {
+        // body_stmts 는 서버가 accept 시작 전에 한 번 실행되어야 한다.
+        // stdout 캡처는 테스트 경계에서 까다로워 `@listen` 포트를 비현실적인
+        // 값으로 주어 `resolve_listen_port` 단계에서 일부러 실패시키는 대안
+        // 대신, `run_server` 를 직접 돌리지 않고 **단위 수준**에서
+        // body_stmts 가 비어 있지 않을 때 Interp 에 넘어가는 경로를 server.rs
+        // 내부 단위 테스트로는 재현 불가.
+        //
+        // 대신 고레벨 확인: `@server { @out "boot" @listen 0 ... }` 를 lower 해
+        // body_stmts 벡터가 expected shape 인지 검증. 실제 stdout 출력은 수동
+        // 검증 (fixtures 쪽에서 커버).
+        let hir = {
+            let src = r#"@server {
+                @out "boot"
+                @listen 0
+                @route GET /p { @respond 200 {} }
+            }"#;
+            let lx = lex(src, FileId(0));
+            assert!(lx.diagnostics.is_empty());
+            let pr = parse(lx.tokens, FileId(0));
+            assert!(pr.diagnostics.is_empty());
+            let resolved = resolve(&pr.program);
+            assert!(resolved.diagnostics.is_empty());
+            lower(&pr.program, &resolved)
+        };
+        let HirStmt::Expr(expr) = &hir.items[0] else {
+            panic!("top-level expr expected");
+        };
+        let HirExprKind::Server {
+            body_stmts,
+            listen,
+            routes,
+        } = &expr.kind
+        else {
+            panic!("Server expected");
+        };
+        assert_eq!(body_stmts.len(), 1, "@out belongs in body_stmts");
+        assert!(listen.is_some());
+        assert_eq!(routes.len(), 1);
     }
 }
