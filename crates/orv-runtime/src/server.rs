@@ -120,16 +120,33 @@ pub(crate) fn run_server(
 ///
 /// 운영 경로([`run_server`])와 다른 점:
 /// - 포트 0 으로 바인딩해 OS 에 맡기고 실제 주소를 반환한다.
-/// - accept 루프는 별도 tokio task 로 띄우고 즉시 `(addr, handle)` 을 돌려준다.
+/// - accept 루프는 별도 tokio task 로 띄우고 즉시 `(addr, handle, boot)` 를
+///   돌려준다.
 /// - 호출자는 테스트 끝에 `handle.abort()` 로 서버를 정리한다.
 ///
-/// 통합 테스트에서만 쓰이는 async 헬퍼라 `pub(crate)` + `#[cfg(test)]` 는
-/// 필요 없다 — dev-dependency 쪽 #[tokio::test] 가 이 함수를 직접 부른다.
+/// `body_stmts` 는 `@server { @out "boot" @listen 0 ... }` 처럼 @server 블록
+/// 최상단에 있던 non-route 문장들이다. [`run_server`] 는 이들을 accept 시작
+/// 전에 **공용 stdout** 으로 흘린다. 테스트에서는 stdout 을 가로챌 수 없어
+/// 같은 순서로 `Vec<u8>` writer 에 캡처해 돌려준다 — C5c 의 body_stmts 패치가
+/// 실제로 런타임에 도달하는지 fixture 수준에서 증명하기 위함.
 #[cfg(test)]
 pub(crate) async fn spawn_for_test(
     routes: &[HirExpr],
-) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), RuntimeError> {
+    body_stmts: &[orv_hir::HirStmt],
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>, Vec<u8>), RuntimeError> {
     let entries = collect_routes(routes)?;
+
+    // body_stmts 는 동기 실행. writer 버퍼에 캡처해 테스트가 부트 출력까지
+    // 검증할 수 있도록 한다. 문장이 없으면 빈 벡터.
+    let mut boot_buf: Vec<u8> = Vec::new();
+    if !body_stmts.is_empty() {
+        let boot_program = HirProgram {
+            items: body_stmts.to_vec(),
+            span: body_stmts[0].span(),
+        };
+        run_with_writer(&boot_program, &mut boot_buf)?;
+    }
+
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| {
         RuntimeError::native(format!("test bind failed: {e}"))
     })?;
@@ -140,7 +157,7 @@ pub(crate) async fn spawn_for_test(
     let handle = tokio::spawn(async move {
         let _ = serve_loop(listener, table).await;
     });
-    Ok((addr, handle))
+    Ok((addr, handle, boot_buf))
 }
 
 fn resolve_listen_port(listen: Option<&HirExpr>) -> Result<u16, RuntimeError> {
@@ -756,7 +773,7 @@ mod tests {
                 @route GET /ping { @respond 200 { ok: true, msg: "pong" } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, ct, body) = send_request(addr, "GET", "/ping", None).await;
         assert_eq!(status, 200);
@@ -777,7 +794,7 @@ mod tests {
                 @route GET /users/:id { @respond 200 { id: @param.id } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, _, body) = send_request(addr, "GET", "/users/42", None).await;
         assert_eq!(status, 200);
@@ -796,7 +813,7 @@ mod tests {
                 @route POST /echo { @respond 201 { received: @body } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let payload = r#"{"name":"alice","age":30}"#.to_string();
         let (status, _, body) = send_request(addr, "POST", "/echo", Some(payload)).await;
@@ -816,7 +833,7 @@ mod tests {
                 @route GET /ping { @respond 200 {} }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, _, _) = send_request(addr, "GET", "/missing", None).await;
         assert_eq!(status, 404);
@@ -832,7 +849,7 @@ mod tests {
                 @route DELETE /item/:id { @respond 204 }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, _, body) = send_request(addr, "DELETE", "/item/abc", None).await;
         assert_eq!(status, 204);
@@ -850,7 +867,7 @@ mod tests {
                 @route GET /users/:id { @respond 200 { id: @param.id } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, _, body) = send_request(addr, "GET", "/users/42/", None).await;
         assert_eq!(status, 200, "trailing-slash path should match");
@@ -871,7 +888,7 @@ mod tests {
                 @route GET * { @respond 404 { err: "not found" } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let (status, _, body) = send_request(addr, "GET", "/ping", None).await;
         assert_eq!(status, 200);
@@ -895,7 +912,7 @@ mod tests {
                 @route POST /m { @respond 200 { x: @body.x } }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         // 일반 send_request 는 소문자 content-type 을 붙이므로 저수준 커스텀
         // 헤더로 보낸다.
@@ -934,7 +951,7 @@ mod tests {
                 @route POST /upload { @respond 200 {} }
             }"#,
         );
-        let (addr, handle) = spawn_for_test(&routes).await.expect("spawn");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &[]).await.expect("spawn");
 
         let big = "a".repeat(MAX_BODY_BYTES + 1024);
         let (status, _, _) = send_request(addr, "POST", "/upload", Some(big)).await;
@@ -983,5 +1000,118 @@ mod tests {
         assert_eq!(body_stmts.len(), 1, "@out belongs in body_stmts");
         assert!(listen.is_some());
         assert_eq!(routes.len(), 1);
+    }
+
+    // --- C6 E2E: fixtures/e2e/*.orv 파일을 실제로 lower 하고 서버를 띄워 ---
+    // --- 실제 HTTP 요청으로 응답을 검증한다. ---
+
+    /// `fixtures/e2e/<name>` 경로의 orv 소스를 읽어 `@server { ... }` 의
+    /// (routes, body_stmts) 쌍을 돌려준다. `extract_server_routes` 의
+    /// 확장판 — body_stmts 까지 돌려줘야 catchall fixture 의 부트 `@out` 출력이
+    /// [`spawn_for_test`] 로 흐른다.
+    fn extract_server_from_fixture(name: &str) -> (Vec<HirExpr>, Vec<HirStmt>) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/e2e")
+            .join(name);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let lx = lex(&src, FileId(0));
+        assert!(lx.diagnostics.is_empty(), "lex {name}: {:?}", lx.diagnostics);
+        let pr = parse(lx.tokens, FileId(0));
+        assert!(pr.diagnostics.is_empty(), "parse {name}: {:?}", pr.diagnostics);
+        let resolved = resolve(&pr.program);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "resolve {name}: {:?}",
+            resolved.diagnostics
+        );
+        let hir = lower(&pr.program, &resolved);
+        let HirStmt::Expr(expr) = &hir.items[0] else {
+            panic!("{name}: expected top-level expression");
+        };
+        let HirExprKind::Server {
+            routes, body_stmts, ..
+        } = &expr.kind
+        else {
+            panic!("{name}: expected @server top-level expr");
+        };
+        (routes.clone(), body_stmts.clone())
+    }
+
+    #[tokio::test]
+    async fn fixture_hello_serves_ping() {
+        let (routes, body_stmts) = extract_server_from_fixture("hello.orv");
+        assert!(body_stmts.is_empty(), "hello.orv has no boot stmts");
+        let (addr, handle, boot) = spawn_for_test(&routes, &body_stmts)
+            .await
+            .expect("spawn");
+        assert!(boot.is_empty(), "hello.orv should produce no boot output");
+
+        let (status, ct, body) = send_request(addr, "GET", "/ping", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(ct.as_deref(), Some("application/json"));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["ok"], serde_json::json!(true));
+        assert_eq!(json["msg"], serde_json::json!("pong"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fixture_path_param_covers_param_query_and_json_body() {
+        let (routes, body_stmts) = extract_server_from_fixture("path_param.orv");
+        let (addr, handle, _boot) = spawn_for_test(&routes, &body_stmts)
+            .await
+            .expect("spawn");
+
+        // 1) :id 경로 파라미터
+        let (s1, _, b1) = send_request(addr, "GET", "/users/42", None).await;
+        assert_eq!(s1, 200);
+        let j1: serde_json::Value = serde_json::from_slice(&b1).expect("json");
+        assert_eq!(j1["id"], serde_json::json!("42"));
+
+        // 2) @query.q — URI 에 쿼리스트링 직접 포함
+        let (s2, _, b2) = send_request(addr, "GET", "/search?q=orv", None).await;
+        assert_eq!(s2, 200);
+        let j2: serde_json::Value = serde_json::from_slice(&b2).expect("json");
+        assert_eq!(j2["q"], serde_json::json!("orv"));
+
+        // 3) POST /echo 에 JSON body 보내면 그대로 되돌려받아야 한다
+        let payload = r#"{"name":"alice","age":30}"#.to_string();
+        let (s3, _, b3) = send_request(addr, "POST", "/echo", Some(payload)).await;
+        assert_eq!(s3, 201);
+        let j3: serde_json::Value = serde_json::from_slice(&b3).expect("json");
+        assert_eq!(j3["received"]["name"], serde_json::json!("alice"));
+        assert_eq!(j3["received"]["age"], serde_json::json!(30));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fixture_catchall_boots_specific_route_and_wildcard_fallback() {
+        let (routes, body_stmts) = extract_server_from_fixture("catchall.orv");
+        assert_eq!(body_stmts.len(), 1, "catchall.orv has one boot @out");
+        let (addr, handle, boot) = spawn_for_test(&routes, &body_stmts)
+            .await
+            .expect("spawn");
+
+        // 부트 출력 — C5c 의 body_stmts 패치가 실제로 런타임에 도달하는지
+        // 검증. `@out` 은 줄바꿈을 붙여 기록한다.
+        let boot_str = String::from_utf8(boot).expect("utf-8");
+        assert_eq!(boot_str, "boot ok\n");
+
+        // 1) 구체 라우트가 catchall 보다 먼저 매치
+        let (s1, _, b1) = send_request(addr, "GET", "/ping", None).await;
+        assert_eq!(s1, 200);
+        let j1: serde_json::Value = serde_json::from_slice(&b1).expect("json");
+        assert_eq!(j1["hit"], serde_json::json!("ping"));
+
+        // 2) 그 외 경로는 `@route GET *` 이 잡아 404
+        let (s2, _, b2) = send_request(addr, "GET", "/unknown/path", None).await;
+        assert_eq!(s2, 404);
+        let j2: serde_json::Value = serde_json::from_slice(&b2).expect("json");
+        assert_eq!(j2["err"], serde_json::json!("not found"));
+
+        handle.abort();
     }
 }

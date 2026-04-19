@@ -1,0 +1,26 @@
+// =====================================================
+// e2e/path_param.orv — :param, @query, JSON @body 에코
+// =====================================================
+//
+// C6 E2E fixture. 런타임이 아래 세 라우트를 모두 매치/평가/응답해야 한다.
+//
+// 검증 포인트:
+//   - :id 경로 파라미터 캡처 (@param.id)
+//   - @query.q 쿼리 파라미터 접근
+//   - POST /echo 의 JSON body 를 @body 로 받아 그대로 에코
+
+@server {
+  @listen 0
+
+  @route GET /users/:id {
+    @respond 200 { id: @param.id }
+  }
+
+  @route GET /search {
+    @respond 200 { q: @query.q }
+  }
+
+  @route POST /echo {
+    @respond 201 { received: @body }
+  }
+}

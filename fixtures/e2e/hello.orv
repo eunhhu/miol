@@ -1,0 +1,20 @@
+// =====================================================
+// e2e/hello.orv — 최소 GET 엔드포인트
+// =====================================================
+//
+// C6 E2E fixture. 런타임이 실제로 이 파일을 lower → lower → Server 라우트
+// 테이블을 뽑아 hyper 서버를 띄우고 응답을 검증한다.
+//
+// 검증 포인트:
+//   - @server 블록을 최상위 표현식으로 허용
+//   - @listen 0 (테스트 전용 임의 포트)
+//   - @route GET /ping { @respond 200 { ok: true, msg: "pong" } }
+//   - 응답 Content-Type: application/json, 페이로드가 객체 그대로 직렬화
+
+@server {
+  @listen 0
+
+  @route GET /ping {
+    @respond 200 { ok: true, msg: "pong" }
+  }
+}
