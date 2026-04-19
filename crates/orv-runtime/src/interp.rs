@@ -398,6 +398,13 @@ impl<'w, W: Write> Interp<'w, W> {
                 // 지금은 silent noop — fixture 가 깨지지 않게 한다.
                 Ok(Value::Void)
             }
+            HirExprKind::Server { .. } => {
+                // C5a: 구조적 레이어만 정의한다. 실제 tokio+hyper 서버 기동은
+                // C5b 가 이 arm 을 교체해 구현한다. 지금은 silent noop 으로
+                // 두어 analyzer 까지 통과한 프로그램이 런타임에서 바로 에러
+                // 나지 않게 한다. listen/routes/body_stmts 는 C5b 에서 소비.
+                Ok(Value::Void)
+            }
             HirExprKind::Respond { status, payload } => {
                 // @respond 는 route handler 안에서만 의미가 있다. 그 외
                 // 맥락(REPL 등)에서 호출되면 request ctx 없이 평가되더라도
@@ -1046,6 +1053,7 @@ fn has_side_effect(expr: &HirExpr) -> bool {
             | HirExprKind::Domain { .. }
             | HirExprKind::Route { .. }
             | HirExprKind::Respond { .. }
+            | HirExprKind::Server { .. }
             | HirExprKind::Assign { .. }
             | HirExprKind::Block(_)
             | HirExprKind::If { .. }
@@ -2077,6 +2085,27 @@ mod tests {
             RequestCtx::default(),
         );
         assert_eq!(resp.unwrap().status, 200);
+    }
+
+    #[test]
+    fn server_block_is_silent_noop() {
+        // C5a: @server { @listen N; @route ...; ... } 는 런타임에서 silent
+        // noop 이어야 한다. 실제 서버 기동은 C5b 에서 이 arm 을 교체해
+        // 구현한다. 이 테스트는 미구현 상태로 인한 회귀(예: analyzer 가 추가
+        // 된 뒤 interp arm 을 빼먹고 배포)를 방지한다.
+        let out = run_str(
+            r#"
+            @out "before"
+            @server {
+                @listen 8080
+                @route GET /api { @respond 200 {} }
+            }
+            @out "after"
+            "#,
+        )
+        .unwrap();
+        // server 블록은 stdout 에 아무것도 쓰지 않는다.
+        assert_eq!(out, "before\nafter\n");
     }
 
     #[test]

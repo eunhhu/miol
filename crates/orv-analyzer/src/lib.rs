@@ -310,11 +310,93 @@ impl<'a> Lowerer<'a> {
         if name.name == "respond" {
             return self.lower_respond(origin, args);
         }
+        if name.name == "server" {
+            if let Some(kind) = self.lower_server(args) {
+                return kind;
+            }
+        }
         hir::HirExprKind::Domain {
             name: name.name.clone(),
             name_span: name.span,
             args: args.iter().map(|a| self.expr(a)).collect(),
         }
+    }
+
+    /// `@server { ... }` 블록의 자식 문장을 3 갈래로 분류해
+    /// [`hir::HirExprKind::Server`] 로 내린다.
+    ///
+    /// parser 가 `args == [Block]` 로 넘기는 것이 전제 (`parse_server_call`).
+    /// 그 외 형태면 `None` 을 돌려 fallback `Domain` 경로로 떨어뜨리고 런타임
+    /// 이 "unsupported" 에러로 보고한다.
+    ///
+    /// 분류 규칙 (advisor 피드백):
+    /// - `@listen <expr>` → `listen` 슬롯. 두 번 이상 등장하면 마지막이
+    ///   우세하며 진단을 낸다 (SPEC §11.1 은 단일 listen 을 가정).
+    /// - `@route METHOD /path { ... }` → `routes` 벡터. 반드시
+    ///   [`hir::HirExprKind::Route`] variant 로만 저장한다.
+    /// - 그 외 statement (`@out "boot"`, 미들웨어 등) → `body_stmts` 벡터에
+    ///   순서를 보존해 담는다. C5b 가 서버 기동 직전에 평가할 예정.
+    ///
+    /// # 범위 밖
+    /// SPEC §11.7 의 중첩 라우트 그룹(`@route /admin { @route ... }`)은 path-
+    /// only `@route` 를 parser 가 아직 수용하지 않는다. 이번 커밋 범위 밖.
+    fn lower_server(&self, args: &[ast::Expr]) -> Option<hir::HirExprKind> {
+        let [body_expr] = args else {
+            return None;
+        };
+        let ast::ExprKind::Block(block) = &body_expr.kind else {
+            return None;
+        };
+
+        let mut listen: Option<Box<hir::HirExpr>> = None;
+        let mut routes: Vec<hir::HirExpr> = Vec::new();
+        let mut body_stmts: Vec<hir::HirStmt> = Vec::new();
+
+        for stmt in &block.stmts {
+            // `@listen`/`@route` 만 특수 처리. 그 외 stmt 는 body_stmts 에.
+            if let ast::Stmt::Expr(expr) = stmt {
+                if let ast::ExprKind::Domain { name, args: d_args } = &expr.kind {
+                    if name.name == "listen" {
+                        // `@listen N` — 첫 인자를 port 표현식으로 사용한다.
+                        // 인자가 없거나 여러 개여도 첫 인자만 취하고 나머지
+                        // 는 무시 (MVP).
+                        let port_expr = match d_args.first() {
+                            Some(e) => self.expr(e),
+                            None => hir::HirExpr {
+                                kind: hir::HirExprKind::Void,
+                                ty: hir::Type::Unknown,
+                                span: expr.span,
+                            },
+                        };
+                        // 중복 @listen 은 마지막이 우세. 진단은 C5b 의 서버
+                        // 기동 시 에러로 엮어 올리는 쪽이 자연스러우므로
+                        // 여기서는 조용히 덮어쓴다.
+                        listen = Some(Box::new(port_expr));
+                        continue;
+                    }
+                    if name.name == "route" {
+                        if let Some(kind) = self.lower_route(d_args) {
+                            routes.push(hir::HirExpr {
+                                kind,
+                                ty: hir::Type::Unknown,
+                                span: expr.span,
+                            });
+                            continue;
+                        }
+                        // @route 형태가 이상하면 body_stmts 로 흘려보내고
+                        // runtime 이 unsupported 로 처리하게 둔다.
+                    }
+                }
+            }
+            // 그 외: 원형 그대로 보존.
+            body_stmts.push(self.stmt(stmt));
+        }
+
+        Some(hir::HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        })
     }
 
     /// `@route METHOD /path { body }` 를 전용 variant 로 분해한다.
@@ -653,6 +735,100 @@ mod tests {
             hir::HirExprKind::Domain { name, .. } => assert_eq!(name, "foo"),
             other => panic!("expected Domain fallback, got {other:?}"),
         }
+    }
+
+    // --- @server lowering ---
+
+    fn expect_server(prog: &hir::HirProgram) -> (&Option<Box<hir::HirExpr>>, &Vec<hir::HirExpr>, &Vec<hir::HirStmt>) {
+        let hir::HirStmt::Expr(expr) = &prog.items[0] else {
+            panic!("expected expr");
+        };
+        let hir::HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        } = &expr.kind
+        else {
+            panic!("expected Server variant, got {:?}", expr.kind);
+        };
+        (listen, routes, body_stmts)
+    }
+
+    #[test]
+    fn server_empty_block_lowers_to_empty_server() {
+        let prog = lower_src("@server {}");
+        let (listen, routes, body_stmts) = expect_server(&prog);
+        assert!(listen.is_none());
+        assert!(routes.is_empty());
+        assert!(body_stmts.is_empty());
+    }
+
+    #[test]
+    fn server_collects_listen_and_routes() {
+        let prog = lower_src(
+            r#"@server {
+                @listen 8080
+                @route GET /api { @respond 200 {} }
+                @route POST /users { @respond 201 {} }
+            }"#,
+        );
+        let (listen, routes, body_stmts) = expect_server(&prog);
+
+        // listen 은 Integer 리터럴 표현식으로 저장된다.
+        let listen = listen.as_ref().expect("listen slot should be populated");
+        assert!(matches!(listen.kind, hir::HirExprKind::Integer(ref n) if n == "8080"));
+
+        // routes 는 Route variant 2 개.
+        assert_eq!(routes.len(), 2);
+        for r in routes {
+            assert!(matches!(r.kind, hir::HirExprKind::Route { .. }));
+        }
+
+        // 그 외 stmt 없음.
+        assert!(body_stmts.is_empty());
+    }
+
+    #[test]
+    fn server_preserves_misc_stmts_in_body_stmts() {
+        // SPEC §11.1 예제: `@out "서버 시작..."` 같은 기타 도메인이 server
+        // 블록 안에 올 수 있다. lower_server 는 이를 body_stmts 에 순서대로
+        // 보존해야 한다 (drop/reject 금지).
+        let prog = lower_src(
+            r#"@server {
+                @out "boot"
+                @listen 3000
+                @route GET /health { @respond 200 {} }
+                @out "ready"
+            }"#,
+        );
+        let (listen, routes, body_stmts) = expect_server(&prog);
+
+        let listen = listen.as_ref().expect("listen should be present");
+        assert!(matches!(listen.kind, hir::HirExprKind::Integer(ref n) if n == "3000"));
+        assert_eq!(routes.len(), 1);
+        // @out 두 개가 body_stmts 에 순서대로 보존.
+        assert_eq!(body_stmts.len(), 2);
+        for stmt in body_stmts {
+            let hir::HirStmt::Expr(expr) = stmt else {
+                panic!("expected expr stmt in body_stmts");
+            };
+            assert!(matches!(expr.kind, hir::HirExprKind::Out(_)));
+        }
+    }
+
+    #[test]
+    fn server_with_duplicate_listen_keeps_last() {
+        // @listen 이 중복되면 마지막이 우세. 분석기는 진단 없이 덮어쓴다
+        // (C5b 서버 기동 시점에 엄밀 진단을 낼지 재검토).
+        let prog = lower_src(
+            r#"@server {
+                @listen 8080
+                @listen 9090
+            }"#,
+        );
+        let (listen, _, _) = expect_server(&prog);
+        let listen = listen.as_ref().expect("listen should be present");
+        assert!(matches!(listen.kind, hir::HirExprKind::Integer(ref n) if n == "9090"));
     }
 
     #[test]

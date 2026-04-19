@@ -972,14 +972,17 @@ impl Parser {
             span: at_tok.span,
         };
 
-        // `@route` / `@respond` 는 인자 수/형태가 특수해 전용 서브루틴으로
-        // 분기한다. 일반 도메인의 1-인자 규약(`@out x`, `@html {...}`)을
-        // 건드리지 않기 위해 이름 기반 분기.
+        // `@route` / `@respond` / `@server` 는 인자 수/형태가 특수해 전용
+        // 서브루틴으로 분기한다. 일반 도메인의 1-인자 규약(`@out x`,
+        // `@html {...}`)을 건드리지 않기 위해 이름 기반 분기.
         if name_ident.name == "route" {
             return self.parse_route_call(name_ident);
         }
         if name_ident.name == "respond" {
             return self.parse_respond_call(name_ident);
+        }
+        if name_ident.name == "server" {
+            return self.parse_server_call(name_ident);
         }
 
         let mut args = Vec::new();
@@ -1114,6 +1117,41 @@ impl Parser {
                 args: vec![status_expr, payload_expr],
             },
             span: start_span.join(end_span),
+        })
+    }
+
+    /// `@server { ... }` 를 `Domain { args: [Block] }` 형태로 파싱한다.
+    ///
+    /// 일반 도메인 경로가 아니라 전용 서브루틴을 두는 이유: generic
+    /// `parse_domain_call` 이 `{}` 를 `parse_expr` 로 보내면 `{}` 가 빈 object
+    /// literal 로 낮춰진다 (`looks_like_object_literal()` true). `@server` 는
+    /// 블록 본문이 필수라 여기서 `parse_block()` 을 직접 호출해 블록을
+    /// 강제한다. `@route` body 와 동일한 패턴.
+    ///
+    /// 블록 안에는 `@listen N`, `@route METHOD /path { ... }`, `@out "boot"`
+    /// 같은 기타 도메인이 자유롭게 올 수 있다. 분류(listen/routes/body_stmts)
+    /// 는 analyzer (C5a-3) 가 수행한다.
+    fn parse_server_call(&mut self, name_ident: Ident) -> Option<Expr> {
+        let start_span = name_ident.span;
+        if !matches!(self.peek_kind(), TokenKind::LBrace) {
+            self.diagnostics.push(
+                Diagnostic::error("expected `{` block body after `@server`")
+                    .with_primary(self.peek().span, ""),
+            );
+            return None;
+        }
+        let block = self.parse_block()?;
+        let block_span = block.span;
+        let block_expr = Expr {
+            kind: ExprKind::Block(block),
+            span: block_span,
+        };
+        Some(Expr {
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args: vec![block_expr],
+            },
+            span: start_span.join(block_span),
         })
     }
 
@@ -1878,5 +1916,98 @@ mod tests {
         };
         assert_eq!(name.name, "respond");
         assert_eq!(r_args.len(), 2);
+    }
+
+    // --- @server ---
+    //
+    // `@server { ... }` 는 generic `parse_domain_call` 의 block-인자 경로를
+    // 그대로 탄다. 즉 AST 상에서는 `Domain { name: "server", args: [Block] }`
+    // 형태로 나오며, 블록 안의 `@listen`/`@route`/`@out` 등은 block 의 stmt
+    // 로 각각 도메인 호출로 보존된다. analyzer(C5a-3) 가 이 stmt 들을 3 갈래
+    // (listen/routes/body_stmts) 로 분류한다.
+
+    fn server_block_stmts(stmt: &Stmt) -> &[Stmt] {
+        let Stmt::Expr(expr) = stmt else {
+            panic!("expected expression statement at top level");
+        };
+        let ExprKind::Domain { name, args } = &expr.kind else {
+            panic!("expected domain call, got {:?}", expr.kind);
+        };
+        assert_eq!(name.name, "server");
+        assert_eq!(args.len(), 1, "@server should have single block argument");
+        let ExprKind::Block(block) = &args[0].kind else {
+            panic!("expected block arg, got {:?}", args[0].kind);
+        };
+        &block.stmts
+    }
+
+    #[test]
+    fn server_empty_block() {
+        let r = parse_str("@server {}");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let stmts = server_block_stmts(&r.program.items[0]);
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn server_with_listen_and_route() {
+        let r = parse_str(r#"@server { @listen 8080 @route GET / { @respond 200 {} } }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let stmts = server_block_stmts(&r.program.items[0]);
+        assert_eq!(stmts.len(), 2);
+
+        // 첫 stmt: @listen 8080 — Domain { name: "listen", args: [Integer] }
+        let Stmt::Expr(first) = &stmts[0] else {
+            panic!("expected expr stmt");
+        };
+        let ExprKind::Domain { name, args } = &first.kind else {
+            panic!("expected domain");
+        };
+        assert_eq!(name.name, "listen");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::Integer(ref n) if n == "8080"));
+
+        // 두 번째 stmt: @route GET / { ... } — Domain { name: "route", ... }
+        let Stmt::Expr(second) = &stmts[1] else {
+            panic!("expected expr stmt");
+        };
+        let ExprKind::Domain { name, .. } = &second.kind else {
+            panic!("expected domain");
+        };
+        assert_eq!(name.name, "route");
+    }
+
+    #[test]
+    fn server_preserves_misc_domain_stmts() {
+        // SPEC §11.1 예제는 `@out "서버 시작..."` 같은 기타 도메인을
+        // server 블록 안에서 사용한다. 파서는 이를 그대로 block stmt 로
+        // 유지해야 하며 (drop/reject 금지), 분류는 analyzer 의 몫이다.
+        let r = parse_str(r#"@server { @out "boot" @listen 80 @route GET / { @respond 200 {} } }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let stmts = server_block_stmts(&r.program.items[0]);
+        assert_eq!(stmts.len(), 3);
+        let Stmt::Expr(out_stmt) = &stmts[0] else {
+            panic!("expected expr stmt");
+        };
+        let ExprKind::Domain { name, .. } = &out_stmt.kind else {
+            panic!("expected domain call");
+        };
+        assert_eq!(name.name, "out");
+    }
+
+    #[test]
+    fn server_multiple_routes() {
+        let r = parse_str(
+            r#"@server {
+                @listen 8080
+                @route GET /a { @respond 200 {} }
+                @route POST /b { @respond 201 {} }
+                @route GET /c/:id { @respond 200 {} }
+            }"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let stmts = server_block_stmts(&r.program.items[0]);
+        // @listen + 3 routes.
+        assert_eq!(stmts.len(), 4);
     }
 }

@@ -303,6 +303,35 @@ pub enum HirExprKind {
         /// 생략 시 `HirExprKind::Void` 로 채워진다.
         payload: Box<HirExpr>,
     },
+    /// `@server { @listen N; @route ...; ... }` — HTTP 서버 선언.
+    ///
+    /// 이번 커밋(C5a)에서는 구조적 레이어만 정의한다. 런타임은 이 variant
+    /// 를 평가할 때 silent noop(`Value::Void`)을 반환하며, 실제 tokio+hyper
+    /// 서버 기동은 후속 커밋(C5b)에서 이 arm 을 교체해 구현한다.
+    ///
+    /// # 구조 (advisor 피드백 반영)
+    /// - `listen`: `@listen N` 자식에서 수집한 port 표현식. 없으면 `None`.
+    /// - `routes`: `@route METHOD /path { ... }` 자식들 — 반드시
+    ///   [`HirExprKind::Route`] variant 만 들어간다 (analyzer 에서 강제).
+    /// - `body_stmts`: `@listen`/`@route` 가 아닌 기타 문장(`@out "boot"`,
+    ///   미들웨어 등). SPEC §11.1 예제가 `@out` 을 server 블록 안에 쓰므로
+    ///   drop 하면 유효 프로그램이 깨진다. 현재는 보존만 하고 실행 시점은
+    ///   C5b 에서 결정한다 (서버 기동 직전에 평가).
+    ///
+    /// # 범위 밖
+    /// - `@route /admin { @route ... }` 형태의 중첩 라우트 그룹(SPEC §11.7):
+    ///   바깥 `@route` 가 method 없이 path-only 이므로 C1 parser 가 수용
+    ///   불가. C6 이후 마일스톤에서 처리.
+    Server {
+        /// `@listen N` 에서 수집한 port 표현식. 여러 개 선언 시 마지막이
+        /// 우세하며 analyzer 가 중복 진단을 낸다.
+        listen: Option<Box<HirExpr>>,
+        /// 라우트 목록. analyzer 는 `HirExprKind::Route` 만 여기에 넣는다.
+        routes: Vec<HirExpr>,
+        /// `@listen`/`@route` 이외의 기타 문장 — `@out`, 미들웨어 등.
+        /// 원래 순서대로 보존한다.
+        body_stmts: Vec<HirStmt>,
+    },
     /// 아직 전용 variant 로 분해되지 않은 도메인 호출.
     ///
     /// 도메인이 정식 variant 를 받으면 lowering 이 이쪽에 떨어뜨리지 않고
