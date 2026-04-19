@@ -398,12 +398,26 @@ impl<'w, W: Write> Interp<'w, W> {
                 // 지금은 silent noop — fixture 가 깨지지 않게 한다.
                 Ok(Value::Void)
             }
-            HirExprKind::Server { .. } => {
-                // C5a: 구조적 레이어만 정의한다. 실제 tokio+hyper 서버 기동은
-                // C5b 가 이 arm 을 교체해 구현한다. 지금은 silent noop 으로
-                // 두어 analyzer 까지 통과한 프로그램이 런타임에서 바로 에러
-                // 나지 않게 한다. listen/routes/body_stmts 는 C5b 에서 소비.
-                Ok(Value::Void)
+            HirExprKind::Server {
+                listen,
+                routes,
+                body_stmts,
+            } => {
+                // C5b: tokio + hyper HTTP/1.1 서버 기동. `run_server` 가 포트
+                // 바인딩과 accept 루프를 담당하며, 요청마다 해당 route 의
+                // handler HIR 을 복제해 새 Interp 로 평가한다. 서버가 종료될
+                // 때까지 이 arm 은 블록한다 — Interp 입장에서는 현재 스레드
+                // 에서 서버가 돌고, 서버가 멈추면 Value::Void 로 이어진다.
+                //
+                // 동기 tree-walking 인터프리터와 async hyper 의 간극은
+                // server::run_server 내부의 current_thread 런타임 + block_on
+                // 으로 흡수한다. HIR 값(특히 Rc 기반 Value)이 !Send 라
+                // current_thread 가 자연스럽다.
+                crate::server::run_server(
+                    listen.as_deref(),
+                    routes,
+                    body_stmts,
+                )
             }
             HirExprKind::Respond { status, payload } => {
                 // @respond 는 route handler 안에서만 의미가 있다. 그 외
@@ -2088,24 +2102,24 @@ mod tests {
     }
 
     #[test]
-    fn server_block_is_silent_noop() {
-        // C5a: @server { @listen N; @route ...; ... } 는 런타임에서 silent
-        // noop 이어야 한다. 실제 서버 기동은 C5b 에서 이 arm 을 교체해
-        // 구현한다. 이 테스트는 미구현 상태로 인한 회귀(예: analyzer 가 추가
-        // 된 뒤 interp arm 을 빼먹고 배포)를 방지한다.
-        let out = run_str(
+    fn server_without_listen_returns_runtime_error() {
+        // C5b: @server 는 실제 tokio/hyper 서버를 기동한다. @listen 이 없으면
+        // MVP 에서는 명시 에러를 돌려주어 진단을 쉽게 한다. 실 서버 바인딩
+        // 테스트는 server.rs 모듈의 통합 테스트(#[tokio::test])가 맡고, 여기
+        // 서는 `@server` arm 이 interp eval 경로에 올라오는 것만 검증한다.
+        let err = run_str(
             r#"
-            @out "before"
             @server {
-                @listen 8080
                 @route GET /api { @respond 200 {} }
             }
-            @out "after"
             "#,
         )
-        .unwrap();
-        // server 블록은 stdout 에 아무것도 쓰지 않는다.
-        assert_eq!(out, "before\nafter\n");
+        .unwrap_err();
+        assert!(
+            err.message.contains("@server"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]

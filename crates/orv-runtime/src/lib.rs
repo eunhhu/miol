@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 pub mod interp;
+pub mod server;
 
 pub use interp::{
     run, run_handler_with_request, run_with_writer, HandlerOutcome, RequestCtx, ResponseCtx,
