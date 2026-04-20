@@ -71,6 +71,22 @@ pub struct ResponseCtx {
     /// 응답 body. `@respond` 가 생략된 payload 는 `Value::Void` 로 기록된다
     /// (`@respond 204` 등).
     pub payload: Value,
+    /// 파일 서빙(`@serve "path"`)처럼 JSON 직렬화를 우회해야 하는 경우
+    /// raw 바이트와 Content-Type 을 이 필드로 전달한다. `Some` 이면 서버는
+    /// `payload` 를 무시하고 이 바이트를 그대로 응답 body 로 쓴다.
+    pub raw_body: Option<RawResponseBody>,
+}
+
+/// A5a 파일 서빙용 raw 응답 body.
+///
+/// `@serve "path"` 가 기록한 값. 서버 측 렌더러는 [`ResponseCtx::raw_body`]
+/// 가 `Some` 이면 JSON 직렬화를 건너뛰고 이 바이트를 그대로 body 로 사용한다.
+#[derive(Clone, Debug)]
+pub struct RawResponseBody {
+    /// 파일 바이트 그대로 (HTML/CSS/ICO 등).
+    pub bytes: Vec<u8>,
+    /// 확장자 기반 MIME. 맵 미스 시 `application/octet-stream`.
+    pub content_type: String,
 }
 
 /// [`run_handler_with_request`] 의 반환값.
@@ -466,6 +482,7 @@ impl<'w, W: Write> Interp<'w, W> {
                     self.response = Some(ResponseCtx {
                         status: status_code,
                         payload: payload_value,
+                        raw_body: None,
                     });
                 }
                 // early-return 신호. Route handler 블록/루프가 `return` 과
@@ -507,6 +524,12 @@ impl<'w, W: Write> Interp<'w, W> {
                     if let Some(v) = self.eval_request_domain(name)? {
                         return Ok(v);
                     }
+                }
+                // A5a: `@serve "path"` — 단일 파일 서빙. route handler 안
+                // (request_ctx 있음) 에서만 의미가 있다. 평가 결과는
+                // `@respond` 와 동일하게 response 슬롯에 기록 + early-return.
+                if name == "serve" && self.request.is_some() {
+                    return self.eval_serve(args);
                 }
                 Err(RuntimeError::native(format!(
                     "unsupported domain `@{name}` in MVP interpreter"
@@ -1004,6 +1027,88 @@ impl<'w, W: Write> Interp<'w, W> {
         })
     }
 
+    /// A5a: `@serve "path"` — 단일 파일 서빙.
+    ///
+    /// 동작:
+    /// 1. 인자 1개 평가 → `Value::Str` 이어야 한다. 아니면 RuntimeError.
+    /// 2. `std::fs::metadata` 로 존재/파일 여부 확인.
+    ///    - `NotFound` → 404 응답 기록 후 early-return.
+    ///    - `is_dir` → 이번 마일스톤(A5a)은 단일 파일만. 400 으로 거부하는
+    ///      대신 RuntimeError 로 500 응답 유도 (디렉토리는 A2+A5b).
+    /// 3. 파일 크기 캡([`MAX_SERVE_BYTES`]) 초과 시 500.
+    /// 4. `std::fs::read(path)` → [`RawResponseBody`] 로 래핑, 확장자 기반
+    ///    MIME 부여. status 200 기록 + `pending_return` 으로 early-return.
+    ///
+    /// 경로는 CWD 기준. 여기선 canonicalize 안 함 — 경로가 하드코드 소스에
+    /// 박혀 있고 traversal 위협은 요청 path 가 아니라 개발자 손에 달려 있음.
+    /// 디렉토리 서빙이 들어올 때 요청 path 를 join 하게 되면 그때 canonicalize
+    /// + prefix 검사를 추가한다.
+    fn eval_serve(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.len() != 1 {
+            return Err(RuntimeError::native(format!(
+                "`@serve` expects exactly one string argument, got {}",
+                args.len()
+            )));
+        }
+        let path_value = self.eval(&args[0])?;
+        let path_str = match path_value {
+            Value::Str(s) => s,
+            other => {
+                return Err(RuntimeError::native(format!(
+                    "`@serve` argument must be a string, got {other}"
+                )));
+            }
+        };
+        let path = std::path::Path::new(&path_str);
+
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                // 10MB 캡
+                const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
+                if meta.len() > MAX_SERVE_BYTES {
+                    return Err(RuntimeError::native(format!(
+                        "`@serve` file exceeds {MAX_SERVE_BYTES} bytes: {path_str}"
+                    )));
+                }
+                let bytes = std::fs::read(path).map_err(|e| {
+                    RuntimeError::native(format!("`@serve` read failed: {e}"))
+                })?;
+                let mime = mime_for_path(path);
+                if self.response.is_none() {
+                    self.response = Some(ResponseCtx {
+                        status: 200,
+                        payload: Value::Void,
+                        raw_body: Some(RawResponseBody {
+                            bytes,
+                            content_type: mime,
+                        }),
+                    });
+                }
+                self.pending_return = Some(Value::Void);
+                Ok(Value::Void)
+            }
+            Ok(_) => Err(RuntimeError::native(format!(
+                "`@serve` target is not a regular file (directory serving not yet supported): {path_str}"
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 파일 없음 → 404. RuntimeError 를 던지면 500 이 되므로 직접
+                // response 를 기록하고 early-return 한다.
+                if self.response.is_none() {
+                    self.response = Some(ResponseCtx {
+                        status: 404,
+                        payload: Value::Void,
+                        raw_body: None,
+                    });
+                }
+                self.pending_return = Some(Value::Void);
+                Ok(Value::Void)
+            }
+            Err(e) => Err(RuntimeError::native(format!(
+                "`@serve` metadata failed: {e}"
+            ))),
+        }
+    }
+
     /// 요청 컨텍스트가 있을 때 request-state 도메인 (`@param`, `@query`,
     /// `@header`, `@body`, `@request`) 을 평가한다. 맵 성격은 `Value::Object`
     /// 로 노출되어 기존 `.field` 접근 경로로 조회된다. 지원하지 않는 이름은
@@ -1077,6 +1182,30 @@ impl<'w, W: Write> Interp<'w, W> {
 }
 
 /// void-scope 자동 출력을 피해야 하는 표현식인지.
+/// 파일 확장자 → Content-Type. A5a 하드코드 맵.
+///
+/// 10개 자주 쓰는 웹 asset 확장자만 매핑. 그 외는 `application/octet-stream`.
+/// 더 넓은 MIME 커버리지는 `mime_guess` crate 도입 시점(프로덕션 대비 때)에.
+fn mime_for_path(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("html" | "htm") => "text/html; charset=utf-8".to_string(),
+        Some("css") => "text/css; charset=utf-8".to_string(),
+        Some("js" | "mjs") => "application/javascript; charset=utf-8".to_string(),
+        Some("json") => "application/json".to_string(),
+        Some("svg") => "image/svg+xml".to_string(),
+        Some("png") => "image/png".to_string(),
+        Some("jpg" | "jpeg") => "image/jpeg".to_string(),
+        Some("ico") => "image/x-icon".to_string(),
+        Some("txt") => "text/plain; charset=utf-8".to_string(),
+        Some("woff2") => "font/woff2".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
 fn has_side_effect(expr: &HirExpr) -> bool {
     // `@html { ... }` 은 순수하게 값을 돌려주는 표현식이므로 side-effect
     // 목록에 넣지 않는다. 부수 효과가 있는 건 `@out`, 아직 미지원 도메인,

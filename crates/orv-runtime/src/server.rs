@@ -452,6 +452,17 @@ fn response_from_respond(resp: ResponseCtx) -> Response<Full<Bytes>> {
         .and_then(|s| StatusCode::from_u16(s).ok())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+    // A5a: `@serve` 가 기록한 raw body 는 JSON 경로를 우회하고 그대로 나간다.
+    // body 금지 상태(204/304/1xx)에서도 파일은 있을 수 없는 조합이라 일반
+    // 경로보다 먼저 잡는다.
+    if let Some(raw) = resp.raw_body {
+        return Response::builder()
+            .status(status)
+            .header("content-type", raw.content_type)
+            .body(Full::new(Bytes::from(raw.bytes)))
+            .expect("valid response");
+    }
+
     // RFC 상 body 가 허용되지 않는 상태(204/304/1xx)와 Void payload 는 항상
     // 빈 body 로 보낸다. SPEC 도 `@respond 204 {}` 에서 body 인코더 제거를
     // 기대하므로, payload 값과 무관하게 no-body 경로를 우선한다.
@@ -1682,6 +1693,105 @@ mod tests {
                     // ConnectionRefused 또는 timeout — 기대 경로.
                 }
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_single_file_returns_bytes_and_mime() {
+        // A5a: `@serve "path"` — 단일 파일 서빙. 파일 바이트 그대로 + 확장자
+        // 기반 Content-Type 헤더. 이 테스트는 세 가지를 한 번에 검증한다:
+        //
+        //   1. HTML 확장자는 text/html charset=utf-8
+        //   2. body bytes 가 파일 내용 그대로 (JSON 직렬화 안 됨)
+        //   3. 바이너리 파일 (ICO) 은 image/x-icon
+        run_on_localset(async {
+            let tmp = std::env::temp_dir().join(format!(
+                "orv_serve_test_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&tmp).expect("mktemp");
+            let html_path = tmp.join("index.html");
+            let ico_path = tmp.join("favicon.ico");
+            std::fs::write(&html_path, b"<!doctype html><h1>hi</h1>").expect("write html");
+            // ICO magic bytes — 단순 바이너리 검증용
+            std::fs::write(&ico_path, &[0u8, 0, 1, 0, 1, 0]).expect("write ico");
+
+            let src = format!(
+                r#"@server {{
+                    @listen 0
+                    @route GET /index.html {{ @serve "{}" }}
+                    @route GET /favicon.ico {{ @serve "{}" }}
+                }}"#,
+                html_path.display(),
+                ico_path.display()
+            );
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(&src);
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            // 1+2) HTML
+            let (s_html, ct_html, b_html) = send_request(addr, "GET", "/index.html", None).await;
+            assert_eq!(s_html, 200);
+            assert_eq!(ct_html.as_deref(), Some("text/html; charset=utf-8"));
+            assert_eq!(b_html, b"<!doctype html><h1>hi</h1>");
+
+            // 3) ICO
+            let (s_ico, ct_ico, b_ico) = send_request(addr, "GET", "/favicon.ico", None).await;
+            assert_eq!(s_ico, 200);
+            assert_eq!(ct_ico.as_deref(), Some("image/x-icon"));
+            assert_eq!(b_ico, vec![0u8, 0, 1, 0, 1, 0]);
+
+            handle.abort();
+            std::fs::remove_dir_all(&tmp).ok();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_missing_file_returns_404() {
+        run_on_localset(async {
+            let missing = std::env::temp_dir().join("orv_serve_nonexistent_xyz.html");
+            let _ = std::fs::remove_file(&missing);
+            let src = format!(
+                r#"@server {{
+                    @listen 0
+                    @route GET /missing {{ @serve "{}" }}
+                }}"#,
+                missing.display()
+            );
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(&src);
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, _) = send_request(addr, "GET", "/missing", None).await;
+            assert_eq!(status, 404);
+
+            handle.abort();
         })
         .await;
     }
