@@ -1060,22 +1060,20 @@ impl<'w, W: Write> Interp<'w, W> {
         })
     }
 
-    /// A5a: `@serve "path"` — 단일 파일 서빙.
+    /// `@serve "path"` — 정적 파일/디렉토리 서빙 (A5a + A5b).
     ///
-    /// 동작:
-    /// 1. 인자 1개 평가 → `Value::Str` 이어야 한다. 아니면 RuntimeError.
-    /// 2. `std::fs::metadata` 로 존재/파일 여부 확인.
-    ///    - `NotFound` → 404 응답 기록 후 early-return.
-    ///    - `is_dir` → 이번 마일스톤(A5a)은 단일 파일만. 400 으로 거부하는
-    ///      대신 RuntimeError 로 500 응답 유도 (디렉토리는 A2+A5b).
-    /// 3. 파일 크기 캡([`MAX_SERVE_BYTES`]) 초과 시 500.
-    /// 4. `std::fs::read(path)` → [`RawResponseBody`] 로 래핑, 확장자 기반
-    ///    MIME 부여. status 200 기록 + `pending_return` 으로 early-return.
+    /// 두 모드:
+    /// - **A5a 단일 파일**: `path` 가 regular file → 바이트 그대로 + MIME.
+    /// - **A5b 디렉토리**: `path` 가 directory → 요청 핸들러의 `@param.rest`
+    ///   (예약 이름) 를 `/` 로 join 해 최종 파일 경로 생성. 파일 발견되면
+    ///   A5a 와 같은 경로로 응답.
     ///
-    /// 경로는 CWD 기준. 여기선 canonicalize 안 함 — 경로가 하드코드 소스에
-    /// 박혀 있고 traversal 위협은 요청 path 가 아니라 개발자 손에 달려 있음.
-    /// 디렉토리 서빙이 들어올 때 요청 path 를 join 하게 되면 그때 canonicalize
-    /// + prefix 검사를 추가한다.
+    /// 크기 캡 10MB 공통. 에러 상태:
+    /// - 파일 없음 → 404
+    /// - 디렉토리지만 `rest` 파라미터 없음 → 500 (라우트 선언 오류)
+    /// - `rest` 에 `..` 세그먼트 포함 → 403 (문법적 traversal)
+    /// - canonicalize 결과가 root 밖 → 403 (심볼릭/상대경로 traversal)
+    /// - 심볼릭 링크 → 403 (더 관대한 정책은 후속 논의)
     fn eval_serve(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
         if args.len() != 1 {
             return Err(RuntimeError::native(format!(
@@ -1092,54 +1090,140 @@ impl<'w, W: Write> Interp<'w, W> {
                 )));
             }
         };
-        let path = std::path::Path::new(&path_str);
+        let declared = std::path::Path::new(&path_str);
 
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.is_file() => {
-                // 10MB 캡
-                const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
-                if meta.len() > MAX_SERVE_BYTES {
+        // 1) 대상 분류 — 파일이면 바로 서빙, 디렉토리면 rest join 후 재시도.
+        let meta = match std::fs::metadata(declared) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.respond_status(404);
+            }
+            Err(e) => {
+                return Err(RuntimeError::native(format!(
+                    "`@serve` metadata failed: {e}"
+                )));
+            }
+        };
+
+        let target_path: std::path::PathBuf = if meta.is_file() {
+            declared.to_path_buf()
+        } else if meta.is_dir() {
+            let rest = self
+                .request
+                .as_ref()
+                .and_then(|r| r.params.get("rest"))
+                .cloned();
+            let Some(rest) = rest else {
+                return Err(RuntimeError::native(
+                    "`@serve` on directory requires `@param.rest` — declare route as `/prefix/:rest*`"
+                ));
+            };
+            // 문법적 traversal 차단.
+            if rest.split('/').any(|seg| seg == "..") {
+                return self.respond_status(403);
+            }
+            let candidate = declared.join(&rest);
+
+            // canonicalize 양쪽 후 prefix 검사.
+            let root_canon = match declared.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
                     return Err(RuntimeError::native(format!(
-                        "`@serve` file exceeds {MAX_SERVE_BYTES} bytes: {path_str}"
+                        "`@serve` root canonicalize failed: {e}"
                     )));
                 }
-                let bytes = std::fs::read(path).map_err(|e| {
-                    RuntimeError::native(format!("`@serve` read failed: {e}"))
-                })?;
-                let mime = mime_for_path(path);
-                if self.response.is_none() {
-                    self.response = Some(ResponseCtx {
-                        status: 200,
-                        payload: Value::Void,
-                        raw_body: Some(RawResponseBody {
-                            bytes,
-                            content_type: mime,
-                        }),
-                    });
+            };
+            let target_canon = match candidate.canonicalize() {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return self.respond_status(404);
                 }
-                self.pending_return = Some(Value::Void);
-                Ok(Value::Void)
+                Err(e) => {
+                    return Err(RuntimeError::native(format!(
+                        "`@serve` target canonicalize failed: {e}"
+                    )));
+                }
+            };
+            if !target_canon.starts_with(&root_canon) {
+                return self.respond_status(403);
             }
-            Ok(_) => Err(RuntimeError::native(format!(
-                "`@serve` target is not a regular file (directory serving not yet supported): {path_str}"
-            ))),
+
+            // 심볼릭 링크 거부: canonicalize 는 따라가므로 별도로 symlink
+            // metadata 로 확인한다.
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(sm) if sm.file_type().is_symlink() => {
+                    return self.respond_status(403);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return self.respond_status(404);
+                }
+                Err(e) => {
+                    return Err(RuntimeError::native(format!(
+                        "`@serve` symlink check failed: {e}"
+                    )));
+                }
+            }
+
+            target_canon
+        } else {
+            return Err(RuntimeError::native(format!(
+                "`@serve` target is neither file nor directory: {path_str}"
+            )));
+        };
+
+        // 2) 최종 대상 파일 읽어 응답.
+        let final_meta = match std::fs::metadata(&target_path) {
+            Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 파일 없음 → 404. RuntimeError 를 던지면 500 이 되므로 직접
-                // response 를 기록하고 early-return 한다.
-                if self.response.is_none() {
-                    self.response = Some(ResponseCtx {
-                        status: 404,
-                        payload: Value::Void,
-                        raw_body: None,
-                    });
-                }
-                self.pending_return = Some(Value::Void);
-                Ok(Value::Void)
+                return self.respond_status(404);
             }
-            Err(e) => Err(RuntimeError::native(format!(
-                "`@serve` metadata failed: {e}"
-            ))),
+            Err(e) => {
+                return Err(RuntimeError::native(format!(
+                    "`@serve` final metadata failed: {e}"
+                )));
+            }
+        };
+        if !final_meta.is_file() {
+            // 디렉토리 인덱스 서빙은 범위 밖 — 404.
+            return self.respond_status(404);
         }
+        const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
+        if final_meta.len() > MAX_SERVE_BYTES {
+            return Err(RuntimeError::native(format!(
+                "`@serve` file exceeds {MAX_SERVE_BYTES} bytes: {}",
+                target_path.display()
+            )));
+        }
+        let bytes = std::fs::read(&target_path)
+            .map_err(|e| RuntimeError::native(format!("`@serve` read failed: {e}")))?;
+        let mime = mime_for_path(&target_path);
+        if self.response.is_none() {
+            self.response = Some(ResponseCtx {
+                status: 200,
+                payload: Value::Void,
+                raw_body: Some(RawResponseBody {
+                    bytes,
+                    content_type: mime,
+                }),
+            });
+        }
+        self.pending_return = Some(Value::Void);
+        Ok(Value::Void)
+    }
+
+    /// 단순 상태 코드만 가진 빈 body 응답을 기록하고 early-return 한다.
+    /// `@serve` 가 404/403 같이 body 없는 실패 응답을 반환할 때 사용한다.
+    fn respond_status(&mut self, status: i64) -> Result<Value, RuntimeError> {
+        if self.response.is_none() {
+            self.response = Some(ResponseCtx {
+                status,
+                payload: Value::Void,
+                raw_body: None,
+            });
+        }
+        self.pending_return = Some(Value::Void);
+        Ok(Value::Void)
     }
 
     /// 요청 컨텍스트가 있을 때 request-state 도메인 (`@param`, `@query`,

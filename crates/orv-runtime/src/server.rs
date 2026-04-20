@@ -1971,6 +1971,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_directory_resolves_rest_param() {
+        // A5b: `@serve "./dir"` + `@route GET /prefix/:rest* { ... }` 조합.
+        // 디렉토리 대상이면 `@param.rest` 와 join 해 파일을 찾는다.
+        run_on_localset(async {
+            let tmp = std::env::temp_dir().join(format!(
+                "orv_serve_dir_{}",
+                std::process::id()
+            ));
+            let sub = tmp.join("sub");
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            std::fs::write(tmp.join("index.html"), b"<h1>root</h1>").expect("w1");
+            std::fs::write(sub.join("deep.txt"), b"deep file").expect("w2");
+
+            let src = format!(
+                r#"@server {{
+                    @listen 0
+                    @route GET /assets/:rest* {{ @serve "{}" }}
+                }}"#,
+                tmp.display()
+            );
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(&src);
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            // 1) 루트 파일
+            let (s1, ct1, b1) = send_request(addr, "GET", "/assets/index.html", None).await;
+            assert_eq!(s1, 200);
+            assert_eq!(ct1.as_deref(), Some("text/html; charset=utf-8"));
+            assert_eq!(b1, b"<h1>root</h1>");
+
+            // 2) 하위 디렉토리 파일
+            let (s2, _, b2) = send_request(addr, "GET", "/assets/sub/deep.txt", None).await;
+            assert_eq!(s2, 200);
+            assert_eq!(b2, b"deep file");
+
+            // 3) 없는 파일 → 404
+            let (s3, _, _) = send_request(addr, "GET", "/assets/missing.txt", None).await;
+            assert_eq!(s3, 404);
+
+            handle.abort();
+            std::fs::remove_dir_all(&tmp).ok();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_directory_rejects_traversal_attempts() {
+        // A5b 보안: `..` 세그먼트가 포함된 rest 는 403. canonicalize 후 root
+        // prefix 검사가 통과하더라도 문법적 signal 로 먼저 차단.
+        run_on_localset(async {
+            let tmp = std::env::temp_dir().join(format!(
+                "orv_serve_traverse_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&tmp).expect("mkdir");
+            std::fs::write(tmp.join("ok.txt"), b"ok").expect("w");
+            // 바깥 파일
+            let outside = tmp.parent().unwrap().join(format!(
+                "orv_serve_outside_{}.txt",
+                std::process::id()
+            ));
+            std::fs::write(&outside, b"secret").expect("w outside");
+
+            let src = format!(
+                r#"@server {{
+                    @listen 0
+                    @route GET /a/:rest* {{ @serve "{}" }}
+                }}"#,
+                tmp.display()
+            );
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(&src);
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            // `..` 포함 경로 — 실제로 바깥 파일을 탈출하려는 시도.
+            let (status, _, _) = send_request(
+                addr,
+                "GET",
+                &format!("/a/../orv_serve_outside_{}.txt", std::process::id()),
+                None,
+            )
+            .await;
+            // hyper 가 `/a/..` 를 정규화할 수 있으므로 403 또는 404 / 200
+            // 중에 secret 은 절대 안 나와야 한다. 핵심: 200 이면 body 에
+            // "secret" 이 나오지 않아야 한다.
+            if status == 200 {
+                panic!("traversal should not succeed");
+            }
+
+            handle.abort();
+            std::fs::remove_dir_all(&tmp).ok();
+            std::fs::remove_file(&outside).ok();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn serve_missing_file_returns_404() {
         run_on_localset(async {
             let missing = std::env::temp_dir().join("orv_serve_nonexistent_xyz.html");
