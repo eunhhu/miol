@@ -375,12 +375,13 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                     if name.name == "route" {
-                        if let Some(kind) = self.lower_route(d_args) {
-                            routes.push(hir::HirExpr {
-                                kind,
-                                ty: hir::Type::Unknown,
-                                span: expr.span,
-                            });
+                        // A2a: leaf `@route METHOD /path { ... }` 는 단일
+                        // Route, group `@route /prefix { @route ... }` 는
+                        // 내부를 재귀로 펼쳐 여러 Route 가 된다. 평평한
+                        // vector 로 받는다.
+                        let flattened = self.flatten_route_args(d_args, "", expr.span);
+                        if !flattened.is_empty() {
+                            routes.extend(flattened);
                             continue;
                         }
                         // @route 형태가 이상하면 body_stmts 로 흘려보내고
@@ -399,11 +400,89 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// A2a: `@route` 하나를 재귀적으로 펼쳐 flat `HirExpr` 목록으로 만든다.
+    ///
+    /// - leaf (`method != ""`): 단일 Route variant 반환, path 에 `prefix` 를 앞에 붙임.
+    /// - group (`method == ""`): body block 내부의 `@route` 들을 재귀 lower,
+    ///   자신의 path 를 prefix 에 이어 붙여 전달. group body 의 비-route
+    ///   stmt 는 현재 silent 로 drop — A2-min 은 미들웨어 등을 지원 범위
+    ///   밖으로 둔다. C_middleware 마일스톤에서 진단 경로 합류.
+    ///
+    /// 형식이 이상한 입력(인자 수/타입 불일치)은 빈 벡터. 호출자가 이를
+    /// "변환 실패" 로 간주해 body_stmts 로 밀어 넣는다.
+    fn flatten_route_args(
+        &self,
+        args: &[ast::Expr],
+        prefix: &str,
+        span: orv_diagnostics::Span,
+    ) -> Vec<hir::HirExpr> {
+        let [method_expr, path_expr, body_expr] = args else {
+            return Vec::new();
+        };
+        let method = match &method_expr.kind {
+            ast::ExprKind::String(segs) => match segs.as_slice() {
+                [ast::StringSegment::Str(s)] => s.clone(),
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let path_raw = match &path_expr.kind {
+            ast::ExprKind::String(segs) => match segs.as_slice() {
+                [ast::StringSegment::Str(s)] => s.clone(),
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let ast::ExprKind::Block(block) = &body_expr.kind else {
+            return Vec::new();
+        };
+        let joined = join_route_paths(prefix, &path_raw);
+
+        if method.is_empty() {
+            // Group. body block 의 각 stmt 중 `@route` 만 재귀 unfold.
+            let mut out = Vec::new();
+            for stmt in &block.stmts {
+                if let ast::Stmt::Expr(inner) = stmt {
+                    if let ast::ExprKind::Domain {
+                        name: inner_name,
+                        args: inner_args,
+                    } = &inner.kind
+                    {
+                        if inner_name.name == "route" {
+                            out.extend(self.flatten_route_args(
+                                inner_args,
+                                &joined,
+                                inner.span,
+                            ));
+                        }
+                    }
+                }
+                // 비-route stmt: A2-min 은 silent drop. 미들웨어/let 등의
+                // 그룹-레벨 선언은 C_middleware / 후속에서 재논의.
+            }
+            return out;
+        }
+
+        // Leaf.
+        vec![hir::HirExpr {
+            kind: hir::HirExprKind::Route {
+                method,
+                method_span: method_expr.span,
+                path: joined,
+                path_span: path_expr.span,
+                handler: self.block(block),
+            },
+            ty: hir::Type::Unknown,
+            span,
+        }]
+    }
+
     /// `@route METHOD /path { body }` 를 전용 variant 로 분해한다.
     ///
     /// 파서가 넘긴 3-인자 Domain 은 `[Ident(method), String(path), Block(body)]`
     /// 모양이다. 이 형태가 아니면 `None` 을 돌려 fallback Domain 경로에
     /// 떨어뜨린다 (진단은 상위 계층 몫).
+    #[allow(dead_code)]
     fn lower_route(&self, args: &[ast::Expr]) -> Option<hir::HirExprKind> {
         let [method_expr, path_expr, body_expr] = args else {
             return None;
@@ -501,6 +580,36 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+/// A2a: 라우트 path prefix + suffix 합성.
+///
+/// 규칙:
+/// - prefix 가 비어 있으면 suffix 를 그대로 반환 (normalize 포함).
+/// - prefix 와 suffix 모두 있으면 `/` 로 join 하되 경계의 중복 `/` 는 축소.
+/// - join 결과의 trailing `/` 는 제거 (단 루트 `/` 는 그대로) — runtime 의
+///   `normalize_path` 와 동일한 방침.
+fn join_route_paths(prefix: &str, suffix: &str) -> String {
+    let combined = if prefix.is_empty() {
+        suffix.to_string()
+    } else {
+        let p = prefix.trim_end_matches('/');
+        let s = suffix.trim_start_matches('/');
+        if s.is_empty() {
+            p.to_string()
+        } else {
+            format!("{p}/{s}")
+        }
+    };
+    if combined == "/" {
+        return combined;
+    }
+    let trimmed = combined.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn unary_op(op: ast::UnaryOp) -> hir::UnaryOp {
     match op {
         ast::UnaryOp::Not => hir::UnaryOp::Not,
@@ -544,7 +653,11 @@ mod tests {
 
     fn lower_src(src: &str) -> hir::HirProgram {
         let lx = lex(src, FileId(0));
-        assert!(lx.diagnostics.is_empty(), "lex errors: {:?}", lx.diagnostics);
+        assert!(
+            lx.diagnostics.is_empty(),
+            "lex errors: {:?}",
+            lx.diagnostics
+        );
         let pr = parse(lx.tokens, FileId(0));
         assert!(
             pr.diagnostics.is_empty(),
@@ -739,7 +852,13 @@ mod tests {
 
     // --- @server lowering ---
 
-    fn expect_server(prog: &hir::HirProgram) -> (&Option<Box<hir::HirExpr>>, &Vec<hir::HirExpr>, &Vec<hir::HirStmt>) {
+    fn expect_server(
+        prog: &hir::HirProgram,
+    ) -> (
+        &Option<Box<hir::HirExpr>>,
+        &Vec<hir::HirExpr>,
+        &Vec<hir::HirStmt>,
+    ) {
         let hir::HirStmt::Expr(expr) = &prog.items[0] else {
             panic!("expected expr");
         };
@@ -838,5 +957,77 @@ mod tests {
             panic!("expected let");
         };
         assert_eq!(l.init.ty, hir::Type::Unknown);
+    }
+
+    // --- A2a: nested route groups ---
+
+    /// 그룹 Route 의 method/path 를 문자열로 돌려준다.
+    fn route_method_path(expr: &hir::HirExpr) -> (String, String) {
+        let hir::HirExprKind::Route { method, path, .. } = &expr.kind else {
+            panic!("expected Route variant, got {:?}", expr.kind);
+        };
+        (method.clone(), path.clone())
+    }
+
+    #[test]
+    fn nested_routes_flatten_with_path_prefix() {
+        // SPEC §11.7: `@route /prefix { @route METHOD /suffix { ... } }` 는
+        // `/prefix/suffix` 로 평평화된다. analyzer 수준에서 unfold 하므로
+        // runtime/HIR 에는 flat Route 만 들어간다.
+        let prog = lower_src(
+            r#"@server {
+                @listen 8080
+                @route /admin {
+                    @route GET /users { @respond 200 {} }
+                    @route DELETE /users/:id { @respond 204 {} }
+                }
+            }"#,
+        );
+        let (_, routes, _) = expect_server(&prog);
+        assert_eq!(routes.len(), 2);
+        let (m1, p1) = route_method_path(&routes[0]);
+        let (m2, p2) = route_method_path(&routes[1]);
+        assert_eq!((m1.as_str(), p1.as_str()), ("GET", "/admin/users"));
+        assert_eq!(
+            (m2.as_str(), p2.as_str()),
+            ("DELETE", "/admin/users/:id")
+        );
+    }
+
+    #[test]
+    fn nested_routes_allow_empty_suffix_for_prefix_itself() {
+        // `@route /admin { @route GET / { ... } }` 는 그룹 prefix 자체
+        // (`/admin`) 를 매칭한다. trailing `/` 는 정규화된다.
+        let prog = lower_src(
+            r#"@server {
+                @listen 8080
+                @route /admin {
+                    @route GET / { @respond 200 {} }
+                }
+            }"#,
+        );
+        let (_, routes, _) = expect_server(&prog);
+        assert_eq!(routes.len(), 1);
+        let (m, p) = route_method_path(&routes[0]);
+        assert_eq!((m.as_str(), p.as_str()), ("GET", "/admin"));
+    }
+
+    #[test]
+    fn nested_groups_support_unlimited_depth() {
+        // 3단 중첩도 재귀 unfold 되어야 한다.
+        let prog = lower_src(
+            r#"@server {
+                @listen 8080
+                @route /api {
+                    @route /v1 {
+                        @route GET /ping { @respond 200 {} }
+                    }
+                }
+            }"#,
+        );
+        let (_, routes, _) = expect_server(&prog);
+        assert_eq!(routes.len(), 1);
+        let (m, p) = route_method_path(&routes[0]);
+        assert_eq!((m.as_str(), p.as_str()), ("GET", "/api/v1/ping"));
     }
 }

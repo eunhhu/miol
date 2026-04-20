@@ -1767,6 +1767,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_route_group_prefixes_match_flat() {
+        // A2a E2E: `@route /admin { @route GET /users {...} }` 가 실제
+        // HTTP 요청 `/admin/users` 에 매치되어야 한다. analyzer 의 unfold 가
+        // runtime 매처까지 이어지는지 검증.
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route /admin {
+                        @route GET /users { @respond 200 { hit: "users" } }
+                        @route GET /posts { @respond 200 { hit: "posts" } }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (s1, _, b1) = send_request(addr, "GET", "/admin/users", None).await;
+            assert_eq!(s1, 200);
+            let j1: serde_json::Value = serde_json::from_slice(&b1).expect("json");
+            assert_eq!(j1["hit"], serde_json::json!("users"));
+
+            let (s2, _, b2) = send_request(addr, "GET", "/admin/posts", None).await;
+            assert_eq!(s2, 200);
+            let j2: serde_json::Value = serde_json::from_slice(&b2).expect("json");
+            assert_eq!(j2["hit"], serde_json::json!("posts"));
+
+            // unjoin 경로는 매치 안 돼 404
+            let (s3, _, _) = send_request(addr, "GET", "/users", None).await;
+            assert_eq!(s3, 404);
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn server_level_let_is_visible_to_handlers() {
         // A3: `@server { let x = ...; @route ... }` 에서 선언된 바인딩이
         // 라우트 핸들러 스코프 안에서 읽힌다. @out 같은 부트 문장과 나란히

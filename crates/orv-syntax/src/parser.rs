@@ -130,12 +130,12 @@ impl Parser {
             TokenKind::Keyword(Keyword::Const) => {
                 self.parse_const().map(|s| Stmt::Const(Box::new(s)))
             }
-            TokenKind::Keyword(Keyword::Function) => self
-                .parse_function()
-                .map(|s| Stmt::Function(Box::new(s))),
-            TokenKind::Keyword(Keyword::Struct) => self
-                .parse_struct_decl()
-                .map(|s| Stmt::Struct(Box::new(s))),
+            TokenKind::Keyword(Keyword::Function) => {
+                self.parse_function().map(|s| Stmt::Function(Box::new(s)))
+            }
+            TokenKind::Keyword(Keyword::Struct) => {
+                self.parse_struct_decl().map(|s| Stmt::Struct(Box::new(s)))
+            }
             TokenKind::Keyword(Keyword::Return) => self.parse_return().map(Stmt::Return),
             _ => {
                 // `ident = expr` 대입을 표현식 스테이트먼트로 인식.
@@ -322,9 +322,7 @@ impl Parser {
 
             // 범위 연산자 `..`, `..=` — 특수 AST 노드 Range로.
             // bp는 비교 연산자와 산술 사이에 둔다 (SPEC §2.5).
-            if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq)
-                && 15 >= min_bp
-            {
+            if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq) && 15 >= min_bp {
                 let inclusive = matches!(self.peek_kind(), TokenKind::DotDotEq);
                 self.advance();
                 let rhs = self.parse_expr_bp(16)?;
@@ -768,7 +766,7 @@ impl Parser {
 
     fn parse_return(&mut self) -> Option<ReturnStmt> {
         let ret_tok = self.advance(); // `return`
-        // return 뒤에 표현식이 올 수 있으면 파싱
+                                      // return 뒤에 표현식이 올 수 있으면 파싱
         let (value, span) = if self.is_expr_start() {
             let expr = self.parse_expr()?;
             let span = ret_tok.span.join(expr.span);
@@ -857,9 +855,7 @@ impl Parser {
         } else {
             None
         };
-        let end_span = else_branch
-            .as_ref()
-            .map_or(then.span, |e| e.span);
+        let end_span = else_branch.as_ref().map_or(then.span, |e| e.span);
         Some(Expr {
             kind: ExprKind::If {
                 cond: Box::new(cond),
@@ -1015,6 +1011,12 @@ impl Parser {
         // method — ident(GET/POST/...) 또는 `*`. 사용자 스코프와 겹치지
         // 않도록 String 리터럴로 보존한다. Ident 로 두면 resolver 가 미정의
         // 변수로 진단한다.
+        //
+        // A2a nested route group: method 슬롯에 `/` (Slash) 가 바로 오면
+        // `@route /prefix { @route METHOD /suffix { ... } }` 형태. 이 경우
+        // method 자리에 sentinel `""` 를 넣어 analyzer 가 "그룹" 으로
+        // 인식하게 한다. HIR 까지 가기 전에 analyzer 가 unfold 해서
+        // HIR::Route 의 method 는 항상 non-empty 이다.
         let method_expr = match self.peek_kind().clone() {
             TokenKind::Ident(m) => {
                 let tok = self.advance();
@@ -1030,6 +1032,15 @@ impl Parser {
                     span: tok.span,
                 }
             }
+            TokenKind::Slash => {
+                // group mode — method 없음. 현재 span 만 빌려 온다 (토큰은
+                // 소비하지 않음; path 파싱이 동일 토큰부터 이어간다).
+                let span = self.peek().span;
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(String::new())]),
+                    span,
+                }
+            }
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error("expected HTTP method after `@route`")
@@ -1043,20 +1054,14 @@ impl Parser {
         let path_start = self.peek().span;
         let mut path_end = path_start;
         let mut path_text = String::new();
-        if !matches!(
-            self.peek_kind(),
-            TokenKind::Slash | TokenKind::Star
-        ) {
+        if !matches!(self.peek_kind(), TokenKind::Slash | TokenKind::Star) {
             self.diagnostics.push(
                 Diagnostic::error("expected path starting with `/` or `*` after HTTP method")
                     .with_primary(self.peek().span, ""),
             );
             return None;
         }
-        while !matches!(
-            self.peek_kind(),
-            TokenKind::LBrace | TokenKind::Eof
-        ) {
+        while !matches!(self.peek_kind(), TokenKind::LBrace | TokenKind::Eof) {
             let tok = self.advance();
             path_end = tok.span;
             path_text.push_str(&token_source_repr(&tok.kind));
@@ -1381,17 +1386,25 @@ mod tests {
 
     fn parse_str(src: &str) -> ParseResult {
         let lx = lex(src, FileId(0));
-        assert!(lx.diagnostics.is_empty(), "lex errors: {:?}", lx.diagnostics);
+        assert!(
+            lx.diagnostics.is_empty(),
+            "lex errors: {:?}",
+            lx.diagnostics
+        );
         parse(lx.tokens, FileId(0))
     }
 
     /// 단일 리터럴 세그먼트 문자열인지 검사하고 내용 반환.
     fn plain_string(expr: &Expr) -> Option<&str> {
-        let ExprKind::String(segs) = &expr.kind else { return None };
+        let ExprKind::String(segs) = &expr.kind else {
+            return None;
+        };
         if segs.len() != 1 {
             return None;
         }
-        let StringSegment::Str(s) = &segs[0] else { return None };
+        let StringSegment::Str(s) = &segs[0] else {
+            return None;
+        };
         Some(s)
     }
 
@@ -1560,7 +1573,13 @@ mod tests {
         assert!(r.diagnostics.is_empty());
         let (op, _, rhs) = binary_of(&r.program.items[0]);
         assert_eq!(*op, BinaryOp::Add);
-        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Mul, .. }));
+        assert!(matches!(
+            rhs.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1573,7 +1592,13 @@ mod tests {
         let ExprKind::Paren(inner) = &lhs.kind else {
             panic!();
         };
-        assert!(matches!(inner.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+        assert!(matches!(
+            inner.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1583,7 +1608,13 @@ mod tests {
         assert!(r.diagnostics.is_empty());
         let (op, _, rhs) = binary_of(&r.program.items[0]);
         assert_eq!(*op, BinaryOp::Pow);
-        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Pow, .. }));
+        assert!(matches!(
+            rhs.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Pow,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1607,7 +1638,13 @@ mod tests {
         assert!(r.diagnostics.is_empty());
         let (op, lhs, _) = binary_of(&r.program.items[0]);
         assert_eq!(*op, BinaryOp::And);
-        assert!(matches!(lhs.kind, ExprKind::Unary { op: UnaryOp::Not, .. }));
+        assert!(matches!(
+            lhs.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1617,8 +1654,20 @@ mod tests {
         assert!(r.diagnostics.is_empty());
         let (op, lhs, rhs) = binary_of(&r.program.items[0]);
         assert_eq!(*op, BinaryOp::And);
-        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::Lt, .. }));
-        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Ge, .. }));
+        assert!(matches!(
+            lhs.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Lt,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rhs.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Ge,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1628,7 +1677,13 @@ mod tests {
         assert!(r.diagnostics.is_empty());
         let (op, _, rhs) = binary_of(&r.program.items[0]);
         assert_eq!(*op, BinaryOp::Coalesce);
-        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinaryOp::Or, .. }));
+        assert!(matches!(
+            rhs.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1638,7 +1693,13 @@ mod tests {
         let Stmt::Let(s) = &r.program.items[0] else {
             panic!();
         };
-        assert!(matches!(s.init.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+        assert!(matches!(
+            s.init.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1720,7 +1781,9 @@ mod tests {
     fn string_plain_single_segment() {
         let r = parse_str(r#""hello""#);
         assert!(r.diagnostics.is_empty());
-        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let Stmt::Expr(e) = &r.program.items[0] else {
+            panic!()
+        };
         let segs = segments_of(e);
         assert_eq!(segs.len(), 1);
         assert!(matches!(&segs[0], StringSegment::Str(s) if s == "hello"));
@@ -1730,7 +1793,9 @@ mod tests {
     fn string_interpolation_basic() {
         let r = parse_str(r#""Hello, {name}!""#);
         assert!(r.diagnostics.is_empty());
-        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let Stmt::Expr(e) = &r.program.items[0] else {
+            panic!()
+        };
         let segs = segments_of(e);
         assert_eq!(segs.len(), 3);
         assert!(matches!(&segs[0], StringSegment::Str(s) if s == "Hello, "));
@@ -1743,18 +1808,30 @@ mod tests {
         // {a + b}
         let r = parse_str(r#""sum: {a + b}""#);
         assert!(r.diagnostics.is_empty());
-        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let Stmt::Expr(e) = &r.program.items[0] else {
+            panic!()
+        };
         let segs = segments_of(e);
         assert_eq!(segs.len(), 2);
-        let StringSegment::Interp(inner) = &segs[1] else { panic!() };
-        assert!(matches!(inner.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+        let StringSegment::Interp(inner) = &segs[1] else {
+            panic!()
+        };
+        assert!(matches!(
+            inner.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn string_escapes() {
         let r = parse_str(r#""a\tb\nc\{d\}e""#);
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
-        let Stmt::Expr(e) = &r.program.items[0] else { panic!() };
+        let Stmt::Expr(e) = &r.program.items[0] else {
+            panic!()
+        };
         assert_eq!(plain_string(e), Some("a\tb\nc{d}e"));
     }
 
@@ -1828,9 +1905,7 @@ mod tests {
 
     #[test]
     fn route_with_multiple_params() {
-        let r = parse_str(
-            r#"@route DELETE /api/v1/users/:userId/posts/:postId { @out "x" }"#,
-        );
+        let r = parse_str(r#"@route DELETE /api/v1/users/:userId/posts/:postId { @out "x" }"#);
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
         let (method, path) = route_method_and_path(&r.program.items[0]);
         assert_eq!(method, "DELETE");
@@ -1850,10 +1925,12 @@ mod tests {
     fn route_preserves_existing_single_arg_domains() {
         // `@out x` 와 `@html { ... }` 는 기존 동작 유지 — route 전용
         // 파싱이 다른 도메인에 누수되면 안 된다.
-        let r = parse_str(r#"
+        let r = parse_str(
+            r#"
             @out "hi"
             @out @html { @p "x" }
-        "#);
+        "#,
+        );
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
         assert_eq!(r.program.items.len(), 2);
     }
