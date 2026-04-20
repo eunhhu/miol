@@ -100,6 +100,12 @@ pub struct HandlerOutcome {
     pub value: Value,
     /// `@respond` 로 기록된 응답. 없으면 `None`.
     pub response: Option<ResponseCtx>,
+    /// A3 하이브리드: handler 가 server-level `let` 으로 선언된 이름을
+    /// 재할당한 경우의 경고 메시지들. 기능은 허용 (per-request clone) 되지만
+    /// 개발자에게 "상태는 요청 간 공유되지 않으며 영속 상태는 `@db`/`@cache`
+    /// 를 사용하라" 는 신호를 준다. 호출자(`handle_request`)가 stderr 로
+    /// 흘려보낸다.
+    pub warnings: Vec<String>,
 }
 
 /// 런타임 에러.
@@ -301,6 +307,9 @@ pub(crate) fn run_handler_with_request_in_env<W: Write>(
     writer: &mut W,
 ) -> Result<HandlerOutcome, RuntimeError> {
     let mut interp = Interp::new_with_env(writer, env);
+    // A3: 진입 시점의 env 키를 "server-level captured" 로 기록. handler 가
+    // 이 이름을 재할당하면 경고를 적립한다 (기능은 허용).
+    interp.captured_names = interp.env.keys().copied().collect();
     interp.request = Some(request);
     let value = interp.eval(handler)?;
     // `@respond` 가 있었다면 pending_return 도 세팅돼 있다. handler 종료
@@ -310,6 +319,7 @@ pub(crate) fn run_handler_with_request_in_env<W: Write>(
     Ok(HandlerOutcome {
         value,
         response: interp.response.take(),
+        warnings: std::mem::take(&mut interp.warnings),
     })
 }
 
@@ -318,6 +328,14 @@ struct Interp<'w, W: Write> {
     writer: &'w mut W,
     pending_return: Option<Value>,
     loop_signal: LoopSignal,
+    /// A3 하이브리드: handler 진입 시점에 보유하고 있던 env 키들. 이후
+    /// `Assign` arm 이 이 집합 안의 name 을 타깃으로 삼으면 [`Self::warnings`]
+    /// 에 기록한다 (기능은 허용, 신호만 남김).
+    captured_names: std::collections::HashSet<NameId>,
+    /// 누적 경고. 동일 name 은 1회만 기록한다.
+    warnings: Vec<String>,
+    /// 경고 중복 방지 집합.
+    warned_names: std::collections::HashSet<NameId>,
     /// when 가드의 `$` — 스코프 바인딩이 아니므로 별도 슬롯에 보관한다.
     dollar: Option<Value>,
     /// HTML 렌더 모드 버퍼. `Some` 이면 `@tag` 도메인 호출과 자동 출력이
@@ -348,6 +366,9 @@ impl<'w, W: Write> Interp<'w, W> {
             html_buffer: None,
             request: None,
             response: None,
+            captured_names: std::collections::HashSet::new(),
+            warnings: Vec::new(),
+            warned_names: std::collections::HashSet::new(),
         }
     }
 
@@ -566,6 +587,18 @@ impl<'w, W: Write> Interp<'w, W> {
                         "cannot assign to undefined `{}`",
                         target.name
                     )));
+                }
+                // A3 하이브리드: handler 가 server-level (또는 top-level)
+                // 바인딩을 재할당하면 1회 경고 적립. 실제 동작은 per-request
+                // clone 이라 다른 요청에 누수되지 않지만, 개발자에게 "요청 간
+                // 공유되지 않는다, 영속 상태는 @db/@cache 를 쓰라" 는 신호.
+                if self.captured_names.contains(&target.id)
+                    && self.warned_names.insert(target.id)
+                {
+                    self.warnings.push(format!(
+                        "[orv] assignment to server-level `{}` is per-request only; use @db or @cache for shared state",
+                        target.name
+                    ));
                 }
                 let v = self.eval(value)?;
                 self.env.insert(target.id, v.clone());

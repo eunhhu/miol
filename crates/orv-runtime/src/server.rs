@@ -440,6 +440,12 @@ async fn handle_request(
         }
     };
 
+    // A3 하이브리드: server-level 바인딩 재할당 경고는 stderr 로 흘린다.
+    // 프로덕션 로깅 레이어가 없는 MVP 이므로 단순 eprintln.
+    for w in &outcome.warnings {
+        eprintln!("{w}");
+    }
+
     match outcome.response {
         Some(resp) => response_from_respond(resp),
         None => default_response(outcome.value),
@@ -1756,6 +1762,98 @@ mod tests {
 
             handle.abort();
             std::fs::remove_dir_all(&tmp).ok();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn server_level_let_is_visible_to_handlers() {
+        // A3: `@server { let x = ...; @route ... }` 에서 선언된 바인딩이
+        // 라우트 핸들러 스코프 안에서 읽힌다. @out 같은 부트 문장과 나란히
+        // 섞여 있어도 동작해야 한다.
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @out "boot"
+                    let version = "1.0.0"
+                    let greeting = "hello"
+                    @route GET /v { @respond 200 { v: version, g: greeting } }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, body) = send_request(addr, "GET", "/v", None).await;
+            assert_eq!(status, 200);
+            let j: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(j["v"], serde_json::json!("1.0.0"));
+            assert_eq!(j["g"], serde_json::json!("hello"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn server_level_let_reassignment_is_per_request() {
+        // A3 하이브리드: 핸들러가 server-level `let` 을 재할당해도 per-request
+        // clone 이라 다른 요청에 안 샌다. 두 번 호출 시 둘 다 counter == 1.
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    let mut counter = 0
+                    @route GET /inc {
+                        counter = counter + 1
+                        @respond 200 { counter: counter }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            // 두 번 연속 호출 — 공유 상태면 1, 2 가 나오고, per-request clone
+            // 이면 둘 다 1 이 나온다. 후자가 A3 가 약속한 동작.
+            let (s1, _, b1) = send_request(addr, "GET", "/inc", None).await;
+            assert_eq!(s1, 200);
+            let j1: serde_json::Value = serde_json::from_slice(&b1).expect("json");
+            assert_eq!(j1["counter"], serde_json::json!(1));
+
+            let (s2, _, b2) = send_request(addr, "GET", "/inc", None).await;
+            assert_eq!(s2, 200);
+            let j2: serde_json::Value = serde_json::from_slice(&b2).expect("json");
+            assert_eq!(
+                j2["counter"],
+                serde_json::json!(1),
+                "second request saw leaked mutation from first"
+            );
+
+            handle.abort();
         })
         .await;
     }
