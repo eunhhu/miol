@@ -118,6 +118,11 @@ pub struct HirFunctionStmt {
     pub body: HirFunctionBody,
     /// B2 MVP: `async function` 여부. 타입 표면에만 영향, interp 는 sync.
     pub is_async: bool,
+    /// C0: `define` 선언 여부. 후속 마일스톤에서 `@Name` invoke registry 가
+    /// 이 플래그를 참조한다.
+    pub is_define: bool,
+    /// C0: `pub` 가시성 modifier. B3 import 에서 실제 의미 부여.
+    pub is_pub: bool,
     /// 전체 범위.
     pub span: Span,
 }

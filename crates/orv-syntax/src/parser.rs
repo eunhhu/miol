@@ -41,6 +41,17 @@ struct Parser {
     diagnostics: Vec<Diagnostic>,
 }
 
+/// `function`/`define` 선언 파서 플래그.
+///
+/// `async`/`pub`/`define` modifier 들이 `parse_function` 한 자리에 모이므로
+/// 각 조합을 bool 3 개로 전달한다.
+#[derive(Default, Clone, Copy)]
+struct FunctionFlags {
+    is_async: bool,
+    is_define: bool,
+    is_pub: bool,
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>, file: FileId) -> Self {
         Self {
@@ -131,7 +142,7 @@ impl Parser {
                 self.parse_const().map(|s| Stmt::Const(Box::new(s)))
             }
             TokenKind::Keyword(Keyword::Function) => self
-                .parse_function(false)
+                .parse_function(FunctionFlags::default())
                 .map(|s| Stmt::Function(Box::new(s))),
             TokenKind::Keyword(Keyword::Async) => {
                 // `async function ...` — Async modifier 소비 후 function 파서로.
@@ -140,8 +151,46 @@ impl Parser {
                     self.error("expected `function` after `async`");
                     return None;
                 }
-                self.parse_function(true)
-                    .map(|s| Stmt::Function(Box::new(s)))
+                self.parse_function(FunctionFlags {
+                    is_async: true,
+                    ..FunctionFlags::default()
+                })
+                .map(|s| Stmt::Function(Box::new(s)))
+            }
+            TokenKind::Keyword(Keyword::Define) => self
+                .parse_function(FunctionFlags {
+                    is_define: true,
+                    ..FunctionFlags::default()
+                })
+                .map(|s| Stmt::Function(Box::new(s))),
+            TokenKind::Keyword(Keyword::Pub) => {
+                // `pub function`, `pub define`, `pub async function` 셋 모두 수용.
+                self.advance();
+                let mut flags = FunctionFlags {
+                    is_pub: true,
+                    ..FunctionFlags::default()
+                };
+                if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Async)) {
+                    self.advance();
+                    flags.is_async = true;
+                    if !matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Function)) {
+                        self.error("expected `function` after `pub async`");
+                        return None;
+                    }
+                }
+                match self.peek_kind() {
+                    TokenKind::Keyword(Keyword::Function) => {
+                        self.parse_function(flags).map(|s| Stmt::Function(Box::new(s)))
+                    }
+                    TokenKind::Keyword(Keyword::Define) => {
+                        flags.is_define = true;
+                        self.parse_function(flags).map(|s| Stmt::Function(Box::new(s)))
+                    }
+                    _ => {
+                        self.error("expected `function` or `define` after `pub`");
+                        None
+                    }
+                }
             }
             TokenKind::Keyword(Keyword::Struct) => {
                 self.parse_struct_decl().map(|s| Stmt::Struct(Box::new(s)))
@@ -716,8 +765,8 @@ impl Parser {
         })
     }
 
-    fn parse_function(&mut self, is_async: bool) -> Option<FunctionStmt> {
-        let fn_tok = self.advance(); // `function`
+    fn parse_function(&mut self, flags: FunctionFlags) -> Option<FunctionStmt> {
+        let fn_tok = self.advance(); // `function` or `define`
         let name = self.parse_ident("function name")?;
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
@@ -761,7 +810,9 @@ impl Parser {
             params,
             return_ty,
             body,
-            is_async,
+            is_async: flags.is_async,
+            is_define: flags.is_define,
+            is_pub: flags.is_pub,
             span: fn_tok.span.join(end_span),
         })
     }

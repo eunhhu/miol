@@ -60,6 +60,12 @@ pub struct FunctionStmt {
     /// B2 MVP: `async function` 선언 여부. 타입 표면만 보존하며 interp 는
     /// sync 실행한다. 실제 Future 스케줄링은 후속 마일스톤.
     pub is_async: bool,
+    /// C0: `define Name(...)` 으로 선언된 사용자 정의 도메인 여부. 현재
+    /// runtime 은 function 과 동일하게 실행하며, 후속 C_html/C_middleware
+    /// 에서 `@Name` invoke registry 가 이 플래그를 참조한다.
+    pub is_define: bool,
+    /// C0: `pub` 가시성 modifier. B3 import 마일스톤까지는 표면만 보존.
+    pub is_pub: bool,
     /// 전체 범위.
     pub span: Span,
 }

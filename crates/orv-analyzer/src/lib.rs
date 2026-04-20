@@ -130,6 +130,8 @@ impl<'a> Lowerer<'a> {
             return_ty: f.return_ty.as_ref().map(|t| self.ty_ref(t)),
             body: self.function_body(&f.body),
             is_async: f.is_async,
+            is_define: f.is_define,
+            is_pub: f.is_pub,
             span: f.span,
         }
     }

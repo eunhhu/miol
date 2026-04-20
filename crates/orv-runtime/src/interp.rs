@@ -2700,6 +2700,61 @@ mod tests {
         assert_eq!(out, "plus\n");
     }
 
+    // --- C0: define / pub define ---
+
+    #[test]
+    fn define_is_callable_like_function() {
+        // SPEC §9: `define Name() -> body` 는 function 과 같은 invoke 경로.
+        // C0 는 표면 키워드만 추가, 런타임은 function 처럼 동작.
+        let out = run_str(
+            r#"
+            define Pi() -> 3.14159
+            @out Pi()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "3.14159\n");
+    }
+
+    #[test]
+    fn define_with_block_body_returns_last_expr() {
+        let out = run_str(
+            r#"
+            define Greet(name: string) -> {
+              "Hello, {name}!"
+            }
+            @out Greet("orv")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "Hello, orv!\n");
+    }
+
+    #[test]
+    fn pub_define_parses() {
+        // `pub` modifier 는 파서 통과만 필요. 의미론(export) 는 B3 import 에서.
+        let out = run_str(
+            r#"
+            pub define Answer() -> 42
+            @out Answer()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn pub_function_parses() {
+        let out = run_str(
+            r#"
+            pub function add(a: int, b: int): int -> a + b
+            @out add(2, 3)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "5\n");
+    }
+
     // --- B2: async/await (sync MVP) ---
 
     #[test]
