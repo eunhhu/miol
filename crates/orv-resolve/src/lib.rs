@@ -362,6 +362,7 @@ impl Resolver {
                 self.resolve_function_body(params, body);
             }
             ExprKind::Throw(inner) => self.resolve_expr(inner),
+            ExprKind::Await(inner) => self.resolve_expr(inner),
             ExprKind::Try { try_block, catch } => {
                 self.resolve_block(try_block);
                 if let Some(clause) = catch {

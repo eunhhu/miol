@@ -116,6 +116,8 @@ pub struct HirFunctionStmt {
     pub return_ty: Option<HirTypeRef>,
     /// 본문.
     pub body: HirFunctionBody,
+    /// B2 MVP: `async function` 여부. 타입 표면에만 영향, interp 는 sync.
+    pub is_async: bool,
     /// 전체 범위.
     pub span: Span,
 }
@@ -434,6 +436,8 @@ pub enum HirExprKind {
     },
     /// `throw expr`.
     Throw(Box<HirExpr>),
+    /// `await expr` — B2 MVP 는 identity (피연산자 평가 결과 반환).
+    Await(Box<HirExpr>),
     /// `try { ... } catch [binding] { ... }`.
     Try {
         /// 시도 블록.

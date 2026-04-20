@@ -129,6 +129,7 @@ impl<'a> Lowerer<'a> {
             params: f.params.iter().map(|p| self.param(p)).collect(),
             return_ty: f.return_ty.as_ref().map(|t| self.ty_ref(t)),
             body: self.function_body(&f.body),
+            is_async: f.is_async,
             span: f.span,
         }
     }
@@ -261,6 +262,7 @@ impl<'a> Lowerer<'a> {
                 body: Box::new(self.function_body(body)),
             },
             ast::ExprKind::Throw(inner) => hir::HirExprKind::Throw(Box::new(self.expr(inner))),
+            ast::ExprKind::Await(inner) => hir::HirExprKind::Await(Box::new(self.expr(inner))),
             ast::ExprKind::Try { try_block, catch } => hir::HirExprKind::Try {
                 try_block: self.block(try_block),
                 catch: catch.as_ref().map(|c| hir::HirCatchClause {

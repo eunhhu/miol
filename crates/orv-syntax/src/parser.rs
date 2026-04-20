@@ -130,8 +130,18 @@ impl Parser {
             TokenKind::Keyword(Keyword::Const) => {
                 self.parse_const().map(|s| Stmt::Const(Box::new(s)))
             }
-            TokenKind::Keyword(Keyword::Function) => {
-                self.parse_function().map(|s| Stmt::Function(Box::new(s)))
+            TokenKind::Keyword(Keyword::Function) => self
+                .parse_function(false)
+                .map(|s| Stmt::Function(Box::new(s))),
+            TokenKind::Keyword(Keyword::Async) => {
+                // `async function ...` — Async modifier 소비 후 function 파서로.
+                self.advance();
+                if !matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Function)) {
+                    self.error("expected `function` after `async`");
+                    return None;
+                }
+                self.parse_function(true)
+                    .map(|s| Stmt::Function(Box::new(s)))
             }
             TokenKind::Keyword(Keyword::Struct) => {
                 self.parse_struct_decl().map(|s| Stmt::Struct(Box::new(s)))
@@ -634,6 +644,20 @@ impl Parser {
                     span,
                 });
             }
+            TokenKind::Keyword(Keyword::Await) => {
+                let await_tok = self.advance();
+                // B2 MVP: identity — 피연산자를 평가해 그대로 반환. postfix
+                // (call/field/index) 까지 포함해야 `await outer()` 가
+                // `Await(Call(outer))` 로 파싱된다. parse_expr 는 binary
+                // 까지 먹지만 MVP 는 관대하게 전체 식을 소비한다 (JS 와
+                // 약간 다른 precedence 지만 차이가 드러나는 케이스가 없음).
+                let expr = self.parse_expr()?;
+                let span = await_tok.span.join(expr.span);
+                return Some(Expr {
+                    kind: ExprKind::Await(Box::new(expr)),
+                    span,
+                });
+            }
             TokenKind::Keyword(Keyword::Try) => return self.parse_try(),
             TokenKind::LBracket => return self.parse_array_literal(),
             TokenKind::LBrace => {
@@ -687,7 +711,7 @@ impl Parser {
         })
     }
 
-    fn parse_function(&mut self) -> Option<FunctionStmt> {
+    fn parse_function(&mut self, is_async: bool) -> Option<FunctionStmt> {
         let fn_tok = self.advance(); // `function`
         let name = self.parse_ident("function name")?;
         self.expect(&TokenKind::LParen, "`(`")?;
@@ -732,6 +756,7 @@ impl Parser {
             params,
             return_ty,
             body,
+            is_async,
             span: fn_tok.span.join(end_span),
         })
     }
@@ -1296,6 +1321,7 @@ impl Parser {
                 | TokenKind::True
                 | TokenKind::False
                 | TokenKind::Keyword(Keyword::Void)
+                | TokenKind::Keyword(Keyword::Await)
                 | TokenKind::Ident(_)
                 | TokenKind::Regex { .. }
                 | TokenKind::At(_)

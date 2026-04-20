@@ -827,6 +827,11 @@ impl<'w, W: Write> Interp<'w, W> {
                 let v = self.eval(inner)?;
                 Err(RuntimeError::thrown(v))
             }
+            HirExprKind::Await(inner) => {
+                // B2 MVP: identity. Future 추상이 아직 없으므로 피연산자를
+                // 평가해 그대로 돌려준다. 실제 스케줄링은 후속 마일스톤.
+                self.eval(inner)
+            }
             HirExprKind::Try { try_block, catch } => match self.eval_block(try_block) {
                 Ok(v) => Ok(v),
                 Err(e) if e.thrown.is_some() => {
@@ -2680,6 +2685,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "plus\n");
+    }
+
+    // --- B2: async/await (sync MVP) ---
+
+    #[test]
+    fn async_function_runs_synchronously() {
+        // SPEC §7.1: `async function` 선언 + `await EXPR` 호출.
+        // MVP 의미: async 는 타입 표면만, 실행은 sync. await 는 identity.
+        let out = run_str(
+            r#"
+            async function greet(): string -> {
+              "hello"
+            }
+            let msg: string = await greet()
+            @out msg
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn await_on_plain_value_is_identity() {
+        // MVP: await 가 Future 아닌 값에 대해도 그대로 통과.
+        let out = run_str(
+            r#"
+            let x: int = await 42
+            @out x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn await_inside_async_function_body() {
+        // async 함수 내부에서 await 사용. 중첩 동작.
+        let out = run_str(
+            r#"
+            async function inner(): int -> {
+              await 10
+            }
+            async function outer(): int -> {
+              let n = await inner()
+              n + 1
+            }
+            @out await outer()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "11\n");
     }
 
     // --- B4: @env domain ---

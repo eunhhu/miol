@@ -57,6 +57,9 @@ pub struct FunctionStmt {
     pub return_ty: Option<TypeRef>,
     /// 본문 — `{ ... }` 블록 또는 단일 표현식.
     pub body: FunctionBody,
+    /// B2 MVP: `async function` 선언 여부. 타입 표면만 보존하며 interp 는
+    /// sync 실행한다. 실제 Future 스케줄링은 후속 마일스톤.
+    pub is_async: bool,
     /// 전체 범위.
     pub span: Span,
 }
@@ -325,6 +328,8 @@ pub enum ExprKind {
     },
     /// `throw expr` — 에러 발생.
     Throw(Box<Expr>),
+    /// `await expr` — async 결과 대기. B2 MVP 는 identity (sync 평가).
+    Await(Box<Expr>),
     /// `try { ... } catch [binding [: type]] { ... }`.
     Try {
         /// 시도 블록.
