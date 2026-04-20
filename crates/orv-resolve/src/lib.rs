@@ -481,11 +481,9 @@ mod tests {
         let program = parse_source("@out ghost");
         let result = resolve(&program);
         assert_eq!(result.diagnostics.len(), 1);
-        assert!(
-            result.diagnostics[0]
-                .message
-                .contains("undefined variable `ghost`")
-        );
+        assert!(result.diagnostics[0]
+            .message
+            .contains("undefined variable `ghost`"));
     }
 
     #[test]
@@ -527,7 +525,11 @@ mod tests {
         let src = "for i in 0..3 { @out i }\n@out i";
         let program = parse_source(src);
         let result = resolve(&program);
-        assert_eq!(result.diagnostics.len(), 1, "second `i` should be undefined");
+        assert_eq!(
+            result.diagnostics.len(),
+            1,
+            "second `i` should be undefined"
+        );
     }
 
     #[test]

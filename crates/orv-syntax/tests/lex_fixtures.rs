@@ -22,11 +22,7 @@ fn lex_fixture(name: &str) -> orv_syntax::LexResult {
 #[test]
 fn lex_01_basics_without_errors() {
     let r = lex_fixture("01-basics.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
     assert!(r.tokens.len() > 10);
     assert_eq!(r.tokens.last().map(|t| &t.kind), Some(&TokenKind::Eof));
 }
@@ -34,74 +30,46 @@ fn lex_01_basics_without_errors() {
 #[test]
 fn lex_02_types_without_errors() {
     let r = lex_fixture("02-types.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
     assert!(r.tokens.len() > 10);
 }
 
 #[test]
 fn lex_03_domains_without_errors() {
     let r = lex_fixture("03-domains.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
     assert!(r.tokens.len() > 10);
 }
 
 #[test]
 fn lex_04_web_without_errors() {
     let r = lex_fixture("04-web.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
     assert!(r.tokens.len() > 10);
 }
 
 #[test]
 fn lex_05_server_without_errors() {
     let r = lex_fixture("05-server.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
 }
 
 #[test]
 fn lex_06_optimization_without_errors() {
     let r = lex_fixture("06-optimization.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
 }
 
 #[test]
 fn lex_07_fullstack_without_errors() {
     let r = lex_fixture("07-fullstack-showcase.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
 }
 
 #[test]
 fn lex_08_superapp_without_errors() {
     let r = lex_fixture("08-superapp-simulation.orv");
-    assert!(
-        r.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        r.diagnostics
-    );
+    assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
 }
 
 #[test]
