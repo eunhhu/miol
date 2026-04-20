@@ -800,7 +800,7 @@ impl<'w, W: Write> Interp<'w, W> {
             )));
         }
         let saved = std::mem::replace(&mut self.env, lam.env.clone());
-        for (p, v) in lam.params.iter().zip(args.into_iter()) {
+        for (p, v) in lam.params.iter().zip(args) {
             self.env.insert(p.name.id, v);
         }
         let saved_return = self.pending_return.take();
@@ -938,7 +938,7 @@ impl<'w, W: Write> Interp<'w, W> {
         // 복제해 파라미터로 오버레이하고, 호출 종료 시 원본으로 복원.
         let saved = std::mem::take(&mut self.env);
         self.env = saved.clone();
-        for (p, v) in func.params.iter().zip(args.into_iter()) {
+        for (p, v) in func.params.iter().zip(args) {
             self.env.insert(p.name.id, v);
         }
         let saved_return = self.pending_return.take();

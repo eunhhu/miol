@@ -3,7 +3,7 @@
 //! MVP: `orv run <file>`로 `.orv` 파일을 tree-walking 인터프리터로 실행한다.
 //! 이후 `orv build`, `orv check`, `orv dev` 등이 추가된다.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -81,10 +81,7 @@ fn cmd_dump(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn report_diagnostics(
-    diags: &[orv_diagnostics::Diagnostic],
-    path: &PathBuf,
-) -> anyhow::Result<()> {
+fn report_diagnostics(diags: &[orv_diagnostics::Diagnostic], path: &Path) -> anyhow::Result<()> {
     if diags.is_empty() {
         return Ok(());
     }

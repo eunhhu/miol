@@ -377,7 +377,12 @@ pub struct WhenArm {
 }
 
 /// `when`의 패턴. MVP는 리터럴, `_` 와일드카드, `$` 현재값 참조, 범위만.
+///
+/// `Wildcard` 는 zero-size variant 라 Expr 를 담는 다른 variant 와 크기 차이가
+/// 크지만, 패턴 분기는 한 번에 보존되며 빈도가 균등해 Box 래핑의 실익이 없다.
+/// clippy 의 `large_enum_variant` 는 이 영역에서 false positive 로 취급.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Pattern {
     /// `_` 기본 분기.
     Wildcard,

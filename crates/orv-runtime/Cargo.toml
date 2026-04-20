@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # @server HTTP 런타임 (C5b) — MVP 는 HTTP/1.1. SPEC §11 의 QUIC/HTTP3
 # 기본값은 이후 마일스톤에서 합류한다.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

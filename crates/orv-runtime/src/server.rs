@@ -1,3 +1,9 @@
+// Clippy: `Arc<HashMap<NameId, Value>>` / `Arc<Vec<RouteEntry>>` 는 내부에 !Send
+// 타입(`Rc` 기반 Value)을 담는다. 이 파일의 서버는 tokio `current_thread` +
+// `spawn_local` 로만 쓰이므로 cross-thread 공유가 발생하지 않지만 타입
+// 시스템은 그 사실을 모른다. 구조적 allow 를 파일 레벨로 준다.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! `@server` HTTP 런타임 (C5b, MVP).
 //!
 //! tokio 의 `current_thread` 런타임 위에서 hyper 1.x HTTP/1.1 서버를 기동한다.
@@ -178,6 +184,9 @@ where
     Ok((addr, handle, boot_buf))
 }
 
+/// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 환경)`.
+type PreparedServerState = (u16, Vec<RouteEntry>, HashMap<NameId, Value>);
+
 fn prepare_server_state<W: std::io::Write>(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
@@ -185,7 +194,7 @@ fn prepare_server_state<W: std::io::Write>(
     captured_env: HashMap<NameId, Value>,
     boot_writer: &mut W,
     allow_ephemeral_port: bool,
-) -> Result<(u16, Vec<RouteEntry>, HashMap<NameId, Value>), RuntimeError> {
+) -> Result<PreparedServerState, RuntimeError> {
     // 1) listen 포트 결정. 운영 경로는 @listen 없으면 에러, 테스트 경로는 `0`
     //    을 허용해 OS 임의 포트 바인딩을 사용할 수 있다.
     let port = resolve_listen_port(listen, allow_ephemeral_port)?;
@@ -1784,7 +1793,7 @@ mod tests {
             let ico_path = tmp.join("favicon.ico");
             std::fs::write(&html_path, b"<!doctype html><h1>hi</h1>").expect("write html");
             // ICO magic bytes — 단순 바이너리 검증용
-            std::fs::write(&ico_path, &[0u8, 0, 1, 0, 1, 0]).expect("write ico");
+            std::fs::write(&ico_path, [0u8, 0, 1, 0, 1, 0]).expect("write ico");
 
             let src = format!(
                 r#"@server {{

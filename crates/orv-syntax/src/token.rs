@@ -191,8 +191,12 @@ pub enum Keyword {
 
 impl Keyword {
     /// 키워드 문자열을 매칭한다. 존재하지 않으면 `None`.
+    ///
+    /// `FromStr` trait 대신 inherent method 를 쓰는 이유: 렉서에서만 호출되고
+    /// 에러 타입이 필요 없어 `Option<Self>` 로 충분하다. trait 구현은
+    /// 오버헤드만 늘어난다.
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn match_keyword(s: &str) -> Option<Self> {
         Some(match s {
             "let" => Self::Let,
             "mut" => Self::Mut,

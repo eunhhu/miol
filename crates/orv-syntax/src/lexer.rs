@@ -67,10 +67,8 @@ impl<'src> Lexer<'src> {
     }
 
     fn error(&mut self, message: impl Into<String>, start: u32, end: u32) {
-        self.diagnostics.push(
-            Diagnostic::error(message)
-                .with_primary(self.span(start, end), ""),
-        );
+        self.diagnostics
+            .push(Diagnostic::error(message).with_primary(self.span(start, end), ""));
     }
 
     fn run(&mut self) {
@@ -147,7 +145,7 @@ impl<'src> Lexer<'src> {
         let kind = match text {
             "true" => TokenKind::True,
             "false" => TokenKind::False,
-            _ => match Keyword::from_str(text) {
+            _ => match Keyword::match_keyword(text) {
                 Some(kw) => TokenKind::Keyword(kw),
                 None => TokenKind::Ident(text.to_string()),
             },
@@ -225,10 +223,9 @@ impl<'src> Lexer<'src> {
                 Some('"') => {
                     let body_end = self.cursor.offset();
                     self.cursor.advance(); // 닫는 '"'
-                    // 플래그 수집
+                                           // 플래그 수집
                     let flags_start = self.cursor.offset();
-                    self.cursor
-                        .eat_while(|c| c.is_ascii_alphabetic());
+                    self.cursor.eat_while(|c| c.is_ascii_alphabetic());
                     let flags_end = self.cursor.offset();
                     let pattern = self.cursor.slice(body_start, body_end).to_string();
                     let flags = self.cursor.slice(flags_start, flags_end).to_string();
