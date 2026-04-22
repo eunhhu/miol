@@ -487,6 +487,19 @@ pub enum HirExprKind {
         /// 인덱스.
         index: Box<HirExpr>,
     },
+    /// SPEC 부록: `target[start:end]` 슬라이싱 (string / array).
+    ///
+    /// 양쪽 경계 모두 `Option` 으로 유지해 `[:]` / `[:b]` / `[a:]` 를
+    /// 표현한다. 런타임은 음수 인덱스를 파이썬식으로 해석하며, 결과 타입은
+    /// target 과 동일하다 (String → String, Array(T) → Array(T)).
+    Slice {
+        /// 대상 표현식.
+        target: Box<HirExpr>,
+        /// 시작 인덱스. `None` 은 0.
+        start: Option<Box<HirExpr>>,
+        /// 끝 인덱스(exclusive). `None` 은 `length`.
+        end: Option<Box<HirExpr>>,
+    },
     /// 필드 접근 — 필드 이름은 문자열 그대로.
     Field {
         /// 대상.
@@ -507,6 +520,17 @@ pub enum HirExprKind {
     Throw(Box<HirExpr>),
     /// `await expr` — B2 MVP 는 identity (피연산자 평가 결과 반환).
     Await(Box<HirExpr>),
+    /// SPEC §4.9 `expr as <type>` — 타입 캐스팅.
+    ///
+    /// 런타임은 원시 타입 간 변환을 허용한다 (numeric width, string→int 파싱,
+    /// display-based string 캐스트 등). 타입 체커는 `ty` 의 해석을 HIR 타입
+    /// 슬롯에 실어 준다.
+    Cast {
+        /// 피연산자.
+        expr: Box<HirExpr>,
+        /// 타겟 타입 어노테이션.
+        ty: HirTypeRef,
+    },
     /// `try { ... } catch [binding] { ... }`.
     Try {
         /// 시도 블록.

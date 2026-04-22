@@ -363,7 +363,18 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Option<TypeRef> {
-        let name = self.parse_ident("type name")?;
+        // SPEC §4.1: `void` 는 원시 타입이지만 토큰이 예약어라 일반 ident
+        // 경로로는 잡히지 않는다. 타입 자리에서만 Keyword::Void 를 Named("void")
+        // 으로 합성해 받아들인다 — 표현식 자리의 `void` 리터럴은 그대로 유지.
+        let name = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Void)) {
+            let tok = self.advance();
+            Ident {
+                name: "void".to_string(),
+                span: tok.span,
+            }
+        } else {
+            self.parse_ident("type name")?
+        };
         let mut ty = TypeRef {
             span: name.span,
             kind: TypeRefKind::Named(name),
@@ -467,19 +478,49 @@ impl Parser {
                 lhs = self.finish_call(lhs)?;
                 continue;
             }
-            // 후위 연산자 — 인덱스 `[idx]`.
+            // 후위 연산자 — 인덱스 `[idx]` 또는 슬라이스 `[a:b]` / `[:b]` /
+            // `[a:]` / `[:]`. `[` 뒤 첫 토큰이 `:` 면 start 생략, 아니면
+            // 표현식을 파싱 후 다음 토큰이 `:` 이면 슬라이스로 승격한다.
             if matches!(self.peek_kind(), TokenKind::LBracket) && 30 >= min_bp {
                 self.advance();
-                let idx = self.parse_expr()?;
-                let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
-                let span = lhs.span.join(rbracket.span);
-                lhs = Expr {
-                    kind: ExprKind::Index {
-                        target: Box::new(lhs),
-                        index: Box::new(idx),
-                    },
-                    span,
+                let start = if matches!(self.peek_kind(), TokenKind::Colon) {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
                 };
+                if matches!(self.peek_kind(), TokenKind::Colon) {
+                    self.advance(); // `:`
+                    let end = if matches!(self.peek_kind(), TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(self.parse_expr()?)
+                    };
+                    let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+                    let span = lhs.span.join(rbracket.span);
+                    lhs = Expr {
+                        kind: ExprKind::Slice {
+                            target: Box::new(lhs),
+                            start: start.map(Box::new),
+                            end: end.map(Box::new),
+                        },
+                        span,
+                    };
+                } else {
+                    let Some(idx) = start else {
+                        // `[]` 빈 인덱스는 허용되지 않는다.
+                        self.error("empty index `[]` is not allowed");
+                        return None;
+                    };
+                    let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+                    let span = lhs.span.join(rbracket.span);
+                    lhs = Expr {
+                        kind: ExprKind::Index {
+                            target: Box::new(lhs),
+                            index: Box::new(idx),
+                        },
+                        span,
+                    };
+                }
                 continue;
             }
             // 후위 연산자 — 필드 `.field`.
@@ -491,6 +532,22 @@ impl Parser {
                     kind: ExprKind::Field {
                         target: Box::new(lhs),
                         field,
+                    },
+                    span,
+                };
+                continue;
+            }
+            // SPEC §4.9 `expr as <type>` — 타입 캐스팅. 후위 연산자로 처리해
+            // `a + b as int` 는 `a + (b as int)` 로, `x as int + 1` 은
+            // `(x as int) + 1` 로 해석된다 (Rust 와 동일).
+            if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::As)) && 22 >= min_bp {
+                self.advance(); // `as`
+                let ty = self.parse_type()?;
+                let span = lhs.span.join(ty.span);
+                lhs = Expr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(lhs),
+                        ty,
                     },
                     span,
                 };
@@ -1346,6 +1403,24 @@ impl Parser {
         )
     }
 
+    /// `{ ... }` 블록 또는 `: <stmt>` 한 줄 조건문을 파싱한다.
+    ///
+    /// SPEC §6.1: `if cond : @out "..."` 같은 한 줄 조건문을 지원한다. 동일
+    /// 규약이 `else` / `for`/`while` 본문에도 적용된다 — 개행 기반 "한 줄"
+    /// 동작이 필요한 곳에서 재사용한다. `:` 분기는 단일 stmt 하나만 소비한다.
+    fn parse_block_or_single_line(&mut self) -> Option<Block> {
+        if matches!(self.peek_kind(), TokenKind::Colon) {
+            let colon = self.advance();
+            let stmt = self.parse_stmt()?;
+            let span = colon.span.join(stmt.span());
+            return Some(Block {
+                stmts: vec![stmt],
+                span,
+            });
+        }
+        self.parse_block()
+    }
+
     fn parse_block(&mut self) -> Option<Block> {
         let lbrace = self.expect(&TokenKind::LBrace, "`{`")?;
         let mut stmts = Vec::new();
@@ -1383,14 +1458,17 @@ impl Parser {
     fn parse_if(&mut self) -> Option<Expr> {
         let if_tok = self.advance(); // `if`
         let cond = self.parse_expr()?;
-        let then = self.parse_block()?;
+        // SPEC §6.1: 한 줄 조건문 `if cond : <stmt>` — `{` 대신 `:` 를 만나면
+        // 뒤따르는 단일 stmt 를 블록 한 덩어리로 감싼다. else 분기는 같은
+        // 규약을 반복 적용한다.
+        let then = self.parse_block_or_single_line()?;
         let else_branch = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
             self.advance();
             // `else if`는 else 분기에 새 if 표현식을 중첩.
             if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::If)) {
                 Some(Box::new(self.parse_if()?))
             } else {
-                let block = self.parse_block()?;
+                let block = self.parse_block_or_single_line()?;
                 let span = block.span;
                 Some(Box::new(Expr {
                     kind: ExprKind::Block(block),
@@ -1582,6 +1660,26 @@ impl Parser {
         }
         if name_ident.name == "redirect" {
             return self.parse_redirect_call(name_ident);
+        }
+
+        // SPEC 부록 I/O 도메인 — `@fs.read <path>`, `@fs.write <path> <content>
+        // <encoding>`, `@process.run <cmd>`, `@fetch <METHOD> <url>`.
+        //
+        // 공통 규약: `@name.method` dotted chain 혹은 `@name` 단독 뒤에 공백
+        // 구분 positional 인자들이 온다. `test.txt` / `./test.txt` 같은 bare
+        // path 토큰열은 자동으로 문자열 리터럴로 합성되며, `GET` 같은 ident
+        // 는 자연스럽게 String 토큰으로 받아 쓴다.
+        //
+        // 결과 AST: `Call { callee: Field{Domain, method}, args }` 로 떨어뜨려
+        // interp 의 기존 BoundMethod 호출 경로를 그대로 탄다. `@fetch` 는
+        // dotted chain 이 없는 특수 케이스라 `Domain` 을 그대로 callee 로 쓴다.
+        if matches!(name_ident.name.as_str(), "fs" | "process")
+            && matches!(self.peek_kind(), TokenKind::Dot)
+        {
+            return self.parse_io_domain_call(name_ident, at_tok.span);
+        }
+        if name_ident.name == "fetch" {
+            return self.parse_fetch_call(name_ident, at_tok.span);
         }
 
         // C_html-min: 대문자로 시작하는 `@Name(args...)` 는 사용자 정의 도메인
@@ -1877,6 +1975,151 @@ impl Parser {
                 args,
             },
             span: start_span.join(end_span),
+        })
+    }
+
+    /// SPEC 부록 `@fs.read` / `@fs.write` / `@process.run` 같은 lowercase dotted
+    /// I/O 도메인을 `Call { callee: Field{Domain, method}, args }` 로 파싱한다.
+    ///
+    /// 메서드 체인(`.read`) 을 먼저 수집한 뒤 positional 인자를 공백 구분으로
+    /// 흡수한다. bare path (`test.txt`, `./test.txt`) 는 [`Self::try_parse_bare_path`]
+    /// 가 문자열 리터럴로 합성한다.
+    fn parse_io_domain_call(&mut self, name_ident: Ident, at_span: Span) -> Option<Expr> {
+        // `.method` 체인 수집 — SPEC 예제는 single method 이지만 확장 여지로
+        // 반복을 허용한다.
+        let receiver = Expr {
+            kind: ExprKind::Domain {
+                name: name_ident.clone(),
+                args: Vec::new(),
+            },
+            span: name_ident.span,
+        };
+        let mut callee = receiver;
+        while matches!(self.peek_kind(), TokenKind::Dot) {
+            // 다음 토큰이 ident 가 아니면 path 시작 (`@fs ./a`) 이므로 멈춘다.
+            if !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) {
+                break;
+            }
+            self.advance(); // `.`
+            let field = self.parse_ident("method name")?;
+            let span = callee.span.join(field.span);
+            callee = Expr {
+                kind: ExprKind::Field {
+                    target: Box::new(callee),
+                    field,
+                },
+                span,
+            };
+        }
+
+        let mut args = Vec::new();
+        let mut end_span = callee.span;
+        while !matches!(self.peek_kind(), TokenKind::At(_)) && self.is_io_arg_start() {
+            if let Some(path) = self.try_parse_bare_path() {
+                end_span = path.span;
+                args.push(path);
+                continue;
+            }
+            let arg = self.parse_expr()?;
+            end_span = arg.span;
+            args.push(arg);
+        }
+
+        Some(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span: at_span.join(end_span),
+        })
+    }
+
+    /// SPEC 부록 `@fetch <METHOD> <url>` — dotted chain 이 없는 1~2 arg 도메인.
+    ///
+    /// 일반 1-arg 규약으로는 `GET "url"` 에서 url 이 잘려나가므로 여기서 2 arg
+    /// 을 모두 흡수한다. MVP 런타임은 아직 실제 HTTP 요청을 보내지 않지만
+    /// 파서가 원형을 보존하는 것이 목표.
+    fn parse_fetch_call(&mut self, name_ident: Ident, at_span: Span) -> Option<Expr> {
+        let mut args = Vec::new();
+        let mut end_span = name_ident.span;
+        while !matches!(self.peek_kind(), TokenKind::At(_)) && self.is_io_arg_start() {
+            if let Some(path) = self.try_parse_bare_path() {
+                end_span = path.span;
+                args.push(path);
+                continue;
+            }
+            let arg = self.parse_expr()?;
+            end_span = arg.span;
+            args.push(arg);
+        }
+        Some(Expr {
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args,
+            },
+            span: at_span.join(end_span),
+        })
+    }
+
+    /// I/O 도메인 positional arg 시작 토큰. 일반 arg-start 에 더해 `.` / `/` 를
+    /// 허용해 bare path (`./foo`, `/abs`) 를 받아 낸다.
+    fn is_io_arg_start(&self) -> bool {
+        self.is_domain_arg_start()
+            || matches!(
+                self.peek_kind(),
+                TokenKind::Dot | TokenKind::Slash
+            )
+    }
+
+    /// 인접 토큰 열을 shell-style path 리터럴로 합성한다.
+    ///
+    /// 반환값은 `String` 세그먼트 하나인 `Expr`. 경로로 간주하려면 `.` 또는
+    /// `/` 가 한 번 이상 포함돼야 한다 — 단일 ident 는 일반 표현식에 맡긴다
+    /// (변수 참조와 모호함 방지). 토큰 사이에 공백이 끼면 (span.end != next.start)
+    /// 즉시 종료한다.
+    fn try_parse_bare_path(&mut self) -> Option<Expr> {
+        let saved = self.pos;
+        let first_tok = self.peek();
+        if !matches!(
+            first_tok.kind,
+            TokenKind::Ident(_) | TokenKind::Dot | TokenKind::Slash
+        ) {
+            return None;
+        }
+        let first_span = first_tok.span;
+        let mut text = String::new();
+        let mut prev_end = first_span.range.start;
+        let mut end_span = first_span;
+
+        loop {
+            let tok = self.peek();
+            if !text.is_empty() && tok.span.range.start != prev_end {
+                break;
+            }
+            match &tok.kind {
+                TokenKind::Ident(s) => text.push_str(s),
+                TokenKind::Dot => text.push('.'),
+                TokenKind::Slash => text.push('/'),
+                TokenKind::Minus => text.push('-'),
+                TokenKind::Integer(s) => text.push_str(s),
+                _ => break,
+            }
+            let consumed = self.advance();
+            end_span = consumed.span;
+            prev_end = consumed.span.range.end;
+        }
+
+        if !text.contains('.') && !text.contains('/') {
+            // 단일 ident 만 소비한 경우 — 원위치로 복원하고 경로가 아님을 알린다.
+            self.pos = saved;
+            return None;
+        }
+        Some(Expr {
+            kind: ExprKind::String(vec![StringSegment::Str(text)]),
+            span: first_span.join(end_span),
         })
     }
 
@@ -2296,6 +2539,62 @@ mod tests {
         };
         let ty = s.ty.as_ref().unwrap();
         assert!(matches!(ty.kind, TypeRefKind::Nullable(_)));
+    }
+
+    #[test]
+    fn as_cast_postfix() {
+        // SPEC §4.9: `expr as <type>` 는 후위 연산자.
+        let r = parse_str("let new_n: short = n as short");
+        assert!(
+            r.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            r.diagnostics
+        );
+        let Stmt::Let(s) = &r.program.items[0] else {
+            panic!();
+        };
+        let ExprKind::Cast { expr, ty } = &s.init.kind else {
+            panic!("expected Cast, got {:?}", s.init.kind);
+        };
+        assert!(matches!(expr.kind, ExprKind::Ident(ref id) if id.name == "n"));
+        assert!(matches!(&ty.kind, TypeRefKind::Named(id) if id.name == "short"));
+    }
+
+    #[test]
+    fn as_cast_binds_tighter_than_addition() {
+        // `a + b as int` → `a + (b as int)` (Rust 와 동일).
+        let r = parse_str("a + b as int");
+        assert!(r.diagnostics.is_empty(), "diags: {:?}", r.diagnostics);
+        let Stmt::Expr(e) = &r.program.items[0] else {
+            panic!();
+        };
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+            panic!("expected Binary, got {:?}", e.kind);
+        };
+        assert_eq!(*op, BinaryOp::Add);
+        assert!(matches!(lhs.kind, ExprKind::Ident(ref id) if id.name == "a"));
+        assert!(matches!(&rhs.kind, ExprKind::Cast { .. }));
+    }
+
+    #[test]
+    fn void_type_annotation() {
+        // SPEC §4.1: `void` 는 원시 타입 — 어노테이션 자리에서 허용된다.
+        // 값 자리의 `void` 리터럴과는 독립적으로 인식되어야 한다.
+        let r = parse_str("let x: void = void");
+        assert!(
+            r.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            r.diagnostics
+        );
+        let Stmt::Let(s) = &r.program.items[0] else {
+            panic!();
+        };
+        let ty = s.ty.as_ref().unwrap();
+        let TypeRefKind::Named(id) = &ty.kind else {
+            panic!("expected Named(void), got {:?}", ty.kind);
+        };
+        assert_eq!(id.name, "void");
+        assert!(matches!(s.init.kind, ExprKind::Void));
     }
 
     #[test]

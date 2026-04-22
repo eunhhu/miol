@@ -17,7 +17,7 @@
 
 use orv_hir::{
     BinaryOp, HirBlock, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt, HirParam,
-    HirPattern, HirProgram, HirStmt, HirStringSegment, NameId, UnaryOp,
+    HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeRef, HirTypeRefKind, NameId, UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -1029,6 +1029,18 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Object(out))
             }
+            HirExprKind::Slice { target, start, end } => {
+                let t = self.eval(target)?;
+                let start_v = match start {
+                    Some(e) => Some(self.eval(e)?),
+                    None => None,
+                };
+                let end_v = match end {
+                    Some(e) => Some(self.eval(e)?),
+                    None => None,
+                };
+                apply_slice(t, start_v, end_v)
+            }
             HirExprKind::Index { target, index } => {
                 let t = self.eval(target)?;
                 let i = self.eval(index)?;
@@ -1156,6 +1168,10 @@ impl<'w, W: Write> Interp<'w, W> {
                 // B2 MVP: identity. Future 추상이 아직 없으므로 피연산자를
                 // 평가해 그대로 돌려준다. 실제 스케줄링은 후속 마일스톤.
                 self.eval(inner)
+            }
+            HirExprKind::Cast { expr, ty } => {
+                let v = self.eval(expr)?;
+                apply_cast(v, ty)
             }
             HirExprKind::Try { try_block, catch } => match self.eval_block(try_block) {
                 Ok(v) => Ok(v),
@@ -2378,6 +2394,127 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value, RuntimeError> {
     }
 }
 
+/// SPEC §4.9 `expr as <type>` 런타임 변환.
+///
+/// MVP 규칙:
+/// - 대상이 `Nullable(T)` 이면 안쪽 `T` 로 재귀 캐스트. void 는 그대로 통과.
+/// - `int` 계열(`int`, `short`, `byte`, `long`, `uint`, `ulong` 등): Float 는
+///   truncate, String 은 정수 파싱, Bool 은 0/1.
+/// - `float` / `double`: Int 는 f64 로 확장, String 은 부동소수점 파싱.
+/// - `string`: 모든 원시 값을 [`value_to_display`] 로 직렬화.
+/// - `bool`: Int 는 nonzero, String 은 `"true"`/`"false"`, Bool 은 그대로.
+/// - `void`: 무엇이든 `Value::Void`.
+/// - 이외 이름 (사용자 struct 등) 은 원본 값을 그대로 유지한다 — 타입 체커
+///   합류 후에 엄격화 가능.
+fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
+    // Array(T) 는 pass-through (원소별 캐스트는 아직 미지원 — MVP 범위 밖).
+    if matches!(ty.kind, HirTypeRefKind::Array(_)) {
+        return Ok(value);
+    }
+    if let HirTypeRefKind::Nullable(inner) = &ty.kind {
+        if matches!(value, Value::Void) {
+            return Ok(Value::Void);
+        }
+        return apply_cast(value, inner);
+    }
+    let HirTypeRefKind::Named(name) = &ty.kind else {
+        return Ok(value);
+    };
+    match name.as_str() {
+        "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => match value {
+            Value::Int(i) => Ok(Value::Int(i)),
+            Value::Float(f) => Ok(Value::Int(f.trunc() as i64)),
+            Value::Bool(b) => Ok(Value::Int(i64::from(b))),
+            Value::Str(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(Value::Int)
+                .map_err(|_| RuntimeError::native(format!("cannot cast string `{s}` to int"))),
+            other => Err(RuntimeError::native(format!(
+                "cannot cast {other} to int"
+            ))),
+        },
+        "float" | "double" => match value {
+            Value::Float(f) => Ok(Value::Float(f)),
+            #[allow(clippy::cast_precision_loss)]
+            Value::Int(i) => Ok(Value::Float(i as f64)),
+            Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
+            Value::Str(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| RuntimeError::native(format!("cannot cast string `{s}` to float"))),
+            other => Err(RuntimeError::native(format!(
+                "cannot cast {other} to float"
+            ))),
+        },
+        "string" => Ok(Value::Str(value_to_display(&value))),
+        "bool" => match value {
+            Value::Bool(b) => Ok(Value::Bool(b)),
+            Value::Int(i) => Ok(Value::Bool(i != 0)),
+            Value::Float(f) => Ok(Value::Bool(f != 0.0)),
+            Value::Str(s) => match s.as_str() {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err(RuntimeError::native(format!(
+                    "cannot cast string `{s}` to bool"
+                ))),
+            },
+            other => Err(RuntimeError::native(format!(
+                "cannot cast {other} to bool"
+            ))),
+        },
+        "void" => Ok(Value::Void),
+        // 사용자 정의 타입 (struct 이름 등) — MVP 는 pass-through.
+        _ => Ok(value),
+    }
+}
+
+/// SPEC 부록: `target[start:end]` 슬라이싱 — 문자열은 char 경계, 배열은 원소
+/// 경계로 자른다. 음수 인덱스는 파이썬식으로 `length` 에서 뺀 값이며, 범위를
+/// 벗어나면 단순 clamp (에러 대신 빈 결과) 한다.
+fn apply_slice(
+    target: Value,
+    start: Option<Value>,
+    end: Option<Value>,
+) -> Result<Value, RuntimeError> {
+    fn as_int(v: Option<Value>, what: &str) -> Result<Option<i64>, RuntimeError> {
+        match v {
+            None => Ok(None),
+            Some(Value::Int(n)) => Ok(Some(n)),
+            Some(other) => Err(RuntimeError::native(format!(
+                "slice {what} must be an integer, got {other}"
+            ))),
+        }
+    }
+    fn resolve(range: Option<i64>, default: i64, n: i64) -> i64 {
+        let raw = range.unwrap_or(default);
+        let adjusted = if raw < 0 { raw + n } else { raw };
+        adjusted.clamp(0, n)
+    }
+    let start_i = as_int(start, "start")?;
+    let end_i = as_int(end, "end")?;
+    match target {
+        Value::Str(s) => {
+            let chars: Vec<char> = s.chars().collect();
+            let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+            let lo = resolve(start_i, 0, n);
+            let hi = resolve(end_i, n, n);
+            let (lo, hi) = if lo > hi { (lo, lo) } else { (lo, hi) };
+            let slice: String = chars[lo as usize..hi as usize].iter().collect();
+            Ok(Value::Str(slice))
+        }
+        Value::Array(items) => {
+            let n = i64::try_from(items.len()).unwrap_or(i64::MAX);
+            let lo = resolve(start_i, 0, n);
+            let hi = resolve(end_i, n, n);
+            let (lo, hi) = if lo > hi { (lo, lo) } else { (lo, hi) };
+            Ok(Value::Array(items[lo as usize..hi as usize].to_vec()))
+        }
+        other => Err(RuntimeError::native(format!("cannot slice {other}"))),
+    }
+}
+
 fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     match (op, l, r) {
@@ -2499,6 +2636,120 @@ mod tests {
     fn explicit_out_prints_string() {
         let out = run_str(r#"@out "Hello, Orv!""#).unwrap();
         assert_eq!(out, "Hello, Orv!\n");
+    }
+
+    #[test]
+    fn cast_int_to_float_and_back() {
+        // SPEC §4.9: numeric width 캐스팅.
+        let out = run_str(
+            r#"
+            let n: int = 8
+            let f: float = n as float
+            @out f
+            let m: int = 3.9 as int
+            @out m
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "8\n3\n");
+    }
+
+    #[test]
+    fn cast_string_to_int_parses() {
+        // `@param.id as int` 같은 경로를 흉내 — string → int 는 파싱한다.
+        let out = run_str(
+            r#"
+            let s: string = "42"
+            let n: int = s as int
+            @out n + 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "43\n");
+    }
+
+    #[test]
+    fn string_slice_basic() {
+        // SPEC 부록 문자열 메서드: `[a:b]` / `[:b]` / `[a:]`.
+        let out = run_str(
+            r#"
+            let s: string = "Hello World"
+            @out s[0:5]
+            @out s[6:]
+            @out s[:5]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "Hello\nWorld\nHello\n");
+    }
+
+    #[test]
+    fn string_slice_negative_and_full() {
+        let out = run_str(
+            r#"
+            let s: string = "abcdef"
+            @out s[-3:]
+            @out s[:-2]
+            @out s[:]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "def\nabcd\nabcdef\n");
+    }
+
+    #[test]
+    fn single_line_if_body() {
+        // SPEC §6.1: `if cond : <stmt>` 한 줄 조건문.
+        let out = run_str(
+            r#"
+            let num: int = 10
+            if num > 5 : @out "greater"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "greater\n");
+    }
+
+    #[test]
+    fn single_line_if_inside_for_loop() {
+        // 루프 본문의 한 줄 `continue` 도 같은 규약.
+        let out = run_str(
+            r#"
+            for item in [1, 2, 3] {
+              if item == 2 : continue
+              @out item
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "1\n3\n");
+    }
+
+    #[test]
+    fn array_slice_copies_range() {
+        let out = run_str(
+            r#"
+            let arr: int[] = [10, 20, 30, 40, 50]
+            let mid: int[] = arr[1:4]
+            @out mid.length
+            for v in mid { @out v }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\n20\n30\n40\n");
+    }
+
+    #[test]
+    fn cast_to_string_uses_display() {
+        let out = run_str(
+            r#"
+            let n: int = 7
+            let s: string = n as string
+            @out s + "!"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "7!\n");
     }
 
     #[test]

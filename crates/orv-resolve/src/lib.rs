@@ -416,6 +416,15 @@ impl Resolver {
                 self.resolve_expr(target);
                 self.resolve_expr(index);
             }
+            ExprKind::Slice { target, start, end } => {
+                self.resolve_expr(target);
+                if let Some(s) = start {
+                    self.resolve_expr(s);
+                }
+                if let Some(e) = end {
+                    self.resolve_expr(e);
+                }
+            }
             ExprKind::Field { target, .. } => {
                 // 필드 이름은 소유 구조에 따라 해석되므로 여기서는 대상만.
                 self.resolve_expr(target);
@@ -425,6 +434,10 @@ impl Resolver {
             }
             ExprKind::Throw(inner) => self.resolve_expr(inner),
             ExprKind::Await(inner) => self.resolve_expr(inner),
+            // SPEC §4.9 `expr as <type>`: 타입 참조 안의 이름은 타입 네임
+            // 스페이스 (struct 이름, 원시 타입) 이라 resolver 의 binding
+            // 스코프와 무관하다. expr 만 해석한다.
+            ExprKind::Cast { expr, .. } => self.resolve_expr(expr),
             ExprKind::Try { try_block, catch } => {
                 self.resolve_block(try_block);
                 if let Some(clause) = catch {

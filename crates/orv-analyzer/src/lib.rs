@@ -284,6 +284,10 @@ impl<'a> Lowerer<'a> {
                 }
                 hir::Type::Unknown
             }
+            // SPEC §4.9 `expr as <type>`: 추론 타입은 target annotation.
+            // analyzer MVP 는 원본 표현식에 대한 호환성 검증을 하지 않는다 —
+            // 런타임 cast 가 허용 범위를 가리는 것이 자연스럽다 (string → int 등).
+            ast::ExprKind::Cast { ty, .. } => self.ty_ref_to_type(ty),
             // 나머지 모든 케이스 — 후속 스테이지 확장.
             _ => hir::Type::Unknown,
         }
@@ -329,7 +333,8 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Unary { expr, .. }
             | ast::ExprKind::Paren(expr)
             | ast::ExprKind::Throw(expr)
-            | ast::ExprKind::Await(expr) => self.collect_return_types_from_expr(expr, out),
+            | ast::ExprKind::Await(expr)
+            | ast::ExprKind::Cast { expr, .. } => self.collect_return_types_from_expr(expr, out),
             ast::ExprKind::Binary { lhs, rhs, .. } => {
                 self.collect_return_types_from_expr(lhs, out);
                 self.collect_return_types_from_expr(rhs, out);
@@ -389,6 +394,15 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Index { target, index } => {
                 self.collect_return_types_from_expr(target, out);
                 self.collect_return_types_from_expr(index, out);
+            }
+            ast::ExprKind::Slice { target, start, end } => {
+                self.collect_return_types_from_expr(target, out);
+                if let Some(s) = start {
+                    self.collect_return_types_from_expr(s, out);
+                }
+                if let Some(e) = end {
+                    self.collect_return_types_from_expr(e, out);
+                }
             }
             ast::ExprKind::Field { target, .. } => self.collect_return_types_from_expr(target, out),
             ast::ExprKind::Lambda { .. } => {}
@@ -737,6 +751,11 @@ impl<'a> Lowerer<'a> {
                 target: Box::new(self.expr(target)),
                 index: Box::new(self.expr(index)),
             },
+            ast::ExprKind::Slice { target, start, end } => hir::HirExprKind::Slice {
+                target: Box::new(self.expr(target)),
+                start: start.as_ref().map(|s| Box::new(self.expr(s))),
+                end: end.as_ref().map(|e| Box::new(self.expr(e))),
+            },
             ast::ExprKind::Field { target, field } => hir::HirExprKind::Field {
                 target: Box::new(self.expr(target)),
                 field: field.name.clone(),
@@ -748,6 +767,10 @@ impl<'a> Lowerer<'a> {
             },
             ast::ExprKind::Throw(inner) => hir::HirExprKind::Throw(Box::new(self.expr(inner))),
             ast::ExprKind::Await(inner) => hir::HirExprKind::Await(Box::new(self.expr(inner))),
+            ast::ExprKind::Cast { expr, ty } => hir::HirExprKind::Cast {
+                expr: Box::new(self.expr(expr)),
+                ty: self.ty_ref(ty),
+            },
             ast::ExprKind::Try { try_block, catch } => hir::HirExprKind::Try {
                 try_block: self.block(try_block),
                 catch: catch.as_ref().map(|c| hir::HirCatchClause {

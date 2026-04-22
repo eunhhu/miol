@@ -400,6 +400,17 @@ pub enum ExprKind {
         /// 인덱스 표현식.
         index: Box<Expr>,
     },
+    /// SPEC 부록 문자열 메서드의 `str[a:b]` / `str[:b]` / `str[a:]` 슬라이싱.
+    /// 배열 슬라이싱(`arr[a:b]`) 도 동일 노드로 표현한다. 양쪽 모두 생략된
+    /// `[:]` 는 전체 복제 의미.
+    Slice {
+        /// 대상 표현식.
+        target: Box<Expr>,
+        /// 시작 인덱스. 생략 시 0.
+        start: Option<Box<Expr>>,
+        /// 끝 인덱스(exclusive). 생략 시 `length`.
+        end: Option<Box<Expr>>,
+    },
     /// 필드/속성 접근 `target.field`.
     Field {
         /// 대상 표현식.
@@ -418,6 +429,14 @@ pub enum ExprKind {
     Throw(Box<Expr>),
     /// `await expr` — async 결과 대기. B2 MVP 는 identity (sync 평가).
     Await(Box<Expr>),
+    /// SPEC §4.9 타입 캐스팅 — `expr as <type>`. 숫자 width 캐스팅이 기본
+    /// 의미이며, 런타임은 원시 타입 간 변환을 허용한다 (string→int 파싱 등).
+    Cast {
+        /// 피연산자.
+        expr: Box<Expr>,
+        /// 타겟 타입.
+        ty: TypeRef,
+    },
     /// `try { ... } catch [binding [: type]] { ... }`.
     Try {
         /// 시도 블록.
