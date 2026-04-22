@@ -1259,8 +1259,6 @@ impl<'w, W: Write> Interp<'w, W> {
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
-        let saved_context = std::mem::take(&mut self.context);
-        let saved_after = std::mem::take(&mut self.after_queue);
         let result = match &lam.body {
             HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
@@ -1273,8 +1271,6 @@ impl<'w, W: Write> Interp<'w, W> {
         self.pending_return = saved_return;
         self.env = saved;
         self.loop_signal = saved_loop;
-        self.context = saved_context;
-        self.after_queue = saved_after;
         Ok(result)
     }
 
@@ -1475,8 +1471,6 @@ impl<'w, W: Write> Interp<'w, W> {
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
-        let saved_context = std::mem::take(&mut self.context);
-        let saved_after = std::mem::take(&mut self.after_queue);
         let result_value = match &func.body {
             HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
@@ -1493,8 +1487,6 @@ impl<'w, W: Write> Interp<'w, W> {
         }
         self.env = saved;
         self.loop_signal = saved_loop;
-        self.context = saved_context;
-        self.after_queue = saved_after;
         Ok(result_value)
     }
 
@@ -1519,8 +1511,6 @@ impl<'w, W: Write> Interp<'w, W> {
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
-        let saved_context = std::mem::take(&mut self.context);
-        let saved_after = std::mem::take(&mut self.after_queue);
         let result_value = match &func.body {
             HirFunctionBody::Block(b) => {
                 let ctl = self.eval_block_ctl(b)?;
@@ -1537,8 +1527,6 @@ impl<'w, W: Write> Interp<'w, W> {
         }
         self.env = saved;
         self.loop_signal = saved_loop;
-        self.context = saved_context;
-        self.after_queue = saved_after;
         Ok(result_value)
     }
 
