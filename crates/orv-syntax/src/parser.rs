@@ -40,7 +40,16 @@ pub struct ParseResult {
 /// 토큰 스트림을 받아 프로그램을 파싱한다.
 #[must_use]
 pub fn parse(tokens: Vec<Token>, file: FileId) -> ParseResult {
-    let mut p = Parser::new(tokens, file);
+    parse_with_newlines(tokens, file, Vec::new())
+}
+
+/// [`parse`] 의 확장형 — 소스 내 개행 오프셋을 같이 받아 파서가 "같은 줄" 을
+/// 판정할 수 있게 한다. 줄바꿈으로 문장이 나뉘는 paren-less 도메인 호출
+/// (`@fs.write`, `@Auth` 등) 에서 다음 줄 stmt 를 잘못 인자로 흡수하는 문제를
+/// 막기 위함.
+#[must_use]
+pub fn parse_with_newlines(tokens: Vec<Token>, file: FileId, newlines: Vec<u32>) -> ParseResult {
+    let mut p = Parser::new(tokens, file, newlines);
     let items = p.parse_program();
     let span = p.file_span();
     ParseResult {
@@ -54,6 +63,8 @@ struct Parser {
     pos: usize,
     file: FileId,
     diagnostics: Vec<Diagnostic>,
+    /// 소스 내 개행 위치(정렬된 바이트 오프셋). 비어 있으면 줄 정보 없음.
+    newlines: Vec<u32>,
 }
 
 /// `function`/`define` 선언 파서 플래그.
@@ -68,13 +79,40 @@ struct FunctionFlags {
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, file: FileId) -> Self {
+    fn new(tokens: Vec<Token>, file: FileId, newlines: Vec<u32>) -> Self {
         Self {
             tokens,
             pos: 0,
             file,
             diagnostics: Vec::new(),
+            newlines,
         }
+    }
+
+    /// `[a, b)` 범위에 개행이 포함돼 있으면 true.
+    ///
+    /// 파서의 `newlines` 가 비어 있으면 정보가 없어 항상 false — 기존
+    /// 동작(같은 줄 가정) 을 유지한다. 이진 탐색으로 O(log n).
+    fn has_newline_between(&self, a: u32, b: u32) -> bool {
+        if a >= b || self.newlines.is_empty() {
+            return false;
+        }
+        // `a..b` 에 걸치는 개행 오프셋이 하나라도 있는지.
+        match self.newlines.binary_search(&a) {
+            Ok(_) => true,
+            Err(idx) => idx < self.newlines.len() && self.newlines[idx] < b,
+        }
+    }
+
+    /// 이전 소비 토큰의 끝 오프셋과 현재 토큰의 시작 오프셋 사이에 개행이
+    /// 있으면 true. 파서 내부 루프에서 "다음 줄로 넘어갔는지" 판정용.
+    fn newline_before_cur(&self) -> bool {
+        if self.pos == 0 {
+            return false;
+        }
+        let prev_end = self.tokens[self.pos - 1].span.range.end;
+        let cur_start = self.peek().span.range.start;
+        self.has_newline_between(prev_end, cur_start)
     }
 
     // ── 커서 유틸 ──
@@ -1774,6 +1812,14 @@ impl Parser {
                 if matches!(self.peek_kind(), TokenKind::At(_)) {
                     break;
                 }
+                // 줄바꿈이 있고 다음 토큰이 block `{` 이 아니면 stmt 경계.
+                // `@Layout\n{...}` 처럼 블록 본문을 다음 줄에 두는 패턴은
+                // 계속 허용하기 위해 `{` 만 예외로 둔다.
+                if self.newline_before_cur()
+                    && !matches!(self.peek_kind(), TokenKind::LBrace)
+                {
+                    break;
+                }
                 let arg = self.parse_expr()?;
                 end_span = arg.span;
                 // block 은 관례상 마지막.
@@ -2015,9 +2061,41 @@ impl Parser {
             };
         }
 
+        // `@fs.write(a, b)` 처럼 괄호 호출 문법도 지원한다. 공백-구분
+        // positional 과 독립적으로 받아들이기 위해 callee 뒤에 `(` 가 바로
+        // 붙으면 일반 함수 호출로 흡수한다. 여기서 소비하지 않고 postfix
+        // `(` 핸들러 (parse_expr_bp) 에 맡기면 되지만 본 함수는 domain 엔트리
+        // 라 직접 처리.
+        if matches!(self.peek_kind(), TokenKind::LParen) && !self.newline_before_cur() {
+            self.advance(); // `(`
+            let mut args = Vec::new();
+            while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                let arg = self.parse_expr()?;
+                args.push(arg);
+                if matches!(self.peek_kind(), TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+            return Some(Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(callee),
+                    args,
+                },
+                span: at_span.join(rparen.span),
+            });
+        }
+
         let mut args = Vec::new();
         let mut end_span = callee.span;
-        while !matches!(self.peek_kind(), TokenKind::At(_)) && self.is_io_arg_start() {
+        // 줄바꿈은 I/O 도메인 호출의 stmt 경계 — 다음 줄 stmt 가 인자로
+        // 흡수되는 것을 막기 위해 개행이 있으면 루프 종료.
+        while !matches!(self.peek_kind(), TokenKind::At(_))
+            && self.is_io_arg_start()
+            && !self.newline_before_cur()
+        {
             if let Some(path) = self.try_parse_bare_path() {
                 end_span = path.span;
                 args.push(path);
@@ -2045,7 +2123,24 @@ impl Parser {
     fn parse_fetch_call(&mut self, name_ident: Ident, at_span: Span) -> Option<Expr> {
         let mut args = Vec::new();
         let mut end_span = name_ident.span;
-        while !matches!(self.peek_kind(), TokenKind::At(_)) && self.is_io_arg_start() {
+        // 첫 인자는 HTTP method. 관례상 `GET`/`POST`/... 같은 bare ident 로
+        // 쓰므로 변수 참조가 아니라 string 리터럴로 고정 해석한다. 따옴표로
+        // 감싼 `"GET"` 도 parse_expr 경로에서 자연스럽게 받아 들인다.
+        if matches!(self.peek_kind(), TokenKind::Ident(_)) && !self.newline_before_cur() {
+            let tok = self.advance();
+            let TokenKind::Ident(name) = tok.kind else {
+                unreachable!("peeked Ident");
+            };
+            end_span = tok.span;
+            args.push(Expr {
+                kind: ExprKind::String(vec![StringSegment::Str(name)]),
+                span: tok.span,
+            });
+        }
+        while !matches!(self.peek_kind(), TokenKind::At(_))
+            && self.is_io_arg_start()
+            && !self.newline_before_cur()
+        {
             if let Some(path) = self.try_parse_bare_path() {
                 end_span = path.span;
                 args.push(path);
@@ -2112,8 +2207,10 @@ impl Parser {
             prev_end = consumed.span.range.end;
         }
 
-        if !text.contains('.') && !text.contains('/') {
-            // 단일 ident 만 소비한 경우 — 원위치로 복원하고 경로가 아님을 알린다.
+        if !text.contains('.') && !text.contains('/') && !text.contains('-') {
+            // 단일 ident 만 소비한 경우 — 원위치로 복원하고 shell 토큰이
+            // 아님을 알린다. `-` 를 포함하면 `utf-8` / `-v` 같은 옵션 토큰
+            // 으로 인정.
             self.pos = saved;
             return None;
         }
@@ -2233,7 +2330,8 @@ impl Parser {
                     for d in inner_lex.diagnostics {
                         self.diagnostics.push(d);
                     }
-                    let mut sub = Parser::new(inner_lex.tokens, span.file);
+                    let mut sub =
+                        Parser::new(inner_lex.tokens, span.file, inner_lex.newlines);
                     match sub.parse_expr() {
                         Some(expr) => segments.push(StringSegment::Interp(expr)),
                         None => {

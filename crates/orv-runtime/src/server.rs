@@ -728,6 +728,7 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
         Value::BoundMethod { method, .. } => J::String(format!("<method {method}>")),
         Value::Db(_) => J::String("<db>".into()),
         Value::TypeName(n) => J::String(format!("<type {n}>")),
+        Value::Builtin(n) => J::String(format!("<builtin {n}>")),
     }
 }
 

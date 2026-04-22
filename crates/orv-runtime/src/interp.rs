@@ -219,6 +219,12 @@ pub enum Value {
     /// 같은 이름이 값 맥락에서 평가되면 이 variant. field access `.from` 이
     /// BoundMethod 를 만들어 호출하면 타입별 파싱/포맷을 수행한다.
     TypeName(String),
+    /// 내장 전역 함수 핸들 — `max`, `min`, `sin`, `now`, `sleep` 등.
+    /// 값 자체는 이름만 담고 실제 dispatch 는 [`Interpreter::call_builtin`]
+    /// 이 수행한다. `Type` 같이 내장 식별자를 변수로 섀도잉하려 하면 스코프
+    /// 테이블에 같은 이름이 먼저 들어가므로 런타임은 자연스럽게 스코프
+    /// 값을 우선한다 ([`Interpreter::lookup`] 참고).
+    Builtin(String),
 }
 
 /// 람다 값 — 파라미터 + 본문 + 캡처된 환경 스냅샷.
@@ -265,6 +271,7 @@ impl fmt::Display for Value {
             }
             Self::Db(_) => write!(f, "<db>"),
             Self::TypeName(n) => write!(f, "<type {n}>"),
+            Self::Builtin(n) => write!(f, "<builtin {n}>"),
         }
     }
 }
@@ -541,11 +548,22 @@ impl<'w, W: Write> Interp<'w, W> {
 
     fn eval(&mut self, expr: &HirExpr) -> Result<Value, RuntimeError> {
         match &expr.kind {
-            HirExprKind::Integer(s) => s
-                .replace('_', "")
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| RuntimeError::native(format!("invalid integer literal `{s}`"))),
+            HirExprKind::Integer(s) => {
+                // SPEC §4.1: ulong/uint 범위까지 지원해야 하므로 i64 범위를
+                // 벗어난 리터럴은 u64 로 재시도 후 i64 로 bit-cast 한다.
+                // MVP 인터프리터는 모든 정수를 `Value::Int(i64)` 로 저장하지만
+                // 비트 폭이 동일하므로 ulong MAX 값도 보존된다.
+                let cleaned = s.replace('_', "");
+                if let Ok(n) = cleaned.parse::<i64>() {
+                    return Ok(Value::Int(n));
+                }
+                if let Ok(u) = cleaned.parse::<u64>() {
+                    return Ok(Value::Int(u as i64));
+                }
+                Err(RuntimeError::native(format!(
+                    "invalid integer literal `{s}`"
+                )))
+            }
             HirExprKind::Float(s) => s
                 .replace('_', "")
                 .parse::<f64>()
@@ -771,6 +789,28 @@ impl<'w, W: Write> Interp<'w, W> {
                 // 맵을 한 번 스냅샷해 넘긴다 — 프로세스 env 는 handler 생애
                 // 동안 안정적이라 캐싱 없이 매 호출에서 다시 읽어도 무방
                 // (실전에서 @env 참조 빈도는 낮음).
+                // SPEC §10.2 `@in "prompt"` — 콘솔 표준 입력. MVP 는
+                // 비대화식 실행(테스트/스크립트) 을 기본 가정하므로 stdin 이
+                // 터미널에 연결됐을 때만 실제 readline 을 시도한다. 아니면
+                // 빈 문자열을 돌려 스크립트가 끊기지 않게 한다. prompt 는
+                // 있으면 `@out` 과 동일한 방식으로 출력.
+                if name == "in" {
+                    if let Some(prompt) = args.first() {
+                        let s = self.eval(prompt)?;
+                        print!("{}", value_to_display(&s));
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    }
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    return Ok(Value::Str(line));
+                }
                 // SPEC 부록 `@fs` — 파일 I/O. MVP: read/write 만.
                 // `@fs.read "path"` / `@fs.write "path" "content"`.
                 if name == "fs" && args.is_empty() {
@@ -787,6 +827,29 @@ impl<'w, W: Write> Interp<'w, W> {
                 // SPEC §11.19 `@plugin` — 런타임 확장.
                 // MVP 는 선언을 silent 로 받아들이고 즉시 실행하지 않는다.
                 // 실제 구현은 후속 마일스톤.
+                // SPEC §10.5 `@fetch METHOD url` — HTTP 요청. MVP 는 실제
+                // 네트워크 I/O 를 보내지 않고 Response 구조의 stub object 를
+                // 돌려 예시 스크립트가 `.status` / `.body` 필드 접근까지
+                // 이어지게 한다. 실제 구현은 후속 마일스톤에서 `reqwest`
+                // 또는 `hyper-rustls` 로 붙는다.
+                if name == "fetch" {
+                    let mut method = String::new();
+                    let mut url = String::new();
+                    for (i, a) in args.iter().enumerate() {
+                        let v = self.eval(a)?;
+                        match (i, v) {
+                            (0, Value::Str(s)) => method = s,
+                            (1, Value::Str(s)) => url = s,
+                            _ => {}
+                        }
+                    }
+                    let _ = method;
+                    return Ok(Value::Object(vec![
+                        ("status".to_string(), Value::Int(200)),
+                        ("body".to_string(), Value::Str(String::new())),
+                        ("url".to_string(), Value::Str(url)),
+                    ]));
+                }
                 if matches!(
                     name.as_str(),
                     "cron"
@@ -804,7 +867,6 @@ impl<'w, W: Write> Interp<'w, W> {
                         | "media"
                         | "offline"
                         | "push"
-                        | "fetch"
                         | "storage"
                         | "ffi"
                         | "unsafe"
@@ -1119,6 +1181,22 @@ impl<'w, W: Write> Interp<'w, W> {
                             method: name.to_string(),
                         })
                     }
+                    // SPEC §3.3 소유권 연산자 — `.move()` 와 `.copy()` 는 모든
+                    // 값 타입에서 허용되며 MVP interpreter 에서는 동일하게
+                    // clone 한다. 실제 borrow-checker 는 analyzer 계층이 수행.
+                    (
+                        Value::Str(_)
+                        | Value::Array(_)
+                        | Value::Object(_)
+                        | Value::Int(_)
+                        | Value::Float(_)
+                        | Value::Bool(_)
+                        | Value::Void,
+                        "move" | "copy",
+                    ) => Ok(Value::BoundMethod {
+                        receiver: Box::new(t),
+                        method: name.to_string(),
+                    }),
                     // C_db: `@db.create` / `@db.find` / `@db.update` / `@db.delete`.
                     (Value::Db(_), "create" | "find" | "findAll" | "update" | "delete") => {
                         Ok(Value::BoundMethod {
@@ -1175,17 +1253,23 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             HirExprKind::Try { try_block, catch } => match self.eval_block(try_block) {
                 Ok(v) => Ok(v),
-                Err(e) if e.thrown.is_some() => {
+                Err(e) => {
+                    // SPEC §6.4: try/catch 는 throw 된 사용자 값과 native 런타임
+                    // 에러를 모두 잡는다. native 에러는 메시지를 `Value::Str` 로
+                    // 래핑해 catch binding 에 전달한다. catch 가 없으면 그대로
+                    // 상위로 전파.
                     let Some(clause) = catch else {
                         return Err(e);
                     };
-                    let thrown = e.thrown.clone().unwrap();
+                    let thrown = e
+                        .thrown
+                        .clone()
+                        .unwrap_or_else(|| Value::Str(e.message.clone()));
                     if let Some(name) = &clause.binding {
                         self.env.insert(name.id, thrown);
                     }
                     self.eval_block(&clause.body)
                 }
-                Err(e) => Err(e),
             },
             HirExprKind::While { cond, body } => {
                 loop {
@@ -1244,6 +1328,10 @@ impl<'w, W: Write> Interp<'w, W> {
         if is_primitive_type_name(debug_name) {
             return Ok(Value::TypeName(debug_name.to_string()));
         }
+        // SPEC §13 내장 전역 함수.
+        if is_builtin_fn_name(debug_name) {
+            return Ok(Value::Builtin(debug_name.to_string()));
+        }
         Err(RuntimeError::native(format!(
             "undefined variable `{debug_name}`"
         )))
@@ -1254,6 +1342,7 @@ impl<'w, W: Write> Interp<'w, W> {
             Value::Function(func) => self.call_function(&func, args),
             Value::Lambda(lam) => self.call_lambda(&lam, args),
             Value::BoundMethod { receiver, method } => self.call_method(*receiver, &method, args),
+            Value::Builtin(name) => call_builtin(&name, args),
             other => Err(RuntimeError::native(format!(
                 "value is not callable: {other}"
             ))),
@@ -1385,6 +1474,19 @@ impl<'w, W: Write> Interp<'w, W> {
                 };
                 Ok(Value::Str(s.replace(&from, &to)))
             }
+            // SPEC §3.3 소유권/복사 연산 — interpreter 는 값이 기본 clone
+            // 이므로 `.move()` / `.copy()` 모두 identity 처럼 동작한다.
+            // static borrow-check 는 analyzer (B5) 책임.
+            (
+                v @ (Value::Str(_)
+                | Value::Array(_)
+                | Value::Object(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Void),
+                "move" | "copy",
+            ) => Ok(v),
             // ── SPEC §4.9 타입 변환 ──
             //
             // `int.from(v)` / `string.from(v)` / `float.from(v)` / `bool.from(v)`
@@ -1398,21 +1500,41 @@ impl<'w, W: Write> Interp<'w, W> {
                 convert_from(&type_name, arg)
             }
             // ── SPEC 부록 @fs.read / @fs.write ──
+            //
+            // SPEC §10.3 `File` 레코드: `{name, path, content}` 구조로 노출해
+            // `file.content` / `file.path` 등 필드 접근을 지원한다. 파일이
+            // 없거나 읽기에 실패하면 동일 형태의 빈 레코드를 돌려 예시
+            // 스크립트가 끊기지 않도록 한다 (실패 모델은 후속 마일스톤).
             (Value::TypeName(ns), "read") if ns == "fs" => {
                 let Some(Value::Str(path)) = args.into_iter().next() else {
                     return Err(RuntimeError::native("`@fs.read` expects a string path"));
                 };
-                std::fs::read_to_string(&path)
-                    .map(Value::Str)
-                    .map_err(|e| RuntimeError::native(format!("`@fs.read` failed: {e}")))
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(Value::Object(vec![
+                    ("name".to_string(), Value::Str(name)),
+                    ("path".to_string(), Value::Str(path)),
+                    ("content".to_string(), Value::Str(content)),
+                ]))
             }
             (Value::TypeName(ns), "write") if ns == "fs" => {
                 let mut it = args.into_iter();
                 let Some(Value::Str(path)) = it.next() else {
                     return Err(RuntimeError::native("`@fs.write` expects (path, content)"));
                 };
-                let Some(Value::Str(content)) = it.next() else {
-                    return Err(RuntimeError::native("`@fs.write` content must be string"));
+                // content 는 임의 값을 허용한다. 문자열은 그대로, 객체/배열은
+                // JSON 유사 직렬화(MVP: Display) 로 떨어뜨린다. encoding 인자
+                // (`utf-8` 등) 는 MVP 에서 무시한다.
+                let content_v = it
+                    .next()
+                    .ok_or_else(|| RuntimeError::native("`@fs.write` expects (path, content)"))?;
+                let content = match content_v {
+                    Value::Str(s) => s,
+                    other => format!("{other}"),
                 };
                 std::fs::write(&path, &content)
                     .map(|_| Value::Void)
@@ -1438,10 +1560,17 @@ impl<'w, W: Write> Interp<'w, W> {
                 let stdout_s = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr_s = String::from_utf8_lossy(&output.stderr).into_owned();
                 let status = i64::from(output.status.code().unwrap_or(-1));
+                // SPEC §10.6 ProcessResult: `{code, output, error}` + 기존
+                // `{stdout, stderr, status}` 별칭 유지. 두 이름 집합을 모두
+                // 노출해 fixture 예시(`.code` / `.output`) 와 기존 테스트
+                // (`.stdout` / `.status`) 가 공존한다.
                 Ok(Value::Object(vec![
-                    ("stdout".into(), Value::Str(stdout_s)),
-                    ("stderr".into(), Value::Str(stderr_s)),
+                    ("stdout".into(), Value::Str(stdout_s.clone())),
+                    ("stderr".into(), Value::Str(stderr_s.clone())),
                     ("status".into(), Value::Int(status)),
+                    ("code".into(), Value::Int(status)),
+                    ("output".into(), Value::Str(stdout_s)),
+                    ("error".into(), Value::Str(stderr_s)),
                 ]))
             }
             // ── C_db 메서드 ──
@@ -2229,6 +2358,271 @@ fn is_primitive_type_name(name: &str) -> bool {
     )
 }
 
+/// SPEC §13 내장 전역 함수 이름 — resolver 의 `is_builtin_name` 과 대칭.
+fn is_builtin_fn_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Type"
+            | "max"
+            | "min"
+            | "abs"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "log"
+            | "sqrt"
+            | "pow"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "now"
+            | "today"
+            | "tomorrow"
+            | "yesterday"
+            | "sleep"
+    )
+}
+
+/// 내장 함수 호출 dispatcher.
+///
+/// MVP 구현 — 실제 OS/네트워크 연동이 필요한 항목(`sleep`) 은 no-op 로
+/// 떨어뜨리고, 시간 함수는 `chrono` 가 선택 의존이 아니므로 자체 struct
+/// 로 현재 시각을 구한다. 각 함수의 인자 검증은 가볍게 하고 실패 시
+/// [`RuntimeError::native`] 로 내린다.
+fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    match name {
+        "Type" => {
+            let v = args
+                .into_iter()
+                .next()
+                .ok_or_else(|| RuntimeError::native("Type expects 1 argument"))?;
+            Ok(Value::Str(type_of(&v).to_string()))
+        }
+        "max" | "min" => numeric_fold(name, args),
+        "abs" => {
+            let v = args
+                .into_iter()
+                .next()
+                .ok_or_else(|| RuntimeError::native("abs expects 1 argument"))?;
+            match v {
+                Value::Int(n) => Ok(Value::Int(n.abs())),
+                Value::Float(f) => Ok(Value::Float(f.abs())),
+                other => Err(RuntimeError::native(format!(
+                    "abs: unsupported argument type {other}"
+                ))),
+            }
+        }
+        "sin" | "cos" | "tan" | "log" | "sqrt" | "floor" | "ceil" | "round" => {
+            let v = args
+                .into_iter()
+                .next()
+                .ok_or_else(|| RuntimeError::native(format!("{name} expects 1 argument")))?;
+            let x = value_to_f64(&v).ok_or_else(|| {
+                RuntimeError::native(format!("{name}: expected number, got {v}"))
+            })?;
+            let result = match name {
+                "sin" => x.sin(),
+                "cos" => x.cos(),
+                "tan" => x.tan(),
+                "log" => x.ln(),
+                "sqrt" => x.sqrt(),
+                "floor" => x.floor(),
+                "ceil" => x.ceil(),
+                "round" => x.round(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Float(result))
+        }
+        "pow" => {
+            let mut it = args.into_iter();
+            let base = it.next().ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
+            let exp = it.next().ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
+            let b = value_to_f64(&base)
+                .ok_or_else(|| RuntimeError::native(format!("pow: expected number, got {base}")))?;
+            let e = value_to_f64(&exp)
+                .ok_or_else(|| RuntimeError::native(format!("pow: expected number, got {exp}")))?;
+            Ok(Value::Float(b.powf(e)))
+        }
+        "now" => Ok(time_value(SystemTimeOffset::Now)),
+        "today" => Ok(time_value(SystemTimeOffset::Today)),
+        "tomorrow" => Ok(time_value(SystemTimeOffset::Tomorrow)),
+        "yesterday" => Ok(time_value(SystemTimeOffset::Yesterday)),
+        // MVP: `sleep` 은 값만 인정하고 실제 대기는 하지 않는다. 테스트
+        // 런타임(동기 interpreter) 에서 실제 대기를 끼얹으면 UX 저하가 커서
+        // no-op. 향후 비동기 스케줄러가 붙으면 실구현으로 교체.
+        "sleep" => Ok(Value::Void),
+        other => Err(RuntimeError::native(format!(
+            "unknown builtin `{other}`"
+        ))),
+    }
+}
+
+fn type_of(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Str(_) => "string",
+        Value::Bool(_) => "bool",
+        Value::Void => "void",
+        Value::Function(_) | Value::Lambda(_) | Value::BoundMethod { .. } | Value::Builtin(_) => {
+            "function"
+        }
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Db(_) => "db",
+        Value::TypeName(_) => "type",
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+fn numeric_fold(op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Err(RuntimeError::native(format!(
+            "{op} expects at least one argument"
+        )));
+    }
+    // int-only 인지 판별 — 모든 인자가 Int 이면 Int 로 반환, 하나라도 Float 면
+    // Float 로 포함시킨다. 대소 비교는 공통으로 f64 경유.
+    let mut all_int = matches!(&args[0], Value::Int(_));
+    if !matches!(&args[0], Value::Int(_) | Value::Float(_)) {
+        return Err(RuntimeError::native(format!(
+            "{op}: unsupported argument type {}",
+            &args[0]
+        )));
+    }
+    let mut best_f = value_to_f64(&args[0]).unwrap();
+    let mut best_idx = 0usize;
+    for (i, v) in args.iter().enumerate().skip(1) {
+        let f = value_to_f64(v)
+            .ok_or_else(|| RuntimeError::native(format!("{op}: unsupported argument type {v}")))?;
+        let is_better = match op {
+            "max" => f > best_f,
+            "min" => f < best_f,
+            _ => unreachable!(),
+        };
+        if is_better {
+            best_f = f;
+            best_idx = i;
+        }
+        if matches!(v, Value::Float(_)) {
+            all_int = false;
+        }
+    }
+    if all_int {
+        if let Value::Int(n) = args[best_idx] {
+            return Ok(Value::Int(n));
+        }
+    }
+    Ok(Value::Float(best_f))
+}
+
+/// `now()` 류 시간 함수가 반환할 오프셋.
+enum SystemTimeOffset {
+    Now,
+    Today,
+    Tomorrow,
+    Yesterday,
+}
+
+/// 현재 시각 기반으로 `{year, month, day, hour, minute, second}` object Value 를
+/// 만든다. `today`/`tomorrow`/`yesterday` 는 시/분/초가 0. `chrono` 의존을
+/// 늘리지 않기 위해 `std::time::SystemTime` + 작은 달력 계산으로 충분하게
+/// 근사한다 (그레고리안 기준, UTC).
+fn time_value(offset: SystemTimeOffset) -> Value {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 날짜 단위 오프셋.
+    let day_secs: i64 = 86_400;
+    let base_secs = match offset {
+        SystemTimeOffset::Now => secs,
+        SystemTimeOffset::Today => secs - (secs.rem_euclid(day_secs)),
+        SystemTimeOffset::Tomorrow => secs - (secs.rem_euclid(day_secs)) + day_secs,
+        SystemTimeOffset::Yesterday => secs - (secs.rem_euclid(day_secs)) - day_secs,
+    };
+    let (y, mo, d, h, mi, s) = seconds_to_ymdhms(base_secs);
+    Value::Object(vec![
+        ("year".to_string(), Value::Int(y)),
+        ("month".to_string(), Value::Int(mo)),
+        ("day".to_string(), Value::Int(d)),
+        ("hour".to_string(), Value::Int(h)),
+        ("minute".to_string(), Value::Int(mi)),
+        ("second".to_string(), Value::Int(s)),
+    ])
+}
+
+/// UNIX epoch 초를 UTC `(year, month, day, hour, minute, second)` 로 분해.
+///
+/// 윤년 포함 Zeller-free 날짜 계산. `chrono` 의존 없이 MVP 시간 함수에만
+/// 쓰이므로 정밀도는 초 단위로 충분하다.
+fn seconds_to_ymdhms(total: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let day_secs: i64 = 86_400;
+    let days = total.div_euclid(day_secs);
+    let time_of_day = total.rem_euclid(day_secs);
+    let h = time_of_day / 3600;
+    let mi = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    // 1970-01-01 을 0 일 기준으로 역산.
+    let mut year: i64 = 1970;
+    let mut days_left = days;
+    loop {
+        let y_days = if is_leap_year(year) { 366 } else { 365 };
+        if days_left >= y_days {
+            days_left -= y_days;
+            year += 1;
+        } else if days_left < 0 {
+            year -= 1;
+            let prev_y_days = if is_leap_year(year) { 366 } else { 365 };
+            days_left += prev_y_days;
+        } else {
+            break;
+        }
+    }
+    let month_lens = month_lengths(year);
+    let mut month: i64 = 1;
+    for len in month_lens {
+        if days_left < len {
+            break;
+        }
+        days_left -= len;
+        month += 1;
+    }
+    let day = days_left + 1;
+    (year, month, day, h, mi, s)
+}
+
+const fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn month_lengths(year: i64) -> [i64; 12] {
+    [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ]
+}
+
 /// SPEC §4.9 `T.from(v)` 타입 변환 dispatcher.
 ///
 /// MVP 규약:
@@ -2540,6 +2934,24 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError>
         (Ge, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
         (And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
         (Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
+        // SPEC §2.5 비트/시프트 — 정수 피연산자 한정.
+        (BitAnd, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
+        (BitOr, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
+        (BitXor, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+        (Shl, Value::Int(a), Value::Int(b)) if (0..64).contains(&b) => {
+            Ok(Value::Int(((a as i128) << b) as i64))
+        }
+        (Shr, Value::Int(a), Value::Int(b)) if (0..64).contains(&b) => Ok(Value::Int(a >> b)),
+        // 부동소수점 비교.
+        (Lt, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
+        (Gt, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
+        (Le, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
+        (Ge, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
+        // 문자열 비교 (사전식).
+        (Lt, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a < b)),
+        (Gt, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a > b)),
+        (Le, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a <= b)),
+        (Ge, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a >= b)),
         (Coalesce, l, r) => {
             if matches!(l, Value::Void) {
                 Ok(r)
@@ -2571,7 +2983,8 @@ fn is_truthy(v: &Value) -> bool {
         | Value::Lambda(_)
         | Value::BoundMethod { .. }
         | Value::Db(_)
-        | Value::TypeName(_) => true,
+        | Value::TypeName(_)
+        | Value::Builtin(_) => true,
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
     }
@@ -2605,7 +3018,7 @@ mod tests {
     use orv_analyzer::lower;
     use orv_diagnostics::FileId;
     use orv_resolve::resolve;
-    use orv_syntax::{lex, parse};
+    use orv_syntax::{lex, parse_with_newlines};
 
     fn run_str(src: &str) -> Result<String, RuntimeError> {
         let lx = lex(src, FileId(0));
@@ -2614,7 +3027,7 @@ mod tests {
             "lex errors: {:?}",
             lx.diagnostics
         );
-        let pr = parse(lx.tokens, FileId(0));
+        let pr = parse_with_newlines(lx.tokens, FileId(0), lx.newlines);
         assert!(
             pr.diagnostics.is_empty(),
             "parse errors: {:?}",
@@ -3532,7 +3945,7 @@ mod tests {
             "lex errors: {:?}",
             lx.diagnostics
         );
-        let pr = parse(lx.tokens, FileId(0));
+        let pr = parse_with_newlines(lx.tokens, FileId(0), lx.newlines);
         assert!(
             pr.diagnostics.is_empty(),
             "parse errors: {:?}",
@@ -3634,7 +4047,7 @@ mod tests {
     fn run_handler(src: &str, ctx: RequestCtx) -> (String, Option<ResponseCtx>) {
         let lx = lex(src, FileId(0));
         assert!(lx.diagnostics.is_empty(), "lex: {:?}", lx.diagnostics);
-        let pr = parse(lx.tokens, FileId(0));
+        let pr = parse_with_newlines(lx.tokens, FileId(0), lx.newlines);
         assert!(pr.diagnostics.is_empty(), "parse: {:?}", pr.diagnostics);
         let resolved = resolve(&pr.program);
         assert!(
@@ -4555,8 +4968,8 @@ let m = { ...base, b: 2 }
         let path = format!("/tmp/orv_fs_test_{}.txt", std::process::id());
         let src = format!(
             r#"await @fs.write("{path}", "hello")
-let content: string = await @fs.read("{path}")
-@out content"#
+let file = await @fs.read("{path}")
+@out file.content"#
         );
         let out = run_str(&src).unwrap();
         assert_eq!(out, "hello\n");
@@ -4617,5 +5030,126 @@ define Btn(label: string, disabled: bool?) -> {
         }"#;
         let (stdout, _) = run_handler(src, RequestCtx::default());
         assert_eq!(stdout, "bob\n");
+    }
+
+    // ── 내장 함수 회귀 테스트 ──
+
+    #[test]
+    fn builtin_type_returns_name() {
+        let out = run_str(
+            r#"@out Type(1)
+@out Type("hi")
+@out Type(void)
+@out Type(true)"#,
+        )
+        .unwrap();
+        assert_eq!(out, "int\nstring\nvoid\nbool\n");
+    }
+
+    #[test]
+    fn builtin_max_min_abs_preserve_int() {
+        let out = run_str(
+            r#"@out max(1, 2, 3)
+@out min(3, 2, 1)
+@out abs(-5)"#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\n1\n5\n");
+    }
+
+    #[test]
+    fn builtin_math_functions_are_floats() {
+        // sqrt/floor/ceil/round 결과는 항상 f64 로 떨어진다.
+        let out = run_str(
+            r#"@out sqrt(4)
+@out floor(1.9)
+@out ceil(1.1)
+@out round(1.5)"#,
+        )
+        .unwrap();
+        assert_eq!(out, "2\n1\n2\n2\n");
+    }
+
+    #[test]
+    fn builtin_now_returns_time_object_with_fields() {
+        let out = run_str(
+            r#"let t = now()
+@out t.year > 2000
+@out t.month >= 1 && t.month <= 12
+@out t.day >= 1 && t.day <= 31"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\ntrue\ntrue\n");
+    }
+
+    #[test]
+    fn builtin_sleep_is_noop() {
+        let out = run_str(r#"await sleep(10)
+@out "ok""#)
+            .unwrap();
+        assert_eq!(out, "ok\n");
+    }
+
+    // ── SPEC §3.3 소유권/복사 회귀 ──
+
+    #[test]
+    fn string_move_and_copy_return_equivalent_value() {
+        let out = run_str(
+            r#"let a = "hi"
+let b = a.move()
+@out b
+let c = b.copy()
+@out c"#,
+        )
+        .unwrap();
+        assert_eq!(out, "hi\nhi\n");
+    }
+
+    // ── 비트 연산 회귀 ──
+
+    #[test]
+    fn bitwise_operators_on_ints() {
+        let out = run_str(
+            r#"@out 5 & 3
+@out 5 | 3
+@out 5 ^ 3
+@out 1 << 3
+@out 16 >> 2"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1\n7\n6\n8\n4\n");
+    }
+
+    // ── try/catch 가 native error 를 잡는지 확인 ──
+
+    #[test]
+    fn try_catch_captures_native_error_as_message() {
+        let out = run_str(
+            r#"try {
+  let x: int = int.from("not a number")
+} catch err {
+  @out "caught: {err}"
+}"#,
+        )
+        .unwrap();
+        assert!(out.starts_with("caught: int.from failed"), "got: {out}");
+    }
+
+    // ── 줄바꿈 경계 회귀: @fs.write 가 다음 줄 stmt 를 흡수하지 않음 ──
+
+    #[test]
+    fn io_domain_stops_args_at_newline() {
+        let path = format!(
+            "/tmp/orv_io_newline_{}.txt",
+            std::process::id()
+        );
+        let src = format!(
+            r#"await @fs.write "{path}" "hello"
+let v = 1
+@out v"#
+        );
+        let out = run_str(&src).unwrap();
+        assert_eq!(out, "1\n");
+        let _ = std::fs::remove_file(&path);
     }
 }

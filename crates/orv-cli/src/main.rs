@@ -73,7 +73,7 @@ fn cmd_dump(path: &PathBuf) -> anyhow::Result<()> {
     let file_id = FileId(0);
     let lx = orv_syntax::lex(&source, file_id);
     report_diagnostics(&lx.diagnostics, path)?;
-    let pr = orv_syntax::parse(lx.tokens, file_id);
+    let pr = orv_syntax::parse_with_newlines(lx.tokens, file_id, lx.newlines);
     report_diagnostics(&pr.diagnostics, path)?;
     println!("{:#?}", pr.program);
     Ok(())

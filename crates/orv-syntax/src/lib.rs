@@ -13,5 +13,5 @@ mod parser;
 mod token;
 
 pub use lexer::{lex, LexResult};
-pub use parser::{parse, ParseResult};
+pub use parser::{parse, parse_with_newlines, ParseResult};
 pub use token::{Keyword, Token, TokenKind};

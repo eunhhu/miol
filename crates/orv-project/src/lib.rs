@@ -120,7 +120,7 @@ impl Loader {
         self.next_file_id += 1;
         let lx = orv_syntax::lex(&source, file_id);
         self.diagnostics.extend(lx.diagnostics);
-        let pr = orv_syntax::parse(lx.tokens, file_id);
+        let pr = orv_syntax::parse_with_newlines(lx.tokens, file_id, lx.newlines);
         self.diagnostics.extend(pr.diagnostics);
 
         // import 를 먼저 따라가 의존 파일을 로드한다 (depth-first).

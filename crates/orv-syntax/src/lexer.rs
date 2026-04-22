@@ -14,6 +14,10 @@ pub struct LexResult {
     pub tokens: Vec<Token>,
     /// 수집된 진단(에러 포함).
     pub diagnostics: Vec<Diagnostic>,
+    /// 소스 내 개행(`\n`) 바이트 오프셋 — 파서가 "같은 줄" 판정에 사용.
+    ///
+    /// `base_offset` 이 더해진 절대 오프셋이다. 정렬된 상태로 보장된다.
+    pub newlines: Vec<u32>,
 }
 
 /// 소스 문자열과 파일 ID를 받아 토큰화한다.
@@ -30,9 +34,20 @@ pub fn lex(source: &str, file: FileId) -> LexResult {
 pub fn lex_with_base_offset(source: &str, file: FileId, base_offset: u32) -> LexResult {
     let mut lx = Lexer::new(source, file, base_offset);
     lx.run();
+    // 소스를 한 번 더 훑어 개행 오프셋을 수집한다. 파서 단계에서 두
+    // 토큰이 같은 줄에 있는지 판정해야 하는데, 렉서는 공백을 건너뛰느라
+    // 이 정보를 토큰에 담지 않는다. 단일 pass 의 비용이 미미하고 별도
+    // 자료구조로 두면 기존 토큰 스트림이 바뀌지 않는다.
+    let mut newlines = Vec::new();
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            newlines.push(base_offset + u32::try_from(i).unwrap_or(u32::MAX));
+        }
+    }
     LexResult {
         tokens: lx.tokens,
         diagnostics: lx.diagnostics,
+        newlines,
     }
 }
 

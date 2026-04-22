@@ -178,6 +178,12 @@ impl Resolver {
                 if is_primitive_type_name(&ident.name) {
                     return;
                 }
+                // SPEC §13 내장 전역 함수 (`Type`, `max`, `sin`, `now`, ...).
+                // 동일하게 스코프 섀도잉 우선이므로 resolver 는 진단만
+                // 건너뛰고 런타임이 `Value::Builtin` 으로 해석한다.
+                if is_builtin_name(&ident.name) {
+                    return;
+                }
                 self.diagnostics.push(undefined_diagnostic(ident));
             }
         }
@@ -512,6 +518,26 @@ fn is_primitive_type_name(name: &str) -> bool {
             | "double"
             | "string"
             | "bool"
+    )
+}
+
+/// SPEC §13 내장 전역 함수 이름 — 별도 선언 없이 참조 가능.
+///
+/// 런타임 [`Value::Builtin`] 에 대응되는 집합. 동일 이름을 사용자 스코프에서
+/// 다시 선언하면 일반 변수로 덮어써진다 ([`Resolver::resolve_reference`] 가
+/// 스코프 먼저 조회).
+fn is_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        // 타입 소개
+        "Type"
+        // 수학
+        | "max" | "min" | "abs" | "sin" | "cos" | "tan" | "log" | "sqrt" | "pow" | "floor" | "ceil" | "round"
+        // 시간
+        | "now" | "today" | "tomorrow" | "yesterday"
+        // 제어
+        | "sleep"
+        // 문자열/배열 공용은 method 에 위임 — 전역 함수는 이 목록으로 제한.
     )
 }
 
