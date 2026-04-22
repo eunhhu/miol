@@ -116,7 +116,7 @@ when current {
 // 리터럴 타입 + 유니온
 type Size = "{uint}{SizeUnit}" | "auto" | uint
 type HttpMethod = "GET" | "POST" | "PUT" | "DELETE"
-type Result<T> = T | Error
+type Result<T, E> = { ok: true, value: T } | { ok: false, error: E }
 
 let padding: Size = "16px"
 let margin: Size = "auto"
@@ -424,7 +424,7 @@ struct Profile {
 // 자동 생성되는 정적 메서드:
 //   .validate(unknown): bool            — 통과 여부만
 //   .parse(unknown): T                  — 성공 시 T, 실패 시 throw
-//   .safeParse(unknown): Result<T>      — 성공/에러 객체
+//   .safeParse(unknown): Result<T, ValidationError[]> — 성공/에러 객체
 //   .errors(unknown): ValidationError[] — 모든 필드 에러 수집
 //   .is(unknown): bool                  — 타입 가드 (when에서 narrowing)
 
@@ -439,13 +439,13 @@ try {
   let user: User = User.parse(input)
   @out "valid: {user.name}"
 } catch err: Error<ValidationError[]> {
-  for e in err.value {
+  for e in err.msg {
     @out "{e.path}: {e.message}"
   }
 }
 
 // 3) safeParse — 에러 객체로 처리 (throw 없음)
-let result: Result<User> = User.safeParse(input)
+let result: Result<User, ValidationError[]> = User.safeParse(input)
 when result.ok {
   true -> @out "✓ {result.value.name}"
   false -> @out "✗ {result.error.length}개 에러"
@@ -500,12 +500,12 @@ type StrongPassword = string(min=8) where
   $.contains(r"[^a-zA-Z0-9]")
 
 struct Registration {
-  email: email
+  email: Email
   password: StrongPassword
   age: int where $ >= 13              // 인라인 where
 }
 
-let r: Result<Registration> = Registration.safeParse(input)
+let r: Result<Registration, ValidationError[]> = Registration.safeParse(input)
 
 // -----------------------------------------------------
 // ValidationError — 표준 에러 타입

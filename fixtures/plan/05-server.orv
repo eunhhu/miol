@@ -36,7 +36,7 @@
   // POST
   @route POST /api/users {
     let body = @body
-    let user = await @db.create User data=body
+    let user = await @db.create User %data=body
     @respond 201 { user: user }
   }
 
@@ -417,7 +417,7 @@ let api = @route /api {
 
 // 클라이언트에서 사용 — .fetch()
 // let 바인딩된 내부 RPC는 @respond payload를 그대로 디코딩해 반환
-let user = await getUser.fetch(param={ id: 42 })
+let user = await getUser.fetch("/42")
 @out user.name  // 바이너리로 수신, 자동 디코딩
 
 // 그룹 facade — 상대 경로

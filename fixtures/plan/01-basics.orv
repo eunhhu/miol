@@ -105,7 +105,7 @@ progress = 50                // → "진행률: 50%"
 progress = 100               // → "진행률: 100%"
 
 // sig + @fs — 파일 반응형
-let sig config = { port: 8080, debug: false }
+let sig config: { port: int, debug: bool } = { port: 8080, debug: false }
 await @fs.write "config.json" config   // 파일에 초기값 기록
 config.port = 3000                     // → config.json 자동 rewrite
 config.debug = true                    // → config.json 자동 rewrite
@@ -274,8 +274,8 @@ let vc: int = 30
 // 시간
 // -----------------------------------------------------
 
-let now_time: Time = now()
-@out "{now_time.year}-{now_time.month}-{now_time.day} {now_time.hour}:{now_time.minute}:{now_time.second}"
+let current_time: Time = now()
+@out "{current_time.year}-{current_time.month}-{current_time.day} {current_time.hour}:{current_time.minute}:{current_time.second}"
 
 let today_time: Time = today()
 @out "{today_time.year}-{today_time.month}-{today_time.day}"

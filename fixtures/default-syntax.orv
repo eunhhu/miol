@@ -82,11 +82,11 @@ let s: string = string.from(f)
 // 변수
 let name: string = "John"
 let mut count: int = 0
-let sig signed_count: int = -10
+let sig reactive_count: int = -10
 
-@out "name: {name}, count: {count}, signed_count: {signed_count}"
+@out "name: {name}, count: {count}, reactive_count: {reactive_count}"
 
-signed_count = 30 // 바꾸면 반응형이라 자동으로 출력됨
+reactive_count = 30 // 바꾸면 반응형이라 자동으로 출력됨
 
 // 상수
 
@@ -259,6 +259,13 @@ define MyDomain( // 도메인 선언
   @out "it's {n}"
 }
 
+@design {
+  @colors { primary: "#1a1a2e" }
+  @spacing { md: "16px" }
+}
+
+@div { style={ backgroundColor: @design.colors.primary, padding: @design.spacing.md } }
+
 // 표준 라이브러리
 
 // io
@@ -318,8 +325,9 @@ let yesterday: Time = yesterday()
 // server
 let server: Server = @server {
   @listen 8080
+  @out "server listening on 8080"
 
   @route GET / {
-    @respond 200 {"message": "Hello, World!"}
+    @respond 200 { message: "Hello, World!" }
   }
 }

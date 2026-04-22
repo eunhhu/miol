@@ -175,7 +175,7 @@ let getUser = @route GET /api/user/:id {
 // 개발자가 작성한 코드
 define UserList(ids: int[]) -> @ul {
   for id in ids {
-    let user = await getUser.fetch(param={ id: id })
+    let user = await getUser.fetch("/{id}")
     @li "{user.name}"
   }
 }
@@ -193,7 +193,7 @@ define UserList(ids: int[]) -> @ul {
 // 배칭 비활성화가 필요하면
 define UserListNoBatch(ids: int[]) -> @ul {
   for id in ids {
-    let user = await getUser.fetch(param={ id: id }) @hint batch=never
+    let user = await getUser.fetch("/{id}") @hint batch=never
     @li "{user.name}"
   }
 }
@@ -398,7 +398,7 @@ pub define AlwaysCSR() -> @html @hint render=csr {
 
 pub define BuildTimeBlog() -> @html @hint render=ssg {
   @body {
-    let post = await getPost.fetch(param={ id: 1 })
+    let post = await getPost.fetch("/1")
     @h1 "{post.title}"
     @p "{post.content}"
   }
@@ -422,13 +422,13 @@ let getPost = @route GET /api/post/:id {
   @respond 200 await @db.find Post { @where id=id }
 }
 
-let live = await getUser.fetch(param={ id: 1 }) @hint cache=never
+let live = await getUser.fetch("/1") @hint cache=never
 // → 캐시 완전 비활성화, 매번 요청
 
-let immutable = await getPost.fetch(param={ id: 1 }) @hint cache=immutable
+let immutable = await getPost.fetch("/1") @hint cache=immutable
 // → 한 번 받으면 영원히 캐시
 
-let timed = await getPost.fetch(param={ id: 2 }) @hint cache=60s
+let timed = await getPost.fetch("/2") @hint cache=60s
 // → 60초 TTL
 
 // 프리페치
