@@ -77,7 +77,12 @@ fn lex_e2e_fixtures_without_errors() {
     // C6 E2E fixture. `fixtures/e2e/` 는 `crates/orv-runtime/tests` 경로의
     // 통합 테스트가 실제로 로드해 서버를 띄우는 runnable 예제 모음.
     // 이 렉싱 테스트는 lex 단계 회귀를 막는 빠른 안전망.
-    let e2e = ["hello.orv", "path_param.orv", "catchall.orv", "middleware.orv"];
+    let e2e = [
+        "hello.orv",
+        "path_param.orv",
+        "catchall.orv",
+        "middleware.orv",
+    ];
     for name in e2e {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/e2e")
@@ -109,7 +114,7 @@ fn every_fixture_token_span_is_in_bounds() {
     for name in fixtures {
         let path = fixture_path(name);
         let source = std::fs::read_to_string(&path).unwrap();
-        let source_len = source.len() as u32;
+        let source_len = u32::try_from(source.len()).expect("fixture source fits in u32");
         let r = lex(&source, FileId(0));
         for tok in &r.tokens {
             assert!(

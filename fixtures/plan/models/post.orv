@@ -1,0 +1,13 @@
+pub struct Post {
+  title: string
+  content: string
+  likes: int
+  tags: {name: string}[]
+  creator: User
+  nullable: string?
+}
+
+pub define PostCard(post: Post) -> @article {
+  @h2 "{post.title}"
+  @p "{post.content}"
+}

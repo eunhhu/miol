@@ -1,0 +1,8 @@
+pub struct User {
+  name: string
+  age: int
+}
+
+pub function createUser(input: {name: string, email: string}): User -> {
+  { name: input.name, age: 0, email: input.email }
+}

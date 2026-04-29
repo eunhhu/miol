@@ -9,7 +9,7 @@
 use orv_diagnostics::Span;
 
 /// 한 개의 토큰.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Token {
     /// 토큰 종류.
     pub kind: TokenKind,
@@ -26,7 +26,7 @@ impl Token {
 }
 
 /// 토큰 종류. 페이로드는 문자열 리터럴/정규식처럼 값을 동반해야 하는 경우에만 가진다.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
     // ── 리터럴 ──
     /// 정수 리터럴 — 10진수만 지원 (MVP). 값은 소스 슬라이스로 재파싱한다.

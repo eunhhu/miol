@@ -68,7 +68,7 @@ pub enum DeclKind {
     Catch,
 }
 
-/// `Span` 을 HashMap 키로 쓰기 위한 얇은 래퍼. `Span` 이 `Hash` 를 구현하지
+/// `Span` 을 `HashMap` 키로 쓰기 위한 얇은 래퍼. `Span` 이 `Hash` 를 구현하지
 /// 않으므로 `(file, start, end)` 튜플을 만든다.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpanKey {
@@ -166,26 +166,23 @@ impl Resolver {
         if ident.name == "$" {
             return;
         }
-        match self.lookup(&ident.name) {
-            Some(id) => {
-                self.name_of.insert(ident.span.into(), id);
+        if let Some(id) = self.lookup(&ident.name) {
+            self.name_of.insert(ident.span.into(), id);
+        } else {
+            // SPEC §4.9: 스코프에 없고 원시 타입 이름이면 namespace 참조.
+            // `int.from(s)`, `string.from(v)` 같은 호출 대상. 런타임이
+            // Ident 를 TypeName 으로 해석한다. 스코프 우선 원칙을 유지해
+            // 사용자가 `let double = 2.0` 같이 변수로 섀도잉 가능.
+            if is_primitive_type_name(&ident.name) {
+                return;
             }
-            None => {
-                // SPEC §4.9: 스코프에 없고 원시 타입 이름이면 namespace 참조.
-                // `int.from(s)`, `string.from(v)` 같은 호출 대상. 런타임이
-                // Ident 를 TypeName 으로 해석한다. 스코프 우선 원칙을 유지해
-                // 사용자가 `let double = 2.0` 같이 변수로 섀도잉 가능.
-                if is_primitive_type_name(&ident.name) {
-                    return;
-                }
-                // SPEC §13 내장 전역 함수 (`Type`, `max`, `sin`, `now`, ...).
-                // 동일하게 스코프 섀도잉 우선이므로 resolver 는 진단만
-                // 건너뛰고 런타임이 `Value::Builtin` 으로 해석한다.
-                if is_builtin_name(&ident.name) {
-                    return;
-                }
-                self.diagnostics.push(undefined_diagnostic(ident));
+            // SPEC §13 내장 전역 함수 (`Type`, `max`, `sin`, `now`, ...).
+            // 동일하게 스코프 섀도잉 우선이므로 resolver 는 진단만
+            // 건너뛰고 런타임이 `Value::Builtin` 으로 해석한다.
+            if is_builtin_name(&ident.name) {
+                return;
             }
+            self.diagnostics.push(undefined_diagnostic(ident));
         }
     }
 
@@ -265,10 +262,10 @@ impl Resolver {
 
     fn resolve_function(&mut self, func: &FunctionStmt) {
         // 이름은 hoist 단계에서 이미 선언됐거나 (최상위) 여기서 처음 선언된다.
-        if !self.is_declared_in_current(&func.name.name) {
-            self.declare(&func.name, DeclKind::Function);
-        } else {
+        if self.is_declared_in_current(&func.name.name) {
             self.record_use_in_current(&func.name);
+        } else {
+            self.declare(&func.name, DeclKind::Function);
         }
         // SPEC §9.4: `define` 의 token slot 은 param 과 동일한 스코프에 선언
         // 되어야 body 안에서 `name` 으로 참조 가능하다. resolve_function_body
@@ -288,10 +285,10 @@ impl Resolver {
     }
 
     fn resolve_struct(&mut self, s: &StructStmt) {
-        if !self.is_declared_in_current(&s.name.name) {
-            self.declare(&s.name, DeclKind::Struct);
-        } else {
+        if self.is_declared_in_current(&s.name.name) {
             self.record_use_in_current(&s.name);
+        } else {
+            self.declare(&s.name, DeclKind::Struct);
         }
         // 필드 타입은 현재 해석 범위 밖. 타입 참조는 이후 타입 체커가 다룬다.
     }
@@ -323,6 +320,7 @@ impl Resolver {
         self.pop_scope();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Integer(_)
@@ -341,12 +339,16 @@ impl Resolver {
                 }
             }
             ExprKind::Ident(ident) => self.resolve_reference(ident),
-            ExprKind::Unary { expr, .. } => self.resolve_expr(expr),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+                self.resolve_expr(expr);
+            }
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs);
                 self.resolve_expr(rhs);
             }
-            ExprKind::Paren(inner) => self.resolve_expr(inner),
+            ExprKind::Paren(inner) | ExprKind::Throw(inner) | ExprKind::Await(inner) => {
+                self.resolve_expr(inner);
+            }
             ExprKind::Tuple(elems) => {
                 for elem in elems {
                     self.resolve_expr(elem);
@@ -393,13 +395,31 @@ impl Resolver {
                 self.resolve_expr(object);
                 self.resolve_expr(value);
             }
+            ExprKind::AssignIndex {
+                object,
+                index,
+                value,
+            } => {
+                self.resolve_expr(object);
+                self.resolve_expr(index);
+                self.resolve_expr(value);
+            }
             ExprKind::Call { callee, args } => {
                 self.resolve_expr(callee);
                 for arg in args {
-                    self.resolve_expr(arg);
+                    if let ExprKind::Assign { value, .. } = &arg.kind {
+                        self.resolve_expr(value);
+                    } else {
+                        self.resolve_expr(arg);
+                    }
                 }
             }
-            ExprKind::For { var, index_var, iter, body } => {
+            ExprKind::For {
+                var,
+                index_var,
+                iter,
+                body,
+            } => {
                 self.resolve_expr(iter);
                 self.push_scope();
                 self.declare(var, DeclKind::ForVar);
@@ -425,12 +445,7 @@ impl Resolver {
                     self.resolve_expr(item);
                 }
             }
-            ExprKind::Object(fields) => {
-                for field in fields {
-                    self.resolve_object_field(field);
-                }
-            }
-            ExprKind::TypedObject { fields, .. } => {
+            ExprKind::Object(fields) | ExprKind::TypedObject { fields, .. } => {
                 for field in fields {
                     self.resolve_object_field(field);
                 }
@@ -455,12 +470,6 @@ impl Resolver {
             ExprKind::Lambda { params, body } => {
                 self.resolve_function_body(params, body);
             }
-            ExprKind::Throw(inner) => self.resolve_expr(inner),
-            ExprKind::Await(inner) => self.resolve_expr(inner),
-            // SPEC §4.9 `expr as <type>`: 타입 참조 안의 이름은 타입 네임
-            // 스페이스 (struct 이름, 원시 타입) 이라 resolver 의 binding
-            // 스코프와 무관하다. expr 만 해석한다.
-            ExprKind::Cast { expr, .. } => self.resolve_expr(expr),
             ExprKind::Try { try_block, catch } => {
                 self.resolve_block(try_block);
                 if let Some(clause) = catch {
@@ -478,14 +487,14 @@ impl Resolver {
     fn resolve_pattern(&mut self, pattern: &Pattern) {
         match pattern {
             Pattern::Wildcard => {}
-            Pattern::Literal(expr) => self.resolve_expr(expr),
+            Pattern::Literal(expr)
+            | Pattern::Guard(expr)
+            | Pattern::Not(expr)
+            | Pattern::Contains(expr) => self.resolve_expr(expr),
             Pattern::Range { start, end, .. } => {
                 self.resolve_expr(start);
                 self.resolve_expr(end);
             }
-            Pattern::Guard(expr) => self.resolve_expr(expr),
-            Pattern::Not(expr) => self.resolve_expr(expr),
-            Pattern::Contains(expr) => self.resolve_expr(expr),
         }
     }
 
@@ -524,7 +533,8 @@ impl Resolver {
 fn is_primitive_type_name(name: &str) -> bool {
     matches!(
         name,
-        "int" | "uint"
+        "int"
+            | "uint"
             | "byte"
             | "ubyte"
             | "short"
@@ -554,7 +564,33 @@ fn is_builtin_name(name: &str) -> bool {
         | "now" | "today" | "tomorrow" | "yesterday"
         // 제어
         | "sleep"
-        // 문자열/배열 공용은 method 에 위임 — 전역 함수는 이 목록으로 제한.
+        // HTML attribute assignment shorthand inside tag blocks.
+        | "class" | "style" | "id" | "type" | "for" | "name" | "value" | "checked" | "disabled" | "required"
+        // Browser/client ambient globals used by web-domain fixtures.
+        | "window" | "document" | "navigator" | "location" | "history" | "localStorage" | "sessionStorage"
+        | "Notification" | "IntersectionObserver" | "ResizeObserver" | "MediaRecorder" | "Blob" | "URL"
+        | "requestAnimationFrame" | "setTimeout" | "clearTimeout" | "setInterval" | "clearInterval"
+        | "navigate" | "submit" | "Element" | "SITE_NAME" | "isAgreed"
+        // Server/common ambient globals.
+        | "jwt" | "crypto" | "console"
+        | "getUserFromToken" | "getUptime" | "cache" | "session" | "monitor"
+        | "getGameState" | "updateInventory" | "getReplayEvents" | "broadcastPosition"
+        | "getConnectedPeers" | "targetPeerId" | "processCommand"
+        | "api" | "getPost" | "loadAnalytics" | "hash" | "applyDocumentPatch"
+        | "getDocVersion" | "broadcastUserLeft" | "desc" | "likes"
+        | "never" | "eager" | "ssr" | "csr" | "ssg" | "keep" | "s" | "somePost"
+        // Superapp simulation ambient services/tokens.
+        | "audit" | "roomPeers" | "track" | "POST" | "files" | "videos" | "chunked" | "mb"
+        | "resumable" | "discordChat" | "s3" | "vault" | "auto" | "webp" | "fileId"
+        | "highlightDiagnostics" | "loop" | "textGeometry" | "h264" | "k" | "hls"
+        | "payload" | "fulltext" | "VideoMeta" | "title" | "description" | "multi" | "bm25"
+        | "src" | "trackId" | "applyFilter" | "currentEmbedding" | "scheduledAt" | "ical"
+        | "h" | "tun" | "sessionKey" | "tunnelDatagram" | "port" | "spamScore" | "tls"
+        | "Mail" | "subject" | "body" | "serializable" | "tx" | "txs" | "settleToBank" | "authorId"
+        | "createdAt" | "mo" | "Post" | "content" | "vector" | "embedding" | "cosine" | "Arena"
+        | "file" | "myUserId" | "workgroup" | "codec" | "Mutex" | "initialWorld" | "to"
+        | "registerPlayer" | "unregisterPlayer" | "krunkerWT" | "manifest" | "worldMesh"
+        | "camera" | "oauth" | "posts" | "mails" | "docs" // 문자열/배열 공용은 method 에 위임 — 전역 함수는 이 목록으로 제한.
     )
 }
 

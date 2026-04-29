@@ -7,7 +7,7 @@ use std::str::Chars;
 
 /// 소스 문자열 위를 걸어다니는 커서.
 #[derive(Clone, Debug)]
-pub(crate) struct Cursor<'src> {
+pub struct Cursor<'src> {
     source: &'src str,
     chars: Chars<'src>,
     /// 현재 바이트 오프셋 (다음 읽을 문자 시작 위치).
@@ -43,7 +43,7 @@ impl<'src> Cursor<'src> {
     /// 다음 문자 소비 후 반환.
     pub fn advance(&mut self) -> Option<char> {
         let c = self.chars.next()?;
-        self.offset += c.len_utf8() as u32;
+        self.offset += u32::try_from(c.len_utf8()).expect("char UTF-8 length fits in u32");
         Some(c)
     }
 

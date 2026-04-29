@@ -123,7 +123,7 @@ pub struct FunctionStmt {
     /// sync 실행한다. 실제 Future 스케줄링은 후속 마일스톤.
     pub is_async: bool,
     /// C0: `define Name(...)` 으로 선언된 사용자 정의 도메인 여부. 현재
-    /// runtime 은 function 과 동일하게 실행하며, 후속 C_html/C_middleware
+    /// runtime 은 function 과 동일하게 실행하며, 후속 `C_html`/`C_middleware`
     /// 에서 `@Name` invoke registry 가 이 플래그를 참조한다.
     pub is_define: bool,
     /// C0: `pub` 가시성 modifier. B3 import 마일스톤까지는 표면만 보존.
@@ -269,6 +269,10 @@ pub enum TypeRefKind {
     Nullable(Box<TypeRef>),
     /// 배열 (`T[]`).
     Array(Box<TypeRef>),
+    /// 문자열 패턴 타입 (`"{uint}px"`). 현재는 파서/표면 보존용.
+    Pattern(String),
+    /// union 타입 (`A | B`).
+    Union(Vec<TypeRef>),
     /// 인라인 오브젝트 타입 (`{name: T, age: U}`).
     InlineObject(Vec<(Ident, TypeRef)>),
     /// 튜플 타입 (`(int, string)`).
@@ -378,10 +382,19 @@ pub enum ExprKind {
         /// 우변 값.
         value: Box<Expr>,
     },
+    /// 인덱스 재대입 — `obj[key] = value` / `arr[i] = value`.
+    AssignIndex {
+        /// 좌변 대상 표현식.
+        object: Box<Expr>,
+        /// 인덱스/키 표현식.
+        index: Box<Expr>,
+        /// 우변 값.
+        value: Box<Expr>,
+    },
     /// `for binding in iter { body }` 루프.
     ///
     /// SPEC §6.4 에서 `for (item, index) in arr` 형태의 index 동반 순회도
-    /// 허용한다. index_var 가 `Some` 이면 0-based 인덱스가 해당 바인딩에
+    /// 허용한다. `index_var` 가 `Some` 이면 0-based 인덱스가 해당 바인딩에
     /// 주입된다.
     For {
         /// 루프 변수 이름.

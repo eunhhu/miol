@@ -43,13 +43,9 @@ pub fn load_project(entry: &Path) -> Result<LoadedProject, LoadError> {
     let mut loader = Loader::default();
     loader.load_file(entry)?;
     let merged_items = loader.take_merged_items();
-    let span = merged_items
-        .first()
-        .map(Stmt::span)
-        .unwrap_or_else(|| orv_diagnostics::Span::new(
-            FileId(0),
-            orv_diagnostics::ByteRange::new(0, 0),
-        ));
+    let span = merged_items.first().map(Stmt::span).unwrap_or_else(|| {
+        orv_diagnostics::Span::new(FileId(0), orv_diagnostics::ByteRange::new(0, 0))
+    });
     Ok(LoadedProject {
         program: Program {
             items: merged_items,
@@ -195,10 +191,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "orv_test_{}_{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("orv_test_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (rel, content) in tree {
@@ -217,7 +210,10 @@ mod tests {
         let r = run_in_tempdir(
             &[
                 ("models/user.orv", "pub struct User { name: string }"),
-                ("main.orv", "import models.user.User\nlet u: User = { name: \"x\" }"),
+                (
+                    "main.orv",
+                    "import models.user.User\nlet u: User = { name: \"x\" }",
+                ),
             ],
             "main.orv",
         )
@@ -261,11 +257,8 @@ mod tests {
 
     #[test]
     fn unresolved_import_returns_error() {
-        let err = run_in_tempdir(
-            &[("main.orv", "import does.not.exist.X")],
-            "main.orv",
-        )
-        .unwrap_err();
+        let err =
+            run_in_tempdir(&[("main.orv", "import does.not.exist.X")], "main.orv").unwrap_err();
         match err {
             LoadError::UnresolvedImport { module, .. } => {
                 assert_eq!(module, "does.not.exist");

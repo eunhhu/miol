@@ -1,3 +1,8 @@
+// The current runtime is single-threaded, but DB handles are cloned through the
+// same `Arc<Mutex<_>>` shape used by the HTTP layer. Values can contain `Rc`
+// function/lambda handles, so the DB is intentionally not `Send + Sync` yet.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! tree-walking 인터프리터 — HIR 버전.
 //!
 //! SPEC §0 에서 채택한 V8 Ignition 모델의 "영구 dev-loop 실행 경로" 다.
@@ -788,13 +793,10 @@ impl<'w, W: Write> Interp<'w, W> {
                 // Domain name 은 resolve 에서 NameId 바인딩을 받지 않아 env
                 // 선형 탐색. 함수 수 적어 실용.
                 if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                    let func = self
-                        .env
-                        .values()
-                        .find_map(|v| match v {
-                            Value::Function(f) if f.name.name == *name => Some(f.clone()),
-                            _ => None,
-                        });
+                    let func = self.env.values().find_map(|v| match v {
+                        Value::Function(f) if f.name.name == *name => Some(f.clone()),
+                        _ => None,
+                    });
                     if let Some(func) = func {
                         return self.call_user_domain(&func, args);
                     }
@@ -1002,6 +1004,52 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(new_value)
             }
+            HirExprKind::AssignIndex {
+                object,
+                index,
+                value,
+            } => {
+                let obj_value = self.eval(object)?;
+                let key = self.eval(index)?;
+                let new_value = self.eval(value)?;
+                match (obj_value, key) {
+                    (Value::Object(mut fields), Value::Str(key)) => {
+                        if let Some(slot) = fields.iter_mut().find(|(k, _)| k == &key) {
+                            slot.1 = new_value.clone();
+                        } else {
+                            fields.push((key, new_value.clone()));
+                        }
+                        if let HirExprKind::Ident(id) = &object.kind {
+                            self.env.insert(id.id, Value::Object(fields));
+                        }
+                        Ok(new_value)
+                    }
+                    (Value::Array(mut items), Value::Int(idx)) => {
+                        let idx = usize::try_from(idx).map_err(|_| {
+                            RuntimeError::native("array index must be non-negative")
+                        })?;
+                        let Some(slot) = items.get_mut(idx) else {
+                            return Err(RuntimeError::native(format!(
+                                "array index {idx} out of bounds"
+                            )));
+                        };
+                        *slot = new_value.clone();
+                        if let HirExprKind::Ident(id) = &object.kind {
+                            self.env.insert(id.id, Value::Array(items));
+                        }
+                        Ok(new_value)
+                    }
+                    (Value::Object(_), other) => Err(RuntimeError::native(format!(
+                        "object index assignment key must be string, got {other}"
+                    ))),
+                    (Value::Array(_), other) => Err(RuntimeError::native(format!(
+                        "array index assignment key must be int, got {other}"
+                    ))),
+                    (other, _) => Err(RuntimeError::native(format!(
+                        "cannot assign index on non-indexable value: {other}"
+                    ))),
+                }
+            }
             HirExprKind::For {
                 var,
                 index_var,
@@ -1042,10 +1090,7 @@ impl<'w, W: Write> Interp<'w, W> {
                 let iter_value = self.eval(iter)?;
                 let items: Vec<Value> = match iter_value {
                     Value::Array(xs) => xs,
-                    Value::Str(s) => s
-                        .chars()
-                        .map(|c| Value::Str(c.to_string()))
-                        .collect(),
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     other => {
                         return Err(RuntimeError::native(format!(
                             "for loop iterable must be a range, array, or string, got {other}"
@@ -1055,7 +1100,8 @@ impl<'w, W: Write> Interp<'w, W> {
                 for (i, item) in items.into_iter().enumerate() {
                     self.env.insert(var.id, item);
                     if let Some(iv) = index_var {
-                        self.env.insert(iv.id, Value::Int(i64::try_from(i).unwrap_or(0)));
+                        self.env
+                            .insert(iv.id, Value::Int(i64::try_from(i).unwrap_or(0)));
                     }
                     self.eval_block(body)?;
                     match self.loop_signal {
@@ -1120,7 +1166,17 @@ impl<'w, W: Write> Interp<'w, W> {
                     "Set" => {
                         let mut values = Vec::with_capacity(fields.len());
                         for f in fields {
-                            values.push(self.eval(&f.value)?);
+                            let v = self.eval(&f.value)?;
+                            if f.is_spread {
+                                let Value::Array(source) = v else {
+                                    return Err(RuntimeError::native(
+                                        "Set spread `...expr` requires an array value",
+                                    ));
+                                };
+                                values.extend(source);
+                            } else {
+                                values.push(v);
+                            }
                         }
                         Ok(Value::Array(values))
                     }
@@ -1128,7 +1184,20 @@ impl<'w, W: Write> Interp<'w, W> {
                         let mut out: Vec<(String, Value)> = Vec::with_capacity(fields.len());
                         for f in fields {
                             let v = self.eval(&f.value)?;
-                            out.push((f.name.clone(), v));
+                            if f.is_spread {
+                                let Value::Object(source) = v else {
+                                    return Err(RuntimeError::native(
+                                        "Map spread `...expr` requires an object value",
+                                    ));
+                                };
+                                for (k, v) in source {
+                                    out.retain(|(ek, _)| ek != &k);
+                                    out.push((k, v));
+                                }
+                            } else {
+                                out.retain(|(ek, _)| ek != &f.name);
+                                out.push((f.name.clone(), v));
+                            }
                         }
                         Ok(Value::Object(out))
                     }
@@ -1137,7 +1206,20 @@ impl<'w, W: Write> Interp<'w, W> {
                         let mut out: Vec<(String, Value)> = Vec::with_capacity(fields.len());
                         for f in fields {
                             let v = self.eval(&f.value)?;
-                            out.push((f.name.clone(), v));
+                            if f.is_spread {
+                                let Value::Object(source) = v else {
+                                    return Err(RuntimeError::native(
+                                        "typed object spread `...expr` requires an object value",
+                                    ));
+                                };
+                                for (k, v) in source {
+                                    out.retain(|(ek, _)| ek != &k);
+                                    out.push((k, v));
+                                }
+                            } else {
+                                out.retain(|(ek, _)| ek != &f.name);
+                                out.push((f.name.clone(), v));
+                            }
                         }
                         Ok(Value::Object(out))
                     }
@@ -1269,12 +1351,10 @@ impl<'w, W: Write> Interp<'w, W> {
                         })
                     }
                     // SPEC 부록 `@process.run`.
-                    (Value::TypeName(ns), "run") if ns == "process" => {
-                        Ok(Value::BoundMethod {
-                            receiver: Box::new(t),
-                            method: name.to_string(),
-                        })
-                    }
+                    (Value::TypeName(ns), "run") if ns == "process" => Ok(Value::BoundMethod {
+                        receiver: Box::new(t),
+                        method: name.to_string(),
+                    }),
                     (Value::Object(fields), _) => fields
                         .iter()
                         .find(|(k, _)| k == field)
@@ -1545,10 +1625,9 @@ impl<'w, W: Write> Interp<'w, W> {
             // 형태 파싱/포맷. 실패 시 RuntimeError — SPEC 은 throw 를 규정하지만
             // MVP 는 native error 로 보고.
             (Value::TypeName(type_name), "from") if type_name != "fs" => {
-                let arg = args
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| RuntimeError::native(format!("`{type_name}.from` expects one argument")))?;
+                let arg = args.into_iter().next().ok_or_else(|| {
+                    RuntimeError::native(format!("`{type_name}.from` expects one argument"))
+                })?;
                 convert_from(&type_name, arg)
             }
             // ── SPEC 부록 @fs.read / @fs.write ──
@@ -1606,9 +1685,7 @@ impl<'w, W: Write> Interp<'w, W> {
                     .arg("-c")
                     .arg(&cmd)
                     .output()
-                    .map_err(|e| {
-                        RuntimeError::native(format!("`@process.run` failed: {e}"))
-                    })?;
+                    .map_err(|e| RuntimeError::native(format!("`@process.run` failed: {e}")))?;
                 let stdout_s = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr_s = String::from_utf8_lossy(&output.stderr).into_owned();
                 let status = i64::from(output.status.code().unwrap_or(-1));
@@ -1959,8 +2036,7 @@ impl<'w, W: Write> Interp<'w, W> {
         } else {
             let first = &func.token_slots[0];
             let values = std::mem::take(&mut positional);
-            let mut pairs: Vec<(NameId, Value)> =
-                vec![(first.name.id, Value::Array(values))];
+            let mut pairs: Vec<(NameId, Value)> = vec![(first.name.id, Value::Array(values))];
             // 다른 slot 들은 현재 빈 배열로 초기화 (MVP).
             for slot in func.token_slots.iter().skip(1) {
                 pairs.push((slot.name.id, Value::Array(Vec::new())));
@@ -2397,7 +2473,8 @@ fn register_nested_defines(
 fn is_primitive_type_name(name: &str) -> bool {
     matches!(
         name,
-        "int" | "uint"
+        "int"
+            | "uint"
             | "byte"
             | "ubyte"
             | "short"
@@ -2470,9 +2547,8 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
                 .into_iter()
                 .next()
                 .ok_or_else(|| RuntimeError::native(format!("{name} expects 1 argument")))?;
-            let x = value_to_f64(&v).ok_or_else(|| {
-                RuntimeError::native(format!("{name}: expected number, got {v}"))
-            })?;
+            let x = value_to_f64(&v)
+                .ok_or_else(|| RuntimeError::native(format!("{name}: expected number, got {v}")))?;
             let result = match name {
                 "sin" => x.sin(),
                 "cos" => x.cos(),
@@ -2488,8 +2564,12 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         }
         "pow" => {
             let mut it = args.into_iter();
-            let base = it.next().ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
-            let exp = it.next().ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
+            let base = it
+                .next()
+                .ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
+            let exp = it
+                .next()
+                .ok_or_else(|| RuntimeError::native("pow expects 2 arguments"))?;
             let b = value_to_f64(&base)
                 .ok_or_else(|| RuntimeError::native(format!("pow: expected number, got {base}")))?;
             let e = value_to_f64(&exp)
@@ -2504,9 +2584,7 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         // 런타임(동기 interpreter) 에서 실제 대기를 끼얹으면 UX 저하가 커서
         // no-op. 향후 비동기 스케줄러가 붙으면 실구현으로 교체.
         "sleep" => Ok(Value::Void),
-        other => Err(RuntimeError::native(format!(
-            "unknown builtin `{other}`"
-        ))),
+        other => Err(RuntimeError::native(format!("unknown builtin `{other}`"))),
     }
 }
 
@@ -2752,9 +2830,7 @@ fn call_db_method(
     match method {
         "create" => {
             if args.len() != 2 {
-                return Err(RuntimeError::native(
-                    "`db.create` expects (table, data)",
-                ));
+                return Err(RuntimeError::native("`db.create` expects (table, data)"));
             }
             let table = require_str(&args[0], "table name")?;
             let data = require_obj(&args[1], "data")?;
@@ -2762,9 +2838,7 @@ fn call_db_method(
         }
         "find" => {
             if args.len() != 2 {
-                return Err(RuntimeError::native(
-                    "`db.find` expects (table, filter)",
-                ));
+                return Err(RuntimeError::native("`db.find` expects (table, filter)"));
             }
             let table = require_str(&args[0], "table name")?;
             let filter = require_obj(&args[1], "filter")?;
@@ -2793,13 +2867,13 @@ fn call_db_method(
             let table = require_str(&args[0], "table name")?;
             let filter = require_obj(&args[1], "filter")?;
             let data = require_obj(&args[2], "data")?;
-            Ok(Value::Int(db.lock().unwrap().update(&table, &filter, &data)))
+            Ok(Value::Int(
+                db.lock().unwrap().update(&table, &filter, &data),
+            ))
         }
         "delete" => {
             if args.len() != 2 {
-                return Err(RuntimeError::native(
-                    "`db.delete` expects (table, filter)",
-                ));
+                return Err(RuntimeError::native("`db.delete` expects (table, filter)"));
             }
             let table = require_str(&args[0], "table name")?;
             let filter = require_obj(&args[1], "filter")?;
@@ -2823,6 +2897,7 @@ fn has_side_effect(expr: &HirExpr) -> bool {
             | HirExprKind::Server { .. }
             | HirExprKind::Assign { .. }
             | HirExprKind::AssignField { .. }
+            | HirExprKind::AssignIndex { .. }
             | HirExprKind::Block(_)
             | HirExprKind::If { .. }
             | HirExprKind::When { .. }
@@ -2878,24 +2953,22 @@ fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
                 .parse::<i64>()
                 .map(Value::Int)
                 .map_err(|_| RuntimeError::native(format!("cannot cast string `{s}` to int"))),
-            other => Err(RuntimeError::native(format!(
-                "cannot cast {other} to int"
-            ))),
+            other => Err(RuntimeError::native(format!("cannot cast {other} to int"))),
         },
-        "float" | "double" => match value {
-            Value::Float(f) => Ok(Value::Float(f)),
-            #[allow(clippy::cast_precision_loss)]
-            Value::Int(i) => Ok(Value::Float(i as f64)),
-            Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
-            Value::Str(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| RuntimeError::native(format!("cannot cast string `{s}` to float"))),
-            other => Err(RuntimeError::native(format!(
-                "cannot cast {other} to float"
-            ))),
-        },
+        "float" | "double" => {
+            match value {
+                Value::Float(f) => Ok(Value::Float(f)),
+                #[allow(clippy::cast_precision_loss)]
+                Value::Int(i) => Ok(Value::Float(i as f64)),
+                Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
+                Value::Str(s) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
+                    RuntimeError::native(format!("cannot cast string `{s}` to float"))
+                }),
+                other => Err(RuntimeError::native(format!(
+                    "cannot cast {other} to float"
+                ))),
+            }
+        }
         "string" => Ok(Value::Str(value_to_display(&value))),
         "bool" => match value {
             Value::Bool(b) => Ok(Value::Bool(b)),
@@ -2908,9 +2981,7 @@ fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
                     "cannot cast string `{s}` to bool"
                 ))),
             },
-            other => Err(RuntimeError::native(format!(
-                "cannot cast {other} to bool"
-            ))),
+            other => Err(RuntimeError::native(format!("cannot cast {other} to bool"))),
         },
         "void" => Ok(Value::Void),
         // 사용자 정의 타입 (struct 이름 등) — MVP 는 pass-through.
@@ -3241,6 +3312,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "Alice\n");
+    }
+
+    #[test]
+    fn primitive_type_name_can_be_shadowed_by_user_binding() {
+        let out = run_str(
+            r#"
+            let string = "shadowed"
+            @out string
+            let double = 2.5
+            @out double
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "shadowed\n2.5\n");
     }
 
     #[test]
@@ -4544,7 +4629,10 @@ mod tests {
             @respond 200 {}
         }"#;
         let (stdout, resp) = run_handler(src, RequestCtx::default());
-        assert_eq!(stdout, "", "handler body must not run after @respond in @before");
+        assert_eq!(
+            stdout, "",
+            "handler body must not run after @respond in @before"
+        );
         let resp = resp.expect("response recorded");
         assert_eq!(resp.status, 401);
     }
@@ -4651,7 +4739,11 @@ define Req(x: string) -> { @out x }
 @Req
 "#;
         let err = run_str(src).unwrap_err();
-        assert!(err.message.contains("missing required property"), "got: {}", err.message);
+        assert!(
+            err.message.contains("missing required property"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -4662,7 +4754,11 @@ define P(a: string) -> { @out a }
 @P a="ok" b="nope"
 "#;
         let err = run_str(src).unwrap_err();
-        assert!(err.message.contains("unknown property"), "got: {}", err.message);
+        assert!(
+            err.message.contains("unknown property"),
+            "got: {}",
+            err.message
+        );
     }
 
     // ── SPEC §9.4 Token slot (Stage 2) ──
@@ -4706,7 +4802,8 @@ define P() -> { @out "x" }
 "#;
         let err = run_str(src).unwrap_err();
         assert!(
-            err.message.contains("got 1 positional arg(s) but declares no token slot"),
+            err.message
+                .contains("got 1 positional arg(s) but declares no token slot"),
             "got: {}",
             err.message
         );
@@ -4871,11 +4968,19 @@ define A() -> {
 
     #[test]
     fn int_from_invalid_string_errors() {
-        let err = run_str(
-            r#"let n: int = int.from("nope")"#,
-        )
-        .unwrap_err();
+        let err = run_str(r#"let n: int = int.from("nope")"#).unwrap_err();
         assert!(err.message.contains("int.from"));
+    }
+
+    #[test]
+    fn cast_to_type_alias_uses_aliased_runtime_type() {
+        let out = run_str(
+            r#"type Num = int
+let n: Num = "42" as Num
+@out n + 1"#,
+        )
+        .unwrap();
+        assert_eq!(out, "43\n");
     }
 
     // ── SPEC §6.4 tuple destructuring for in ──
@@ -4993,6 +5098,28 @@ let m = { ...base, b: 2 }
         )
         .unwrap();
         assert_eq!(out, "{ a: 1, b: 2 }\n");
+    }
+
+    #[test]
+    fn typed_map_spread_merges_object_fields() {
+        let out = run_str(
+            r#"let base = { a: 1 }
+let m = Map{...base, "b": 2}
+@out m"#,
+        )
+        .unwrap();
+        assert_eq!(out, "{ a: 1, b: 2 }\n");
+    }
+
+    #[test]
+    fn typed_set_spread_flattens_array_elements() {
+        let out = run_str(
+            r#"let xs = [1, 2]
+let ys = Set{...xs, 3}
+@out ys"#,
+        )
+        .unwrap();
+        assert_eq!(out, "[1, 2, 3]\n");
     }
 
     #[test]
@@ -5139,9 +5266,11 @@ define Btn(label: string, disabled: bool?) -> {
 
     #[test]
     fn builtin_sleep_is_noop() {
-        let out = run_str(r#"await sleep(10)
-@out "ok""#)
-            .unwrap();
+        let out = run_str(
+            r#"await sleep(10)
+@out "ok""#,
+        )
+        .unwrap();
         assert_eq!(out, "ok\n");
     }
 
@@ -5194,10 +5323,7 @@ let c = b.copy()
 
     #[test]
     fn io_domain_stops_args_at_newline() {
-        let path = format!(
-            "/tmp/orv_io_newline_{}.txt",
-            std::process::id()
-        );
+        let path = format!("/tmp/orv_io_newline_{}.txt", std::process::id());
         let src = format!(
             r#"await @fs.write "{path}" "hello"
 let v = 1

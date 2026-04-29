@@ -1,0 +1,3 @@
+pub function formatDate(value: string): string -> value
+
+pub function slugify(value: string): string -> value

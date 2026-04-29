@@ -1599,6 +1599,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_shopping_mall_covers_catalog_and_order_flow() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_from_fixture("shopping_mall.orv");
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (health_status, _, health_body) = send_request(addr, "GET", "/health", None).await;
+            assert_eq!(health_status, 200);
+            let health: serde_json::Value =
+                serde_json::from_slice(&health_body).expect("health json");
+            assert_eq!(health["ok"], serde_json::json!(true));
+
+            let product_payload = serde_json::json!({
+                "sku": "kettle",
+                "name": "Kettle",
+                "price": 25000,
+                "stock": 2
+            })
+            .to_string();
+            let (create_product_status, _, create_product_body) =
+                send_request(addr, "POST", "/products", Some(product_payload)).await;
+            assert_eq!(create_product_status, 201);
+            let created_product: serde_json::Value =
+                serde_json::from_slice(&create_product_body).expect("product json");
+            assert_eq!(created_product["product"]["id"], serde_json::json!(1));
+            assert_eq!(
+                created_product["product"]["sku"],
+                serde_json::json!("kettle")
+            );
+
+            let (list_status, _, list_body) = send_request(addr, "GET", "/products", None).await;
+            assert_eq!(list_status, 200);
+            let list: serde_json::Value = serde_json::from_slice(&list_body).expect("list json");
+            assert_eq!(list["products"].as_array().map(Vec::len), Some(1));
+            assert_eq!(list["products"][0]["name"], serde_json::json!("Kettle"));
+
+            let order_payload = serde_json::json!({
+                "customer": "ada",
+                "sku": "kettle",
+                "quantity": 1,
+                "total": 25000
+            })
+            .to_string();
+            let (create_order_status, _, create_order_body) =
+                send_request(addr, "POST", "/orders", Some(order_payload)).await;
+            assert_eq!(create_order_status, 201);
+            let created_order: serde_json::Value =
+                serde_json::from_slice(&create_order_body).expect("order json");
+            assert_eq!(
+                created_order["order"]["status"],
+                serde_json::json!("reserved")
+            );
+            assert_eq!(created_order["order"]["total"], serde_json::json!(25000));
+            assert_eq!(created_order["remainingStock"], serde_json::json!(1));
+            let order_id = created_order["order"]["id"].as_i64().expect("order id");
+
+            let (find_order_status, _, find_order_body) =
+                send_request(addr, "GET", "/orders/ada", None).await;
+            assert_eq!(find_order_status, 200);
+            let found_order: serde_json::Value =
+                serde_json::from_slice(&find_order_body).expect("found order json");
+            assert_eq!(found_order["order"]["customer"], serde_json::json!("ada"));
+            assert_eq!(found_order["order"]["sku"], serde_json::json!("kettle"));
+
+            let (find_product_status, _, find_product_body) =
+                send_request(addr, "GET", "/products/kettle", None).await;
+            assert_eq!(find_product_status, 200);
+            let found_product: serde_json::Value =
+                serde_json::from_slice(&find_product_body).expect("found product json");
+            assert_eq!(found_product["product"]["stock"], serde_json::json!(1));
+
+            let oversell_payload = serde_json::json!({
+                "customer": "grace",
+                "sku": "kettle",
+                "quantity": 2,
+                "total": 50000
+            })
+            .to_string();
+            let (oversell_status, _, oversell_body) =
+                send_request(addr, "POST", "/orders", Some(oversell_payload)).await;
+            assert_eq!(oversell_status, 409);
+            let oversell: serde_json::Value =
+                serde_json::from_slice(&oversell_body).expect("oversell json");
+            assert_eq!(oversell["err"], serde_json::json!("out_of_stock"));
+            assert_eq!(oversell["stock"], serde_json::json!(1));
+
+            let member_payload = serde_json::json!({
+                "handle": "ada",
+                "name": "Ada Lovelace",
+                "email": "ada@example.test"
+            })
+            .to_string();
+            let (create_member_status, _, create_member_body) =
+                send_request(addr, "POST", "/members", Some(member_payload)).await;
+            assert_eq!(create_member_status, 201);
+            let created_member: serde_json::Value =
+                serde_json::from_slice(&create_member_body).expect("member json");
+            assert_eq!(created_member["member"]["handle"], serde_json::json!("ada"));
+
+            let (find_member_status, _, find_member_body) =
+                send_request(addr, "GET", "/members/ada", None).await;
+            assert_eq!(find_member_status, 200);
+            let found_member: serde_json::Value =
+                serde_json::from_slice(&find_member_body).expect("found member json");
+            assert_eq!(
+                found_member["member"]["email"],
+                serde_json::json!("ada@example.test")
+            );
+
+            let payment_payload = serde_json::json!({
+                "orderId": order_id,
+                "amount": 25000,
+                "method": "card"
+            })
+            .to_string();
+            let (payment_status, _, payment_body) =
+                send_request(addr, "POST", "/payments", Some(payment_payload)).await;
+            assert_eq!(payment_status, 201);
+            let payment: serde_json::Value =
+                serde_json::from_slice(&payment_body).expect("payment json");
+            assert_eq!(payment["payment"]["status"], serde_json::json!("captured"));
+            assert_eq!(payment["order"]["status"], serde_json::json!("paid"));
+
+            let shipment_payload = serde_json::json!({
+                "orderId": order_id,
+                "carrier": "post",
+                "address": "Seoul"
+            })
+            .to_string();
+            let (shipment_status, _, shipment_body) =
+                send_request(addr, "POST", "/shipments", Some(shipment_payload)).await;
+            assert_eq!(shipment_status, 201);
+            let shipment: serde_json::Value =
+                serde_json::from_slice(&shipment_body).expect("shipment json");
+            assert_eq!(shipment["shipment"]["status"], serde_json::json!("ready"));
+            assert_eq!(shipment["order"]["status"], serde_json::json!("shipped"));
+
+            let shipment_path = format!("/shipments/{order_id}");
+            let (find_shipment_status, _, find_shipment_body) =
+                send_request(addr, "GET", &shipment_path, None).await;
+            assert_eq!(find_shipment_status, 200);
+            let found_shipment: serde_json::Value =
+                serde_json::from_slice(&find_shipment_body).expect("found shipment json");
+            assert_eq!(
+                found_shipment["shipment"]["tracking"],
+                serde_json::json!("TRK-LOCAL")
+            );
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn fixture_catchall_boots_specific_route_and_wildcard_fallback() {
         run_on_localset(async {
             let ServerTestCase {

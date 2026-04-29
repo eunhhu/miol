@@ -65,8 +65,7 @@ fn main() -> ExitCode {
 fn cmd_run(path: &Path) -> anyhow::Result<()> {
     // B3: entry 파일에서 시작해 import 를 따라 multi-file 을 하나의 Program 으로
     // 병합한다. import 가 없으면 entry 한 파일만 로드되므로 기존 동작과 동일.
-    let loaded = orv_project::load_project(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     report_diagnostics(&loaded.diagnostics, path)?;
 
     let resolved = orv_resolve::resolve(&loaded.program);
@@ -81,8 +80,7 @@ fn cmd_run(path: &Path) -> anyhow::Result<()> {
 
 fn cmd_check(path: &Path) -> anyhow::Result<()> {
     // 파일을 읽어 파싱과 타입 검사만 수행하고 실행은 하지 않는다.
-    let loaded = orv_project::load_project(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     report_diagnostics(&loaded.diagnostics, path)?;
 
     let resolved = orv_resolve::resolve(&loaded.program);

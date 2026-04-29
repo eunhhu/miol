@@ -1,0 +1,32 @@
+pub struct User {
+  id: string
+  name: string
+  email: string?
+}
+
+pub struct Channel {
+  id: string
+  name: string
+}
+
+pub struct Message {
+  id: string
+  userId: string
+  text: string
+}
+
+pub struct FileMeta {
+  id: string
+  name: string
+  size: int
+}
+
+pub struct Document {
+  id: string
+  title: string
+}
+
+pub struct Payment {
+  id: string
+  amount: int
+}

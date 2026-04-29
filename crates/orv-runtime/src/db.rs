@@ -148,7 +148,10 @@ mod tests {
     use super::*;
 
     fn obj(pairs: &[(&str, Value)]) -> Vec<(String, Value)> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -158,18 +161,27 @@ mod tests {
         let Value::Object(fields) = v else {
             panic!("create must return object");
         };
-        assert!(matches!(fields.iter().find(|(k, _)| k == "id"), Some((_, Value::Int(1)))));
+        assert!(matches!(
+            fields.iter().find(|(k, _)| k == "id"),
+            Some((_, Value::Int(1)))
+        ));
         let v2 = db.create("User", obj(&[("name", Value::Str("bob".into()))]));
         let Value::Object(fields2) = v2 else {
             panic!("create must return object");
         };
-        assert!(matches!(fields2.iter().find(|(k, _)| k == "id"), Some((_, Value::Int(2)))));
+        assert!(matches!(
+            fields2.iter().find(|(k, _)| k == "id"),
+            Some((_, Value::Int(2)))
+        ));
     }
 
     #[test]
     fn find_one_returns_void_when_missing() {
         let db = InMemoryDb::new();
-        assert!(matches!(db.find_one("User", &obj(&[("id", Value::Int(1))])), Value::Void));
+        assert!(matches!(
+            db.find_one("User", &obj(&[("id", Value::Int(1))])),
+            Value::Void
+        ));
     }
 
     #[test]
@@ -180,7 +192,9 @@ mod tests {
         let Value::Object(fields) = v else {
             panic!("expected object");
         };
-        assert!(fields.iter().any(|(k, v)| k == "name" && matches!(v, Value::Str(s) if s == "alice")));
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "name" && matches!(v, Value::Str(s) if s == "alice")));
     }
 
     #[test]
@@ -199,7 +213,13 @@ mod tests {
     #[test]
     fn update_mutates_matching_rows() {
         let mut db = InMemoryDb::new();
-        db.create("User", obj(&[("name", Value::Str("alice".into())), ("age", Value::Int(25))]));
+        db.create(
+            "User",
+            obj(&[
+                ("name", Value::Str("alice".into())),
+                ("age", Value::Int(25)),
+            ]),
+        );
         let n = db.update(
             "User",
             &obj(&[("id", Value::Int(1))]),
@@ -209,7 +229,9 @@ mod tests {
         let Value::Object(row) = db.find_one("User", &obj(&[("id", Value::Int(1))])) else {
             panic!("expected object");
         };
-        assert!(row.iter().any(|(k, v)| k == "age" && matches!(v, Value::Int(26))));
+        assert!(row
+            .iter()
+            .any(|(k, v)| k == "age" && matches!(v, Value::Int(26))));
     }
 
     #[test]

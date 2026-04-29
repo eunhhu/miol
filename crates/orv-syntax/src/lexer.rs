@@ -70,7 +70,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn span(&self, start: u32, end: u32) -> Span {
+    const fn span(&self, start: u32, end: u32) -> Span {
         Span::new(
             self.file,
             ByteRange::new(start + self.base_offset, end + self.base_offset),
@@ -160,10 +160,8 @@ impl<'src> Lexer<'src> {
         let kind = match text {
             "true" => TokenKind::True,
             "false" => TokenKind::False,
-            _ => match Keyword::match_keyword(text) {
-                Some(kw) => TokenKind::Keyword(kw),
-                None => TokenKind::Ident(text.to_string()),
-            },
+            _ => Keyword::match_keyword(text)
+                .map_or_else(|| TokenKind::Ident(text.to_string()), TokenKind::Keyword),
         };
         self.push(kind, start, end);
     }
@@ -197,6 +195,8 @@ impl<'src> Lexer<'src> {
     fn lex_string(&mut self, start: u32) {
         self.cursor.advance(); // 여는 '"'
         let body_start = self.cursor.offset();
+        let mut interpolation_depth = 0u32;
+        let mut in_interpolation_string = false;
 
         loop {
             match self.cursor.peek() {
@@ -204,7 +204,7 @@ impl<'src> Lexer<'src> {
                     self.error("unterminated string literal", start, self.cursor.offset());
                     return;
                 }
-                Some('"') => {
+                Some('"') if interpolation_depth == 0 => {
                     let body_end = self.cursor.offset();
                     self.cursor.advance(); // 닫는 '"'
                     let end = self.cursor.offset();
@@ -212,9 +212,29 @@ impl<'src> Lexer<'src> {
                     self.push(TokenKind::String(text), start, end);
                     return;
                 }
+                Some('"') => {
+                    if self.cursor.peek2().is_none() {
+                        let body_end = self.cursor.offset();
+                        self.cursor.advance(); // 닫는 '"'
+                        let end = self.cursor.offset();
+                        let text = self.cursor.slice(body_start, body_end).to_string();
+                        self.push(TokenKind::String(text), start, end);
+                        return;
+                    }
+                    in_interpolation_string = !in_interpolation_string;
+                    self.cursor.advance();
+                }
                 Some('\\') => {
                     self.cursor.advance();
                     // 이스케이프는 파서가 해석. 줄바꿈 허용(이후 보강 가능).
+                    self.cursor.advance();
+                }
+                Some('{') if !in_interpolation_string => {
+                    interpolation_depth = interpolation_depth.saturating_add(1);
+                    self.cursor.advance();
+                }
+                Some('}') if interpolation_depth > 0 && !in_interpolation_string => {
+                    interpolation_depth -= 1;
                     self.cursor.advance();
                 }
                 Some(_) => {
@@ -272,6 +292,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn lex_punct(&mut self, start: u32) {
         let c = self.cursor.advance().unwrap();
         let kind = match c {
@@ -389,11 +410,11 @@ impl<'src> Lexer<'src> {
     }
 }
 
-fn is_ident_start(c: char) -> bool {
+const fn is_ident_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
 }
 
-fn is_ident_continue(c: char) -> bool {
+const fn is_ident_continue(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
 }
 
@@ -507,6 +528,18 @@ mod tests {
         assert_eq!(
             ks,
             vec![TokenKind::String("hello, {name}!".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn strings_keep_quotes_inside_interpolation() {
+        let ks = kinds(r#""/?page={page}&tag={tag ?? ""}""#);
+        assert_eq!(
+            ks,
+            vec![
+                TokenKind::String(r#"/?page={page}&tag={tag ?? ""}"#.into()),
+                TokenKind::Eof,
+            ]
         );
     }
 

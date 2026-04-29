@@ -39,15 +39,16 @@ pub fn lower(program: &ast::Program, resolved: &ResolveResult) -> hir::HirProgra
 
 /// B5: 타입 체크 진단을 함께 수집한다.
 #[must_use]
-pub fn lower_with_diagnostics(
-    program: &ast::Program,
-    resolved: &ResolveResult,
-) -> LowerResult {
+pub fn lower_with_diagnostics(program: &ast::Program, resolved: &ResolveResult) -> LowerResult {
     let lowerer = Lowerer {
         resolved,
         name_types: RefCell::new(HashMap::new()),
+        alias_scopes: RefCell::new(vec![HashMap::new()]),
+        struct_scopes: RefCell::new(vec![HashMap::new()]),
         diagnostics: RefCell::new(Vec::new()),
     };
+    lowerer.predeclare_type_aliases(&program.items);
+    lowerer.predeclare_structs(&program.items);
     // 함수 선언은 resolver 와 동일하게 먼저 hoist 해 두어야, 뒤에서 선언된
     // 함수에 대한 호출도 타입 추론/검사에서 시그니처를 볼 수 있다.
     lowerer.predeclare_function_signatures(&program.items);
@@ -74,6 +75,10 @@ struct Lowerer<'a> {
     /// NameId → 이 바인딩의 타입. let/const/param 선언 시점에 채운다.
     /// 참조 사이트에서 `Ident` 타입 추론에 사용.
     name_types: RefCell<HashMap<NameId, hir::Type>>,
+    /// 타입 별칭 스코프. 가장 안쪽 스코프가 뒤에 온다.
+    alias_scopes: RefCell<Vec<HashMap<String, ast::TypeAliasStmt>>>,
+    /// struct 이름 → 필드 shape. 가장 안쪽 스코프가 뒤에 온다.
+    struct_scopes: RefCell<Vec<HashMap<String, hir::Type>>>,
     /// 누적 진단.
     diagnostics: RefCell<Vec<Diagnostic>>,
 }
@@ -104,6 +109,72 @@ impl<'a> Lowerer<'a> {
                 ret: Box::new(ret_ty),
             },
         );
+    }
+
+    fn push_alias_scope(&self) {
+        self.alias_scopes.borrow_mut().push(HashMap::new());
+        self.struct_scopes.borrow_mut().push(HashMap::new());
+    }
+
+    fn pop_alias_scope(&self) {
+        self.alias_scopes.borrow_mut().pop();
+        self.struct_scopes.borrow_mut().pop();
+    }
+
+    fn predeclare_type_aliases(&self, stmts: &[ast::Stmt]) {
+        let mut scopes = self.alias_scopes.borrow_mut();
+        let Some(scope) = scopes.last_mut() else {
+            return;
+        };
+        for stmt in stmts {
+            if let ast::Stmt::TypeAlias(alias) = stmt {
+                scope.insert(alias.name.name.clone(), (**alias).clone());
+            }
+        }
+    }
+
+    fn lookup_type_alias(&self, name: &str) -> Option<ast::TypeAliasStmt> {
+        let scopes = self.alias_scopes.borrow();
+        scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn predeclare_structs(&self, stmts: &[ast::Stmt]) {
+        let mut structs = self.struct_scopes.borrow_mut();
+        let Some(scope) = structs.last_mut() else {
+            return;
+        };
+        for stmt in stmts {
+            if let ast::Stmt::Struct(s) = stmt {
+                let shape = hir::Type::InlineObject(
+                    s.fields
+                        .iter()
+                        .map(|field| (field.name.name.clone(), self.ty_ref_to_type(&field.ty)))
+                        .collect(),
+                );
+                scope.entry(s.name.name.clone()).or_insert(shape);
+            }
+        }
+    }
+
+    fn lookup_struct_type(&self, name: &str) -> Option<hir::Type> {
+        let scopes = self.struct_scopes.borrow();
+        scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn with_alias_scope<T>(&self, stmts: &[ast::Stmt], f: impl FnOnce() -> T) -> T {
+        self.push_alias_scope();
+        self.predeclare_type_aliases(stmts);
+        self.predeclare_structs(stmts);
+        self.predeclare_function_signatures(stmts);
+        let out = f();
+        self.pop_alias_scope();
+        out
     }
 
     fn predeclare_function_signatures(&self, stmts: &[ast::Stmt]) {
@@ -141,14 +212,16 @@ impl<'a> Lowerer<'a> {
                 ast::TypeRefKind::Array(inner) => {
                     hir::HirTypeRefKind::Array(Box::new(self.ty_ref(inner)))
                 }
-                ast::TypeRefKind::InlineObject(fields) => {
-                    hir::HirTypeRefKind::InlineObject(
-                        fields
-                            .iter()
-                            .map(|(name, ty)| (name.name.clone(), self.ty_ref(ty)))
-                            .collect(),
-                    )
+                ast::TypeRefKind::Pattern(raw) => hir::HirTypeRefKind::Pattern(raw.clone()),
+                ast::TypeRefKind::Union(items) => {
+                    hir::HirTypeRefKind::Union(items.iter().map(|t| self.ty_ref(t)).collect())
                 }
+                ast::TypeRefKind::InlineObject(fields) => hir::HirTypeRefKind::InlineObject(
+                    fields
+                        .iter()
+                        .map(|(name, ty)| (name.name.clone(), self.ty_ref(ty)))
+                        .collect(),
+                ),
                 ast::TypeRefKind::Tuple(elements) => {
                     hir::HirTypeRefKind::Tuple(elements.iter().map(|t| self.ty_ref(t)).collect())
                 }
@@ -156,37 +229,132 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn expanded_ty_ref(&self, t: &ast::TypeRef) -> hir::HirTypeRef {
+        self.expanded_ty_ref_inner(t, &mut Vec::new())
+    }
+
+    fn expanded_ty_ref_inner(
+        &self,
+        t: &ast::TypeRef,
+        alias_stack: &mut Vec<String>,
+    ) -> hir::HirTypeRef {
+        let kind = match &t.kind {
+            ast::TypeRefKind::Named(id) => {
+                if alias_stack.iter().any(|seen| seen == &id.name) {
+                    hir::HirTypeRefKind::Named(id.name.clone())
+                } else if let Some(alias) = self.lookup_type_alias(&id.name) {
+                    if alias.params.is_empty() {
+                        alias_stack.push(id.name.clone());
+                        let expanded = self.expanded_ty_ref_inner(&alias.ty, alias_stack);
+                        alias_stack.pop();
+                        expanded.kind
+                    } else {
+                        hir::HirTypeRefKind::Named(id.name.clone())
+                    }
+                } else {
+                    hir::HirTypeRefKind::Named(id.name.clone())
+                }
+            }
+            ast::TypeRefKind::Nullable(inner) => hir::HirTypeRefKind::Nullable(Box::new(
+                self.expanded_ty_ref_inner(inner, alias_stack),
+            )),
+            ast::TypeRefKind::Array(inner) => {
+                hir::HirTypeRefKind::Array(Box::new(self.expanded_ty_ref_inner(inner, alias_stack)))
+            }
+            ast::TypeRefKind::Pattern(raw) => hir::HirTypeRefKind::Pattern(raw.clone()),
+            ast::TypeRefKind::Union(items) => hir::HirTypeRefKind::Union(
+                items
+                    .iter()
+                    .map(|ty| self.expanded_ty_ref_inner(ty, alias_stack))
+                    .collect(),
+            ),
+            ast::TypeRefKind::InlineObject(fields) => hir::HirTypeRefKind::InlineObject(
+                fields
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            name.name.clone(),
+                            self.expanded_ty_ref_inner(ty, alias_stack),
+                        )
+                    })
+                    .collect(),
+            ),
+            ast::TypeRefKind::Tuple(elements) => hir::HirTypeRefKind::Tuple(
+                elements
+                    .iter()
+                    .map(|ty| self.expanded_ty_ref_inner(ty, alias_stack))
+                    .collect(),
+            ),
+        };
+        hir::HirTypeRef { kind, span: t.span }
+    }
+
     /// SPEC §4.1 원시 이름을 [`hir::Type`] 으로 정규화한다. 알 수 없는 이름은
     /// `Struct(name)` 으로 두어 후속 pass 가 구조체 조회를 시도할 수 있게 한다.
     fn ty_ref_to_type(&self, t: &ast::TypeRef) -> hir::Type {
+        self.ty_ref_to_type_inner(t, &mut Vec::new())
+    }
+
+    fn ty_ref_to_type_inner(&self, t: &ast::TypeRef, alias_stack: &mut Vec<String>) -> hir::Type {
         match &t.kind {
-            ast::TypeRefKind::Named(id) => match id.name.as_str() {
-                // MVP: 정수 계열은 전부 Int 로 묶는다. 세분화는 후속 스테이지.
-                "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => {
-                    hir::Type::Int
-                }
-                "float" | "double" => hir::Type::Float,
-                "string" => hir::Type::String,
-                "bool" => hir::Type::Bool,
-                "void" => hir::Type::Void,
-                other => hir::Type::Struct(other.to_string()),
-            },
-            ast::TypeRefKind::Tuple(elements) => {
-                hir::Type::Tuple(elements.iter().map(|t| self.ty_ref_to_type(t)).collect())
-            },
+            ast::TypeRefKind::Named(id) => self.named_type_to_type(&id.name, alias_stack),
+            ast::TypeRefKind::Tuple(elements) => hir::Type::Tuple(
+                elements
+                    .iter()
+                    .map(|t| self.ty_ref_to_type_inner(t, alias_stack))
+                    .collect(),
+            ),
             ast::TypeRefKind::Nullable(inner) => {
-                hir::Type::Nullable(Box::new(self.ty_ref_to_type(inner)))
+                hir::Type::Nullable(Box::new(self.ty_ref_to_type_inner(inner, alias_stack)))
             }
             ast::TypeRefKind::Array(inner) => {
-                hir::Type::Array(Box::new(self.ty_ref_to_type(inner)))
+                hir::Type::Array(Box::new(self.ty_ref_to_type_inner(inner, alias_stack)))
             }
+            ast::TypeRefKind::Pattern(_) | ast::TypeRefKind::Union(_) => hir::Type::Unknown,
             ast::TypeRefKind::InlineObject(fields) => hir::Type::InlineObject(
                 fields
                     .iter()
-                    .map(|(name, ty)| (name.name.clone(), self.ty_ref_to_type(ty)))
+                    .map(|(name, ty)| {
+                        (
+                            name.name.clone(),
+                            self.ty_ref_to_type_inner(ty, alias_stack),
+                        )
+                    })
                     .collect(),
             ),
         }
+    }
+
+    fn named_type_to_type(&self, name: &str, alias_stack: &mut Vec<String>) -> hir::Type {
+        match name {
+            // MVP: 정수 계열은 전부 Int 로 묶는다. 세분화는 후속 스테이지.
+            "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => {
+                return hir::Type::Int;
+            }
+            "float" | "double" => return hir::Type::Float,
+            "string" => return hir::Type::String,
+            "bool" => return hir::Type::Bool,
+            "void" => return hir::Type::Void,
+            "unknown" | "Vector" | "Array" | "Set" | "Map" | "Tuple" | "Function" => {
+                return hir::Type::Unknown;
+            }
+            _ => {}
+        }
+        if alias_stack.iter().any(|seen| seen == name) {
+            return hir::Type::Struct(name.to_string());
+        }
+        if let Some(alias) = self.lookup_type_alias(name) {
+            if alias.params.is_empty() {
+                alias_stack.push(name.to_string());
+                let ty = self.ty_ref_to_type_inner(&alias.ty, alias_stack);
+                alias_stack.pop();
+                return ty;
+            }
+        }
+        if name.len() == 1 && name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return hir::Type::Unknown;
+        }
+        hir::Type::Struct(name.to_string())
     }
 
     /// 표현식 모양에서 타입을 단방향 추론한다. MVP 수준 — 리터럴/이항연산/
@@ -277,6 +445,18 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Tuple(elems) => {
                 hir::Type::Tuple(elems.iter().map(|e| self.infer_type(e)).collect())
             }
+            ast::ExprKind::Object(fields) => {
+                if fields.iter().any(|f| f.is_spread) {
+                    hir::Type::Unknown
+                } else {
+                    hir::Type::InlineObject(
+                        fields
+                            .iter()
+                            .map(|f| (f.name.name.clone(), self.infer_type(&f.value)))
+                            .collect(),
+                    )
+                }
+            }
             // B5 Stage 2: Call — callee 의 Function 타입이 알려져 있으면 arity/
             // 인자 타입 매칭을 수행하고 결과 타입을 돌려준다. callee 가 Function
             // 이 아니면 Unknown (native/bound-method 등 MVP 범위 밖).
@@ -299,7 +479,7 @@ impl<'a> Lowerer<'a> {
                     } else {
                         for (i, (arg, ptype)) in args.iter().zip(params.iter()).enumerate() {
                             let aty = self.infer_type(arg);
-                            if !ptype.is_assignable_from(&aty) {
+                            if !self.is_assignable(ptype, &aty) {
                                 self.diagnostics.borrow_mut().push(
                                     Diagnostic::error(format!(
                                         "type mismatch: `{fname}` arg #{} expects `{}` but got `{}`",
@@ -330,10 +510,11 @@ impl<'a> Lowerer<'a> {
         block: &ast::Block,
         out: &mut Vec<(hir::Type, orv_diagnostics::Span)>,
     ) {
-        self.predeclare_function_signatures(&block.stmts);
-        for stmt in &block.stmts {
-            self.collect_return_types_from_stmt(stmt, out);
-        }
+        self.with_alias_scope(&block.stmts, || {
+            for stmt in &block.stmts {
+                self.collect_return_types_from_stmt(stmt, out);
+            }
+        });
     }
 
     fn collect_return_types_from_stmt(
@@ -409,6 +590,15 @@ impl<'a> Lowerer<'a> {
             }
             ast::ExprKind::AssignField { object, value, .. } => {
                 self.collect_return_types_from_expr(object, out);
+                self.collect_return_types_from_expr(value, out);
+            }
+            ast::ExprKind::AssignIndex {
+                object,
+                index,
+                value,
+            } => {
+                self.collect_return_types_from_expr(object, out);
+                self.collect_return_types_from_expr(index, out);
                 self.collect_return_types_from_expr(value, out);
             }
             ast::ExprKind::For { iter, body, .. } => {
@@ -490,6 +680,66 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `target = value` 대입 호환성 검사. 불일치 시 diagnostics 에 에러 추가.
+    fn is_assignable(&self, target: &hir::Type, value: &hir::Type) -> bool {
+        if matches!(target, hir::Type::Unknown) || matches!(value, hir::Type::Unknown) {
+            return true;
+        }
+        if matches!(value, hir::Type::Void) {
+            return true;
+        }
+        if target == value {
+            return true;
+        }
+        match target {
+            hir::Type::Nullable(inner) => {
+                matches!(value, hir::Type::Void) || self.is_assignable(inner, value)
+            }
+            hir::Type::Array(target_inner) => match value {
+                hir::Type::Array(value_inner) => self.is_assignable(target_inner, value_inner),
+                _ => false,
+            },
+            hir::Type::Tuple(target_elems) => match value {
+                hir::Type::Tuple(value_elems) => {
+                    target_elems.len() == value_elems.len()
+                        && target_elems.iter().zip(value_elems.iter()).all(
+                            |(target_elem, value_elem)| self.is_assignable(target_elem, value_elem),
+                        )
+                }
+                _ => false,
+            },
+            hir::Type::InlineObject(target_fields) => match value {
+                hir::Type::InlineObject(value_fields) => {
+                    self.inline_object_assignable(target_fields, value_fields)
+                }
+                hir::Type::Struct(name) => self
+                    .lookup_struct_type(name)
+                    .is_some_and(|shape| self.is_assignable(target, &shape)),
+                _ => false,
+            },
+            hir::Type::Struct(name) => {
+                if matches!(value, hir::Type::Struct(_)) {
+                    return false;
+                }
+                self.lookup_struct_type(name)
+                    .is_some_and(|shape| self.is_assignable(&shape, value))
+            }
+            _ => false,
+        }
+    }
+
+    fn inline_object_assignable(
+        &self,
+        target_fields: &[(String, hir::Type)],
+        value_fields: &[(String, hir::Type)],
+    ) -> bool {
+        target_fields.iter().all(|(target_name, target_ty)| {
+            value_fields
+                .iter()
+                .find(|(value_name, _)| value_name == target_name)
+                .is_some_and(|(_, value_ty)| self.is_assignable(target_ty, value_ty))
+        })
+    }
+
     fn check_assign(
         &self,
         target: &hir::Type,
@@ -497,7 +747,7 @@ impl<'a> Lowerer<'a> {
         value_span: orv_diagnostics::Span,
         what: &str,
     ) {
-        if !target.is_assignable_from(value_ty) {
+        if !self.is_assignable(target, value_ty) {
             let msg = format!(
                 "type mismatch: {what} annotated as `{}` but value has type `{}`",
                 target.display(),
@@ -527,7 +777,12 @@ impl<'a> Lowerer<'a> {
                 let decl_ty = match &l.ty {
                     Some(ty_ref) => {
                         let target = self.ty_ref_to_type(ty_ref);
-                        self.check_assign(&target, &init_ty, l.init.span, &format!("`{}`", l.name.name));
+                        self.check_assign(
+                            &target,
+                            &init_ty,
+                            l.init.span,
+                            &format!("`{}`", l.name.name),
+                        );
                         target
                     }
                     None => init_ty.clone(),
@@ -551,7 +806,12 @@ impl<'a> Lowerer<'a> {
                 let decl_ty = match &c.ty {
                     Some(ty_ref) => {
                         let target = self.ty_ref_to_type(ty_ref);
-                        self.check_assign(&target, &init_ty, c.init.span, &format!("`{}`", c.name.name));
+                        self.check_assign(
+                            &target,
+                            &init_ty,
+                            c.init.span,
+                            &format!("`{}`", c.name.name),
+                        );
                         target
                     }
                     None => init_ty.clone(),
@@ -628,9 +888,6 @@ impl<'a> Lowerer<'a> {
         // B5 Stage 2: return annotation 이 있으면 body 의 최종 표현식 타입과
         // 비교해 불일치 시 진단. 명시적 `return` 과 block 마지막 표현식을 모두
         // 잠재적 반환 경로로 보고 검사한다. void 함수는 `Unknown` 이라 skip.
-        if let ast::FunctionBody::Block(block) = &f.body {
-            self.predeclare_function_signatures(&block.stmts);
-        }
         if !matches!(ret_ty, hir::Type::Unknown) {
             for (body_ty, span) in self.function_body_value_types(&f.body) {
                 self.check_assign(
@@ -669,12 +926,15 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn block(&self, b: &ast::Block) -> hir::HirBlock {
-        self.predeclare_function_signatures(&b.stmts);
+    fn block_inner(&self, b: &ast::Block) -> hir::HirBlock {
         hir::HirBlock {
             stmts: b.stmts.iter().map(|s| self.stmt(s)).collect(),
             span: b.span,
         }
+    }
+
+    fn block(&self, b: &ast::Block) -> hir::HirBlock {
+        self.with_alias_scope(&b.stmts, || self.block_inner(b))
     }
 
     fn expr(&self, e: &ast::Expr) -> hir::HirExpr {
@@ -697,7 +957,7 @@ impl<'a> Lowerer<'a> {
                     .map(|seg| match seg {
                         ast::StringSegment::Str(s) => hir::HirStringSegment::Str(s.clone()),
                         ast::StringSegment::Interp(inner) => {
-                            hir::HirStringSegment::Interp(self.expr(inner))
+                            hir::HirStringSegment::Interp(Box::new(self.expr(inner)))
                         }
                     })
                     .collect(),
@@ -753,6 +1013,15 @@ impl<'a> Lowerer<'a> {
                 object: Box::new(self.expr(object)),
                 field: field.name.clone(),
                 field_span: field.span,
+                value: Box::new(self.expr(value)),
+            },
+            ast::ExprKind::AssignIndex {
+                object,
+                index,
+                value,
+            } => hir::HirExprKind::AssignIndex {
+                object: Box::new(self.expr(object)),
+                index: Box::new(self.expr(index)),
                 value: Box::new(self.expr(value)),
             },
             ast::ExprKind::Call { callee, args } => hir::HirExprKind::Call {
@@ -835,7 +1104,7 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Await(inner) => hir::HirExprKind::Await(Box::new(self.expr(inner))),
             ast::ExprKind::Cast { expr, ty } => hir::HirExprKind::Cast {
                 expr: Box::new(self.expr(expr)),
-                ty: self.ty_ref(ty),
+                ty: self.expanded_ty_ref(ty),
             },
             ast::ExprKind::Try { try_block, catch } => hir::HirExprKind::Try {
                 try_block: self.block(try_block),
@@ -1889,7 +2158,9 @@ let x: int = useAdd()"#,
         );
         assert!(!r.diagnostics.is_empty());
         assert!(
-            r.diagnostics.iter().any(|d| d.message.contains("type mismatch")),
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("type mismatch")),
             "{:?}",
             r.diagnostics
         );
@@ -1915,5 +2186,55 @@ let x: string = f()"#,
         );
         assert!(!bad.diagnostics.is_empty());
         assert!(bad.diagnostics[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn type_alias_tuple_expands_for_annotation_check() {
+        let r = lower_diag(
+            r#"type Pair = (int, string)
+let p: Pair = (1, "x")"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn type_alias_inline_object_preserves_field_type_checks() {
+        let r = lower_diag(
+            r#"type User = {name: string}
+let bad: User = { name: 1 }"#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn struct_annotation_accepts_inline_object_value() {
+        let r = lower_diag(
+            r#"struct Product { id: int, name: string }
+let product: Product = { name: "Coffee", id: 1 }"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn struct_array_annotation_accepts_inline_object_elements() {
+        let r = lower_diag(
+            r#"struct Product { id: int, name: string }
+let catalog: Product[] = [
+  { id: 1, name: "Coffee" },
+  { id: 2, name: "Tea" }
+]"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn struct_annotation_rejects_inline_object_field_mismatch() {
+        let r = lower_diag(
+            r#"struct Product { id: int, name: string }
+let product: Product = { id: "bad", name: "Coffee" }"#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("type mismatch"));
     }
 }

@@ -281,6 +281,12 @@ pub enum HirTypeRefKind {
     Nullable(Box<HirTypeRef>),
     /// `T[]`.
     Array(Box<HirTypeRef>),
+    /// 문자열 패턴 타입 (`"{uint}px"`). 현재는 표면 보존용이며 타입 슬롯은
+    /// `Unknown` 으로 처리한다.
+    Pattern(String),
+    /// union 타입 (`A | B`). Stage 1 에서는 보존만 하고 정밀 assignability 는
+    /// 후속 타입 체커 단계가 담당한다.
+    Union(Vec<HirTypeRef>),
     /// `{name: T, age: U}` 인라인 오브젝트 타입.
     InlineObject(Vec<(String, HirTypeRef)>),
     /// `(int, string)` 튜플 타입.
@@ -315,7 +321,7 @@ pub enum HirExprKind {
     Void,
     /// 원시 타입 이름 참조 (`int`, `string`, `float`, `bool`).
     TypeName(String),
-    /// 식별자 참조 (NameId 로 해결됨).
+    /// 식별자 참조 (`NameId` 로 해결됨).
     Ident(HirIdent),
     /// 전위 단항 연산.
     Unary {
@@ -441,7 +447,7 @@ pub enum HirExprKind {
     },
     /// 대입 — 현재는 식별자 좌변만.
     Assign {
-        /// 좌변 (기존 바인딩의 NameId 를 가리킨다).
+        /// 좌변 (기존 바인딩의 `NameId` 를 가리킨다).
         target: HirIdent,
         /// 우변.
         value: Box<HirExpr>,
@@ -454,6 +460,15 @@ pub enum HirExprKind {
         field: String,
         /// 필드 이름 스팬.
         field_span: Span,
+        /// 우변.
+        value: Box<HirExpr>,
+    },
+    /// 인덱스 재대입 — `obj[key] = value` / `arr[i] = value`.
+    AssignIndex {
+        /// 좌변 대상 표현식.
+        object: Box<HirExpr>,
+        /// 인덱스/키 표현식.
+        index: Box<HirExpr>,
         /// 우변.
         value: Box<HirExpr>,
     },
@@ -653,7 +668,7 @@ pub enum HirStringSegment {
     /// 이스케이프 해제된 리터럴 조각.
     Str(String),
     /// `{expr}` 보간.
-    Interp(HirExpr),
+    Interp(Box<HirExpr>),
 }
 
 /// 전위 단항 연산자.
@@ -735,13 +750,13 @@ pub enum Type {
     /// 값 없음.
     Void,
     /// `T?` — void 를 허용하는 nullable.
-    Nullable(Box<Type>),
+    Nullable(Box<Self>),
     /// `T[]` — 동종 배열.
-    Array(Box<Type>),
+    Array(Box<Self>),
     /// `(T1, T2, ...)` — 튜플. 고정 길이 heterogeneous 집합.
-    Tuple(Vec<Type>),
+    Tuple(Vec<Self>),
     /// `{name: T, age: U}` — 인라인 오브젝트 타입.
-    InlineObject(Vec<(String, Type)>),
+    InlineObject(Vec<(String, Self)>),
     /// 사용자 정의 struct. 필드 타입 lookup 은 별도 테이블을 통해 수행.
     Struct(String),
     /// 함수 타입 — 파라미터 타입 시퀀스와 반환 타입.
@@ -749,9 +764,9 @@ pub enum Type {
     /// MVP 는 arity-exact 매칭. optional/rest/named argument 는 후속.
     Function {
         /// 파라미터 타입들.
-        params: Vec<Type>,
+        params: Vec<Self>,
         /// 반환 타입. annotation 누락 시 `Unknown`.
-        ret: Box<Type>,
+        ret: Box<Self>,
     },
 }
 
@@ -801,9 +816,10 @@ impl Type {
             if a.len() != b.len() {
                 return false;
             }
-            return a.iter().zip(b.iter()).all(|((n1, t1), (n2, t2))| {
-                n1 == n2 && t1.is_assignable_from(t2)
-            });
+            return a
+                .iter()
+                .zip(b.iter())
+                .all(|((n1, t1), (n2, t2))| n1 == n2 && t1.is_assignable_from(t2));
         }
         false
     }
@@ -821,8 +837,12 @@ impl Type {
             Self::Nullable(inner) => format!("{}?", inner.display()),
             Self::Array(inner) => format!("{}[]", inner.display()),
             Self::Tuple(elems) => {
-                let es = elems.iter().map(Self::display).collect::<Vec<_>>().join(", ");
-                format!("({})", es)
+                let es = elems
+                    .iter()
+                    .map(Self::display)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({es})")
             }
             Self::InlineObject(fields) => {
                 let fs = fields
@@ -830,7 +850,7 @@ impl Type {
                     .map(|(n, t)| format!("{}: {}", n, t.display()))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{{{}}}", fs)
+                format!("{{{fs}}}")
             }
             Self::Struct(name) => name.clone(),
             Self::Function { params, ret } => {
