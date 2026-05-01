@@ -35,7 +35,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use orv_hir::{HirExpr, HirExprKind, HirProgram, NameId};
+use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, NameId};
 use tokio::net::TcpListener;
 
 use crate::interp::{
@@ -51,6 +51,7 @@ use crate::interp::{
 /// 멀티파트 파일 업로드는 막는 선. 파일 업로드는 SPEC §11 의 별도 경로로
 /// 다룬다.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const ORV_ORIGIN_ID_HEADER: &str = "x-orv-origin-id";
 
 /// `@server` 가 수집한 단일 라우트 — handler HIR 의 스냅샷.
 ///
@@ -63,6 +64,7 @@ struct RouteEntry {
     method: String,
     path: String,
     handler: HirExpr,
+    origin_id: String,
 }
 
 /// 포트 번호와 라우트 테이블을 들고 hyper 서버를 기동한다.
@@ -286,6 +288,7 @@ fn collect_routes(routes: &[HirExpr]) -> Result<Vec<RouteEntry>, RuntimeError> {
             method: method.clone(),
             path: path.clone(),
             handler: handler_expr,
+            origin_id: origin_id("route", &format!("{method} {path}"), expr.span),
         });
     }
     Ok(out)
@@ -309,7 +312,7 @@ where
     // 재진입이 가능하다.
     tokio::pin!(shutdown);
     loop {
-        let (stream, _peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             biased;
             // shutdown 우선. accept 가 동시에 준비되어도 먼저 빠져나간다.
             () = &mut shutdown => return Ok(()),
@@ -325,6 +328,7 @@ where
         let routes = Arc::clone(&routes);
         let captured_env = Arc::clone(&captured_env);
         let db = Arc::clone(&db);
+        let client_ip = peer.ip().to_string();
         // MVP: 커넥션 직렬 처리. tokio::task::spawn 은 `!Send` Future 를 못
         // 받고, spawn_local 은 LocalSet 안에서만 동작한다. 동시 요청 처리가
         // 필요한 순간(C6 이후)에 LocalSet 경로를 도입한다. 현재는 요청당 지연
@@ -333,7 +337,10 @@ where
             let routes = Arc::clone(&routes);
             let captured_env = Arc::clone(&captured_env);
             let db = Arc::clone(&db);
-            async move { Ok::<_, Infallible>(handle_request(req, routes, captured_env, db).await) }
+            let client_ip = client_ip.clone();
+            async move {
+                Ok::<_, Infallible>(handle_request(req, routes, captured_env, db, client_ip).await)
+            }
         });
         // MVP: keep-alive 차단. `serve_connection().await` 는 연결이 닫힐 때
         // 까지 반환하지 않아서, 직렬 accept 루프에서 keep-alive 한 클라이언트가
@@ -354,6 +361,7 @@ async fn handle_request(
     routes: Arc<Vec<RouteEntry>>,
     captured_env: Arc<HashMap<NameId, Value>>,
     db: Arc<Mutex<crate::db::InMemoryDb>>,
+    client_ip: String,
 ) -> Response<Full<Bytes>> {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
@@ -432,6 +440,7 @@ async fn handle_request(
     let ctx = RequestCtx {
         method,
         path,
+        ip: client_ip,
         params,
         query,
         headers,
@@ -467,12 +476,12 @@ async fn handle_request(
     }
 
     match outcome.response {
-        Some(resp) => response_from_respond(resp),
-        None => default_response(outcome.value),
+        Some(resp) => response_from_respond(resp, Some(&entry.origin_id)),
+        None => default_response(outcome.value, Some(&entry.origin_id)),
     }
 }
 
-fn response_from_respond(resp: ResponseCtx) -> Response<Full<Bytes>> {
+fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response<Full<Bytes>> {
     let status = u16::try_from(resp.status)
         .ok()
         .and_then(|s| StatusCode::from_u16(s).ok())
@@ -481,8 +490,7 @@ fn response_from_respond(resp: ResponseCtx) -> Response<Full<Bytes>> {
     // SPEC §11.9: `@redirect` 가 기록한 Location 이 있으면 body 없이
     // `Location:` 헤더 + 상태로 응답한다. payload/raw_body 는 무시.
     if let Some(loc) = resp.location {
-        return Response::builder()
-            .status(status)
+        return response_builder(status, origin_id)
             .header("location", loc)
             .body(Full::new(Bytes::new()))
             .expect("valid response");
@@ -492,8 +500,7 @@ fn response_from_respond(resp: ResponseCtx) -> Response<Full<Bytes>> {
     // body 금지 상태(204/304/1xx)에서도 파일은 있을 수 없는 조합이라 일반
     // 경로보다 먼저 잡는다.
     if let Some(raw) = resp.raw_body {
-        return Response::builder()
-            .status(status)
+        return response_builder(status, origin_id)
             .header("content-type", raw.content_type)
             .body(Full::new(Bytes::from(raw.bytes)))
             .expect("valid response");
@@ -503,15 +510,13 @@ fn response_from_respond(resp: ResponseCtx) -> Response<Full<Bytes>> {
     // 빈 body 로 보낸다. SPEC 도 `@respond 204 {}` 에서 body 인코더 제거를
     // 기대하므로, payload 값과 무관하게 no-body 경로를 우선한다.
     if status_disallows_body(status) || matches!(resp.payload, Value::Void) {
-        return Response::builder()
-            .status(status)
+        return response_builder(status, origin_id)
             .body(Full::new(Bytes::new()))
             .expect("valid response");
     }
     let json = value_to_json(&resp.payload);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
-    Response::builder()
-        .status(status)
+    response_builder(status, origin_id)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .expect("valid response")
@@ -523,23 +528,29 @@ fn status_disallows_body(status: StatusCode) -> bool {
         || status == StatusCode::NOT_MODIFIED
 }
 
-fn default_response(value: Value) -> Response<Full<Bytes>> {
+fn default_response(value: Value, origin_id: Option<&str>) -> Response<Full<Bytes>> {
     // handler 가 `@respond` 없이 값으로 끝나면 그 값을 JSON 으로 200 응답.
     // Void 는 빈 200. 이렇게 하면 `@route GET /health { "ok" }` 같은 간단한
     // 핸들러가 그대로 동작한다.
     if matches!(value, Value::Void) {
-        return Response::builder()
-            .status(StatusCode::OK)
+        return response_builder(StatusCode::OK, origin_id)
             .body(Full::new(Bytes::new()))
             .expect("valid response");
     }
     let json = value_to_json(&value);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
-    Response::builder()
-        .status(StatusCode::OK)
+    response_builder(StatusCode::OK, origin_id)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .expect("valid response")
+}
+
+fn response_builder(status: StatusCode, origin_id: Option<&str>) -> hyper::http::response::Builder {
+    let mut builder = Response::builder().status(status);
+    if let Some(origin_id) = origin_id {
+        builder = builder.header(ORV_ORIGIN_ID_HEADER, origin_id);
+    }
+    builder
 }
 
 fn plain_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
@@ -714,6 +725,7 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
             .unwrap_or(J::Null),
         Value::Bool(b) => J::Bool(*b),
         Value::Str(s) => J::String(s.clone()),
+        Value::Regex { pattern, flags } => J::String(format!("r\"{pattern}\"{flags}")),
         Value::Void => J::Null,
         Value::Array(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Tuple(elems) => J::Array(elems.iter().map(value_to_json).collect()),
@@ -774,7 +786,7 @@ mod tests {
     use hyper::client::conn::http1 as client_http1;
     use hyper_util::rt::TokioIo;
     use orv_analyzer::lower;
-    use orv_diagnostics::FileId;
+    use orv_diagnostics::{FileId, Span};
     use orv_hir::{HirExpr, HirExprKind, HirProgram, HirStmt};
     use orv_resolve::resolve;
     use orv_syntax::{lex, parse};
@@ -1069,15 +1081,34 @@ mod tests {
         }
     }
 
-    /// 요청을 쏘고 (status, content-type, body 바이트) 튜플로 돌려준다.
+    const TEST_ORIGIN_HEADER: &str = "x-orv-origin-id";
+
+    fn expected_origin_id(kind: &str, name: &str, span: Span) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in kind
+            .as_bytes()
+            .iter()
+            .chain(name.as_bytes())
+            .copied()
+            .chain(span.file.index().to_le_bytes())
+            .chain(span.range.start.to_le_bytes())
+            .chain(span.range.end.to_le_bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("ori_{hash:016x}")
+    }
+
+    /// 요청을 쏘고 (status, content-type, origin id, body 바이트) 튜플로 돌려준다.
     ///
     /// Request body 는 `body` 가 `Some` 이면 application/json 으로 보낸다.
-    async fn send_request(
+    async fn send_request_full(
         addr: SocketAddr,
         method: &str,
         path: &str,
         body: Option<String>,
-    ) -> (u16, Option<String>, Vec<u8>) {
+    ) -> (u16, Option<String>, Option<String>, Vec<u8>) {
         let stream = TcpStream::connect(addr).await.expect("connect");
         let io = TokioIo::new(stream);
         let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
@@ -1109,7 +1140,25 @@ mod tests {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let origin = resp
+            .headers()
+            .get(TEST_ORIGIN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
+        (status, ct, origin, bytes)
+    }
+
+    /// 요청을 쏘고 (status, content-type, body 바이트) 튜플로 돌려준다.
+    ///
+    /// Request body 는 `body` 가 `Some` 이면 application/json 으로 보낸다.
+    async fn send_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let (status, ct, _origin, bytes) = send_request_full(addr, method, path, body).await;
         (status, ct, bytes)
     }
 
@@ -1147,6 +1196,47 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["ok"], serde_json::json!(true));
             assert_eq!(json["msg"], serde_json::json!("pong"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_response_includes_route_origin_id_header() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route GET /ping { @respond 200 { ok: true } }
+                }"#,
+            );
+            let route = routes
+                .iter()
+                .find(|expr| matches!(expr.kind, HirExprKind::Route { .. }))
+                .expect("route");
+            let expected_origin = expected_origin_id("route", "GET /ping", route.span);
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, ct, origin, body) = send_request_full(addr, "GET", "/ping", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(ct.as_deref(), Some("application/json"));
+            assert_eq!(origin.as_deref(), Some(expected_origin.as_str()));
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["ok"], serde_json::json!(true));
 
             handle.abort();
         })
@@ -1835,6 +1925,68 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["role"], serde_json::json!("admin"));
             assert_eq!(json["uid"], serde_json::json!(42));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fixture_domains_exercises_reference_runtime_stubs() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_from_fixture("domains.orv");
+            assert!(body_stmts.is_empty(), "domains.orv has no boot stmts");
+            let (addr, handle, boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+            assert!(boot.is_empty(), "domains.orv should produce no boot output");
+
+            let (status, ct, body) = send_request(addr, "GET", "/domains", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(ct.as_deref(), Some("application/json"));
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["chunkSize"], serde_json::json!(5));
+            assert_eq!(json["path"], serde_json::json!("files/upload-1.txt"));
+            assert_eq!(
+                json["url"],
+                serde_json::json!("/orv-storage/files/upload-1.txt?signed=1")
+            );
+            assert_eq!(json["job"], serde_json::json!("queued"));
+            assert_eq!(json["videoId"], serde_json::json!("upload-1"));
+            assert_eq!(json["doc"], serde_json::json!("42"));
+            assert_eq!(json["mail"], serde_json::json!(true));
+            assert_eq!(json["media"], serde_json::json!("camera"));
+            assert_eq!(json["upload"], serde_json::json!("upload-1"));
+            assert_eq!(json["push"], serde_json::json!(true));
+            assert_eq!(
+                json["subscription"],
+                serde_json::json!("push://subscription")
+            );
+            assert_eq!(json["sent"], serde_json::json!("sent"));
+            assert_eq!(json["cache"], serde_json::json!("assets-v1"));
+            assert_eq!(json["cached"], serde_json::json!("stored"));
+            assert_eq!(json["loaded"], serde_json::json!("code"));
+            assert_eq!(json["local"], serde_json::json!("logo"));
+            assert_eq!(json["tun"], serde_json::json!("orv0"));
+            assert_eq!(json["packetBytes"], serde_json::json!(6));
+            assert_eq!(
+                json["plugin"],
+                serde_json::json!("ext/markdown-preview.wasm")
+            );
+            assert_eq!(json["activation"], serde_json::json!("activated"));
+            assert_eq!(json["compute"], serde_json::json!("compute"));
+            assert_eq!(json["observability"], serde_json::json!("superapp"));
 
             handle.abort();
         })

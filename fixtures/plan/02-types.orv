@@ -344,10 +344,10 @@ let counter = makeCounter()
 // 리터럴 제약을 타입 시그니처에 붙이면 컴파일타임 체크 + 런타임 validator 자동 생성.
 
 // (a) 길이 / 범위 제약 — (min..max)
-let short: string(3..50) = "hi"          // ❌ 컴파일 에러 — 길이 < 3
+// let short: string(3..50) = "hi"       // ❌ 컴파일 에러 — 길이 < 3
 let ok_name: string(3..50) = "Alice"     // ✓
 let age: int(0..120) = 25                // ✓
-let bad_age: int(0..120) = 200           // ❌ 범위 초과
+// let bad_age: int(0..120) = 200        // ❌ 범위 초과
 
 // 단일 범위 — 개수만 제한
 let pin: string(4) = "1234"              // 정확히 4자
@@ -377,10 +377,10 @@ type IPv4 = "{IPByte}.{IPByte}.{IPByte}.{IPByte}"
 type ISODate = "{int(4)}-{int(2)}-{int(2)}"
 
 let email: Email = "user@orv.dev"                // ✓
-let bad_email: Email = "not an email"            // ❌
+// let bad_email: Email = "not an email"          // ❌
 
 let ip: IPv4 = "192.168.0.1"                     // ✓
-let bad_ip: IPv4 = "999.999.999.999"             // ❌
+// let bad_ip: IPv4 = "999.999.999.999"           // ❌
 
 // 내장 스키마 타입 (표준)
 let e: Email = "a@b.c"        // 내장 email validator

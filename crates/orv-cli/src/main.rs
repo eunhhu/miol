@@ -1,7 +1,7 @@
 //! orv CLI 프론트엔드 — `orv` 바이너리.
 //!
 //! MVP: `orv run <file>`로 `.orv` 파일을 tree-walking 인터프리터로 실행한다.
-//! 이후 `orv build`, `orv check`, `orv dev` 등이 추가된다.
+//! `orv origins <file>`은 HIR 기반 origin map JSON을 출력한다.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,6 +33,11 @@ enum Command {
         /// 대상 파일 경로.
         file: PathBuf,
     },
+    /// HIR 기반 origin map을 JSON으로 출력한다.
+    Origins {
+        /// 대상 파일 경로.
+        file: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -59,10 +64,36 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Origins { file } => match cmd_origins(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
 fn cmd_run(path: &Path) -> anyhow::Result<()> {
+    let lowered = load_checked_hir(path)?;
+    orv_runtime::run(&lowered.program).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn cmd_check(path: &Path) -> anyhow::Result<()> {
+    let _lowered = load_checked_hir(path)?;
+    println!("check: {} passed", path.display());
+    Ok(())
+}
+
+fn cmd_origins(path: &Path) -> anyhow::Result<()> {
+    let lowered = load_checked_hir(path)?;
+    let origins = orv_compiler::origin_map(&lowered.program);
+    println!("{}", serde_json::to_string_pretty(&origins)?);
+    Ok(())
+}
+
+fn load_checked_hir(path: &Path) -> anyhow::Result<orv_analyzer::LowerResult> {
     // B3: entry 파일에서 시작해 import 를 따라 multi-file 을 하나의 Program 으로
     // 병합한다. import 가 없으면 entry 한 파일만 로드되므로 기존 동작과 동일.
     let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -74,23 +105,7 @@ fn cmd_run(path: &Path) -> anyhow::Result<()> {
     // B5: 타입 진단도 보고. 에러면 실행 전에 중단.
     let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
     report_diagnostics(&lowered.diagnostics, path)?;
-    orv_runtime::run(&lowered.program).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
-}
-
-fn cmd_check(path: &Path) -> anyhow::Result<()> {
-    // 파일을 읽어 파싱과 타입 검사만 수행하고 실행은 하지 않는다.
-    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    report_diagnostics(&loaded.diagnostics, path)?;
-
-    let resolved = orv_resolve::resolve(&loaded.program);
-    report_diagnostics(&resolved.diagnostics, path)?;
-
-    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
-    report_diagnostics(&lowered.diagnostics, path)?;
-
-    println!("check: {} passed", path.display());
-    Ok(())
+    Ok(lowered)
 }
 
 fn cmd_dump(path: &PathBuf) -> anyhow::Result<()> {
@@ -156,4 +171,58 @@ fn report_diagnostics(diags: &[orv_diagnostics::Diagnostic], path: &Path) -> any
         anyhow::bail!("aborting due to previous errors");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_path(parts: &[&str]) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../..");
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
+    fn orv_files_under(parts: &[&str]) -> Vec<PathBuf> {
+        let root = workspace_path(parts);
+        let mut files = Vec::new();
+        collect_orv_files(&root, &mut files);
+        files.sort();
+        files
+    }
+
+    fn collect_orv_files(root: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(root)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", root.display()))
+        {
+            let path = entry.expect("fixture dir entry").path();
+            if path.is_dir() {
+                collect_orv_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "orv") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn check_accepts_all_e2e_fixtures() {
+        let files = orv_files_under(&["fixtures", "e2e"]);
+        assert!(!files.is_empty(), "expected e2e fixtures");
+        for file in files {
+            cmd_check(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
+    }
+
+    #[test]
+    fn check_accepts_plan_and_default_fixtures() {
+        let mut files = orv_files_under(&["fixtures", "plan"]);
+        files.push(workspace_path(&["fixtures", "default-syntax.orv"]));
+        assert!(!files.is_empty(), "expected plan fixtures");
+        for file in files {
+            cmd_check(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
+    }
 }

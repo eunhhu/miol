@@ -256,8 +256,51 @@ pub struct Ident {
 pub struct TypeRef {
     /// 타입 종류.
     pub kind: TypeRefKind,
+    /// 스키마 제약 (`string(3..50)`, `string(trim, min=1)` 등).
+    pub constraints: Vec<TypeConstraint>,
+    /// 타입 predicate (`type Even = int where $ % 2 == 0`).
+    pub where_clause: Option<Box<Expr>>,
     /// 소스 위치.
     pub span: Span,
+}
+
+/// 타입 제약.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypeConstraint {
+    /// 플래그 제약 (`trim`, `lower`, `unique`).
+    Flag(String),
+    /// 정확한 정수 값 제약 (`string(4)`).
+    ExactInt(i64),
+    /// 정수 범위 제약 (`0..120`, `0..=9`).
+    Range {
+        /// 시작값.
+        start: Option<i64>,
+        /// 끝값.
+        end: Option<i64>,
+        /// 끝값 포함 여부. orv constraint는 `..`도 user-facing validator라
+        /// 기본 포함으로 해석한다.
+        inclusive: bool,
+    },
+    /// 키-값 제약 (`min=3`, `pattern="..."`).
+    KeyValue {
+        /// 키.
+        key: String,
+        /// 값.
+        value: ConstraintValue,
+    },
+}
+
+/// 타입 제약 값.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConstraintValue {
+    /// 정수 값.
+    Int(i64),
+    /// 문자열 값.
+    String(String),
+    /// bool 값.
+    Bool(bool),
+    /// 식별자 값.
+    Ident(String),
 }
 
 /// 타입 참조 변형.
@@ -298,6 +341,13 @@ pub enum ExprKind {
     /// 문자열 리터럴 — 보간 세그먼트 목록.
     /// 보간이 없는 단순 문자열도 `[Str(literal)]` 한 세그먼트로 표현된다.
     String(Vec<StringSegment>),
+    /// 정규식 리터럴 `r"pattern"flags`.
+    Regex {
+        /// 정규식 본문.
+        pattern: String,
+        /// 플래그 문자열 (`g`, `i`, `m`).
+        flags: String,
+    },
     /// `true`.
     True,
     /// `false`.
@@ -464,6 +514,13 @@ pub enum ExprKind {
         /// 필드 이름.
         field: Ident,
     },
+    /// Optional field access `target?.field`.
+    OptionalField {
+        /// 대상 표현식.
+        target: Box<Expr>,
+        /// 필드 이름.
+        field: Ident,
+    },
     /// 람다 리터럴 `(params) -> body`.
     Lambda {
         /// 파라미터 목록.
@@ -582,7 +639,7 @@ pub enum StringSegment {
     /// 리터럴 문자열 조각 (이스케이프 해제된 최종 값).
     Str(String),
     /// `{expr}` 보간 부분 — 내부 표현식 그대로.
-    Interp(Expr),
+    Interp(Box<Expr>),
 }
 
 /// 이항 연산자.

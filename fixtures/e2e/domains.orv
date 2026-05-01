@@ -1,0 +1,60 @@
+// =====================================================
+// e2e/domains.orv — advanced domain reference runtime
+// =====================================================
+//
+// This fixture keeps storage/job/sync/mail/media/upload on the same HTTP
+// execution path that production handlers use. The implementations are
+// deterministic local stubs, but the language surface must parse, lower, and
+// evaluate as normal handler code.
+
+@server {
+  @listen 0
+
+  @route GET /domains {
+    let chunk = @storage.putChunk("upload-1", 0, "hello")
+    let file = @storage.merge("upload-1", target="files/upload-1.txt")
+    let queued = @job.transcode.enqueue({ videoId: @upload.id })
+    let doc = @sync.open("Doc", "42")
+    let verified = @mail.verify.dkim(@message)
+    let camera = @media.camera({ audio: true, video: false })
+    let granted = @push.request()
+    let sub = @push.subscribe(vapid="public-key")
+    let sent = @push.send({ to: sub.endpoint, title: "Hi" })
+    let cache = @cache.open("assets-v1")
+    let cached = cache.put("/app.js", "code")
+    let loaded = cache.get("/app.js")
+    let store = @offline.store("assets")
+    let local = store.put("logo", "blob")
+    let tun = @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
+    let packet = @net.tun.write(tun, "packet")
+    let plugin = @plugin.load("ext/markdown-preview.wasm")
+    let activation = plugin.activate()
+    let compute = @gpu.compute(file="shaders/blur.wgsl", workgroup=[16, 16, 1])
+    let obs = @observability.configure({ service: "superapp" })
+
+    @respond 200 {
+      chunkSize: chunk.size,
+      path: file.path,
+      url: @storage.signedUrl(file.path),
+      job: queued.status,
+      videoId: queued.payload.videoId,
+      doc: doc.id,
+      mail: verified,
+      media: camera.kind,
+      upload: @upload.id,
+      push: granted,
+      subscription: sub.endpoint,
+      sent: sent.status,
+      cache: cache.name,
+      cached: cached.status,
+      loaded: loaded.value,
+      local: local.key,
+      tun: tun.name,
+      packetBytes: packet.bytes,
+      plugin: plugin.path,
+      activation: activation.status,
+      compute: compute.kind,
+      observability: obs.service
+    }
+  }
+}

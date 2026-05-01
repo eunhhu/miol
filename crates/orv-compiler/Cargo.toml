@@ -13,6 +13,7 @@ orv-analyzer = { workspace = true }
 orv-core = { workspace = true }
 orv-diagnostics = { workspace = true }
 orv-project = { workspace = true }
+orv-resolve = { workspace = true }
 orv-syntax = { workspace = true }
 orv-hir = { workspace = true }
 orv-runtime = { workspace = true }

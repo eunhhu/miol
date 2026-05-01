@@ -25,6 +25,35 @@
 use orv_diagnostics::Span;
 pub use orv_resolve::NameId;
 
+/// Build the compact deterministic fingerprint used by origin maps.
+///
+/// The fingerprint is intentionally derived only from origin kind, display
+/// name, and source span, so compiler artifacts and runtime events can compute
+/// the same value without sharing richer compiler state.
+#[must_use]
+pub fn origin_fingerprint(kind: &str, name: &str, span: Span) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in kind
+        .as_bytes()
+        .iter()
+        .chain(name.as_bytes())
+        .copied()
+        .chain(span.file.index().to_le_bytes())
+        .chain(span.range.start.to_le_bytes())
+        .chain(span.range.end.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Build the public origin id for a source-backed executable node.
+#[must_use]
+pub fn origin_id(kind: &str, name: &str, span: Span) -> String {
+    format!("ori_{}", origin_fingerprint(kind, name, span))
+}
+
 /// 프로그램 — 파일 하나의 최상위 문 목록.
 #[derive(Clone, Debug)]
 pub struct HirProgram {
@@ -73,6 +102,45 @@ impl HirStmt {
             Self::Import(span) => *span,
             Self::Expr(e) => e.span,
         }
+    }
+}
+
+fn display_constraints(constraints: &[HirTypeConstraint]) -> String {
+    constraints
+        .iter()
+        .map(|constraint| match constraint {
+            HirTypeConstraint::Flag(name) => name.clone(),
+            HirTypeConstraint::ExactInt(n) => n.to_string(),
+            HirTypeConstraint::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let lhs = start.map_or_else(String::new, |n| n.to_string());
+                let rhs = end.map_or_else(String::new, |n| n.to_string());
+                let op = if *inclusive { "..=" } else { ".." };
+                format!("{lhs}{op}{rhs}")
+            }
+            HirTypeConstraint::KeyValue { key, value } => {
+                format!("{key}={}", display_constraint_value(value))
+            }
+            HirTypeConstraint::Modulo { divisor, remainder } => {
+                format!("where $ % {divisor} == {remainder}")
+            }
+            HirTypeConstraint::ContainsRegex { pattern, flags } => {
+                format!("where $.contains(r\"{pattern}\"{flags})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_constraint_value(value: &HirConstraintValue) -> String {
+    match value {
+        HirConstraintValue::Int(n) => n.to_string(),
+        HirConstraintValue::String(s) => format!("\"{s}\""),
+        HirConstraintValue::Bool(b) => b.to_string(),
+        HirConstraintValue::Ident(s) => s.clone(),
     }
 }
 
@@ -171,7 +239,7 @@ pub enum HirFunctionBody {
     /// 블록 본문.
     Block(HirBlock),
     /// 단일 표현식 본문.
-    Expr(HirExpr),
+    Expr(Box<HirExpr>),
 }
 
 /// `return expr`.
@@ -267,8 +335,62 @@ pub struct HirIdent {
 pub struct HirTypeRef {
     /// 타입 참조 종류.
     pub kind: HirTypeRefKind,
+    /// 스키마 제약 (`string(3..50)`, `string(trim, min=1)` 등).
+    pub constraints: Vec<HirTypeConstraint>,
     /// 소스 위치.
     pub span: Span,
+}
+
+/// 타입 제약.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HirTypeConstraint {
+    /// 플래그 제약 (`trim`, `lower`, `unique`).
+    Flag(String),
+    /// 정확한 정수 값 제약 (`string(4)`).
+    ExactInt(i64),
+    /// 정수 범위 제약.
+    Range {
+        /// 시작값.
+        start: Option<i64>,
+        /// 끝값.
+        end: Option<i64>,
+        /// 끝값 포함 여부.
+        inclusive: bool,
+    },
+    /// 키-값 제약.
+    KeyValue {
+        /// 키.
+        key: String,
+        /// 값.
+        value: HirConstraintValue,
+    },
+    /// 타입 predicate `$ % divisor == remainder`.
+    Modulo {
+        /// 나눗수.
+        divisor: i64,
+        /// 나머지.
+        remainder: i64,
+    },
+    /// 타입 predicate `$.contains(r"...")`.
+    ContainsRegex {
+        /// 정규식 본문.
+        pattern: String,
+        /// 정규식 플래그.
+        flags: String,
+    },
+}
+
+/// 타입 제약 값.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HirConstraintValue {
+    /// 정수 값.
+    Int(i64),
+    /// 문자열 값.
+    String(String),
+    /// bool 값.
+    Bool(bool),
+    /// 식별자 값.
+    Ident(String),
 }
 
 /// 타입 참조 종류.
@@ -313,6 +435,13 @@ pub enum HirExprKind {
     Float(String),
     /// 문자열 리터럴 — 보간 세그먼트 목록.
     String(Vec<HirStringSegment>),
+    /// 정규식 리터럴 `r"pattern"flags`.
+    Regex {
+        /// 정규식 본문.
+        pattern: String,
+        /// 플래그 문자열 (`g`, `i`, `m`).
+        flags: String,
+    },
     /// `true`.
     True,
     /// `false`.
@@ -555,6 +684,15 @@ pub enum HirExprKind {
         /// 필드 이름 스팬.
         field_span: Span,
     },
+    /// Optional field access. `Void?.field` yields `Void` instead of failing.
+    OptionalField {
+        /// 대상.
+        target: Box<HirExpr>,
+        /// 필드 이름.
+        field: String,
+        /// 필드 이름 스팬.
+        field_span: Span,
+    },
     /// 람다 리터럴 `(params) -> body`.
     Lambda {
         /// 파라미터 목록.
@@ -757,8 +895,19 @@ pub enum Type {
     Tuple(Vec<Self>),
     /// `{name: T, age: U}` — 인라인 오브젝트 타입.
     InlineObject(Vec<(String, Self)>),
+    /// 문자열/불리언 리터럴 패턴 타입. 예: `"admin"`, `"{string}@{string}.{string}"`, `true`.
+    Pattern(String),
+    /// `A | B` — 값이 variant 중 하나에 assignable 하면 통과.
+    Union(Vec<Self>),
     /// 사용자 정의 struct. 필드 타입 lookup 은 별도 테이블을 통해 수행.
     Struct(String),
+    /// 제약이 붙은 타입.
+    Constrained {
+        /// 원 타입.
+        base: Box<Self>,
+        /// 제약 목록.
+        constraints: Vec<HirTypeConstraint>,
+    },
     /// 함수 타입 — 파라미터 타입 시퀀스와 반환 타입.
     ///
     /// MVP 는 arity-exact 매칭. optional/rest/named argument 는 후속.
@@ -821,6 +970,27 @@ impl Type {
                 .zip(b.iter())
                 .all(|((n1, t1), (n2, t2))| n1 == n2 && t1.is_assignable_from(t2));
         }
+        if let Self::Union(items) = self {
+            return items.iter().any(|item| item.is_assignable_from(value));
+        }
+        if let Self::Union(items) = value {
+            return items.iter().all(|item| self.is_assignable_from(item));
+        }
+        if let Self::Pattern(raw) = self {
+            if matches!(raw.as_str(), "true" | "false") {
+                return matches!(value, Self::Bool);
+            }
+            return matches!(value, Self::String | Self::Pattern(_));
+        }
+        if let Self::Constrained { base, .. } = self {
+            return base.is_assignable_from(value);
+        }
+        if let Self::Constrained { base, .. } = value {
+            return self.is_assignable_from(base);
+        }
+        if matches!(self, Self::String) && matches!(value, Self::Pattern(_)) {
+            return true;
+        }
         false
     }
 
@@ -852,7 +1022,16 @@ impl Type {
                     .join(", ");
                 format!("{{{fs}}}")
             }
+            Self::Pattern(raw) => raw.clone(),
+            Self::Union(items) => items
+                .iter()
+                .map(Self::display)
+                .collect::<Vec<_>>()
+                .join(" | "),
             Self::Struct(name) => name.clone(),
+            Self::Constrained { base, constraints } => {
+                format!("{}({})", base.display(), display_constraints(constraints))
+            }
             Self::Function { params, ret } => {
                 let ps = params
                     .iter()

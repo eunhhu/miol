@@ -204,6 +204,7 @@ impl<'a> Lowerer<'a> {
     fn ty_ref(&self, t: &ast::TypeRef) -> hir::HirTypeRef {
         hir::HirTypeRef {
             span: t.span,
+            constraints: lower_type_ref_constraints(t),
             kind: match &t.kind {
                 ast::TypeRefKind::Named(id) => hir::HirTypeRefKind::Named(id.name.clone()),
                 ast::TypeRefKind::Nullable(inner) => {
@@ -238,6 +239,7 @@ impl<'a> Lowerer<'a> {
         t: &ast::TypeRef,
         alias_stack: &mut Vec<String>,
     ) -> hir::HirTypeRef {
+        let constraints = lower_type_ref_constraints(t);
         let kind = match &t.kind {
             ast::TypeRefKind::Named(id) => {
                 if alias_stack.iter().any(|seen| seen == &id.name) {
@@ -245,9 +247,11 @@ impl<'a> Lowerer<'a> {
                 } else if let Some(alias) = self.lookup_type_alias(&id.name) {
                     if alias.params.is_empty() {
                         alias_stack.push(id.name.clone());
-                        let expanded = self.expanded_ty_ref_inner(&alias.ty, alias_stack);
+                        let mut expanded = self.expanded_ty_ref_inner(&alias.ty, alias_stack);
                         alias_stack.pop();
-                        expanded.kind
+                        expanded.constraints.extend(constraints);
+                        expanded.span = t.span;
+                        return expanded;
                     } else {
                         hir::HirTypeRefKind::Named(id.name.clone())
                     }
@@ -286,7 +290,11 @@ impl<'a> Lowerer<'a> {
                     .collect(),
             ),
         };
-        hir::HirTypeRef { kind, span: t.span }
+        hir::HirTypeRef {
+            kind,
+            constraints,
+            span: t.span,
+        }
     }
 
     /// SPEC §4.1 원시 이름을 [`hir::Type`] 으로 정규화한다. 알 수 없는 이름은
@@ -296,7 +304,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn ty_ref_to_type_inner(&self, t: &ast::TypeRef, alias_stack: &mut Vec<String>) -> hir::Type {
-        match &t.kind {
+        let base = match &t.kind {
             ast::TypeRefKind::Named(id) => self.named_type_to_type(&id.name, alias_stack),
             ast::TypeRefKind::Tuple(elements) => hir::Type::Tuple(
                 elements
@@ -310,7 +318,13 @@ impl<'a> Lowerer<'a> {
             ast::TypeRefKind::Array(inner) => {
                 hir::Type::Array(Box::new(self.ty_ref_to_type_inner(inner, alias_stack)))
             }
-            ast::TypeRefKind::Pattern(_) | ast::TypeRefKind::Union(_) => hir::Type::Unknown,
+            ast::TypeRefKind::Pattern(raw) => hir::Type::Pattern(raw.clone()),
+            ast::TypeRefKind::Union(items) => hir::Type::Union(
+                items
+                    .iter()
+                    .map(|t| self.ty_ref_to_type_inner(t, alias_stack))
+                    .collect(),
+            ),
             ast::TypeRefKind::InlineObject(fields) => hir::Type::InlineObject(
                 fields
                     .iter()
@@ -322,7 +336,8 @@ impl<'a> Lowerer<'a> {
                     })
                     .collect(),
             ),
-        }
+        };
+        apply_type_constraints(base, t)
     }
 
     fn named_type_to_type(&self, name: &str, alias_stack: &mut Vec<String>) -> hir::Type {
@@ -351,6 +366,9 @@ impl<'a> Lowerer<'a> {
                 return ty;
             }
         }
+        if let Some(pattern_ty) = standard_pattern_type(name) {
+            return pattern_ty;
+        }
         if name.len() == 1 && name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             return hir::Type::Unknown;
         }
@@ -364,6 +382,7 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Integer(_) => hir::Type::Int,
             ast::ExprKind::Float(_) => hir::Type::Float,
             ast::ExprKind::String(_) => hir::Type::String,
+            ast::ExprKind::Regex { .. } => hir::Type::Struct("Regex".to_string()),
             ast::ExprKind::True | ast::ExprKind::False => hir::Type::Bool,
             ast::ExprKind::Void => hir::Type::Void,
             ast::ExprKind::TypeName(name) => match name.as_str() {
@@ -489,6 +508,14 @@ impl<'a> Lowerer<'a> {
                                     ))
                                     .with_primary(arg.span, ""),
                                 );
+                            } else if let Some(msg) = self.literal_conformance_error(
+                                ptype,
+                                arg,
+                                &format!("`{fname}` arg #{}", i + 1),
+                            ) {
+                                self.diagnostics
+                                    .borrow_mut()
+                                    .push(Diagnostic::error(msg).with_primary(arg.span, ""));
                             }
                         }
                     }
@@ -636,7 +663,9 @@ impl<'a> Lowerer<'a> {
                     self.collect_return_types_from_expr(e, out);
                 }
             }
-            ast::ExprKind::Field { target, .. } => self.collect_return_types_from_expr(target, out),
+            ast::ExprKind::Field { target, .. } | ast::ExprKind::OptionalField { target, .. } => {
+                self.collect_return_types_from_expr(target, out);
+            }
             ast::ExprKind::Lambda { .. } => {}
             ast::ExprKind::Try { try_block, catch } => {
                 self.collect_return_types_from_block(try_block, out);
@@ -647,6 +676,7 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Integer(_)
             | ast::ExprKind::Float(_)
             | ast::ExprKind::String(_)
+            | ast::ExprKind::Regex { .. }
             | ast::ExprKind::True
             | ast::ExprKind::False
             | ast::ExprKind::Void
@@ -707,6 +737,15 @@ impl<'a> Lowerer<'a> {
                 }
                 _ => false,
             },
+            hir::Type::Pattern(raw) => {
+                if matches!(raw.as_str(), "true" | "false") {
+                    matches!(value, hir::Type::Bool)
+                } else {
+                    matches!(value, hir::Type::String | hir::Type::Pattern(_))
+                }
+            }
+            hir::Type::Union(items) => items.iter().any(|item| self.is_assignable(item, value)),
+            hir::Type::Constrained { base, .. } => self.is_assignable(base, value),
             hir::Type::InlineObject(target_fields) => match value {
                 hir::Type::InlineObject(value_fields) => {
                     self.inline_object_assignable(target_fields, value_fields)
@@ -723,6 +762,7 @@ impl<'a> Lowerer<'a> {
                 self.lookup_struct_type(name)
                     .is_some_and(|shape| self.is_assignable(&shape, value))
             }
+            hir::Type::String => matches!(value, hir::Type::Pattern(_)),
             _ => false,
         }
     }
@@ -759,6 +799,111 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn check_assign_expr(&self, target: &hir::Type, value: &ast::Expr, what: &str) {
+        let value_ty = self.infer_type(value);
+        if !self.is_assignable(target, &value_ty) {
+            self.check_assign(target, &value_ty, value.span, what);
+            return;
+        }
+        if let Some(msg) = self.literal_conformance_error(target, value, what) {
+            self.diagnostics
+                .borrow_mut()
+                .push(Diagnostic::error(msg).with_primary(value.span, ""));
+        }
+    }
+
+    fn literal_conformance_error(
+        &self,
+        target: &hir::Type,
+        value: &ast::Expr,
+        what: &str,
+    ) -> Option<String> {
+        match target {
+            hir::Type::Nullable(inner) => {
+                if matches!(value.kind, ast::ExprKind::Void) {
+                    None
+                } else {
+                    self.literal_conformance_error(inner, value, what)
+                }
+            }
+            hir::Type::Union(items) => {
+                let value_ty = self.infer_type(value);
+                if items.iter().any(|item| {
+                    self.is_assignable(item, &value_ty)
+                        && self.literal_conformance_error(item, value, what).is_none()
+                }) {
+                    None
+                } else {
+                    Some(format!(
+                        "type mismatch: {what} annotated as `{}` but literal does not match any union member",
+                        target.display()
+                    ))
+                }
+            }
+            hir::Type::Pattern(raw) => self.pattern_conformance_error(raw, value, what),
+            hir::Type::Constrained { base, constraints } => self
+                .literal_conformance_error(base, value, what)
+                .or_else(|| constraint_conformance_error(constraints, value, what)),
+            hir::Type::Array(inner) => {
+                let ast::ExprKind::Array(items) = &value.kind else {
+                    return None;
+                };
+                items
+                    .iter()
+                    .find_map(|item| self.literal_conformance_error(inner, item, what))
+            }
+            hir::Type::InlineObject(target_fields) => {
+                let ast::ExprKind::Object(value_fields) = &value.kind else {
+                    return None;
+                };
+                target_fields.iter().find_map(|(name, field_ty)| {
+                    value_fields
+                        .iter()
+                        .find(|field| field.name.name == *name)
+                        .and_then(|field| {
+                            self.literal_conformance_error(field_ty, &field.value, what)
+                        })
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn pattern_conformance_error(
+        &self,
+        raw: &str,
+        value: &ast::Expr,
+        what: &str,
+    ) -> Option<String> {
+        match raw {
+            "true" => {
+                if matches!(value.kind, ast::ExprKind::False) {
+                    Some(format!("pattern mismatch: {what} must be literal `true`"))
+                } else {
+                    None
+                }
+            }
+            "false" => {
+                if matches!(value.kind, ast::ExprKind::True) {
+                    Some(format!("pattern mismatch: {what} must be literal `false`"))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let s = plain_string_literal(value)?;
+                if pattern_matches(raw, s) {
+                    None
+                } else {
+                    Some(format!(
+                        "pattern mismatch: {what} value `{s}` does not match `{}`",
+                        display_pattern(raw)
+                    ))
+                }
+            }
+        }
+    }
+
     fn param(&self, p: &ast::Param) -> hir::HirParam {
         hir::HirParam {
             name: self.ident(&p.name),
@@ -777,12 +922,7 @@ impl<'a> Lowerer<'a> {
                 let decl_ty = match &l.ty {
                     Some(ty_ref) => {
                         let target = self.ty_ref_to_type(ty_ref);
-                        self.check_assign(
-                            &target,
-                            &init_ty,
-                            l.init.span,
-                            &format!("`{}`", l.name.name),
-                        );
+                        self.check_assign_expr(&target, &l.init, &format!("`{}`", l.name.name));
                         target
                     }
                     None => init_ty.clone(),
@@ -806,12 +946,7 @@ impl<'a> Lowerer<'a> {
                 let decl_ty = match &c.ty {
                     Some(ty_ref) => {
                         let target = self.ty_ref_to_type(ty_ref);
-                        self.check_assign(
-                            &target,
-                            &init_ty,
-                            c.init.span,
-                            &format!("`{}`", c.name.name),
-                        );
+                        self.check_assign_expr(&target, &c.init, &format!("`{}`", c.name.name));
                         target
                     }
                     None => init_ty.clone(),
@@ -922,7 +1057,7 @@ impl<'a> Lowerer<'a> {
     fn function_body(&self, b: &ast::FunctionBody) -> hir::HirFunctionBody {
         match b {
             ast::FunctionBody::Block(block) => hir::HirFunctionBody::Block(self.block(block)),
-            ast::FunctionBody::Expr(e) => hir::HirFunctionBody::Expr(self.expr(e)),
+            ast::FunctionBody::Expr(e) => hir::HirFunctionBody::Expr(Box::new(self.expr(e))),
         }
     }
 
@@ -962,6 +1097,10 @@ impl<'a> Lowerer<'a> {
                     })
                     .collect(),
             ),
+            ast::ExprKind::Regex { pattern, flags } => hir::HirExprKind::Regex {
+                pattern: pattern.clone(),
+                flags: flags.clone(),
+            },
             ast::ExprKind::True => hir::HirExprKind::True,
             ast::ExprKind::False => hir::HirExprKind::False,
             ast::ExprKind::Void => hir::HirExprKind::Void,
@@ -1096,6 +1235,11 @@ impl<'a> Lowerer<'a> {
                 field: field.name.clone(),
                 field_span: field.span,
             },
+            ast::ExprKind::OptionalField { target, field } => hir::HirExprKind::OptionalField {
+                target: Box::new(self.expr(target)),
+                field: field.name.clone(),
+                field_span: field.span,
+            },
             ast::ExprKind::Lambda { params, body } => hir::HirExprKind::Lambda {
                 params: params.iter().map(|p| self.param(p)).collect(),
                 body: Box::new(self.function_body(body)),
@@ -1130,6 +1274,9 @@ impl<'a> Lowerer<'a> {
         name: &ast::Ident,
         args: &[ast::Expr],
     ) -> hir::HirExprKind {
+        if name.name == "cron" {
+            self.validate_cron_domain(origin, args);
+        }
         if name.name == "out" {
             // 인자가 없으면 빈 줄 출력 동작을 유지하기 위해 `void` 리터럴을
             // 채워 넣는다. 다중 인자는 기존 인터프리터 동작(첫 인자만)과
@@ -1164,6 +1311,25 @@ impl<'a> Lowerer<'a> {
             name: name.name.clone(),
             name_span: name.span,
             args: args.iter().map(|a| self.expr(a)).collect(),
+        }
+    }
+
+    fn validate_cron_domain(&self, origin: &ast::Expr, args: &[ast::Expr]) {
+        let Some(expr) = args.first() else {
+            self.diagnostics.borrow_mut().push(
+                Diagnostic::error("invalid cron expression: missing schedule")
+                    .with_primary(origin.span, ""),
+            );
+            return;
+        };
+        let Some(schedule) = plain_string_literal(expr) else {
+            return;
+        };
+        if !is_valid_cron_expression(schedule) {
+            self.diagnostics.borrow_mut().push(
+                Diagnostic::error(format!("invalid cron expression `{schedule}`"))
+                    .with_primary(expr.span, ""),
+            );
         }
     }
 
@@ -1541,6 +1707,549 @@ fn binary_op(op: ast::BinaryOp) -> hir::BinaryOp {
     }
 }
 
+fn lower_type_ref_constraints(t: &ast::TypeRef) -> Vec<hir::HirTypeConstraint> {
+    let mut constraints = lower_type_constraints(&t.constraints);
+    if let Some(where_clause) = &t.where_clause {
+        lower_where_constraints(where_clause, &mut constraints);
+    }
+    constraints
+}
+
+fn lower_type_constraints(constraints: &[ast::TypeConstraint]) -> Vec<hir::HirTypeConstraint> {
+    constraints
+        .iter()
+        .map(|constraint| match constraint {
+            ast::TypeConstraint::Flag(name) => hir::HirTypeConstraint::Flag(name.clone()),
+            ast::TypeConstraint::ExactInt(n) => hir::HirTypeConstraint::ExactInt(*n),
+            ast::TypeConstraint::Range {
+                start,
+                end,
+                inclusive,
+            } => hir::HirTypeConstraint::Range {
+                start: *start,
+                end: *end,
+                inclusive: *inclusive,
+            },
+            ast::TypeConstraint::KeyValue { key, value } => hir::HirTypeConstraint::KeyValue {
+                key: key.clone(),
+                value: lower_constraint_value(value),
+            },
+        })
+        .collect()
+}
+
+fn lower_constraint_value(value: &ast::ConstraintValue) -> hir::HirConstraintValue {
+    match value {
+        ast::ConstraintValue::Int(n) => hir::HirConstraintValue::Int(*n),
+        ast::ConstraintValue::String(s) => hir::HirConstraintValue::String(s.clone()),
+        ast::ConstraintValue::Bool(b) => hir::HirConstraintValue::Bool(*b),
+        ast::ConstraintValue::Ident(s) => hir::HirConstraintValue::Ident(s.clone()),
+    }
+}
+
+fn apply_type_constraints(base: hir::Type, t: &ast::TypeRef) -> hir::Type {
+    let constraints = lower_type_ref_constraints(t);
+    apply_hir_type_constraints(base, constraints)
+}
+
+fn apply_hir_type_constraints(
+    base: hir::Type,
+    constraints: Vec<hir::HirTypeConstraint>,
+) -> hir::Type {
+    if constraints.is_empty() {
+        base
+    } else {
+        hir::Type::Constrained {
+            base: Box::new(base),
+            constraints,
+        }
+    }
+}
+
+fn lower_where_constraints(expr: &ast::Expr, out: &mut Vec<hir::HirTypeConstraint>) {
+    match &expr.kind {
+        ast::ExprKind::Paren(inner) => lower_where_constraints(inner, out),
+        ast::ExprKind::Binary {
+            op: ast::BinaryOp::And,
+            lhs,
+            rhs,
+        } => {
+            lower_where_constraints(lhs, out);
+            lower_where_constraints(rhs, out);
+        }
+        ast::ExprKind::Binary { op, lhs, rhs } => {
+            if let Some(constraint) = modulo_eq_constraint(*op, lhs, rhs) {
+                out.push(constraint);
+            } else if let Some(constraint) = comparison_constraint(*op, lhs, rhs) {
+                out.push(constraint);
+            }
+        }
+        ast::ExprKind::Call { callee, args } => {
+            if let Some(constraint) = contains_regex_constraint(callee, args) {
+                out.push(constraint);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn modulo_eq_constraint(
+    op: ast::BinaryOp,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+) -> Option<hir::HirTypeConstraint> {
+    if op != ast::BinaryOp::Eq {
+        return None;
+    }
+    if let Some((divisor, remainder)) = modulo_divisor(lhs).zip(int_literal(rhs)) {
+        return Some(hir::HirTypeConstraint::Modulo { divisor, remainder });
+    }
+    let (divisor, remainder) = modulo_divisor(rhs).zip(int_literal(lhs))?;
+    Some(hir::HirTypeConstraint::Modulo { divisor, remainder })
+}
+
+fn modulo_divisor(expr: &ast::Expr) -> Option<i64> {
+    let ast::ExprKind::Binary {
+        op: ast::BinaryOp::Rem,
+        lhs,
+        rhs,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    if !is_dollar(lhs) {
+        return None;
+    }
+    int_literal(rhs)
+}
+
+fn comparison_constraint(
+    op: ast::BinaryOp,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+) -> Option<hir::HirTypeConstraint> {
+    if is_dollar(lhs) {
+        return comparison_bound(op, int_literal(rhs)?);
+    }
+    if is_dollar(rhs) {
+        return comparison_bound(invert_comparison(op)?, int_literal(lhs)?);
+    }
+    None
+}
+
+fn comparison_bound(op: ast::BinaryOp, n: i64) -> Option<hir::HirTypeConstraint> {
+    match op {
+        ast::BinaryOp::Eq => Some(hir::HirTypeConstraint::ExactInt(n)),
+        ast::BinaryOp::Ge => Some(min_constraint(n)),
+        ast::BinaryOp::Gt => n.checked_add(1).map(min_constraint),
+        ast::BinaryOp::Le => Some(max_constraint(n)),
+        ast::BinaryOp::Lt => n.checked_sub(1).map(max_constraint),
+        _ => None,
+    }
+}
+
+fn invert_comparison(op: ast::BinaryOp) -> Option<ast::BinaryOp> {
+    match op {
+        ast::BinaryOp::Eq => Some(ast::BinaryOp::Eq),
+        ast::BinaryOp::Ge => Some(ast::BinaryOp::Le),
+        ast::BinaryOp::Gt => Some(ast::BinaryOp::Lt),
+        ast::BinaryOp::Le => Some(ast::BinaryOp::Ge),
+        ast::BinaryOp::Lt => Some(ast::BinaryOp::Gt),
+        _ => None,
+    }
+}
+
+fn min_constraint(n: i64) -> hir::HirTypeConstraint {
+    hir::HirTypeConstraint::KeyValue {
+        key: "min".to_string(),
+        value: hir::HirConstraintValue::Int(n),
+    }
+}
+
+fn max_constraint(n: i64) -> hir::HirTypeConstraint {
+    hir::HirTypeConstraint::KeyValue {
+        key: "max".to_string(),
+        value: hir::HirConstraintValue::Int(n),
+    }
+}
+
+fn contains_regex_constraint(
+    callee: &ast::Expr,
+    args: &[ast::Expr],
+) -> Option<hir::HirTypeConstraint> {
+    let [arg] = args else {
+        return None;
+    };
+    let ast::ExprKind::Field { target, field } = &callee.kind else {
+        return None;
+    };
+    if field.name != "contains" || !is_dollar(target) {
+        return None;
+    }
+    let ast::ExprKind::Regex { pattern, flags } = &arg.kind else {
+        return None;
+    };
+    Some(hir::HirTypeConstraint::ContainsRegex {
+        pattern: pattern.clone(),
+        flags: flags.clone(),
+    })
+}
+
+fn is_dollar(expr: &ast::Expr) -> bool {
+    matches!(&expr.kind, ast::ExprKind::Ident(id) if id.name == "$")
+}
+
+fn int_literal(expr: &ast::Expr) -> Option<i64> {
+    match &expr.kind {
+        ast::ExprKind::Integer(raw) => raw.parse::<i64>().ok(),
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg,
+            expr,
+        } => int_literal(expr).and_then(i64::checked_neg),
+        ast::ExprKind::Paren(inner) => int_literal(inner),
+        _ => None,
+    }
+}
+
+fn constraint_conformance_error(
+    constraints: &[hir::HirTypeConstraint],
+    value: &ast::Expr,
+    what: &str,
+) -> Option<String> {
+    constraints.iter().find_map(|constraint| {
+        if constraint_satisfied(constraint, value) {
+            None
+        } else {
+            Some(format!(
+                "constraint mismatch: {what} value does not satisfy `{}`",
+                display_constraint(constraint)
+            ))
+        }
+    })
+}
+
+fn constraint_satisfied(constraint: &hir::HirTypeConstraint, value: &ast::Expr) -> bool {
+    match constraint {
+        hir::HirTypeConstraint::Flag(name) if name == "unique" => array_literal_unique(value),
+        hir::HirTypeConstraint::Flag(_) => true,
+        hir::HirTypeConstraint::ExactInt(n) => expr_metric(value).is_none_or(|m| m == *n),
+        hir::HirTypeConstraint::Range { start, end, .. } => expr_metric(value)
+            .is_none_or(|m| start.is_none_or(|s| m >= s) && end.is_none_or(|e| m <= e)),
+        hir::HirTypeConstraint::KeyValue { key, value: cvalue } => match (key.as_str(), cvalue) {
+            ("min", hir::HirConstraintValue::Int(n)) => expr_metric(value).is_none_or(|m| m >= *n),
+            ("max", hir::HirConstraintValue::Int(n)) => expr_metric(value).is_none_or(|m| m <= *n),
+            ("pattern", hir::HirConstraintValue::String(pattern)) => {
+                plain_string_literal(value).is_none_or(|s| simple_pattern_key_matches(pattern, s))
+            }
+            _ => true,
+        },
+        hir::HirTypeConstraint::Modulo { divisor, remainder } => {
+            int_literal(value).is_none_or(|n| *divisor != 0 && n % *divisor == *remainder)
+        }
+        hir::HirTypeConstraint::ContainsRegex { pattern, flags } => plain_string_literal(value)
+            .is_none_or(|s| regex_literal_matches(pattern, flags, s).unwrap_or(true)),
+    }
+}
+
+fn expr_metric(value: &ast::Expr) -> Option<i64> {
+    match &value.kind {
+        ast::ExprKind::Integer(raw) => raw.parse::<i64>().ok(),
+        ast::ExprKind::String(segments) => {
+            let s = plain_string_literal_from_segments(segments)?;
+            i64::try_from(s.chars().count()).ok()
+        }
+        ast::ExprKind::Array(items) => i64::try_from(items.len()).ok(),
+        _ => None,
+    }
+}
+
+fn array_literal_unique(value: &ast::Expr) -> bool {
+    let ast::ExprKind::Array(items) = &value.kind else {
+        return true;
+    };
+    let mut seen = Vec::<String>::new();
+    for item in items {
+        let Some(key) = literal_key(item) else {
+            return true;
+        };
+        if seen.iter().any(|existing| existing == &key) {
+            return false;
+        }
+        seen.push(key);
+    }
+    true
+}
+
+fn literal_key(value: &ast::Expr) -> Option<String> {
+    match &value.kind {
+        ast::ExprKind::Integer(raw) => Some(format!("i:{raw}")),
+        ast::ExprKind::Float(raw) => Some(format!("f:{raw}")),
+        ast::ExprKind::String(segments) => {
+            plain_string_literal_from_segments(segments).map(|s| format!("s:{s}"))
+        }
+        ast::ExprKind::True => Some("b:true".to_string()),
+        ast::ExprKind::False => Some("b:false".to_string()),
+        ast::ExprKind::Void => Some("void".to_string()),
+        _ => None,
+    }
+}
+
+fn plain_string_literal_from_segments(segments: &[ast::StringSegment]) -> Option<&str> {
+    let [ast::StringSegment::Str(s)] = segments else {
+        return None;
+    };
+    Some(s)
+}
+
+fn simple_pattern_key_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "^[a-z0-9_]+$" {
+        return !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    }
+    true
+}
+
+fn regex_literal_matches(pattern: &str, flags: &str, value: &str) -> Option<bool> {
+    let mut builder = regex::RegexBuilder::new(pattern);
+    for flag in flags.chars() {
+        match flag {
+            'g' => {}
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            'm' => {
+                builder.multi_line(true);
+            }
+            _ => return None,
+        }
+    }
+    builder.build().ok().map(|regex| regex.is_match(value))
+}
+
+fn display_constraint(constraint: &hir::HirTypeConstraint) -> String {
+    match constraint {
+        hir::HirTypeConstraint::Flag(name) => name.clone(),
+        hir::HirTypeConstraint::ExactInt(n) => n.to_string(),
+        hir::HirTypeConstraint::Range { start, end, .. } => {
+            let start = start.map_or_else(String::new, |n| n.to_string());
+            let end = end.map_or_else(String::new, |n| n.to_string());
+            format!("{start}..{end}")
+        }
+        hir::HirTypeConstraint::KeyValue { key, value } => {
+            format!("{key}={}", display_hir_constraint_value(value))
+        }
+        hir::HirTypeConstraint::Modulo { divisor, remainder } => {
+            format!("where $ % {divisor} == {remainder}")
+        }
+        hir::HirTypeConstraint::ContainsRegex { pattern, flags } => {
+            format!("where $.contains(r\"{pattern}\"{flags})")
+        }
+    }
+}
+
+fn display_hir_constraint_value(value: &hir::HirConstraintValue) -> String {
+    match value {
+        hir::HirConstraintValue::Int(n) => n.to_string(),
+        hir::HirConstraintValue::String(s) => format!("\"{s}\""),
+        hir::HirConstraintValue::Bool(b) => b.to_string(),
+        hir::HirConstraintValue::Ident(s) => s.clone(),
+    }
+}
+
+fn standard_pattern_type(name: &str) -> Option<hir::Type> {
+    match name {
+        "Email" => Some(hir::Type::Pattern("@Email".to_string())),
+        "URL" => Some(hir::Type::Pattern("@URL".to_string())),
+        "UUID" => Some(hir::Type::Pattern("@UUID".to_string())),
+        "IPv4" => Some(hir::Type::Pattern("@IPv4".to_string())),
+        "ISODate" => Some(hir::Type::Pattern("@ISODate".to_string())),
+        _ => None,
+    }
+}
+
+fn plain_string_literal(value: &ast::Expr) -> Option<&str> {
+    let ast::ExprKind::String(segments) = &value.kind else {
+        return None;
+    };
+    let [ast::StringSegment::Str(s)] = segments.as_slice() else {
+        return None;
+    };
+    Some(s)
+}
+
+fn is_valid_cron_expression(schedule: &str) -> bool {
+    let fields: Vec<&str> = schedule.split_whitespace().collect();
+    if fields.len() != 5 {
+        return false;
+    }
+    fields
+        .iter()
+        .zip([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)])
+        .all(|(field, range)| is_valid_cron_field(field, range))
+}
+
+fn is_valid_cron_field(field: &str, (min, max): (u32, u32)) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    field
+        .split(',')
+        .all(|part| is_valid_cron_part(part, min, max))
+}
+
+fn is_valid_cron_part(part: &str, min: u32, max: u32) -> bool {
+    let (base, step) = part
+        .split_once('/')
+        .map_or((part, None), |(base, step)| (base, Some(step)));
+    if let Some(step) = step {
+        let Ok(n) = step.parse::<u32>() else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+    }
+    if base == "*" {
+        return true;
+    }
+    if let Some((start, end)) = base.split_once('-') {
+        let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
+            return false;
+        };
+        return start <= end && start >= min && end <= max;
+    }
+    base.parse::<u32>()
+        .is_ok_and(|value| value >= min && value <= max)
+}
+
+fn display_pattern(raw: &str) -> &str {
+    raw.strip_prefix('@').unwrap_or(raw)
+}
+
+fn pattern_matches(raw: &str, value: &str) -> bool {
+    match raw {
+        "@Email" => matches_email(value),
+        "@URL" => matches_url(value),
+        "@UUID" => matches_uuid(value),
+        "@IPv4" => matches_ipv4(value),
+        "@ISODate" => matches_iso_date(value),
+        _ if raw.contains('{') && raw.contains('}') => template_matches(raw, value),
+        _ => raw == value,
+    }
+}
+
+fn template_matches(pattern: &str, value: &str) -> bool {
+    let Some(open) = pattern.find('{') else {
+        return pattern == value;
+    };
+    let prefix = &pattern[..open];
+    if !value.starts_with(prefix) {
+        return false;
+    }
+    let after_prefix = &value[prefix.len()..];
+    let Some(close_rel) = pattern[open + 1..].find('}') else {
+        return pattern == value;
+    };
+    let close = open + 1 + close_rel;
+    let placeholder = &pattern[open + 1..close];
+    let rest_pattern = &pattern[close + 1..];
+
+    for end in split_positions(after_prefix) {
+        let segment = &after_prefix[..end];
+        if placeholder_matches(placeholder, segment)
+            && template_matches(rest_pattern, &after_prefix[end..])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_positions(s: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    out.push(s.len());
+    out
+}
+
+fn placeholder_matches(name: &str, value: &str) -> bool {
+    if let Some(n) = exact_placeholder_arg(name, "string") {
+        return value.chars().count() == n;
+    }
+    if let Some(n) = exact_placeholder_arg(name, "int") {
+        return value.len() == n && value.chars().all(|c| c.is_ascii_digit());
+    }
+    match name {
+        "string" => !value.is_empty(),
+        "int" => value.parse::<i64>().is_ok(),
+        "uint" => value.parse::<u64>().is_ok(),
+        "float" => value.parse::<f64>().is_ok(),
+        "bool" => matches!(value, "true" | "false"),
+        "IPByte" => value.parse::<u8>().is_ok(),
+        _ => !value.is_empty(),
+    }
+}
+
+fn exact_placeholder_arg(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+    inner.parse::<usize>().ok()
+}
+
+fn matches_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !local.is_empty() && !host.is_empty() && !tld.is_empty()
+}
+
+fn matches_url(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty() && !rest.is_empty()
+}
+
+fn matches_uuid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    let lens = [8usize, 4, 4, 4, 12];
+    parts.len() == lens.len()
+        && parts
+            .iter()
+            .zip(lens)
+            .all(|(part, len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn matches_ipv4(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.parse::<u8>().is_ok()
+                && (part == &"0" || !part.starts_with('0'))
+        })
+}
+
+fn matches_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let year = &value[0..4];
+    let month = &value[5..7];
+    let day = &value[8..10];
+    year.chars().all(|c| c.is_ascii_digit())
+        && month.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+        && day.parse::<u8>().is_ok_and(|d| (1..=31).contains(&d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1744,6 +2453,24 @@ mod tests {
             hir::HirExprKind::Domain { name, .. } => assert_eq!(name, "foo"),
             other => panic!("expected Domain fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cron_valid_five_field_expression_has_no_diagnostic() {
+        let r = lower_diag(r#"@cron "0 9 * * *" { @out "tick" }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn cron_invalid_expression_reports_diagnostic() {
+        let r = lower_diag(r#"@cron "bad" { @out "tick" }"#);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid cron expression")),
+            "{:?}",
+            r.diagnostics
+        );
     }
 
     // --- @server lowering ---
@@ -2236,5 +2963,123 @@ let product: Product = { id: "bad", name: "Coffee" }"#,
         );
         assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
         assert!(r.diagnostics[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn pattern_alias_accepts_matching_string_literal() {
+        let r = lower_diag(
+            r#"type Email = "{string}@{string}.{string}"
+let email: Email = "user@orv.dev""#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn pattern_alias_rejects_bad_string_literal() {
+        let r = lower_diag(
+            r#"type Email = "{string}@{string}.{string}"
+let email: Email = "not-an-email""#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("pattern"));
+    }
+
+    #[test]
+    fn string_literal_union_rejects_non_member_literal() {
+        let r = lower_diag(
+            r#"type Role = "admin" | "member"
+let role: Role = "owner""#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn primitive_union_accepts_any_member_type() {
+        let r = lower_diag(
+            r#"type Id = int | string
+let a: Id = 1
+let b: Id = "sku-1""#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn primitive_union_rejects_non_member_type() {
+        let r = lower_diag(
+            r#"type Id = int | string
+let bad: Id = true"#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn builtin_email_type_rejects_bad_literal() {
+        let r = lower_diag(r#"let bad: Email = "not-an-email""#);
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("pattern"));
+    }
+
+    #[test]
+    fn template_pattern_understands_ipbyte_placeholder() {
+        let r = lower_diag(
+            r#"type IPByte = int(0..255)
+type IPv4 = "{IPByte}.{IPByte}.{IPByte}.{IPByte}"
+let bad: IPv4 = "999.999.999.999""#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("pattern"));
+    }
+
+    #[test]
+    fn string_length_constraint_rejects_short_literal() {
+        let r = lower_diag(r#"let short: string(3..50) = "hi""#);
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("constraint"));
+    }
+
+    #[test]
+    fn int_range_constraint_rejects_out_of_range_literal() {
+        let r = lower_diag("let bad_age: int(0..120) = 200");
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("constraint"));
+    }
+
+    #[test]
+    fn array_unique_constraint_rejects_duplicate_literals() {
+        let r = lower_diag(r#"let tags: string[](unique, 1..5) = ["a", "a"]"#);
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("unique"));
+    }
+
+    #[test]
+    fn alias_where_modulo_rejects_invalid_literal_annotation() {
+        let r = lower_diag(
+            r"type EvenInt = int where $ % 2 == 0
+let bad: EvenInt = 3",
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("%"));
+    }
+
+    #[test]
+    fn inline_where_bound_rejects_invalid_literal_annotation() {
+        let r = lower_diag(r#"let age: int where $ >= 13 = 12"#);
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("constraint"));
+    }
+
+    #[test]
+    fn alias_where_contains_regex_rejects_invalid_literal_annotation() {
+        let r = lower_diag(
+            r#"type StrongPassword = string(min=8) where
+  $.contains(r"[A-Z]") &&
+  $.contains(r"[0-9]") &&
+  $.contains(r"[^a-zA-Z0-9]")
+let bad: StrongPassword = "password1!""#,
+        );
+        assert!(!r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.contains("contains"));
     }
 }

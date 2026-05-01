@@ -5,10 +5,10 @@
 //! 함수/제어 흐름/도메인/struct는 다음 커밋에서 추가된다.
 
 use crate::ast::{
-    BinaryOp, Block, CatchClause, ConstStmt, EnumStmt, EnumVariant, Expr, ExprKind, FunctionBody,
-    FunctionStmt, Ident, ImportStmt, LetKind, LetStmt, ObjectField, Param, Pattern, Program,
-    ReturnStmt, Stmt, StringSegment, StructField, StructStmt, TokenSlot, TypeAliasStmt, TypeRef,
-    TypeRefKind, UnaryOp, WhenArm,
+    BinaryOp, Block, CatchClause, ConstStmt, ConstraintValue, EnumStmt, EnumVariant, Expr,
+    ExprKind, FunctionBody, FunctionStmt, Ident, ImportStmt, LetKind, LetStmt, ObjectField, Param,
+    Pattern, Program, ReturnStmt, Stmt, StringSegment, StructField, StructStmt, TokenSlot,
+    TypeAliasStmt, TypeConstraint, TypeRef, TypeRefKind, UnaryOp, WhenArm,
 };
 use crate::lexer::lex_with_base_offset;
 
@@ -513,7 +513,7 @@ impl Parser {
 
     fn parse_type(&mut self) -> Option<TypeRef> {
         let first = self.parse_non_union_type()?;
-        let ty = if matches!(self.peek_kind(), TokenKind::Pipe) {
+        let mut ty = if matches!(self.peek_kind(), TokenKind::Pipe) {
             let mut items = vec![first];
             let mut end_span = items[0].span;
             while self.eat(&TokenKind::Pipe) {
@@ -524,12 +524,14 @@ impl Parser {
             let span = items[0].span.join(end_span);
             TypeRef {
                 kind: TypeRefKind::Union(items),
+                constraints: Vec::new(),
+                where_clause: None,
                 span,
             }
         } else {
             first
         };
-        self.consume_type_where_clause();
+        ty.where_clause = self.parse_type_where_clause();
         Some(ty)
     }
 
@@ -543,6 +545,8 @@ impl Parser {
                 ty = TypeRef {
                     span,
                     kind: TypeRefKind::Nullable(Box::new(ty)),
+                    constraints: Vec::new(),
+                    where_clause: None,
                 };
             } else if matches!(self.peek_kind(), TokenKind::LBracket) {
                 // `[` 다음에 `]`가 바로 오는 경우만 타입 `T[]`로 소비한다.
@@ -555,6 +559,8 @@ impl Parser {
                     ty = TypeRef {
                         span,
                         kind: TypeRefKind::Array(Box::new(ty)),
+                        constraints: Vec::new(),
+                        where_clause: None,
                     };
                 } else {
                     break;
@@ -563,7 +569,7 @@ impl Parser {
                 break;
             }
         }
-        self.consume_type_constraints();
+        ty.constraints.extend(self.parse_type_constraints());
         Some(ty)
     }
 
@@ -582,6 +588,8 @@ impl Parser {
             let tok = self.advance();
             return Some(TypeRef {
                 kind: TypeRefKind::Pattern(raw),
+                constraints: self.parse_type_constraints(),
+                where_clause: None,
                 span: tok.span,
             });
         }
@@ -594,6 +602,8 @@ impl Parser {
             };
             return Some(TypeRef {
                 kind: TypeRefKind::Pattern(raw.to_string()),
+                constraints: self.parse_type_constraints(),
+                where_clause: None,
                 span: tok.span,
             });
         }
@@ -609,6 +619,8 @@ impl Parser {
                     name,
                     span: tok.span,
                 }),
+                constraints: self.parse_type_constraints(),
+                where_clause: None,
                 span: tok.span,
             });
         }
@@ -627,6 +639,8 @@ impl Parser {
         let ty = TypeRef {
             span: name.span,
             kind: TypeRefKind::Named(name),
+            constraints: Vec::new(),
+            where_clause: None,
         };
         // SPEC §4.7 generic 타입 인자 `T<U, V>` — MVP 는 소비만, 타입 값은
         // Named(...) 그대로 유지한다. 실제 parameterization 은 후속 stage.
@@ -644,72 +658,121 @@ impl Parser {
             }
             let _ = self.eat(&TokenKind::Gt);
         }
-        // SPEC §4.10 스키마 제약 `string(3..50)`, `int(min=1, max=99)` 등.
-        // MVP 는 토큰만 소비 — 실제 검증은 후속 stage. `(` 로 시작하는 모든
-        // 제약 목록을 `)` 까지 삼킨다. depth counting 으로 중첩 paren 도 처리.
-        self.consume_type_constraints();
+        let mut ty = ty;
+        ty.constraints.extend(self.parse_type_constraints());
         Some(ty)
     }
 
-    fn consume_type_constraints(&mut self) {
-        if matches!(self.peek_kind(), TokenKind::LParen) {
-            let mut depth = 0i32;
-            loop {
-                match self.peek_kind() {
-                    TokenKind::LParen => {
-                        depth += 1;
-                        self.advance();
-                    }
-                    TokenKind::RParen => {
-                        depth -= 1;
-                        self.advance();
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    TokenKind::Eof => break,
-                    _ => {
-                        self.advance();
-                    }
-                }
+    fn parse_type_constraints(&mut self) -> Vec<TypeConstraint> {
+        if !matches!(self.peek_kind(), TokenKind::LParen) {
+            return Vec::new();
+        }
+        self.advance(); // `(`
+        let mut constraints = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            if let Some(constraint) = self.parse_one_type_constraint() {
+                constraints.push(constraint);
+            } else {
+                self.advance();
             }
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            }
+        }
+        let _ = self.eat(&TokenKind::RParen);
+        constraints
+    }
+
+    fn parse_one_type_constraint(&mut self) -> Option<TypeConstraint> {
+        if let Some(start) = self.parse_constraint_int() {
+            if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq) {
+                self.advance();
+                let end = self.parse_constraint_int();
+                return Some(TypeConstraint::Range {
+                    start: Some(start),
+                    end,
+                    inclusive: true,
+                });
+            }
+            return Some(TypeConstraint::ExactInt(start));
+        }
+        if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq) {
+            self.advance();
+            let end = self.parse_constraint_int();
+            return Some(TypeConstraint::Range {
+                start: None,
+                end,
+                inclusive: true,
+            });
+        }
+        let key = match self.peek_kind().clone() {
+            TokenKind::Ident(name) => {
+                self.advance();
+                name
+            }
+            TokenKind::Keyword(keyword) => {
+                self.advance();
+                keyword_lexeme(keyword).to_string()
+            }
+            _ => return None,
+        };
+        if self.eat(&TokenKind::Eq) {
+            let value = self.parse_constraint_value()?;
+            Some(TypeConstraint::KeyValue { key, value })
+        } else {
+            Some(TypeConstraint::Flag(key))
         }
     }
 
-    fn consume_type_where_clause(&mut self) {
+    fn parse_constraint_value(&mut self) -> Option<ConstraintValue> {
+        if let Some(n) = self.parse_constraint_int() {
+            return Some(ConstraintValue::Int(n));
+        }
+        match self.peek_kind().clone() {
+            TokenKind::String(s) => {
+                self.advance();
+                Some(ConstraintValue::String(s))
+            }
+            TokenKind::True => {
+                self.advance();
+                Some(ConstraintValue::Bool(true))
+            }
+            TokenKind::False => {
+                self.advance();
+                Some(ConstraintValue::Bool(false))
+            }
+            TokenKind::Ident(name) => {
+                self.advance();
+                Some(ConstraintValue::Ident(name))
+            }
+            TokenKind::Keyword(keyword) => {
+                self.advance();
+                Some(ConstraintValue::Ident(keyword_lexeme(keyword).to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_constraint_int(&mut self) -> Option<i64> {
+        let sign = if matches!(self.peek_kind(), TokenKind::Minus) {
+            self.advance();
+            -1
+        } else {
+            1
+        };
+        let TokenKind::Integer(raw) = self.peek_kind().clone() else {
+            return None;
+        };
+        self.advance();
+        raw.parse::<i64>().ok().map(|n| n * sign)
+    }
+
+    fn parse_type_where_clause(&mut self) -> Option<Box<Expr>> {
         if !matches!(self.peek_kind(), TokenKind::Ident(s) if s == "where") {
-            return;
+            return None;
         }
         self.advance(); // `where`
-        loop {
-            if matches!(self.peek_kind(), TokenKind::Eof) {
-                break;
-            }
-            if self.newline_before_cur()
-                && (matches!(
-                    self.peek_kind(),
-                    TokenKind::RBrace
-                        | TokenKind::Keyword(
-                            Keyword::Let
-                                | Keyword::Const
-                                | Keyword::Function
-                                | Keyword::Struct
-                                | Keyword::Enum
-                                | Keyword::Type
-                                | Keyword::Define
-                                | Keyword::Pub
-                                | Keyword::Import
-                        )
-                ) || (matches!(self.peek_kind(), TokenKind::Ident(_))
-                    && matches!(
-                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                        Some(TokenKind::Colon)
-                    )))
-            {
-                break;
-            }
-            self.advance();
-        }
+        self.parse_expr_bp(1).map(Box::new)
     }
 
     /// 인라인 오브젝트 타입 파싱 — `{name: T, age: U}`
@@ -729,6 +792,8 @@ impl Parser {
         Some(TypeRef {
             span: lbrace.span.join(rbrace.span),
             kind: TypeRefKind::InlineObject(fields),
+            constraints: Vec::new(),
+            where_clause: None,
         })
     }
 
@@ -747,6 +812,8 @@ impl Parser {
         Some(TypeRef {
             span: lparen.span.join(rparen.span),
             kind: TypeRefKind::Tuple(elements),
+            constraints: Vec::new(),
+            where_clause: None,
         })
     }
 
@@ -850,9 +917,6 @@ impl Parser {
                 continue;
             }
             // 후위 연산자 — optional chain `target?.field`.
-            // Stage 1 은 표면 수용을 우선해 ordinary field access 로 낮춘다.
-            // nullable short-circuit semantics 는 타입/런타임 nullable 정밀화 때
-            // 별도 HIR 노드로 올린다.
             if matches!(self.peek_kind(), TokenKind::Question)
                 && matches!(
                     self.tokens.get(self.pos + 1).map(|t| &t.kind),
@@ -865,12 +929,20 @@ impl Parser {
                 let field = self.parse_ident("field name")?;
                 let span = lhs.span.join(field.span);
                 lhs = Expr {
-                    kind: ExprKind::Field {
+                    kind: ExprKind::OptionalField {
                         target: Box::new(lhs),
                         field,
                     },
                     span,
                 };
+                continue;
+            }
+            if is_reference_parenless_callee(&lhs)
+                && self.is_domain_arg_start()
+                && !self.newline_before_cur()
+                && 30 >= min_bp
+            {
+                lhs = self.finish_parenless_call(lhs)?;
                 continue;
             }
             // Shorthand lambda: `item -> item.id`. Parenthesized lambdas keep
@@ -1331,6 +1403,39 @@ impl Parser {
         })
     }
 
+    fn finish_parenless_call(&mut self, callee: Expr) -> Option<Expr> {
+        let start_span = callee.span;
+        let mut end_span = callee.span;
+        let mut args = Vec::new();
+        while self.is_domain_arg_start() && !self.newline_before_cur() {
+            let arg = if self.looks_like_prop_arg() {
+                let key = self.parse_prop_key("argument name")?;
+                self.expect(&TokenKind::Eq, "`=`")?;
+                let value = self.parse_expr()?;
+                let span = key.span.join(value.span);
+                Expr {
+                    kind: ExprKind::Assign {
+                        target: key,
+                        value: Box::new(value),
+                    },
+                    span,
+                }
+            } else {
+                self.parse_expr_bp(31)?
+            };
+            end_span = arg.span;
+            args.push(arg);
+            let _ = self.eat(&TokenKind::Comma);
+        }
+        Some(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span: start_span.join(end_span),
+        })
+    }
+
     fn parse_prefix(&mut self) -> Option<Expr> {
         let start_tok = self.peek().clone();
         // 전위 단항 `!x`, `-x`, `~x`
@@ -1376,10 +1481,11 @@ impl Parser {
                     span: str_tok.span,
                 });
             }
-            TokenKind::Regex { pattern, .. } => {
-                let raw = pattern.clone();
+            TokenKind::Regex { pattern, flags } => {
+                let pattern = pattern.clone();
+                let flags = flags.clone();
                 self.advance();
-                ExprKind::String(vec![StringSegment::Str(raw)])
+                ExprKind::Regex { pattern, flags }
             }
             TokenKind::True => {
                 self.advance();
@@ -2759,9 +2865,11 @@ impl Parser {
             });
         }
         if matches!(self.peek_kind(), TokenKind::LParen) {
-            self.advance();
+            let lparen = self.advance();
+            let mut params = Vec::new();
             while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                let _ = self.parse_prop_key("job parameter")?;
+                let param = self.parse_prop_key("job parameter")?;
+                params.push(param);
                 if self.eat(&TokenKind::Colon) {
                     let _ = self.parse_type();
                 }
@@ -2771,11 +2879,22 @@ impl Parser {
             }
             let rparen = self.expect(&TokenKind::RParen, "`)`")?;
             end_span = rparen.span;
+            if !params.is_empty() {
+                args.push(Self::job_params_object(
+                    params,
+                    lparen.span.join(rparen.span),
+                ));
+            }
         }
-        if self.eat(&TokenKind::Arrow) && matches!(self.peek_kind(), TokenKind::LBrace) {
-            let block = self.parse_block_expr()?;
-            end_span = block.span;
-            args.push(block);
+        if self.eat(&TokenKind::Arrow) {
+            if !matches!(self.peek_kind(), TokenKind::LBrace) {
+                let _ = self.parse_type();
+            }
+            if matches!(self.peek_kind(), TokenKind::LBrace) {
+                let block = self.parse_block_expr()?;
+                end_span = block.span;
+                args.push(block);
+            }
         }
         Some(Expr {
             kind: ExprKind::Domain {
@@ -2784,6 +2903,21 @@ impl Parser {
             },
             span: at_span.join(end_span),
         })
+    }
+
+    fn job_params_object(params: Vec<Ident>, span: Span) -> Expr {
+        let items = params
+            .into_iter()
+            .map(|param| Expr {
+                kind: ExprKind::String(vec![StringSegment::Str(param.name)]),
+                span: param.span,
+            })
+            .collect();
+        let value = Expr {
+            kind: ExprKind::Array(items),
+            span,
+        };
+        Self::db_sentinel_object("__params__", value, span)
     }
 
     fn parse_db_domain_call(&mut self, name_ident: &Ident, at_span: Span) -> Option<Expr> {
@@ -2842,6 +2976,10 @@ impl Parser {
             });
         }
 
+        if method_name == "transaction" {
+            return self.parse_db_transaction_call(callee, at_span);
+        }
+
         let mut args = Vec::new();
         let mut end_span = callee.span;
         while !matches!(
@@ -2897,11 +3035,109 @@ impl Parser {
         })
     }
 
+    fn parse_db_transaction_call(&mut self, callee: Expr, at_span: Span) -> Option<Expr> {
+        let mut args = Vec::new();
+        let mut end_span = callee.span;
+        loop {
+            if matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+                break;
+            }
+            if self.newline_before_cur() && !matches!(self.peek_kind(), TokenKind::LBrace) {
+                break;
+            }
+            if matches!(self.peek_kind(), TokenKind::At(name) if name == "hint") {
+                let hint = self.parse_hint_arg()?;
+                end_span = hint.span;
+                args.push(hint);
+                continue;
+            }
+            if matches!(self.peek_kind(), TokenKind::At(_)) {
+                break;
+            }
+            if matches!(self.peek_kind(), TokenKind::LBrace) {
+                let block = self.parse_block_expr()?;
+                end_span = block.span;
+                args.push(block);
+                break;
+            }
+            if !self.is_domain_arg_start() {
+                break;
+            }
+            let arg = self.parse_expr()?;
+            end_span = arg.span;
+            args.push(arg);
+        }
+
+        Some(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span: at_span.join(end_span),
+        })
+    }
+
+    fn parse_hint_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@hint`
+        let mut fields = Vec::new();
+        let mut end_span = at_tok.span;
+        while !matches!(
+            self.peek_kind(),
+            TokenKind::LBrace | TokenKind::RBrace | TokenKind::At(_) | TokenKind::Eof
+        ) && !self.newline_before_cur()
+        {
+            if self.looks_like_prop_arg() {
+                let key = self.parse_prop_key("hint property")?;
+                self.expect(&TokenKind::Eq, "`=`")?;
+                let value = self
+                    .try_parse_bare_attr_value()
+                    .or_else(|| self.parse_expr_bp(22))?;
+                let span = key.span.join(value.span);
+                end_span = span;
+                fields.push(ObjectField {
+                    name: key,
+                    value,
+                    is_spread: false,
+                    span,
+                });
+                continue;
+            }
+            if !self.is_domain_arg_start() {
+                break;
+            }
+            let value = self
+                .try_parse_bare_attr_value()
+                .or_else(|| self.parse_expr_bp(22))?;
+            let span = value.span;
+            end_span = span;
+            fields.push(ObjectField {
+                name: Ident {
+                    name: "__value__".to_string(),
+                    span,
+                },
+                value,
+                is_spread: false,
+                span,
+            });
+        }
+        let hint = Expr {
+            kind: ExprKind::Object(fields),
+            span: at_tok.span.join(end_span),
+        };
+        Some(Self::db_sentinel_object("__hint__", hint, at_tok.span))
+    }
+
     fn parse_percent_property_value(&mut self) -> Option<Expr> {
         self.expect(&TokenKind::Percent, "`%`")?;
-        let _key = self.parse_ident("percent property name")?;
+        let key = self.parse_ident("percent property name")?;
         self.expect(&TokenKind::Eq, "`=`")?;
-        self.parse_expr()
+        let value = self.parse_expr()?;
+        if key.name == "inc" {
+            let span = key.span.join(value.span);
+            Some(Self::db_sentinel_object("__inc__", value, span))
+        } else {
+            Some(value)
+        }
     }
 
     fn parse_db_braced_args(&mut self) -> Option<Vec<Expr>> {
@@ -2910,26 +3146,18 @@ impl Parser {
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Percent => args.push(self.parse_percent_property_value()?),
-                TokenKind::At(name) if name == "where" => {
-                    let at_tok = self.advance();
-                    let mut fields = Vec::new();
-                    while self.looks_like_prop_arg() {
-                        let key = self.parse_prop_key("where key")?;
-                        self.expect(&TokenKind::Eq, "`=`")?;
-                        let value = self.parse_expr_bp(22)?;
-                        let span = key.span.join(value.span);
-                        fields.push(ObjectField {
-                            name: key,
-                            value,
-                            is_spread: false,
-                            span,
-                        });
-                    }
-                    args.push(Expr {
-                        kind: ExprKind::Object(fields),
-                        span: at_tok.span,
-                    });
+                TokenKind::At(name) if name == "where" => args.push(self.parse_db_where_arg()?),
+                TokenKind::At(name) if name == "order" => args.push(self.parse_db_order_arg()?),
+                TokenKind::At(name) if name == "skip" => {
+                    args.push(self.parse_db_int_arg("__skip__")?)
                 }
+                TokenKind::At(name) if name == "limit" => {
+                    args.push(self.parse_db_int_arg("__limit__")?)
+                }
+                TokenKind::At(name) if name == "field" => args.push(self.parse_db_field_arg()?),
+                TokenKind::At(name) if name == "match" => args.push(self.parse_db_match_arg()?),
+                TokenKind::At(name) if name == "rank" => args.push(self.parse_db_rank_arg()?),
+                TokenKind::At(name) if name == "near" => args.push(self.parse_db_near_arg()?),
                 _ if self.is_domain_arg_start() => args.push(self.parse_expr()?),
                 _ => {
                     self.advance();
@@ -2941,6 +3169,223 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace, "`}`")?;
         Some(args)
+    }
+
+    fn parse_db_where_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@where`
+        let key = self.parse_prop_key("where key")?;
+        let is_in_operator = (matches!(
+            self.peek_kind(),
+            TokenKind::Ident(op) if op == "in"
+        ) || matches!(self.peek_kind(), TokenKind::Keyword(Keyword::In)))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            );
+        if is_in_operator {
+            self.advance(); // `in`
+            self.advance(); // `=`
+            let value = self.parse_expr_bp(22)?;
+            return Some(Self::db_filter_object(key, "__in", value, at_tok.span));
+        }
+
+        let suffix = match self.peek_kind() {
+            TokenKind::Eq | TokenKind::EqEq => "",
+            TokenKind::BangEq => "__ne",
+            TokenKind::Gt => "__gt",
+            TokenKind::GtEq => "__gte",
+            TokenKind::Lt => "__lt",
+            TokenKind::LtEq => "__lte",
+            _ => {
+                self.error(
+                    "expected `=`, `==`, `!=`, `<`, `<=`, `>`, `>=`, or `in=` after @where key",
+                );
+                return None;
+            }
+        };
+        self.advance();
+        let value = self.parse_expr_bp(22)?;
+        Some(Self::db_filter_object(key, suffix, value, at_tok.span))
+    }
+
+    fn parse_db_order_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@order`
+        let key = self.parse_prop_key("order key")?;
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = match self.peek_kind().clone() {
+            TokenKind::Ident(name) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(name)]),
+                    span: tok.span,
+                }
+            }
+            TokenKind::Keyword(keyword) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(
+                        keyword_text(keyword).to_string(),
+                    )]),
+                    span: tok.span,
+                }
+            }
+            _ => self.parse_expr_bp(1)?,
+        };
+        let order = Expr {
+            kind: ExprKind::Object(vec![ObjectField {
+                name: key,
+                span: value.span,
+                value,
+                is_spread: false,
+            }]),
+            span: at_tok.span,
+        };
+        Some(Self::db_sentinel_object("__order__", order, at_tok.span))
+    }
+
+    fn parse_db_field_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@field`
+        let value = match self.peek_kind().clone() {
+            TokenKind::Ident(name) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(name)]),
+                    span: tok.span,
+                }
+            }
+            TokenKind::Keyword(keyword) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(
+                        keyword_text(keyword).to_string(),
+                    )]),
+                    span: tok.span,
+                }
+            }
+            _ => self.parse_expr_bp(1)?,
+        };
+        Some(Self::db_sentinel_object("__field__", value, at_tok.span))
+    }
+
+    fn parse_db_rank_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@rank`
+        let value = match self.peek_kind().clone() {
+            TokenKind::Ident(name) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(name)]),
+                    span: tok.span,
+                }
+            }
+            TokenKind::Keyword(keyword) => {
+                let tok = self.advance();
+                Expr {
+                    kind: ExprKind::String(vec![StringSegment::Str(
+                        keyword_text(keyword).to_string(),
+                    )]),
+                    span: tok.span,
+                }
+            }
+            _ => self.parse_expr_bp(1)?,
+        };
+        Some(Self::db_sentinel_object("__rank__", value, at_tok.span))
+    }
+
+    fn parse_db_near_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@near`
+        let field = self.parse_prop_key("near field")?;
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let query = self.parse_expr_bp(22)?;
+        let mut fields = vec![ObjectField {
+            name: Ident {
+                name: "field".to_string(),
+                span: field.span,
+            },
+            value: Expr {
+                kind: ExprKind::String(vec![StringSegment::Str(field.name)]),
+                span: field.span,
+            },
+            is_spread: false,
+            span: field.span,
+        }];
+        fields.push(ObjectField {
+            name: Ident {
+                name: "query".to_string(),
+                span: query.span,
+            },
+            span: query.span,
+            value: query,
+            is_spread: false,
+        });
+        while self.looks_like_prop_arg() {
+            let key = self.parse_prop_key("near option")?;
+            self.expect(&TokenKind::Eq, "`=`")?;
+            let value = self.parse_expr_bp(22)?;
+            let span = key.span.join(value.span);
+            fields.push(ObjectField {
+                name: key,
+                value,
+                is_spread: false,
+                span,
+            });
+        }
+        let near = Expr {
+            kind: ExprKind::Object(fields),
+            span: at_tok.span,
+        };
+        Some(Self::db_sentinel_object("__near__", near, at_tok.span))
+    }
+
+    fn parse_db_int_arg(&mut self, sentinel: &str) -> Option<Expr> {
+        let at_tok = self.advance();
+        let value = self.parse_expr_bp(1)?;
+        Some(Self::db_sentinel_object(sentinel, value, at_tok.span))
+    }
+
+    fn parse_db_match_arg(&mut self) -> Option<Expr> {
+        let at_tok = self.advance(); // `@match`
+        let key = self.parse_prop_key("match key")?;
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr_bp(1)?;
+        Some(Self::db_filter_object(
+            key,
+            "__contains",
+            value,
+            at_tok.span,
+        ))
+    }
+
+    fn db_filter_object(key: Ident, suffix: &str, value: Expr, start: Span) -> Expr {
+        let span = key.span.join(value.span);
+        let name = Ident {
+            name: format!("{}{suffix}", key.name),
+            span: key.span,
+        };
+        Expr {
+            kind: ExprKind::Object(vec![ObjectField {
+                name,
+                value,
+                is_spread: false,
+                span,
+            }]),
+            span: start.join(span),
+        }
+    }
+
+    fn db_sentinel_object(name: &str, value: Expr, span: Span) -> Expr {
+        let field_span = span.join(value.span);
+        Expr {
+            kind: ExprKind::Object(vec![ObjectField {
+                name: Ident {
+                    name: name.to_string(),
+                    span,
+                },
+                value,
+                is_spread: false,
+                span: field_span,
+            }]),
+            span: field_span,
+        }
     }
 
     fn looks_like_event_bound_method(&self) -> bool {
@@ -3496,7 +3941,7 @@ impl Parser {
                     }
                     let mut sub = Self::new(inner_lex.tokens, span.file, inner_lex.newlines);
                     match sub.parse_expr() {
-                        Some(expr) => segments.push(StringSegment::Interp(expr)),
+                        Some(expr) => segments.push(StringSegment::Interp(Box::new(expr))),
                         None => {
                             self.diagnostics.push(
                                 Diagnostic::error("invalid expression inside `{...}`")
@@ -3781,7 +4226,9 @@ fn contains_dollar(expr: &Expr) -> bool {
         ExprKind::Paren(inner) => contains_dollar(inner),
         // `$.field` / `$[idx]` / `$.method(...)` 같이 `$` 에서 파생된 표현은
         // 모두 guard 로 취급돼야 when arm 의 dollar 슬롯을 사용할 수 있다.
-        ExprKind::Field { target, .. } => contains_dollar(target),
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            contains_dollar(target)
+        }
         ExprKind::Index { target, index } => contains_dollar(target) || contains_dollar(index),
         ExprKind::Call { callee, args } => {
             contains_dollar(callee) || args.iter().any(contains_dollar)
@@ -3963,6 +4410,58 @@ fn allows_multiline_domain_args(domain_name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_uppercase())
         || allows_html_boolean_shorthand(domain_name)
+}
+
+fn is_reference_parenless_callee(expr: &Expr) -> bool {
+    let ExprKind::Field { target, field } = &expr.kind else {
+        return false;
+    };
+    if field.name == "log"
+        && matches!(&target.kind, ExprKind::Ident(ident) if ident.name == "audit")
+    {
+        return true;
+    }
+    matches!(
+        &target.kind,
+        ExprKind::Domain { name, .. }
+            if matches!(
+                name.name.as_str(),
+                "plugin" | "gpu" | "push" | "storage" | "offline" | "cache" | "net"
+                    | "mail" | "media" | "sync" | "process" | "fs" | "observability" | "ffi"
+            )
+    )
+}
+
+fn keyword_lexeme(keyword: Keyword) -> &'static str {
+    match keyword {
+        Keyword::Let => "let",
+        Keyword::Mut => "mut",
+        Keyword::Sig => "sig",
+        Keyword::Const => "const",
+        Keyword::Function => "function",
+        Keyword::Async => "async",
+        Keyword::Await => "await",
+        Keyword::Return => "return",
+        Keyword::If => "if",
+        Keyword::Else => "else",
+        Keyword::When => "when",
+        Keyword::For => "for",
+        Keyword::In => "in",
+        Keyword::While => "while",
+        Keyword::Break => "break",
+        Keyword::Continue => "continue",
+        Keyword::Try => "try",
+        Keyword::Catch => "catch",
+        Keyword::Throw => "throw",
+        Keyword::Struct => "struct",
+        Keyword::Enum => "enum",
+        Keyword::Type => "type",
+        Keyword::Define => "define",
+        Keyword::Pub => "pub",
+        Keyword::Import => "import",
+        Keyword::Void => "void",
+        Keyword::As => "as",
+    }
 }
 
 fn is_zero_arg_state_domain(domain_name: &str) -> bool {
@@ -4271,6 +4770,19 @@ mod tests {
         assert_eq!(*op, BinaryOp::Add);
         assert!(matches!(lhs.kind, ExprKind::Integer(ref v) if v == "1"));
         assert!(matches!(rhs.kind, ExprKind::Integer(ref v) if v == "2"));
+    }
+
+    #[test]
+    fn regex_literal_preserves_pattern_and_flags() {
+        let r = parse_str(r#"r"[a-z]+"gi"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let Stmt::Expr(expr) = &r.program.items[0] else {
+            panic!("expected expr stmt");
+        };
+        assert!(matches!(
+            &expr.kind,
+            ExprKind::Regex { pattern, flags } if pattern == "[a-z]+" && flags == "gi"
+        ));
     }
 
     #[test]
@@ -4626,6 +5138,78 @@ mod tests {
     }
 
     #[test]
+    fn type_constraints_are_preserved_on_named_and_array_types() {
+        let r = parse_str(
+            r#"let name: string(trim, lower, min=3, max=20) = "Alice"
+let tags: string[](unique, 1..5) = ["a"]"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+        let Stmt::Let(name_stmt) = &r.program.items[0] else {
+            panic!("expected let stmt");
+        };
+        let name_ty = name_stmt.ty.as_ref().expect("name annotation");
+        assert!(name_ty
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TypeConstraint::Flag(name) if name == "trim")));
+        assert!(name_ty
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TypeConstraint::Flag(name) if name == "lower")));
+        assert!(name_ty.constraints.iter().any(|c| {
+            matches!(
+                c,
+                TypeConstraint::KeyValue {
+                    key,
+                    value: ConstraintValue::Int(3)
+                } if key == "min"
+            )
+        }));
+
+        let Stmt::Let(tags_stmt) = &r.program.items[1] else {
+            panic!("expected let stmt");
+        };
+        let tags_ty = tags_stmt.ty.as_ref().expect("tags annotation");
+        assert!(matches!(tags_ty.kind, TypeRefKind::Array(_)));
+        assert!(tags_ty
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TypeConstraint::Flag(name) if name == "unique")));
+        assert!(tags_ty.constraints.iter().any(|c| {
+            matches!(
+                c,
+                TypeConstraint::Range {
+                    start: Some(1),
+                    end: Some(5),
+                    inclusive: true,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn type_where_clause_is_preserved() {
+        let r = parse_str(
+            r"type EvenInt = int where $ % 2 == 0
+struct Registration {
+  age: int where $ >= 13
+}",
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+        let Stmt::TypeAlias(alias) = &r.program.items[0] else {
+            panic!("expected type alias");
+        };
+        assert!(alias.ty.where_clause.is_some());
+
+        let Stmt::Struct(stmt) = &r.program.items[1] else {
+            panic!("expected struct");
+        };
+        assert!(stmt.fields[0].ty.where_clause.is_some());
+    }
+
+    #[test]
     fn db_update_block_with_where_and_data_parses() {
         let r = parse_str(
             r#"
@@ -4639,6 +5223,21 @@ mod tests {
               @respond 200 { user: user }
             }
             "#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn db_where_in_operator_parses() {
+        let r = parse_str(
+            r"
+            @route GET /feed {
+              let posts = await @db.find Post {
+                @where authorId in=following.map(f -> f.authorId)
+              }
+              @respond 200 posts
+            }
+            ",
         );
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
     }

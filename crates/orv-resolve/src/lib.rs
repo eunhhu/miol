@@ -325,6 +325,7 @@ impl Resolver {
         match &expr.kind {
             ExprKind::Integer(_)
             | ExprKind::Float(_)
+            | ExprKind::Regex { .. }
             | ExprKind::True
             | ExprKind::False
             | ExprKind::Void
@@ -463,7 +464,7 @@ impl Resolver {
                     self.resolve_expr(e);
                 }
             }
-            ExprKind::Field { target, .. } => {
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
                 // 필드 이름은 소유 구조에 따라 해석되므로 여기서는 대상만.
                 self.resolve_expr(target);
             }

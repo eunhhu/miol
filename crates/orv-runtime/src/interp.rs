@@ -20,9 +20,11 @@
 //! 본문에서 생긴 로컬은 호출자에 새지 않는다. 정밀한 capture 분석은 이후
 //! 최적화로 미룬다.
 
+use crate::db::{DbFilter, DbFilterOp, DbNear, DbOrder, DbQuery, InMemoryDb};
 use orv_hir::{
-    BinaryOp, HirBlock, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt, HirParam,
-    HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeRef, HirTypeRefKind, NameId, UnaryOp,
+    BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt,
+    HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
+    HirTypeRefKind, NameId, UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -71,6 +73,8 @@ pub struct RequestCtx {
     pub method: String,
     /// 요청 경로 (매칭된 원본).
     pub path: String,
+    /// 클라이언트 IP.
+    pub ip: String,
     /// 경로 매개변수 (`:id` → `"42"`).
     pub params: HashMap<String, String>,
     /// 쿼리 매개변수.
@@ -86,6 +90,7 @@ impl Default for RequestCtx {
         Self {
             method: String::new(),
             path: String::new(),
+            ip: String::new(),
             params: HashMap::new(),
             query: HashMap::new(),
             headers: HashMap::new(),
@@ -197,6 +202,13 @@ pub enum Value {
     Float(f64),
     /// 문자열.
     Str(String),
+    /// 정규식 리터럴 `r"pattern"flags`.
+    Regex {
+        /// 정규식 본문.
+        pattern: String,
+        /// 플래그 문자열 (`g`, `i`, `m`).
+        flags: String,
+    },
     /// 불리언.
     Bool(bool),
     /// void (값 없음).
@@ -245,12 +257,26 @@ pub struct LambdaValue {
     pub env: HashMap<NameId, Value>,
 }
 
+#[derive(Clone, Debug)]
+struct JobHandler {
+    params: Vec<String>,
+    body: HirBlock,
+    retries: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CronHandler {
+    schedule: String,
+    body: HirBlock,
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(v) => write!(f, "{v}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Str(v) => write!(f, "{v}"),
+            Self::Regex { pattern, flags } => write!(f, "r\"{pattern}\"{flags}"),
             Self::Bool(v) => write!(f, "{v}"),
             Self::Void => write!(f, "void"),
             Self::Function(func) => write!(f, "<function {}>", func.name.name),
@@ -472,6 +498,26 @@ struct Interp<'w, W: Write> {
     /// C_db: 프로세스 내 in-memory DB. handler 호출 간 공유되어 이전 요청이
     /// 쓴 데이터를 다음 요청이 읽을 수 있다. 서버 재시작 시 소실.
     db: Arc<Mutex<crate::db::InMemoryDb>>,
+    /// SPEC §4 runtime validator: struct 이름 -> 필드 타입.
+    type_structs: HashMap<String, Vec<(String, HirTypeRef)>>,
+    /// SPEC §4 runtime validator: type alias 이름 -> 실제 타입.
+    type_aliases: HashMap<String, HirTypeRef>,
+    /// SPEC §11.15/§11.20 참조 런타임: chunked upload 와 storage API 가
+    /// fixture/e2e 값 흐름을 검증할 수 있게 인터프리터 생애 동안만 보관한다.
+    storage_chunks: HashMap<String, Vec<(i64, Value)>>,
+    storage_files: HashMap<String, Value>,
+    /// SPEC §10.13 reference runtime cache/store state.
+    cache_entries: HashMap<String, HashMap<String, Value>>,
+    offline_entries: HashMap<String, HashMap<String, Value>>,
+    /// SPEC §10.7 design token sections.
+    design_tokens: HashMap<String, Value>,
+    /// SPEC §11.18 job declarations registered in this interpreter.
+    job_handlers: HashMap<String, JobHandler>,
+    /// SPEC §11.18 cron declarations registered in this interpreter.
+    cron_handlers: Vec<CronHandler>,
+    /// Runtime-only bindings for domain handlers whose parameter names are not
+    /// resolver-managed lexical declarations yet.
+    dynamic_scopes: Vec<HashMap<String, Value>>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -492,6 +538,16 @@ impl<'w, W: Write> Interp<'w, W> {
             after_queue: Vec::new(),
             content_slot: None,
             db: Arc::new(Mutex::new(crate::db::InMemoryDb::new())),
+            type_structs: HashMap::new(),
+            type_aliases: HashMap::new(),
+            storage_chunks: HashMap::new(),
+            storage_files: HashMap::new(),
+            cache_entries: HashMap::new(),
+            offline_entries: HashMap::new(),
+            design_tokens: HashMap::new(),
+            job_handlers: HashMap::new(),
+            cron_handlers: Vec::new(),
+            dynamic_scopes: Vec::new(),
         }
     }
 
@@ -527,11 +583,24 @@ impl<'w, W: Write> Interp<'w, W> {
                     register_nested_defines(&mut self.env, &f.name.name, f);
                 }
             }
-            HirStmt::Struct(_) => {
-                // MVP: 타입 정보만 필요하며 런타임은 noop. 이후 커밋에서 확장.
+            HirStmt::Struct(s) => {
+                self.type_structs.insert(
+                    s.name.name.clone(),
+                    s.fields
+                        .iter()
+                        .map(|field| (field.name.clone(), field.annotation.clone()))
+                        .collect(),
+                );
+                self.env
+                    .insert(s.name.id, Value::TypeName(s.name.name.clone()));
             }
-            HirStmt::TypeAlias(_) => {
-                // MVP: 타입 정보만 필요하며 런타임은 noop.
+            HirStmt::TypeAlias(alias) => {
+                if alias.params.is_empty() {
+                    self.type_aliases
+                        .insert(alias.name.name.clone(), alias.ty.clone());
+                }
+                self.env
+                    .insert(alias.name.id, Value::TypeName(alias.name.name.clone()));
             }
             HirStmt::Enum(e) => {
                 // SPEC §4.4: enum 을 Value::Object 로 env 에 바인딩.
@@ -602,6 +671,10 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 Ok(Value::Str(out))
             }
+            HirExprKind::Regex { pattern, flags } => Ok(Value::Regex {
+                pattern: pattern.clone(),
+                flags: flags.clone(),
+            }),
             HirExprKind::True => Ok(Value::Bool(true)),
             HirExprKind::False => Ok(Value::Bool(false)),
             HirExprKind::Void => Ok(Value::Void),
@@ -838,6 +911,33 @@ impl<'w, W: Write> Interp<'w, W> {
                 if name == "process" && args.is_empty() {
                     return Ok(Value::TypeName("process".to_string()));
                 }
+                if name == "job" {
+                    return self.eval_job_domain(args);
+                }
+                if name == "cron" {
+                    return self.eval_cron_domain(args);
+                }
+                if name == "unsafe" {
+                    return self.eval_unsafe_domain(args);
+                }
+                if name == "observability" {
+                    return self.eval_observability_domain(args);
+                }
+                if name == "offline" {
+                    return self.eval_offline_domain(args);
+                }
+                if name == "ffi" {
+                    return self.eval_ffi_domain(args);
+                }
+                if name == "cache" {
+                    return self.eval_cache_domain(args);
+                }
+                if name == "design" {
+                    return self.eval_design_domain(args);
+                }
+                if let Some(value) = eval_reference_domain(name, args) {
+                    return Ok(value);
+                }
                 // SPEC §11.18 `@cron` / `@job` — 스케줄링/백그라운드 작업.
                 // SPEC §10.7 `@design` — 디자인 토큰 선언 (빌드 타임 CSS emit).
                 // SPEC §11.11-11.14 `@ws` / `@wt` / `@webrtc` — 실시간 채널.
@@ -864,32 +964,10 @@ impl<'w, W: Write> Interp<'w, W> {
                     let _ = method;
                     return Ok(Value::Object(vec![
                         ("status".to_string(), Value::Int(200)),
+                        ("method".to_string(), Value::Str(method)),
                         ("body".to_string(), Value::Str(String::new())),
                         ("url".to_string(), Value::Str(url)),
                     ]));
-                }
-                if matches!(
-                    name.as_str(),
-                    "cron"
-                        | "job"
-                        | "design"
-                        | "ws"
-                        | "wt"
-                        | "webrtc"
-                        | "upload"
-                        | "plugin"
-                        | "net"
-                        | "mail"
-                        | "sync"
-                        | "gpu"
-                        | "media"
-                        | "offline"
-                        | "push"
-                        | "storage"
-                        | "ffi"
-                        | "unsafe"
-                ) {
-                    return Ok(Value::Void);
                 }
                 // SPEC §11.9: `@redirect` — route handler 안에서 HTTP redirect.
                 // `@redirect "/path"` → 302 Found, `@redirect 301 "/moved"` → 301.
@@ -1299,71 +1377,14 @@ impl<'w, W: Write> Interp<'w, W> {
                     }
                 }
                 let t = self.eval(target)?;
-                let name = field.as_str();
-                match (&t, name) {
-                    (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
-                    (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
-                    (Value::Array(_), "map" | "filter" | "reduce" | "push" | "concat" | "join") => {
-                        Ok(Value::BoundMethod {
-                            receiver: Box::new(t),
-                            method: name.to_string(),
-                        })
-                    }
-                    (Value::Str(_), "toLowerCase" | "toUpperCase" | "contains" | "replace") => {
-                        Ok(Value::BoundMethod {
-                            receiver: Box::new(t),
-                            method: name.to_string(),
-                        })
-                    }
-                    // SPEC §3.3 소유권 연산자 — `.move()` 와 `.copy()` 는 모든
-                    // 값 타입에서 허용되며 MVP interpreter 에서는 동일하게
-                    // clone 한다. 실제 borrow-checker 는 analyzer 계층이 수행.
-                    (
-                        Value::Str(_)
-                        | Value::Array(_)
-                        | Value::Object(_)
-                        | Value::Int(_)
-                        | Value::Float(_)
-                        | Value::Bool(_)
-                        | Value::Void,
-                        "move" | "copy",
-                    ) => Ok(Value::BoundMethod {
-                        receiver: Box::new(t),
-                        method: name.to_string(),
-                    }),
-                    // C_db: `@db.create` / `@db.find` / `@db.update` / `@db.delete`.
-                    (Value::Db(_), "create" | "find" | "findAll" | "update" | "delete") => {
-                        Ok(Value::BoundMethod {
-                            receiver: Box::new(t),
-                            method: name.to_string(),
-                        })
-                    }
-                    // SPEC §4.9: `int.from` / `string.from` / `float.from` / `bool.from`.
-                    (Value::TypeName(_), "from") => Ok(Value::BoundMethod {
-                        receiver: Box::new(t),
-                        method: name.to_string(),
-                    }),
-                    // SPEC 부록 `@fs.read` / `@fs.write`. Native namespace 공유.
-                    (Value::TypeName(ns), "read" | "write") if ns == "fs" => {
-                        Ok(Value::BoundMethod {
-                            receiver: Box::new(t),
-                            method: name.to_string(),
-                        })
-                    }
-                    // SPEC 부록 `@process.run`.
-                    (Value::TypeName(ns), "run") if ns == "process" => Ok(Value::BoundMethod {
-                        receiver: Box::new(t),
-                        method: name.to_string(),
-                    }),
-                    (Value::Object(fields), _) => fields
-                        .iter()
-                        .find(|(k, _)| k == field)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| {
-                            RuntimeError::native(format!("no field `{field}` on object"))
-                        }),
-                    _ => Err(RuntimeError::native(format!("no field `{field}` on {t}"))),
+                field_value(t, field, false)
+            }
+            HirExprKind::OptionalField { target, field, .. } => {
+                let t = self.eval(target)?;
+                if matches!(t, Value::Void) {
+                    return Ok(Value::Void);
                 }
+                field_value(t, field, true)
             }
             HirExprKind::Lambda { params, body } => Ok(Value::Lambda(Rc::new(LambdaValue {
                 params: params.clone(),
@@ -1434,13 +1455,59 @@ impl<'w, W: Write> Interp<'w, W> {
             }
             HirExprKind::Call { callee, args } => {
                 let callee_value = self.eval(callee)?;
+                if matches!(callee.kind, HirExprKind::OptionalField { .. })
+                    && matches!(callee_value, Value::Void)
+                {
+                    return Ok(Value::Void);
+                }
+                if let Value::BoundMethod { receiver, method } = &callee_value {
+                    if method == "transaction" {
+                        if let Value::Db(db) = receiver.as_ref() {
+                            return self.eval_db_transaction(db.clone(), args);
+                        }
+                    }
+                    if method == "render" {
+                        if let Value::TypeName(ns) = receiver.as_ref() {
+                            if ns == "gpu" {
+                                return Ok(gpu_render_raw(args));
+                            }
+                        }
+                    }
+                }
                 let mut evaluated = Vec::with_capacity(args.len());
                 for a in args {
-                    evaluated.push(self.eval(a)?);
+                    evaluated.push(self.eval_call_arg(a)?);
                 }
                 self.call_value(callee_value, evaluated)
             }
         }
+    }
+
+    fn eval_call_arg(&mut self, arg: &HirExpr) -> Result<Value, RuntimeError> {
+        if let HirExprKind::Assign { target, value } = &arg.kind {
+            let value = self.eval(value)?;
+            return Ok(Value::Object(vec![(target.name.clone(), value)]));
+        }
+        self.eval(arg)
+    }
+
+    fn eval_db_transaction(
+        &mut self,
+        db: Arc<Mutex<InMemoryDb>>,
+        args: &[HirExpr],
+    ) -> Result<Value, RuntimeError> {
+        let snapshot = db.lock().unwrap().clone();
+        let mut last = Value::Void;
+        for arg in args {
+            match self.eval_call_arg(arg) {
+                Ok(value) => last = value,
+                Err(err) => {
+                    *db.lock().unwrap() = snapshot;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(last)
     }
 
     fn lookup(&self, id: NameId, debug_name: &str) -> Result<Value, RuntimeError> {
@@ -1455,6 +1522,14 @@ impl<'w, W: Write> Interp<'w, W> {
         // 스코프 우선. 같은 이름의 사용자 변수가 있으면 그쪽.
         if let Some(v) = self.env.get(&id) {
             return Ok(v.clone());
+        }
+        for scope in self.dynamic_scopes.iter().rev() {
+            if let Some(v) = scope.get(debug_name) {
+                return Ok(v.clone());
+            }
+        }
+        if debug_name == "audit" {
+            return Ok(Value::TypeName("audit".to_string()));
         }
         // SPEC §4.9: env 에 없고 원시 타입 이름이면 namespace 핸들.
         if is_primitive_type_name(debug_name) {
@@ -1509,6 +1584,184 @@ impl<'w, W: Write> Interp<'w, W> {
         self.env = saved;
         self.loop_signal = saved_loop;
         Ok(result)
+    }
+
+    fn call_type_validation_method(
+        &self,
+        type_name: &str,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let [input] = args.as_slice() else {
+            return Err(RuntimeError::native(format!(
+                "`{type_name}.{method}` expects one argument"
+            )));
+        };
+        let result = self.validate_type_name(type_name, input.clone(), "$");
+        match method {
+            "parse" => result.map_err(|errors| RuntimeError::thrown(Value::Array(errors))),
+            "safeParse" => Ok(match result {
+                Ok(value) => Value::Object(vec![
+                    ("ok".to_string(), Value::Bool(true)),
+                    ("value".to_string(), value),
+                ]),
+                Err(errors) => Value::Object(vec![
+                    ("ok".to_string(), Value::Bool(false)),
+                    ("error".to_string(), Value::Array(errors)),
+                ]),
+            }),
+            "errors" => Ok(match result {
+                Ok(_) => Value::Array(Vec::new()),
+                Err(errors) => Value::Array(errors),
+            }),
+            "is" => Ok(Value::Bool(result.is_ok())),
+            _ => unreachable!("field access only exposes known validator methods"),
+        }
+    }
+
+    fn validate_type_name(
+        &self,
+        type_name: &str,
+        value: Value,
+        path: &str,
+    ) -> Result<Value, Vec<Value>> {
+        if let Some(alias) = self.type_aliases.get(type_name).cloned() {
+            return self.validate_type_ref(&alias, value, path);
+        }
+        if let Some(fields) = self.type_structs.get(type_name).cloned() {
+            return self.validate_struct_fields(type_name, &fields, value, path);
+        }
+        let ty = HirTypeRef {
+            kind: HirTypeRefKind::Named(type_name.to_string()),
+            constraints: Vec::new(),
+            span: orv_diagnostics::Span::DUMMY,
+        };
+        self.validate_type_ref(&ty, value, path)
+    }
+
+    fn validate_type_ref(
+        &self,
+        ty: &HirTypeRef,
+        value: Value,
+        path: &str,
+    ) -> Result<Value, Vec<Value>> {
+        if let HirTypeRefKind::Named(name) = &ty.kind {
+            if let Some(alias) = self.type_aliases.get(name).cloned() {
+                let value = self.validate_type_ref(&alias, value, path)?;
+                return self.apply_validation_constraints(value, &ty.constraints, path, ty);
+            }
+            if let Some(fields) = self.type_structs.get(name).cloned() {
+                let value = self.validate_struct_fields(name, &fields, value, path)?;
+                return self.apply_validation_constraints(value, &ty.constraints, path, ty);
+            }
+        }
+        let actual = value.clone();
+        apply_cast(value, ty).map_err(|err| {
+            vec![validation_error(
+                path,
+                "type_mismatch",
+                &err.message,
+                &display_type_ref(ty),
+                actual,
+            )]
+        })
+    }
+
+    fn validate_struct_fields(
+        &self,
+        type_name: &str,
+        fields: &[(String, HirTypeRef)],
+        value: Value,
+        path: &str,
+    ) -> Result<Value, Vec<Value>> {
+        let actual = value.clone();
+        let Value::Object(input_fields) = value else {
+            return Err(vec![validation_error(
+                path,
+                "type_mismatch",
+                &format!("expected object for `{type_name}`"),
+                type_name,
+                actual,
+            )]);
+        };
+
+        let mut errors = Vec::new();
+        let mut out = Vec::with_capacity(fields.len());
+        for (field_name, field_ty) in fields {
+            let field_path = child_path(path, field_name);
+            match input_fields
+                .iter()
+                .find(|(input_name, _)| input_name == field_name)
+            {
+                Some((_, field_value)) => {
+                    match self.validate_type_ref(field_ty, field_value.clone(), &field_path) {
+                        Ok(value) => out.push((field_name.clone(), value)),
+                        Err(mut field_errors) => errors.append(&mut field_errors),
+                    }
+                }
+                None if self.type_ref_allows_void(field_ty) => {
+                    out.push((field_name.clone(), Value::Void));
+                }
+                None => errors.push(validation_error(
+                    &field_path,
+                    "missing_required",
+                    &format!("missing required property `{field_name}`"),
+                    &display_type_ref(field_ty),
+                    Value::Void,
+                )),
+            }
+        }
+
+        for (input_name, input_value) in &input_fields {
+            if !fields
+                .iter()
+                .any(|(field_name, _)| field_name == input_name)
+            {
+                errors.push(validation_error(
+                    &child_path(path, input_name),
+                    "unknown_property",
+                    &format!("unknown property `{input_name}`"),
+                    type_name,
+                    input_value.clone(),
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(Value::Object(out))
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn apply_validation_constraints(
+        &self,
+        value: Value,
+        constraints: &[HirTypeConstraint],
+        path: &str,
+        ty: &HirTypeRef,
+    ) -> Result<Value, Vec<Value>> {
+        let actual = value.clone();
+        apply_value_constraints(value, constraints).map_err(|err| {
+            vec![validation_error(
+                path,
+                "constraint_mismatch",
+                &err.message,
+                &display_type_ref(ty),
+                actual,
+            )]
+        })
+    }
+
+    fn type_ref_allows_void(&self, ty: &HirTypeRef) -> bool {
+        match &ty.kind {
+            HirTypeRefKind::Nullable(_) => true,
+            HirTypeRefKind::Named(name) => self
+                .type_aliases
+                .get(name)
+                .is_some_and(|alias| self.type_ref_allows_void(alias)),
+            _ => false,
+        }
     }
 
     fn call_method(
@@ -1587,13 +1840,15 @@ impl<'w, W: Write> Interp<'w, W> {
             // ── 문자열 메서드 ──
             (Value::Str(s), "toLowerCase") => Ok(Value::Str(s.to_lowercase())),
             (Value::Str(s), "toUpperCase") => Ok(Value::Str(s.to_uppercase())),
-            (Value::Str(s), "contains") => {
-                let needle = match args.into_iter().next() {
-                    Some(Value::Str(v)) => v,
-                    _ => return Err(RuntimeError::native("contains expects string argument")),
-                };
-                Ok(Value::Bool(s.contains(&needle)))
-            }
+            (Value::Str(s), "contains") => match args.into_iter().next() {
+                Some(Value::Str(needle)) => Ok(Value::Bool(s.contains(&needle))),
+                Some(Value::Regex { pattern, flags }) => {
+                    regex_contains(&s, &pattern, &flags).map(Value::Bool)
+                }
+                _ => Err(RuntimeError::native(
+                    "contains expects string or regex argument",
+                )),
+            },
             (Value::Str(s), "replace") => {
                 let mut it = args.into_iter();
                 let from = match it.next() {
@@ -1611,6 +1866,7 @@ impl<'w, W: Write> Interp<'w, W> {
             // static borrow-check 는 analyzer (B5) 책임.
             (
                 v @ (Value::Str(_)
+                | Value::Regex { .. }
                 | Value::Array(_)
                 | Value::Object(_)
                 | Value::Int(_)
@@ -1629,6 +1885,9 @@ impl<'w, W: Write> Interp<'w, W> {
                     RuntimeError::native(format!("`{type_name}.from` expects one argument"))
                 })?;
                 convert_from(&type_name, arg)
+            }
+            (Value::TypeName(type_name), "parse" | "safeParse" | "errors" | "is") => {
+                self.call_type_validation_method(&type_name, method, args)
             }
             // ── SPEC 부록 @fs.read / @fs.write ──
             //
@@ -1702,6 +1961,16 @@ impl<'w, W: Write> Interp<'w, W> {
                     ("error".into(), Value::Str(stderr_s)),
                 ]))
             }
+            (Value::TypeName(ns), "runDue" | "tick") if ns == "cron" => self.run_due_crons(),
+            (Value::TypeName(ns), method) if is_reference_namespace_method(&ns, method) => {
+                self.call_reference_method(&ns, method, &args)
+            }
+            (Value::Object(fields), "put" | "get" | "delete")
+                if object_kind(&fields)
+                    .is_some_and(|kind| matches!(kind, "cache" | "offline.store")) =>
+            {
+                self.call_stateful_object_method(&fields, method, &args)
+            }
             // ── C_db 메서드 ──
             //
             // 시그니처 (MVP):
@@ -1710,11 +1979,505 @@ impl<'w, W: Write> Interp<'w, W> {
             //   db.findAll(table: string, filter: object?) -> object[]
             //   db.update(table: string, filter: object, data: object) -> int
             //   db.delete(table: string, filter: object) -> int
-            (Value::Db(db), m @ ("create" | "find" | "findAll" | "update" | "delete")) => {
-                call_db_method(&db, m, args)
-            }
+            (
+                Value::Db(db),
+                m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
+                | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze"),
+            ) => call_db_method(&db, m, args),
             (recv, m) => Err(RuntimeError::native(format!("no method `{m}` on {recv}"))),
         }
+    }
+
+    fn call_stateful_object_method(
+        &mut self,
+        fields: &[(String, Value)],
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let kind = object_kind(fields).unwrap_or_default();
+        let name = object_field(fields, "name")
+            .map(value_to_display)
+            .unwrap_or_default();
+        match (kind, method) {
+            ("cache", "put") | ("offline.store", "put") => {
+                let key = string_arg(args, 0, "`put` expects (key, value)")?;
+                let value = args
+                    .get(1)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::native("`put` expects (key, value)"))?;
+                self.state_bucket_mut(kind, &name)
+                    .insert(key.clone(), value);
+                Ok(Value::Object(vec![
+                    ("status".to_string(), Value::Str("stored".to_string())),
+                    ("key".to_string(), Value::Str(key)),
+                ]))
+            }
+            ("cache", "get") | ("offline.store", "get") => {
+                let key = string_arg(args, 0, "`get` expects key")?;
+                let value = self
+                    .state_bucket(kind, &name)
+                    .and_then(|items| items.get(&key).cloned())
+                    .unwrap_or(Value::Void);
+                Ok(Value::Object(vec![
+                    ("key".to_string(), Value::Str(key)),
+                    ("value".to_string(), value),
+                ]))
+            }
+            ("cache", "delete") | ("offline.store", "delete") => {
+                let key = string_arg(args, 0, "`delete` expects key")?;
+                let removed = self.state_bucket_mut(kind, &name).remove(&key).is_some();
+                Ok(Value::Object(vec![
+                    ("key".to_string(), Value::Str(key)),
+                    ("removed".to_string(), Value::Bool(removed)),
+                ]))
+            }
+            _ => Err(RuntimeError::native(format!(
+                "no method `{method}` on {kind}"
+            ))),
+        }
+    }
+
+    fn state_bucket(&self, kind: &str, name: &str) -> Option<&HashMap<String, Value>> {
+        match kind {
+            "cache" => self.cache_entries.get(name),
+            "offline.store" => self.offline_entries.get(name),
+            _ => None,
+        }
+    }
+
+    fn state_bucket_mut(&mut self, kind: &str, name: &str) -> &mut HashMap<String, Value> {
+        match kind {
+            "cache" => self.cache_entries.entry(name.to_string()).or_default(),
+            "offline.store" => self.offline_entries.entry(name.to_string()).or_default(),
+            _ => unreachable!("state bucket checked before call"),
+        }
+    }
+
+    fn call_reference_method(
+        &mut self,
+        ns: &str,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        match ns {
+            "storage" => self.call_storage_method(method, args),
+            "sync" => call_sync_method(method, args),
+            "mail" | "mail.verify" => call_mail_method(ns, method, args),
+            "media" => call_media_method(method, args),
+            "push" => call_push_method(method, args),
+            "offline" => call_offline_method(method, args),
+            "cache" => call_cache_method(method, args),
+            "net" | "net.tcp" | "net.udp" | "net.tun" => call_net_method(ns, method, args),
+            "plugin" | "plugin.host" => call_plugin_method(ns, method, args),
+            "gpu" => call_gpu_method(method, args),
+            "observability" => call_observability_method(method, args),
+            "ffi" => call_ffi_method(method, args),
+            "audit" => call_audit_method(method, args),
+            _ if ns.starts_with("job.") && method == "enqueue" => {
+                let name = ns.strip_prefix("job.").unwrap_or(ns).to_string();
+                let payload = args.first().cloned().unwrap_or(Value::Void);
+                let (status, result, error) =
+                    if let Some(handler) = self.job_handlers.get(&name).cloned() {
+                        match self.run_job_handler_with_retries(&handler, args) {
+                            Ok(result) => ("completed", result, None),
+                            Err(err) => ("failed", Value::Void, Some(err.message)),
+                        }
+                    } else {
+                        ("queued", Value::Void, None)
+                    };
+                let mut fields = vec![
+                    ("name".to_string(), Value::Str(name)),
+                    ("status".to_string(), Value::Str(status.to_string())),
+                    ("payload".to_string(), payload),
+                ];
+                if !matches!(result, Value::Void) {
+                    fields.push(("result".to_string(), result));
+                }
+                if let Some(error) = error {
+                    fields.push(("error".to_string(), Value::Str(error)));
+                }
+                Ok(self.db.lock().unwrap().create("Job", fields))
+            }
+            _ => Err(RuntimeError::native(format!(
+                "no method `{method}` on <type {ns}>"
+            ))),
+        }
+    }
+
+    fn eval_job_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("job".to_string()));
+        }
+        let job_name = args
+            .first()
+            .and_then(string_literal_from_expr)
+            .unwrap_or_else(|| "job".to_string());
+        if let Some(body) = args.iter().find_map(|arg| match &arg.kind {
+            HirExprKind::Block(block) => Some(block.clone()),
+            _ => None,
+        }) {
+            let params = args
+                .iter()
+                .find_map(job_params_from_expr)
+                .unwrap_or_default();
+            let retries = self.job_retries_from_args(args)?;
+            self.job_handlers.insert(
+                job_name.clone(),
+                JobHandler {
+                    params,
+                    body: body.clone(),
+                    retries,
+                },
+            );
+            return Ok(Value::Object(vec![
+                ("name".to_string(), Value::Str(job_name)),
+                ("status".to_string(), Value::Str("registered".to_string())),
+            ]));
+        }
+        Ok(Value::TypeName(format!("job.{job_name}")))
+    }
+
+    fn eval_cron_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("cron".to_string()));
+        }
+        let schedule = args
+            .iter()
+            .find_map(string_literal_from_expr)
+            .unwrap_or_else(|| "manual".to_string());
+        if let Some(body) = args.iter().find_map(|arg| match &arg.kind {
+            HirExprKind::Block(block) => Some(block.clone()),
+            _ => None,
+        }) {
+            self.cron_handlers.push(CronHandler {
+                schedule: schedule.clone(),
+                body,
+            });
+        }
+        Ok(self.db.lock().unwrap().create(
+            "Cron",
+            vec![
+                ("schedule".to_string(), Value::Str(schedule)),
+                ("status".to_string(), Value::Str("registered".to_string())),
+            ],
+        ))
+    }
+
+    fn run_due_crons(&mut self) -> Result<Value, RuntimeError> {
+        let handlers = self.cron_handlers.clone();
+        let mut ran = 0i64;
+        for handler in handlers {
+            match self.eval_block(&handler.body) {
+                Ok(_) => {
+                    self.db.lock().unwrap().create(
+                        "CronRun",
+                        vec![
+                            ("schedule".to_string(), Value::Str(handler.schedule)),
+                            ("ok".to_string(), Value::Bool(true)),
+                        ],
+                    );
+                    ran += 1;
+                }
+                Err(err) => {
+                    self.db.lock().unwrap().create(
+                        "CronRun",
+                        vec![
+                            ("schedule".to_string(), Value::Str(handler.schedule)),
+                            ("ok".to_string(), Value::Bool(false)),
+                            ("error".to_string(), Value::Str(err.message.clone())),
+                        ],
+                    );
+                    return Err(err);
+                }
+            }
+        }
+        Ok(Value::Int(ran))
+    }
+
+    fn eval_unsafe_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        for arg in args {
+            if let HirExprKind::Block(block) = &arg.kind {
+                return self.eval_block(block);
+            }
+        }
+        Ok(Value::Object(vec![(
+            "kind".to_string(),
+            Value::Str("unsafe".to_string()),
+        )]))
+    }
+
+    fn eval_observability_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("observability".to_string()));
+        }
+        let config = if let Some(arg) = args.first() {
+            self.eval_call_arg(arg)?
+        } else {
+            Value::Object(Vec::new())
+        };
+        let service = match &config {
+            Value::Object(fields) => object_field(fields, "service")
+                .cloned()
+                .unwrap_or_else(|| Value::Str("orv".to_string())),
+            _ => Value::Str("orv".to_string()),
+        };
+        Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("observability".to_string())),
+            ("service".to_string(), service),
+            ("config".to_string(), config),
+        ]))
+    }
+
+    fn eval_offline_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("offline".to_string()));
+        }
+        for arg in args {
+            if let HirExprKind::Block(block) = &arg.kind {
+                self.eval_block(block)?;
+            }
+        }
+        Ok(Value::Object(vec![(
+            "kind".to_string(),
+            Value::Str("offline".to_string()),
+        )]))
+    }
+
+    fn eval_ffi_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("ffi".to_string()));
+        }
+        let abi = args
+            .iter()
+            .find_map(string_literal_from_expr)
+            .unwrap_or_else(|| "native".to_string());
+        Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("ffi".to_string())),
+            ("abi".to_string(), Value::Str(abi)),
+        ]))
+    }
+
+    fn eval_cache_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Value::TypeName("cache".to_string()));
+        }
+        let name = args
+            .iter()
+            .find_map(string_literal_from_expr)
+            .unwrap_or_else(|| "cache".to_string());
+        Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("cache".to_string())),
+            ("name".to_string(), Value::Str(name)),
+        ]))
+    }
+
+    fn eval_design_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if args.is_empty() {
+            return Ok(self.design_value());
+        }
+        for arg in args {
+            if let HirExprKind::Block(block) = &arg.kind {
+                self.capture_design_block(block)?;
+            }
+        }
+        Ok(self.design_value())
+    }
+
+    fn capture_design_block(&mut self, block: &HirBlock) -> Result<(), RuntimeError> {
+        for stmt in &block.stmts {
+            let HirStmt::Expr(expr) = stmt else {
+                continue;
+            };
+            let HirExprKind::Domain { name, args, .. } = &expr.kind else {
+                continue;
+            };
+            if !matches!(
+                name.as_str(),
+                "colors" | "spacing" | "typography" | "breakpoints"
+            ) {
+                continue;
+            }
+            let section = args
+                .first()
+                .map(|arg| self.eval_call_arg(arg))
+                .transpose()?
+                .unwrap_or_else(|| Value::Object(Vec::new()));
+            self.design_tokens.insert(name.clone(), section);
+        }
+        Ok(())
+    }
+
+    fn design_value(&self) -> Value {
+        Value::Object(
+            self.design_tokens
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn job_retries_from_args(&mut self, args: &[HirExpr]) -> Result<usize, RuntimeError> {
+        for arg in args {
+            if let HirExprKind::Assign { target, value } = &arg.kind {
+                if target.name == "retries" {
+                    return match self.eval(value)? {
+                        Value::Int(n) if n >= 0 => usize::try_from(n).map_err(|_| {
+                            RuntimeError::native("`@job retries` is too large for this runtime")
+                        }),
+                        other => Err(RuntimeError::native(format!(
+                            "`@job retries` expects non-negative int, got {other}"
+                        ))),
+                    };
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    fn run_job_handler_with_retries(
+        &mut self,
+        handler: &JobHandler,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let mut last_err = None;
+        for _ in 0..=handler.retries {
+            match self.run_job_handler_once(handler, args) {
+                Ok(value) => return Ok(value),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| RuntimeError::native("job failed")))
+    }
+
+    fn run_job_handler_once(
+        &mut self,
+        handler: &JobHandler,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let mut scope = HashMap::new();
+        if handler.params.is_empty() {
+            scope.insert(
+                "payload".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            );
+        } else {
+            for (idx, param) in handler.params.iter().enumerate() {
+                scope.insert(param.clone(), args.get(idx).cloned().unwrap_or(Value::Void));
+            }
+        }
+        self.dynamic_scopes.push(scope);
+        let result = self.eval_block(&handler.body);
+        self.dynamic_scopes.pop();
+        result
+    }
+
+    fn call_storage_method(&mut self, method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        match method {
+            "put" => {
+                let path = string_arg(args, 0, "`@storage.put` expects (path, data)")?;
+                let data = args
+                    .get(1)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::native("`@storage.put` expects (path, data)"))?;
+                let file = storage_file_record(&path, data);
+                self.storage_files.insert(path, file.clone());
+                Ok(file)
+            }
+            "get" => {
+                let path = string_arg(args, 0, "`@storage.get` expects a string path")?;
+                Ok(self
+                    .storage_files
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or(Value::Void))
+            }
+            "delete" => {
+                let path = string_arg(args, 0, "`@storage.delete` expects a string path")?;
+                Ok(Value::Bool(self.storage_files.remove(&path).is_some()))
+            }
+            "putChunk" => {
+                let upload_id = string_arg(
+                    args,
+                    0,
+                    "`@storage.putChunk` expects (uploadId, index, data)",
+                )?;
+                let index = int_arg(
+                    args,
+                    1,
+                    "`@storage.putChunk` expects (uploadId, index, data)",
+                )?;
+                let data = args.get(2).cloned().ok_or_else(|| {
+                    RuntimeError::native("`@storage.putChunk` expects (uploadId, index, data)")
+                })?;
+                let chunks = self.storage_chunks.entry(upload_id.clone()).or_default();
+                if let Some((_, slot)) = chunks.iter_mut().find(|(i, _)| *i == index) {
+                    *slot = data.clone();
+                } else {
+                    chunks.push((index, data.clone()));
+                }
+                Ok(Value::Object(vec![
+                    ("uploadId".to_string(), Value::Str(upload_id)),
+                    ("index".to_string(), Value::Int(index)),
+                    ("size".to_string(), Value::Int(storage_value_size(&data))),
+                ]))
+            }
+            "merge" => self.merge_storage_chunks(args),
+            "signedUrl" => {
+                let path = string_arg(args, 0, "`@storage.signedUrl` expects a string path")?;
+                Ok(Value::Str(format!("/orv-storage/{path}?signed=1")))
+            }
+            "stream" => {
+                let path = string_arg(args, 0, "`@storage.stream` expects a string path")?;
+                Ok(Value::Object(vec![
+                    ("path".to_string(), Value::Str(path.clone())),
+                    (
+                        "url".to_string(),
+                        Value::Str(format!("/orv-storage/{path}?signed=1")),
+                    ),
+                    (
+                        "file".to_string(),
+                        self.storage_files
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or(Value::Void),
+                    ),
+                ]))
+            }
+            _ => Err(RuntimeError::native(format!(
+                "no method `{method}` on <type storage>"
+            ))),
+        }
+    }
+
+    fn merge_storage_chunks(&mut self, args: &[Value]) -> Result<Value, RuntimeError> {
+        let upload_id = string_arg(args, 0, "`@storage.merge` expects an upload id string")?;
+        let target = named_arg(args, "target")
+            .and_then(|v| match v {
+                Value::Str(path) => Some(path),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("files/{upload_id}"));
+        let mut chunks = self.storage_chunks.remove(&upload_id).unwrap_or_default();
+        chunks.sort_by_key(|(idx, _)| *idx);
+        let content = Value::Str(
+            chunks
+                .iter()
+                .map(|(_, value)| value_to_display(value))
+                .collect::<Vec<_>>()
+                .join(""),
+        );
+        let size = chunks
+            .iter()
+            .map(|(_, value)| storage_value_size(value))
+            .sum::<i64>();
+        let file = Value::Object(vec![
+            ("id".to_string(), Value::Str(upload_id)),
+            ("path".to_string(), Value::Str(target.clone())),
+            ("size".to_string(), Value::Int(size)),
+            ("content".to_string(), content),
+        ]);
+        self.storage_files.insert(target, file.clone());
+        Ok(file)
     }
 
     /// `call_function` 의 확장 — param 인자 외 추가 바인딩(token slot 등)을
@@ -2195,6 +2958,13 @@ impl<'w, W: Write> Interp<'w, W> {
                 )));
             }
         };
+        if looks_like_html_value(&path_str) {
+            return self.respond_raw(
+                200,
+                path_str.into_bytes(),
+                "text/html; charset=utf-8".to_string(),
+            );
+        }
         let declared = std::path::Path::new(&path_str);
 
         // 1) 대상 분류 — 파일이면 바로 서빙, 디렉토리면 rest join 후 재시도.
@@ -2303,13 +3073,22 @@ impl<'w, W: Write> Interp<'w, W> {
         let bytes = std::fs::read(&target_path)
             .map_err(|e| RuntimeError::native(format!("`@serve` read failed: {e}")))?;
         let mime = mime_for_path(&target_path);
+        self.respond_raw(200, bytes, mime)
+    }
+
+    fn respond_raw(
+        &mut self,
+        status: i64,
+        bytes: Vec<u8>,
+        content_type: String,
+    ) -> Result<Value, RuntimeError> {
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
-                status: 200,
+                status,
                 payload: Value::Void,
                 raw_body: Some(RawResponseBody {
                     bytes,
-                    content_type: mime,
+                    content_type,
                 }),
                 location: None,
             });
@@ -2356,7 +3135,19 @@ impl<'w, W: Write> Interp<'w, W> {
             "request" => Value::Object(vec![
                 ("method".into(), Value::Str(ctx.method.clone())),
                 ("path".into(), Value::Str(ctx.path.clone())),
+                ("ip".into(), Value::Str(ctx.ip.clone())),
             ]),
+            "response" => {
+                let (status, headers) = match &self.response {
+                    Some(resp) => (resp.status, response_headers_object(resp)),
+                    None => (200, Value::Object(Vec::new())),
+                };
+                Value::Object(vec![
+                    ("status".into(), Value::Int(status)),
+                    ("headers".into(), headers),
+                    ("duration".into(), Value::Int(0)),
+                ])
+            }
             _ => return Ok(None),
         }))
     }
@@ -2368,11 +3159,33 @@ impl<'w, W: Write> Interp<'w, W> {
     /// - `@tag expr` — expr 을 평가해 텍스트 콘텐츠로 넣는다.
     /// - `@tag` — 빈 태그.
     fn render_tag(&mut self, name: &str, args: &[HirExpr]) -> Result<(), RuntimeError> {
-        self.html_push(&format!("<{name}>"));
-        if let Some(arg) = args.first() {
+        let mut attrs = String::new();
+        let mut block_attr_prefixes = Vec::new();
+        for arg in args {
             match &arg.kind {
+                HirExprKind::Assign { target, value } => {
+                    if let Some(attr) = self.render_attr(&target.name, value)? {
+                        attrs.push_str(&attr);
+                    }
+                }
+                HirExprKind::Block(block) => {
+                    let prefix_len = self.render_block_attrs(block, &mut attrs)?;
+                    block_attr_prefixes.push((arg.span, prefix_len));
+                }
+                _ => {}
+            }
+        }
+
+        self.html_push(&format!("<{name}{attrs}>"));
+        for arg in args {
+            match &arg.kind {
+                HirExprKind::Assign { .. } => {}
                 HirExprKind::Block(inner) => {
-                    self.eval_block(inner)?;
+                    let skip = block_attr_prefixes
+                        .iter()
+                        .find_map(|(span, len)| (*span == arg.span).then_some(*len))
+                        .unwrap_or(0);
+                    self.eval_html_child_block(inner, skip)?;
                 }
                 _ => {
                     let v = self.eval(arg)?;
@@ -2382,6 +3195,56 @@ impl<'w, W: Write> Interp<'w, W> {
         }
         self.html_push(&format!("</{name}>"));
         Ok(())
+    }
+
+    fn render_block_attrs(
+        &mut self,
+        block: &HirBlock,
+        attrs: &mut String,
+    ) -> Result<usize, RuntimeError> {
+        let mut prefix_len = 0;
+        for stmt in &block.stmts {
+            let Some((name, value)) = html_attr_stmt(stmt) else {
+                break;
+            };
+            if let Some(attr) = self.render_attr(name, value)? {
+                attrs.push_str(&attr);
+            }
+            prefix_len += 1;
+        }
+        Ok(prefix_len)
+    }
+
+    fn eval_html_child_block(
+        &mut self,
+        block: &HirBlock,
+        skip: usize,
+    ) -> Result<Value, RuntimeError> {
+        if skip == 0 {
+            return self.eval_block(block);
+        }
+        let child_block = HirBlock {
+            stmts: block.stmts.iter().skip(skip).cloned().collect(),
+            span: block.span,
+        };
+        self.eval_block(&child_block)
+    }
+
+    fn render_attr(&mut self, name: &str, value: &HirExpr) -> Result<Option<String>, RuntimeError> {
+        let v = self.eval(value)?;
+        Ok(match &v {
+            Value::Void | Value::Bool(false) => None,
+            Value::Bool(true) => Some(format!(" {name}")),
+            Value::Function(_) | Value::Lambda(_) | Value::BoundMethod { .. }
+                if is_event_attr(name) =>
+            {
+                Some(format!(" {name}=\"handler\""))
+            }
+            _ => Some(format!(
+                " {name}=\"{}\"",
+                html_escape_attr(&value_to_display(&v))
+            )),
+        })
     }
 
     /// 현재 HTML 버퍼에 문자열을 붙인다. 버퍼가 없으면 noop (방어적).
@@ -2397,12 +3260,732 @@ impl<'w, W: Write> Interp<'w, W> {
             return;
         }
         let s = value_to_display(v);
-        self.html_push(&s);
+        self.html_push(&html_escape_text(&s));
     }
 
     fn println(&mut self, v: &Value) -> Result<(), RuntimeError> {
         writeln!(self.writer, "{v}").map_err(|e| RuntimeError::native(format!("io error: {e}")))
     }
+}
+
+fn string_literal_from_expr(expr: &HirExpr) -> Option<String> {
+    let HirExprKind::String(segments) = &expr.kind else {
+        return None;
+    };
+    let mut out = String::new();
+    for segment in segments {
+        let HirStringSegment::Str(s) = segment else {
+            return None;
+        };
+        out.push_str(s);
+    }
+    Some(out)
+}
+
+fn html_attr_stmt(stmt: &HirStmt) -> Option<(&str, &HirExpr)> {
+    let HirStmt::Expr(expr) = stmt else {
+        return None;
+    };
+    let HirExprKind::Assign { target, value } = &expr.kind else {
+        return None;
+    };
+    Some((&target.name, value))
+}
+
+fn response_headers_object(resp: &ResponseCtx) -> Value {
+    let mut headers = Vec::new();
+    if let Some(location) = &resp.location {
+        headers.push(("Location".to_string(), Value::Str(location.clone())));
+    }
+    if let Some(raw) = &resp.raw_body {
+        headers.push((
+            "Content-Type".to_string(),
+            Value::Str(raw.content_type.clone()),
+        ));
+    }
+    Value::Object(headers)
+}
+
+fn is_event_attr(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("on") else {
+        return false;
+    };
+    rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+fn html_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn html_escape_attr(s: &str) -> String {
+    html_escape_text(s).replace('"', "&quot;")
+}
+
+fn looks_like_html_value(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    trimmed.starts_with("<html") || trimmed.starts_with("<!doctype")
+}
+
+fn job_params_from_expr(expr: &HirExpr) -> Option<Vec<String>> {
+    let HirExprKind::Object(fields) = &expr.kind else {
+        return None;
+    };
+    let [field] = fields.as_slice() else {
+        return None;
+    };
+    if field.name != "__params__" {
+        return None;
+    }
+    let HirExprKind::Array(items) = &field.value.kind else {
+        return None;
+    };
+    Some(items.iter().filter_map(string_literal_from_expr).collect())
+}
+
+fn call_sync_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "open" => {
+            let kind = string_arg(args, 0, "`@sync.open` expects (kind, id)")?;
+            let id = string_arg(args, 1, "`@sync.open` expects (kind, id)")?;
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str(kind.clone())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("path".to_string(), Value::Str(format!("/sync/{kind}/{id}"))),
+                ("state".to_string(), Value::Object(Vec::new())),
+            ]))
+        }
+        "connect" => {
+            let kind = string_arg(args, 0, "`@sync.connect` expects (kind, path)")?;
+            let path = string_arg(args, 1, "`@sync.connect` expects (kind, path)")?;
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str(kind)),
+                ("id".to_string(), Value::Str(path.clone())),
+                ("path".to_string(), Value::Str(path)),
+                ("state".to_string(), Value::Object(Vec::new())),
+            ]))
+        }
+        "buffer" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("buffer".to_string())),
+            ("ops".to_string(), Value::Array(Vec::new())),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type sync>"
+        ))),
+    }
+}
+
+fn call_mail_method(ns: &str, method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match (ns, method) {
+        ("mail", "send") => Ok(Value::Object(vec![
+            ("status".to_string(), Value::Str("sent".to_string())),
+            (
+                "message".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        ("mail.verify", "dkim" | "spf" | "dmarc") => Ok(Value::Bool(true)),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type {ns}>"
+        ))),
+    }
+}
+
+fn call_media_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "camera" | "screen" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str(method.to_string())),
+            (
+                "constraints".to_string(),
+                args.first()
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Vec::new())),
+            ),
+        ])),
+        "pipeline" | "player" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str(method.to_string())),
+            (
+                "source".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type media>"
+        ))),
+    }
+}
+
+fn call_push_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "request" => Ok(Value::Bool(true)),
+        "subscribe" => Ok(Value::Object(vec![
+            (
+                "endpoint".to_string(),
+                Value::Str("push://subscription".to_string()),
+            ),
+            (
+                "keys".to_string(),
+                Value::Object(vec![
+                    ("p256dh".to_string(), Value::Str("local-p256dh".to_string())),
+                    ("auth".to_string(), Value::Str("local-auth".to_string())),
+                ]),
+            ),
+            (
+                "options".to_string(),
+                args.first()
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Vec::new())),
+            ),
+        ])),
+        "send" => Ok(Value::Object(vec![
+            ("status".to_string(), Value::Str("sent".to_string())),
+            (
+                "message".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type push>"
+        ))),
+    }
+}
+
+fn call_offline_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "store" => {
+            let name = string_arg(args, 0, "`@offline.store` expects a store name")?;
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("offline.store".to_string())),
+                ("name".to_string(), Value::Str(name)),
+                ("records".to_string(), Value::Array(Vec::new())),
+            ]))
+        }
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type offline>"
+        ))),
+    }
+}
+
+fn call_cache_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "open" => {
+            let name = string_arg(args, 0, "`@cache.open` expects a cache name")?;
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("cache".to_string())),
+                ("name".to_string(), Value::Str(name)),
+            ]))
+        }
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type cache>"
+        ))),
+    }
+}
+
+fn call_net_method(ns: &str, method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match (ns, method) {
+        ("net", "tcp" | "udp") => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str(format!("net.{method}"))),
+            (
+                "port".to_string(),
+                named_arg(args, "port").unwrap_or(Value::Int(0)),
+            ),
+            (
+                "path".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        ("net.tun", "create") => {
+            let name = named_string_arg(args, "name").unwrap_or_else(|| "tun0".to_string());
+            let ipv4 = named_string_arg(args, "ipv4").unwrap_or_default();
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("net.tun".to_string())),
+                ("name".to_string(), Value::Str(name)),
+                ("ipv4".to_string(), Value::Str(ipv4)),
+                ("status".to_string(), Value::Str("open".to_string())),
+            ]))
+        }
+        ("net.tun", "write") => {
+            let packet = args.get(1).cloned().unwrap_or(Value::Void);
+            Ok(Value::Object(vec![
+                ("status".to_string(), Value::Str("written".to_string())),
+                ("bytes".to_string(), Value::Int(storage_value_size(&packet))),
+            ]))
+        }
+        ("net.tun", "read") => Ok(Value::Object(vec![
+            ("data".to_string(), Value::Str(String::new())),
+            ("bytes".to_string(), Value::Int(0)),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type {ns}>"
+        ))),
+    }
+}
+
+fn call_plugin_method(ns: &str, method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match (ns, method) {
+        ("plugin", "load") => {
+            let path = string_arg(args, 0, "`@plugin.load` expects a path")?;
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("plugin".to_string())),
+                ("path".to_string(), Value::Str(path)),
+                ("status".to_string(), Value::Str("loaded".to_string())),
+                (
+                    "activate".to_string(),
+                    Value::Builtin("plugin.activate".to_string()),
+                ),
+            ]))
+        }
+        ("plugin", "discover") => {
+            let root = string_arg(args, 0, "`@plugin.discover` expects a root path")?;
+            Ok(Value::Array(vec![Value::Object(vec![
+                (
+                    "kind".to_string(),
+                    Value::Str("plugin.candidate".to_string()),
+                ),
+                (
+                    "path".to_string(),
+                    Value::Str(format!("{root}/plugin.wasm")),
+                ),
+            ])]))
+        }
+        ("plugin.host", "register") | ("plugin", "host") => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("plugin.host".to_string())),
+            (
+                "name".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type {ns}>"
+        ))),
+    }
+}
+
+fn call_gpu_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "compute" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("compute".to_string())),
+            (
+                "file".to_string(),
+                named_arg(args, "file").unwrap_or(Value::Void),
+            ),
+            (
+                "workgroup".to_string(),
+                named_arg(args, "workgroup").unwrap_or(Value::Void),
+            ),
+        ])),
+        "context" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("gpu.context".to_string())),
+            (
+                "target".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        "render" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("render".to_string())),
+            (
+                "commands".to_string(),
+                args.first()
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            ),
+        ])),
+        "textureFrom" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("texture".to_string())),
+            (
+                "source".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type gpu>"
+        ))),
+    }
+}
+
+fn gpu_render_raw(args: &[HirExpr]) -> Value {
+    let commands = args
+        .iter()
+        .find_map(|arg| match &arg.kind {
+            HirExprKind::Block(block) => Some(len_to_i64(block.stmts.len())),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Value::Object(vec![
+        ("kind".to_string(), Value::Str("render".to_string())),
+        ("commands".to_string(), Value::Int(commands)),
+    ])
+}
+
+fn call_observability_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "configure" => {
+            let config = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Vec::new()));
+            let service = match &config {
+                Value::Object(fields) => object_field(fields, "service")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Str("orv".to_string())),
+                _ => Value::Str("orv".to_string()),
+            };
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("observability".to_string())),
+                ("service".to_string(), service),
+                ("config".to_string(), config),
+            ]))
+        }
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type observability>"
+        ))),
+    }
+}
+
+fn call_ffi_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "library" | "load" => Ok(Value::Object(vec![
+            ("kind".to_string(), Value::Str("ffi".to_string())),
+            (
+                "name".to_string(),
+                args.first().cloned().unwrap_or(Value::Void),
+            ),
+        ])),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type ffi>"
+        ))),
+    }
+}
+
+fn call_audit_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "log" => {
+            let name = string_arg(args, 0, "`audit.log` expects an event name")?;
+            let fields = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Vec::new()));
+            Ok(Value::Object(vec![
+                ("kind".to_string(), Value::Str("audit.event".to_string())),
+                ("name".to_string(), Value::Str(name)),
+                ("fields".to_string(), fields),
+            ]))
+        }
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type audit>"
+        ))),
+    }
+}
+
+fn regex_contains(haystack: &str, pattern: &str, flags: &str) -> Result<bool, RuntimeError> {
+    let mut builder = regex::RegexBuilder::new(pattern);
+    for flag in flags.chars() {
+        match flag {
+            'g' => {}
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            'm' => {
+                builder.multi_line(true);
+            }
+            other => {
+                return Err(RuntimeError::native(format!(
+                    "unsupported regex flag `{other}`"
+                )));
+            }
+        }
+    }
+    let regex = builder
+        .build()
+        .map_err(|e| RuntimeError::native(format!("invalid regex literal: {e}")))?;
+    Ok(regex.is_match(haystack))
+}
+
+fn eval_reference_domain(name: &str, args: &[HirExpr]) -> Option<Value> {
+    match name {
+        "storage" if args.is_empty() => Some(Value::TypeName("storage".to_string())),
+        "job" if args.is_empty() => Some(Value::TypeName("job".to_string())),
+        "job" => {
+            let job_name = args
+                .first()
+                .and_then(string_literal_from_expr)
+                .unwrap_or_else(|| "job".to_string());
+            if args
+                .iter()
+                .any(|arg| matches!(arg.kind, HirExprKind::Block(_)))
+            {
+                Some(Value::Object(vec![
+                    ("name".to_string(), Value::Str(job_name)),
+                    ("status".to_string(), Value::Str("registered".to_string())),
+                ]))
+            } else {
+                Some(Value::TypeName(format!("job.{job_name}")))
+            }
+        }
+        "sync" | "mail" | "media" | "push" | "offline" | "cache" | "net" | "plugin" | "gpu"
+        | "observability" | "ffi"
+            if args.is_empty() =>
+        {
+            Some(Value::TypeName(name.to_string()))
+        }
+        "upload" if args.is_empty() => Some(Value::Object(vec![
+            ("id".to_string(), Value::Str("upload-1".to_string())),
+            ("size".to_string(), Value::Int(0)),
+            (
+                "path".to_string(),
+                Value::Str("uploads/upload-1".to_string()),
+            ),
+        ])),
+        "message" if args.is_empty() => Some(Value::Object(vec![
+            ("from".to_string(), Value::Str(String::new())),
+            ("to".to_string(), Value::Str(String::new())),
+            ("subject".to_string(), Value::Str(String::new())),
+            ("body".to_string(), Value::Str(String::new())),
+        ])),
+        "chunk" if args.is_empty() => Some(Value::Object(vec![
+            ("index".to_string(), Value::Int(0)),
+            ("data".to_string(), Value::Str(String::new())),
+        ])),
+        "socket" if args.is_empty() => Some(Value::Object(vec![
+            ("id".to_string(), Value::Str("socket-1".to_string())),
+            ("room".to_string(), Value::Str(String::new())),
+            (
+                "join".to_string(),
+                Value::Builtin("socket.join".to_string()),
+            ),
+            (
+                "leave".to_string(),
+                Value::Builtin("socket.leave".to_string()),
+            ),
+        ])),
+        "packet" | "data" if args.is_empty() => Some(Value::Object(vec![
+            ("type".to_string(), Value::Str(String::new())),
+            ("room".to_string(), Value::Str(String::new())),
+            ("text".to_string(), Value::Str(String::new())),
+            ("target".to_string(), Value::Str(String::new())),
+        ])),
+        "peer" if args.is_empty() => Some(Value::Object(vec![(
+            "id".to_string(),
+            Value::Str("peer-1".to_string()),
+        )])),
+        "session" if args.is_empty() => Some(Value::Object(vec![
+            ("id".to_string(), Value::Str("session-1".to_string())),
+            ("stream".to_string(), Value::Object(Vec::new())),
+            ("datagram".to_string(), Value::Object(Vec::new())),
+        ])),
+        "ws" | "wt" | "webrtc" => {
+            let path = args
+                .first()
+                .and_then(string_literal_from_expr)
+                .unwrap_or_default();
+            Some(Value::Object(vec![
+                ("protocol".to_string(), Value::Str(name.to_string())),
+                ("path".to_string(), Value::Str(path)),
+            ]))
+        }
+        "on" | "emit" | "connect" | "disconnect" | "signal" | "send" | "stream" | "datagram"
+        | "cron" | "design" | "unsafe" | "hint" | "index" | "shard" | "replica" | "partition" => {
+            Some(Value::Void)
+        }
+        _ => None,
+    }
+}
+
+fn is_reference_namespace(ns: &str) -> bool {
+    let root = ns.split('.').next().unwrap_or(ns);
+    matches!(
+        root,
+        "storage"
+            | "job"
+            | "sync"
+            | "mail"
+            | "media"
+            | "push"
+            | "offline"
+            | "cache"
+            | "net"
+            | "plugin"
+            | "gpu"
+            | "observability"
+            | "ffi"
+            | "audit"
+    )
+}
+
+fn is_reference_namespace_method(ns: &str, method: &str) -> bool {
+    match ns {
+        "storage" => matches!(
+            method,
+            "put" | "get" | "delete" | "putChunk" | "merge" | "signedUrl" | "stream"
+        ),
+        "sync" => matches!(method, "open" | "connect" | "buffer"),
+        "mail" => method == "send",
+        "mail.verify" => matches!(method, "dkim" | "spf" | "dmarc"),
+        "media" => matches!(method, "camera" | "screen" | "pipeline" | "player"),
+        "push" => matches!(method, "request" | "subscribe" | "send"),
+        "offline" => method == "store",
+        "cache" => method == "open",
+        "net" => matches!(method, "tcp" | "udp"),
+        "net.tun" => matches!(method, "create" | "write" | "read"),
+        "plugin" => matches!(method, "load" | "host" | "discover"),
+        "plugin.host" => method == "register",
+        "gpu" => matches!(method, "compute" | "context" | "render" | "textureFrom"),
+        "observability" => method == "configure",
+        "ffi" => matches!(method, "library" | "load"),
+        "audit" => method == "log",
+        _ => ns.starts_with("job.") && method == "enqueue",
+    }
+}
+
+fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Value, RuntimeError> {
+    match (&t, field) {
+        (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
+        (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
+        (Value::Array(_), "map" | "filter" | "reduce" | "push" | "concat" | "join") => {
+            Ok(Value::BoundMethod {
+                receiver: Box::new(t),
+                method: field.to_string(),
+            })
+        }
+        (Value::Str(_), "toLowerCase" | "toUpperCase" | "contains" | "replace") => {
+            Ok(Value::BoundMethod {
+                receiver: Box::new(t),
+                method: field.to_string(),
+            })
+        }
+        (
+            Value::Str(_)
+            | Value::Regex { .. }
+            | Value::Array(_)
+            | Value::Object(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Void,
+            "move" | "copy",
+        ) => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (
+            Value::Db(_),
+            "create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search" | "count"
+            | "sum" | "transaction" | "schema" | "connect" | "analyze",
+        ) => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(_), "from") => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(_), "parse" | "safeParse" | "errors" | "is") => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(ns), "read" | "write") if ns == "fs" => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(ns), "run") if ns == "process" => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(ns), "runDue" | "tick") if ns == "cron" => Ok(Value::BoundMethod {
+            receiver: Box::new(t),
+            method: field.to_string(),
+        }),
+        (Value::TypeName(ns), _) if is_reference_namespace_method(ns, field) => {
+            Ok(Value::BoundMethod {
+                receiver: Box::new(t),
+                method: field.to_string(),
+            })
+        }
+        (Value::TypeName(ns), _) if is_reference_namespace(ns) => {
+            Ok(Value::TypeName(format!("{ns}.{field}")))
+        }
+        (Value::Object(fields), _) => {
+            if let Some((_, value)) = fields.iter().find(|(k, _)| k == field) {
+                return Ok(value.clone());
+            }
+            if object_kind(fields).is_some_and(|kind| {
+                matches!(kind, "cache" | "offline.store")
+                    && matches!(field, "put" | "get" | "delete")
+            }) {
+                return Ok(Value::BoundMethod {
+                    receiver: Box::new(t),
+                    method: field.to_string(),
+                });
+            }
+            if missing_object_is_void {
+                Ok(Value::Void)
+            } else {
+                Err(RuntimeError::native(format!(
+                    "no field `{field}` on object"
+                )))
+            }
+        }
+        _ => Err(RuntimeError::native(format!("no field `{field}` on {t}"))),
+    }
+}
+
+fn object_kind(fields: &[(String, Value)]) -> Option<&str> {
+    match object_field(fields, "kind") {
+        Some(Value::Str(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+fn named_arg(args: &[Value], name: &str) -> Option<Value> {
+    args.iter().find_map(|arg| match arg {
+        Value::Object(fields) if fields.len() == 1 && fields[0].0 == name => {
+            Some(fields[0].1.clone())
+        }
+        _ => None,
+    })
+}
+
+fn named_string_arg(args: &[Value], name: &str) -> Option<String> {
+    named_arg(args, name).and_then(|value| match value {
+        Value::Str(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn string_arg(args: &[Value], index: usize, message: &str) -> Result<String, RuntimeError> {
+    match args.get(index) {
+        Some(Value::Str(value)) => Ok(value.clone()),
+        _ => Err(RuntimeError::native(message)),
+    }
+}
+
+fn int_arg(args: &[Value], index: usize, message: &str) -> Result<i64, RuntimeError> {
+    match args.get(index) {
+        Some(Value::Int(value)) => Ok(*value),
+        _ => Err(RuntimeError::native(message)),
+    }
+}
+
+fn storage_value_size(value: &Value) -> i64 {
+    match value {
+        Value::Str(s) => len_to_i64(s.chars().count()),
+        Value::Array(items) | Value::Tuple(items) => len_to_i64(items.len()),
+        Value::Void => 0,
+        _ => len_to_i64(value_to_display(value).chars().count()),
+    }
+}
+
+fn storage_file_record(path: &str, content: Value) -> Value {
+    Value::Object(vec![
+        ("path".to_string(), Value::Str(path.to_string())),
+        ("size".to_string(), Value::Int(storage_value_size(&content))),
+        ("content".to_string(), content),
+    ])
+}
+
+fn len_to_i64(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
 }
 
 /// void-scope 자동 출력을 피해야 하는 표현식인지.
@@ -2510,6 +4093,7 @@ fn is_builtin_fn_name(name: &str) -> bool {
             | "tomorrow"
             | "yesterday"
             | "sleep"
+            | "navigate"
     )
 }
 
@@ -2583,7 +4167,18 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         // MVP: `sleep` 은 값만 인정하고 실제 대기는 하지 않는다. 테스트
         // 런타임(동기 interpreter) 에서 실제 대기를 끼얹으면 UX 저하가 커서
         // no-op. 향후 비동기 스케줄러가 붙으면 실구현으로 교체.
-        "sleep" => Ok(Value::Void),
+        "sleep" | "socket.join" | "socket.leave" => Ok(Value::Void),
+        "navigate" => {
+            let path = string_arg(&args, 0, "navigate expects a path")?;
+            Ok(Value::Object(vec![
+                ("path".to_string(), Value::Str(path)),
+                ("status".to_string(), Value::Str("navigated".to_string())),
+            ]))
+        }
+        "plugin.activate" => Ok(Value::Object(vec![(
+            "status".to_string(),
+            Value::Str("activated".to_string()),
+        )])),
         other => Err(RuntimeError::native(format!("unknown builtin `{other}`"))),
     }
 }
@@ -2593,6 +4188,7 @@ fn type_of(v: &Value) -> &'static str {
         Value::Int(_) => "int",
         Value::Float(_) => "float",
         Value::Str(_) => "string",
+        Value::Regex { .. } => "regex",
         Value::Bool(_) => "bool",
         Value::Void => "void",
         Value::Function(_) | Value::Lambda(_) | Value::BoundMethod { .. } | Value::Builtin(_) => {
@@ -2806,6 +4402,11 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 ///   전체 반환.
 /// - `update(table, filter, data)` — filter 매칭에 data 병합. 갱신 수 반환.
 /// - `delete(table, filter)` — filter 매칭 제거. 삭제 수 반환.
+/// - `upsert(table, filter, data)` — 매칭 row 를 갱신하거나 filter+data 로 생성.
+/// - `count(table, filter?)` — 매칭 row 수.
+/// - `sum(table, filter, @field)` — 매칭 row 의 numeric field 합계.
+/// - `search(table, filter?)` — 현재는 query search alias.
+/// - `transaction(values...)` — 이미 평가된 body 값 중 마지막 값 반환.
 fn call_db_method(
     db: &Arc<Mutex<crate::db::InMemoryDb>>,
     method: &str,
@@ -2819,67 +4420,371 @@ fn call_db_method(
             ))),
         }
     };
-    let require_obj = |v: &Value, what: &str| -> Result<Vec<(String, Value)>, RuntimeError> {
-        match v {
-            Value::Object(fields) => Ok(fields.clone()),
-            other => Err(RuntimeError::native(format!(
-                "`db.{method}` expects {what} to be object, got {other}"
-            ))),
-        }
-    };
     match method {
         "create" => {
-            if args.len() != 2 {
+            if args.len() < 2 {
                 return Err(RuntimeError::native("`db.create` expects (table, data)"));
             }
             let table = require_str(&args[0], "table name")?;
-            let data = require_obj(&args[1], "data")?;
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            let data = parsed.data.unwrap_or_default();
             Ok(db.lock().unwrap().create(&table, data))
         }
         "find" => {
-            if args.len() != 2 {
-                return Err(RuntimeError::native("`db.find` expects (table, filter)"));
+            if args.is_empty() {
+                return Err(RuntimeError::native("`db.find` expects (table[, query])"));
             }
             let table = require_str(&args[0], "table name")?;
-            let filter = require_obj(&args[1], "filter")?;
-            Ok(db.lock().unwrap().find_one(&table, &filter))
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            let db = db.lock().unwrap();
+            if db_find_returns_many(&parsed.query) {
+                Ok(Value::Array(db.find_query(&table, &parsed.query)))
+            } else {
+                Ok(db.find_one_query(&table, &parsed.query))
+            }
         }
         "findAll" => {
-            if args.is_empty() || args.len() > 2 {
+            if args.is_empty() {
                 return Err(RuntimeError::native(
                     "`db.findAll` expects (table[, filter])",
                 ));
             }
             let table = require_str(&args[0], "table name")?;
-            let filter = if let Some(f) = args.get(1) {
-                require_obj(f, "filter")?
-            } else {
-                Vec::new()
-            };
-            Ok(db.lock().unwrap().find_all(&table, &filter))
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            Ok(Value::Array(
+                db.lock().unwrap().find_query(&table, &parsed.query),
+            ))
         }
         "update" => {
-            if args.len() != 3 {
+            if args.len() < 2 {
                 return Err(RuntimeError::native(
                     "`db.update` expects (table, filter, data)",
                 ));
             }
             let table = require_str(&args[0], "table name")?;
-            let filter = require_obj(&args[1], "filter")?;
-            let data = require_obj(&args[2], "data")?;
-            Ok(Value::Int(
-                db.lock().unwrap().update(&table, &filter, &data),
-            ))
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            Ok(Value::Int(db.lock().unwrap().update_query(
+                &table,
+                &parsed.query,
+                &parsed.data.unwrap_or_default(),
+                &parsed.inc,
+            )))
         }
         "delete" => {
-            if args.len() != 2 {
+            if args.is_empty() {
                 return Err(RuntimeError::native("`db.delete` expects (table, filter)"));
             }
             let table = require_str(&args[0], "table name")?;
-            let filter = require_obj(&args[1], "filter")?;
-            Ok(Value::Int(db.lock().unwrap().delete(&table, &filter)))
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            Ok(Value::Int(
+                db.lock().unwrap().delete_query(&table, &parsed.query),
+            ))
         }
+        "upsert" => {
+            if args.len() < 2 {
+                return Err(RuntimeError::native(
+                    "`db.upsert` expects (table, filter, data)",
+                ));
+            }
+            let table = require_str(&args[0], "table name")?;
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            let data = parsed.data.unwrap_or_default();
+            let mut db = db.lock().unwrap();
+            if matches!(db.find_one_query(&table, &parsed.query), Value::Void) {
+                Ok(db.create(
+                    &table,
+                    merge_db_objects(&query_equality_fields(&parsed.query), &data),
+                ))
+            } else {
+                db.update_query(&table, &parsed.query, &data, &parsed.inc);
+                Ok(db.find_one_query(&table, &parsed.query))
+            }
+        }
+        "search" => {
+            if args.is_empty() {
+                return Err(RuntimeError::native(
+                    "`db.search` expects (table[, filter])",
+                ));
+            }
+            let table = require_str(&args[0], "table name")?;
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            Ok(Value::Array(
+                db.lock().unwrap().find_query(&table, &parsed.query),
+            ))
+        }
+        "count" => {
+            if args.is_empty() {
+                return Err(RuntimeError::native("`db.count` expects (table[, filter])"));
+            }
+            let table = require_str(&args[0], "table name")?;
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            Ok(Value::Int(
+                db.lock().unwrap().count_query(&table, &parsed.query),
+            ))
+        }
+        "sum" => {
+            if args.is_empty() {
+                return Err(RuntimeError::native(
+                    "`db.sum` expects (table, query with @field)",
+                ));
+            }
+            let table = require_str(&args[0], "table name")?;
+            let parsed = parse_db_runtime_args(method, &args[1..])?;
+            let [field] = parsed.query.fields.as_slice() else {
+                return Err(RuntimeError::native("`db.sum` expects exactly one @field"));
+            };
+            Ok(db.lock().unwrap().sum_query(&table, &parsed.query, field))
+        }
+        "transaction" => Ok(args.last().cloned().unwrap_or(Value::Void)),
+        "schema" => Ok(Value::Void),
+        "analyze" => Ok(Value::Void),
+        "connect" => Ok(Value::Db(db.clone())),
         other => Err(RuntimeError::native(format!("unknown db method `{other}`"))),
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedDbArgs {
+    query: DbQuery,
+    data: Option<Vec<(String, Value)>>,
+    inc: Vec<(String, Value)>,
+}
+
+fn parse_db_runtime_args(method: &str, args: &[Value]) -> Result<ParsedDbArgs, RuntimeError> {
+    let mut parsed = ParsedDbArgs::default();
+    let mut positional_object_count = 0usize;
+
+    for arg in args {
+        let Value::Object(fields) = arg else {
+            continue;
+        };
+        if let Some((sentinel, value)) = single_sentinel(fields) {
+            match sentinel {
+                "__order__" => parse_db_order(value, &mut parsed.query)?,
+                "__skip__" => parsed.query.skip = Some(db_usize(value, "`@skip`")?),
+                "__limit__" => parsed.query.limit = Some(db_usize(value, "`@limit`")?),
+                "__field__" => parse_db_field(value, &mut parsed.query)?,
+                "__rank__" => {}
+                "__near__" => parse_db_near(value, &mut parsed.query)?,
+                "__inc__" => parsed.inc.extend(db_object_fields(value, "`%inc`")?),
+                _ => {}
+            }
+            continue;
+        }
+
+        match method {
+            "create" => {
+                parsed
+                    .data
+                    .get_or_insert_with(Vec::new)
+                    .extend(fields.clone());
+            }
+            "update" | "upsert" => {
+                if positional_object_count == 0 {
+                    extend_query_filters(&mut parsed.query, fields);
+                } else {
+                    parsed
+                        .data
+                        .get_or_insert_with(Vec::new)
+                        .extend(fields.clone());
+                }
+                positional_object_count += 1;
+            }
+            _ => extend_query_filters(&mut parsed.query, fields),
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn single_sentinel(fields: &[(String, Value)]) -> Option<(&str, &Value)> {
+    let [(key, value)] = fields else {
+        return None;
+    };
+    key.strip_prefix("__").map(|_| (key.as_str(), value))
+}
+
+fn parse_db_order(value: &Value, query: &mut DbQuery) -> Result<(), RuntimeError> {
+    for (field, direction) in db_object_fields(value, "`@order`")? {
+        let desc = match direction {
+            Value::Str(s) if s.eq_ignore_ascii_case("desc") => true,
+            Value::Str(s) if s.eq_ignore_ascii_case("asc") => false,
+            Value::Bool(desc) => desc,
+            other => {
+                return Err(RuntimeError::native(format!(
+                    "`@order` expects asc/desc direction, got {other}"
+                )));
+            }
+        };
+        query.order.push(DbOrder { field, desc });
+    }
+    Ok(())
+}
+
+fn parse_db_field(value: &Value, query: &mut DbQuery) -> Result<(), RuntimeError> {
+    match value {
+        Value::Str(field) => query.fields.push(field.clone()),
+        Value::Array(items) => {
+            for item in items {
+                let Value::Str(field) = item else {
+                    return Err(RuntimeError::native(format!(
+                        "`@field` expects field name string, got {item}"
+                    )));
+                };
+                query.fields.push(field.clone());
+            }
+        }
+        other => {
+            return Err(RuntimeError::native(format!(
+                "`@field` expects field name, got {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_db_near(value: &Value, query: &mut DbQuery) -> Result<(), RuntimeError> {
+    let fields = db_object_fields(value, "`@near`")?;
+    let field = match object_field(&fields, "field") {
+        Some(Value::Str(field)) => field.clone(),
+        Some(other) => {
+            return Err(RuntimeError::native(format!(
+                "`@near` field expects string, got {other}"
+            )));
+        }
+        None => return Err(RuntimeError::native("`@near` expects vector field")),
+    };
+    let vector = match object_field(&fields, "query") {
+        Some(value) => db_vector(value, "`@near` query")?,
+        None => return Err(RuntimeError::native("`@near` expects query vector")),
+    };
+    if let Some(k) = object_field(&fields, "k") {
+        query.limit = Some(db_usize(k, "`@near k`")?);
+    }
+    query.near = Some(DbNear { field, vector });
+    Ok(())
+}
+
+fn object_field<'a>(fields: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value)
+}
+
+fn db_vector(value: &Value, what: &str) -> Result<Vec<f64>, RuntimeError> {
+    let Value::Array(items) = value else {
+        return Err(RuntimeError::native(format!(
+            "{what} expects numeric array"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(n) => Ok(*n),
+            other => Err(RuntimeError::native(format!(
+                "{what} expects numeric array, got {other}"
+            ))),
+        })
+        .collect()
+}
+
+fn db_object_fields(value: &Value, what: &str) -> Result<Vec<(String, Value)>, RuntimeError> {
+    match value {
+        Value::Object(fields) => Ok(fields.clone()),
+        other => Err(RuntimeError::native(format!(
+            "{what} expects object, got {other}"
+        ))),
+    }
+}
+
+fn db_usize(value: &Value, what: &str) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Int(n) => usize::try_from(*n)
+            .map_err(|_| RuntimeError::native(format!("{what} expects non-negative int"))),
+        other => Err(RuntimeError::native(format!(
+            "{what} expects int, got {other}"
+        ))),
+    }
+}
+
+fn extend_query_filters(query: &mut DbQuery, fields: &[(String, Value)]) {
+    for (raw_field, value) in fields {
+        let (field, op) = db_filter_field(raw_field);
+        query.filters.push(DbFilter {
+            field,
+            op,
+            value: value.clone(),
+        });
+    }
+}
+
+fn db_filter_field(raw: &str) -> (String, DbFilterOp) {
+    for (suffix, op) in [
+        ("__gte", DbFilterOp::Ge),
+        ("__lte", DbFilterOp::Le),
+        ("__gt", DbFilterOp::Gt),
+        ("__lt", DbFilterOp::Lt),
+        ("__ne", DbFilterOp::Ne),
+        ("__contains", DbFilterOp::Contains),
+        ("__in", DbFilterOp::In),
+        ("_contains", DbFilterOp::Contains),
+    ] {
+        if let Some(field) = raw.strip_suffix(suffix) {
+            return (field.to_string(), op);
+        }
+    }
+    (raw.to_string(), DbFilterOp::Eq)
+}
+
+fn db_find_returns_many(query: &DbQuery) -> bool {
+    query.filters.is_empty()
+        || query.skip.is_some()
+        || query.limit.is_some()
+        || !query.order.is_empty()
+        || query
+            .filters
+            .iter()
+            .any(|filter| filter.op != DbFilterOp::Eq)
+}
+
+fn query_equality_fields(query: &DbQuery) -> Vec<(String, Value)> {
+    query
+        .filters
+        .iter()
+        .filter(|filter| filter.op == DbFilterOp::Eq)
+        .map(|filter| (filter.field.clone(), filter.value.clone()))
+        .collect()
+}
+
+fn merge_db_objects(base: &[(String, Value)], overlay: &[(String, Value)]) -> Vec<(String, Value)> {
+    let mut out = base.to_vec();
+    for (key, value) in overlay {
+        if let Some((_, slot)) = out.iter_mut().find(|(existing, _)| existing == key) {
+            *slot = value.clone();
+        } else {
+            out.push((key.clone(), value.clone()));
+        }
+    }
+    out
+}
+
+fn validation_error(path: &str, code: &str, message: &str, expected: &str, actual: Value) -> Value {
+    Value::Object(vec![
+        ("path".to_string(), Value::Str(path.to_string())),
+        ("code".to_string(), Value::Str(code.to_string())),
+        ("message".to_string(), Value::Str(message.to_string())),
+        ("expected".to_string(), Value::Str(expected.to_string())),
+        ("actual".to_string(), actual),
+    ])
+}
+
+fn child_path(parent: &str, child: &str) -> String {
+    if parent == "$" {
+        format!("$.{child}")
+    } else {
+        format!("{parent}.{child}")
     }
 }
 
@@ -2929,34 +4834,134 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value, RuntimeError> {
 /// - `void`: 무엇이든 `Value::Void`.
 /// - 이외 이름 (사용자 struct 등) 은 원본 값을 그대로 유지한다 — 타입 체커
 ///   합류 후에 엄격화 가능.
+fn display_type_ref(ty: &HirTypeRef) -> String {
+    let base = match &ty.kind {
+        HirTypeRefKind::Named(name) => name.clone(),
+        HirTypeRefKind::Nullable(inner) => format!("{}?", display_type_ref(inner)),
+        HirTypeRefKind::Array(inner) => format!("{}[]", display_type_ref(inner)),
+        HirTypeRefKind::Pattern(raw) => display_pattern(raw).to_string(),
+        HirTypeRefKind::Union(items) => items
+            .iter()
+            .map(display_type_ref)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        HirTypeRefKind::InlineObject(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, ty)| format!("{name}: {}", display_type_ref(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
+        HirTypeRefKind::Tuple(items) => {
+            let items = items
+                .iter()
+                .map(display_type_ref)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({items})")
+        }
+    };
+    if ty.constraints.is_empty() {
+        base
+    } else {
+        format!("{}({})", base, display_runtime_constraints(&ty.constraints))
+    }
+}
+
+fn cast_pattern(value: Value, raw: &str) -> Result<Value, RuntimeError> {
+    match raw {
+        "true" => match value {
+            Value::Bool(true) => Ok(Value::Bool(true)),
+            other => Err(RuntimeError::native(format!(
+                "pattern mismatch: expected `true`, got {other}"
+            ))),
+        },
+        "false" => match value {
+            Value::Bool(false) => Ok(Value::Bool(false)),
+            other => Err(RuntimeError::native(format!(
+                "pattern mismatch: expected `false`, got {other}"
+            ))),
+        },
+        _ => {
+            let Value::Str(s) = value else {
+                return Err(RuntimeError::native(format!(
+                    "pattern mismatch: expected `{}` string, got {value}",
+                    display_pattern(raw)
+                )));
+            };
+            if pattern_matches(raw, &s) {
+                Ok(Value::Str(s))
+            } else {
+                Err(RuntimeError::native(format!(
+                    "pattern mismatch: `{s}` does not match `{}`",
+                    display_pattern(raw)
+                )))
+            }
+        }
+    }
+}
+
 fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
-    // Array(T) 는 pass-through (원소별 캐스트는 아직 미지원 — MVP 범위 밖).
-    if matches!(ty.kind, HirTypeRefKind::Array(_)) {
-        return Ok(value);
+    if let HirTypeRefKind::Union(items) = &ty.kind {
+        let mut errors = Vec::new();
+        for item in items {
+            match apply_cast(value.clone(), item) {
+                Ok(v) => return apply_value_constraints(v, &ty.constraints),
+                Err(err) => errors.push(err.message),
+            }
+        }
+        return Err(RuntimeError::native(format!(
+            "cannot cast {value} to union `{}`: {}",
+            display_type_ref(ty),
+            errors.join("; ")
+        )));
+    }
+    if let HirTypeRefKind::Array(inner) = &ty.kind {
+        let Value::Array(items) = value else {
+            return Err(RuntimeError::native(format!(
+                "cannot cast {value} to {}",
+                display_type_ref(ty)
+            )));
+        };
+        let casted = items
+            .into_iter()
+            .map(|item| apply_cast(item, inner))
+            .collect::<Result<Vec<_>, _>>()?;
+        return apply_value_constraints(Value::Array(casted), &ty.constraints);
     }
     if let HirTypeRefKind::Nullable(inner) = &ty.kind {
         if matches!(value, Value::Void) {
             return Ok(Value::Void);
         }
-        return apply_cast(value, inner);
+        return apply_value_constraints(apply_cast(value, inner)?, &ty.constraints);
+    }
+    if let HirTypeRefKind::Pattern(raw) = &ty.kind {
+        return apply_value_constraints(cast_pattern(value, raw)?, &ty.constraints);
+    }
+    if let HirTypeRefKind::InlineObject(type_fields) = &ty.kind {
+        return apply_value_constraints(cast_inline_object(value, type_fields)?, &ty.constraints);
+    }
+    if let HirTypeRefKind::Tuple(items) = &ty.kind {
+        return apply_value_constraints(cast_tuple(value, items)?, &ty.constraints);
     }
     let HirTypeRefKind::Named(name) = &ty.kind else {
-        return Ok(value);
+        return apply_value_constraints(value, &ty.constraints);
     };
-    match name.as_str() {
-        "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => match value {
-            Value::Int(i) => Ok(Value::Int(i)),
-            Value::Float(f) => Ok(Value::Int(f.trunc() as i64)),
-            Value::Bool(b) => Ok(Value::Int(i64::from(b))),
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| RuntimeError::native(format!("cannot cast string `{s}` to int"))),
-            other => Err(RuntimeError::native(format!("cannot cast {other} to int"))),
-        },
-        "float" | "double" => {
-            match value {
+    let casted =
+        match name.as_str() {
+            "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => {
+                match value {
+                    Value::Int(i) => Ok(Value::Int(i)),
+                    Value::Float(f) => Ok(Value::Int(f.trunc() as i64)),
+                    Value::Bool(b) => Ok(Value::Int(i64::from(b))),
+                    Value::Str(s) => s.trim().parse::<i64>().map(Value::Int).map_err(|_| {
+                        RuntimeError::native(format!("cannot cast string `{s}` to int"))
+                    }),
+                    other => Err(RuntimeError::native(format!("cannot cast {other} to int"))),
+                }
+            }
+            "float" | "double" => match value {
                 Value::Float(f) => Ok(Value::Float(f)),
                 #[allow(clippy::cast_precision_loss)]
                 Value::Int(i) => Ok(Value::Float(i as f64)),
@@ -2967,26 +4972,339 @@ fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
                 other => Err(RuntimeError::native(format!(
                     "cannot cast {other} to float"
                 ))),
+            },
+            "string" => Ok(Value::Str(value_to_display(&value))),
+            "bool" => match value {
+                Value::Bool(b) => Ok(Value::Bool(b)),
+                Value::Int(i) => Ok(Value::Bool(i != 0)),
+                Value::Float(f) => Ok(Value::Bool(f != 0.0)),
+                Value::Str(s) => match s.as_str() {
+                    "true" => Ok(Value::Bool(true)),
+                    "false" => Ok(Value::Bool(false)),
+                    _ => Err(RuntimeError::native(format!(
+                        "cannot cast string `{s}` to bool"
+                    ))),
+                },
+                other => Err(RuntimeError::native(format!("cannot cast {other} to bool"))),
+            },
+            "void" => Ok(Value::Void),
+            "Email" => cast_pattern(value, "@Email"),
+            "URL" => cast_pattern(value, "@URL"),
+            "UUID" => cast_pattern(value, "@UUID"),
+            "IPv4" => cast_pattern(value, "@IPv4"),
+            "ISODate" => cast_pattern(value, "@ISODate"),
+            // 사용자 정의 타입 (struct 이름 등) — MVP 는 pass-through.
+            _ => Ok(value),
+        }?;
+    apply_value_constraints(casted, &ty.constraints)
+}
+
+fn cast_inline_object(
+    value: Value,
+    type_fields: &[(String, HirTypeRef)],
+) -> Result<Value, RuntimeError> {
+    let Value::Object(mut fields) = value else {
+        return Err(RuntimeError::native(format!(
+            "cannot cast {value} to object"
+        )));
+    };
+    for (name, field_ty) in type_fields {
+        let Some((_, slot)) = fields.iter_mut().find(|(field, _)| field == name) else {
+            return Err(RuntimeError::native(format!(
+                "object cast missing required field `{name}`"
+            )));
+        };
+        *slot = apply_cast(slot.clone(), field_ty)?;
+    }
+    Ok(Value::Object(fields))
+}
+
+fn cast_tuple(value: Value, items: &[HirTypeRef]) -> Result<Value, RuntimeError> {
+    let Value::Tuple(values) = value else {
+        return Err(RuntimeError::native(format!(
+            "cannot cast {value} to tuple"
+        )));
+    };
+    if values.len() != items.len() {
+        return Err(RuntimeError::native(format!(
+            "tuple cast expects {} item(s), got {}",
+            items.len(),
+            values.len()
+        )));
+    }
+    values
+        .into_iter()
+        .zip(items)
+        .map(|(value, ty)| apply_cast(value, ty))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Tuple)
+}
+
+fn apply_value_constraints(
+    mut value: Value,
+    constraints: &[HirTypeConstraint],
+) -> Result<Value, RuntimeError> {
+    if constraints.is_empty() {
+        return Ok(value);
+    }
+    if let Value::Str(s) = &mut value {
+        for constraint in constraints {
+            if let HirTypeConstraint::Flag(name) = constraint {
+                match name.as_str() {
+                    "trim" => *s = s.trim().to_string(),
+                    "lower" => *s = s.to_ascii_lowercase(),
+                    _ => {}
+                }
             }
         }
-        "string" => Ok(Value::Str(value_to_display(&value))),
-        "bool" => match value {
-            Value::Bool(b) => Ok(Value::Bool(b)),
-            Value::Int(i) => Ok(Value::Bool(i != 0)),
-            Value::Float(f) => Ok(Value::Bool(f != 0.0)),
-            Value::Str(s) => match s.as_str() {
-                "true" => Ok(Value::Bool(true)),
-                "false" => Ok(Value::Bool(false)),
-                _ => Err(RuntimeError::native(format!(
-                    "cannot cast string `{s}` to bool"
-                ))),
-            },
-            other => Err(RuntimeError::native(format!("cannot cast {other} to bool"))),
-        },
-        "void" => Ok(Value::Void),
-        // 사용자 정의 타입 (struct 이름 등) — MVP 는 pass-through.
-        _ => Ok(value),
     }
+    for constraint in constraints {
+        if !value_constraint_satisfied(&value, constraint) {
+            return Err(RuntimeError::native(format!(
+                "constraint mismatch: {value} does not satisfy `{}`",
+                display_runtime_constraint(constraint)
+            )));
+        }
+    }
+    Ok(value)
+}
+
+fn value_constraint_satisfied(value: &Value, constraint: &HirTypeConstraint) -> bool {
+    match constraint {
+        HirTypeConstraint::Flag(name) if name == "unique" => value_array_unique(value),
+        HirTypeConstraint::Flag(_) => true,
+        HirTypeConstraint::ExactInt(n) => value_metric(value).is_none_or(|m| m == *n),
+        HirTypeConstraint::Range { start, end, .. } => value_metric(value)
+            .is_none_or(|m| start.is_none_or(|s| m >= s) && end.is_none_or(|e| m <= e)),
+        HirTypeConstraint::KeyValue { key, value: cvalue } => match (key.as_str(), cvalue) {
+            ("min", HirConstraintValue::Int(n)) => value_metric(value).is_none_or(|m| m >= *n),
+            ("max", HirConstraintValue::Int(n)) => value_metric(value).is_none_or(|m| m <= *n),
+            ("pattern", HirConstraintValue::String(pattern)) => match value {
+                Value::Str(s) => simple_pattern_key_matches(pattern, s),
+                _ => true,
+            },
+            _ => true,
+        },
+        HirTypeConstraint::Modulo { divisor, remainder } => match value {
+            Value::Int(n) => *divisor != 0 && n % *divisor == *remainder,
+            _ => true,
+        },
+        HirTypeConstraint::ContainsRegex { pattern, flags } => match value {
+            Value::Str(s) => regex_contains(s, pattern, flags).is_ok_and(|matched| matched),
+            _ => true,
+        },
+    }
+}
+
+fn value_metric(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(n) => Some(*n),
+        Value::Str(s) => i64::try_from(s.chars().count()).ok(),
+        Value::Array(items) => i64::try_from(items.len()).ok(),
+        _ => None,
+    }
+}
+
+fn value_array_unique(value: &Value) -> bool {
+    let Value::Array(items) = value else {
+        return true;
+    };
+    let mut seen = Vec::<String>::new();
+    for item in items {
+        let Some(key) = value_key(item) else {
+            return true;
+        };
+        if seen.iter().any(|existing| existing == &key) {
+            return false;
+        }
+        seen.push(key);
+    }
+    true
+}
+
+fn value_key(value: &Value) -> Option<String> {
+    match value {
+        Value::Int(n) => Some(format!("i:{n}")),
+        Value::Float(n) => Some(format!("f:{n}")),
+        Value::Str(s) => Some(format!("s:{s}")),
+        Value::Bool(b) => Some(format!("b:{b}")),
+        Value::Void => Some("void".to_string()),
+        _ => None,
+    }
+}
+
+fn simple_pattern_key_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "^[a-z0-9_]+$" {
+        return !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    }
+    true
+}
+
+fn display_runtime_constraints(constraints: &[HirTypeConstraint]) -> String {
+    constraints
+        .iter()
+        .map(display_runtime_constraint)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_runtime_constraint(constraint: &HirTypeConstraint) -> String {
+    match constraint {
+        HirTypeConstraint::Flag(name) => name.clone(),
+        HirTypeConstraint::ExactInt(n) => n.to_string(),
+        HirTypeConstraint::Range { start, end, .. } => {
+            let start = start.map_or_else(String::new, |n| n.to_string());
+            let end = end.map_or_else(String::new, |n| n.to_string());
+            format!("{start}..{end}")
+        }
+        HirTypeConstraint::KeyValue { key, value } => {
+            format!("{key}={}", display_runtime_constraint_value(value))
+        }
+        HirTypeConstraint::Modulo { divisor, remainder } => {
+            format!("where $ % {divisor} == {remainder}")
+        }
+        HirTypeConstraint::ContainsRegex { pattern, flags } => {
+            format!("where $.contains(r\"{pattern}\"{flags})")
+        }
+    }
+}
+
+fn display_runtime_constraint_value(value: &HirConstraintValue) -> String {
+    match value {
+        HirConstraintValue::Int(n) => n.to_string(),
+        HirConstraintValue::String(s) => format!("\"{s}\""),
+        HirConstraintValue::Bool(b) => b.to_string(),
+        HirConstraintValue::Ident(s) => s.clone(),
+    }
+}
+
+fn display_pattern(raw: &str) -> &str {
+    raw.strip_prefix('@').unwrap_or(raw)
+}
+
+fn pattern_matches(raw: &str, value: &str) -> bool {
+    match raw {
+        "@Email" => matches_email(value),
+        "@URL" => matches_url(value),
+        "@UUID" => matches_uuid(value),
+        "@IPv4" => matches_ipv4(value),
+        "@ISODate" => matches_iso_date(value),
+        _ if raw.contains('{') && raw.contains('}') => template_matches(raw, value),
+        _ => raw == value,
+    }
+}
+
+fn template_matches(pattern: &str, value: &str) -> bool {
+    let Some(open) = pattern.find('{') else {
+        return pattern == value;
+    };
+    let prefix = &pattern[..open];
+    if !value.starts_with(prefix) {
+        return false;
+    }
+    let after_prefix = &value[prefix.len()..];
+    let Some(close_rel) = pattern[open + 1..].find('}') else {
+        return pattern == value;
+    };
+    let close = open + 1 + close_rel;
+    let placeholder = &pattern[open + 1..close];
+    let rest_pattern = &pattern[close + 1..];
+
+    for end in split_positions(after_prefix) {
+        let segment = &after_prefix[..end];
+        if placeholder_matches(placeholder, segment)
+            && template_matches(rest_pattern, &after_prefix[end..])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_positions(s: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    out.push(s.len());
+    out
+}
+
+fn placeholder_matches(name: &str, value: &str) -> bool {
+    if let Some(n) = exact_placeholder_arg(name, "string") {
+        return value.chars().count() == n;
+    }
+    if let Some(n) = exact_placeholder_arg(name, "int") {
+        return value.len() == n && value.chars().all(|c| c.is_ascii_digit());
+    }
+    match name {
+        "string" => !value.is_empty(),
+        "int" => value.parse::<i64>().is_ok(),
+        "uint" => value.parse::<u64>().is_ok(),
+        "float" => value.parse::<f64>().is_ok(),
+        "bool" => matches!(value, "true" | "false"),
+        "IPByte" => value.parse::<u8>().is_ok(),
+        _ => !value.is_empty(),
+    }
+}
+
+fn exact_placeholder_arg(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+    inner.parse::<usize>().ok()
+}
+
+fn matches_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !local.is_empty() && !host.is_empty() && !tld.is_empty()
+}
+
+fn matches_url(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty() && !rest.is_empty()
+}
+
+fn matches_uuid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    let lens = [8usize, 4, 4, 4, 12];
+    parts.len() == lens.len()
+        && parts
+            .iter()
+            .zip(lens)
+            .all(|(part, len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn matches_ipv4(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.parse::<u8>().is_ok()
+                && (part == &"0" || !part.starts_with('0'))
+        })
+}
+
+fn matches_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let year = &value[0..4];
+    let month = &value[5..7];
+    let day = &value[8..10];
+    year.chars().all(|c| c.is_ascii_digit())
+        && month.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+        && day.parse::<u8>().is_ok_and(|d| (1..=31).contains(&d))
 }
 
 /// SPEC 부록: `target[start:end]` 슬라이싱 — 문자열은 char 경계, 배열은 원소
@@ -3104,7 +5422,8 @@ fn is_truthy(v: &Value) -> bool {
         Value::Int(n) => *n != 0,
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
-        Value::Function(_)
+        Value::Regex { .. }
+        | Value::Function(_)
         | Value::Lambda(_)
         | Value::BoundMethod { .. }
         | Value::Db(_)
@@ -3121,6 +5440,16 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
         (Value::Str(x), Value::Str(y)) => x == y,
+        (
+            Value::Regex {
+                pattern: xp,
+                flags: xf,
+            },
+            Value::Regex {
+                pattern: yp,
+                flags: yf,
+            },
+        ) => xp == yp && xf == yf,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Void, Value::Void) => true,
         (Value::TypeName(a), Value::TypeName(b)) => a == b,
@@ -3812,6 +6141,19 @@ mod tests {
     }
 
     #[test]
+    fn string_contains_accepts_regex_literal() {
+        let out = run_str(
+            r#"let password = "Passw0rd!"
+@out password.contains(r"[A-Z]")
+@out password.contains(r"[0-9]")
+@out password.contains(r"[^a-zA-Z0-9]")
+@out "password".contains(r"[A-Z]")"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\ntrue\ntrue\nfalse\n");
+    }
+
+    #[test]
     fn lambda_closure_captures_env() {
         let out = run_str(
             r#"
@@ -3947,6 +6289,36 @@ mod tests {
     }
 
     #[test]
+    fn optional_field_on_void_returns_void_for_coalesce() {
+        let out = run_str(
+            r#"let user = void
+@out user?.name ?? "guest""#,
+        )
+        .unwrap();
+        assert_eq!(out, "guest\n");
+    }
+
+    #[test]
+    fn optional_field_on_object_returns_field_value() {
+        let out = run_str(
+            r#"let user = { name: "Ada" }
+@out user?.name ?? "guest""#,
+        )
+        .unwrap();
+        assert_eq!(out, "Ada\n");
+    }
+
+    #[test]
+    fn optional_method_call_on_void_returns_void() {
+        let out = run_str(
+            r#"let input = void
+@out input?.focus() ?? "none""#,
+        )
+        .unwrap();
+        assert_eq!(out, "none\n");
+    }
+
+    #[test]
     fn for_iterates_and_sums_array_via_index() {
         let out = run_str(
             r#"
@@ -4076,6 +6448,98 @@ mod tests {
         assert_eq!(out, "<html><p>hello world</p></html>\n");
     }
 
+    #[test]
+    fn html_renders_attributes_boolean_props_and_event_markers() {
+        let out = run_str(
+            r#"@out @html {
+  @a href="/home" class="nav-link" "Home"
+  @input type=email required disabled=false
+  @button onClick={() -> @out "clicked"} "Click"
+}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "<html><a href=\"/home\" class=\"nav-link\">Home</a><input type=\"email\" required></input><button onClick=\"handler\">Click</button></html>\n"
+        );
+    }
+
+    #[test]
+    fn html_renders_block_attributes_before_children() {
+        let out = run_str(
+            r#"@out @html {
+  @nav {
+    class="main-nav"
+    @a href="/" "Home"
+  }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "<html><nav class=\"main-nav\"><a href=\"/\">Home</a></nav></html>\n"
+        );
+    }
+
+    #[test]
+    fn design_domain_preserves_token_sections_for_runtime_lookup() {
+        let out = run_str(
+            r##"@design {
+  @colors { primary: "#0057ff" }
+  @spacing { md: "12px" }
+}
+@out @design.colors.primary
+@out @design.spacing.md"##,
+        )
+        .unwrap();
+        assert_eq!(out, "#0057ff\n12px\n");
+    }
+
+    #[test]
+    fn audit_log_returns_structured_event_handle() {
+        let out = run_str(
+            r#"let event = audit.log("payment.charged", { amount: 42 })
+@out event.name
+@out event.fields.amount"#,
+        )
+        .unwrap();
+        assert_eq!(out, "payment.charged\n42\n");
+    }
+
+    #[test]
+    fn audit_log_accepts_spec_parenless_form() {
+        let out = run_str(
+            r#"let event = audit.log "payment.charged" { amount: 42 }
+@out event.name
+@out event.fields.amount"#,
+        )
+        .unwrap();
+        assert_eq!(out, "payment.charged\n42\n");
+    }
+
+    #[test]
+    fn navigate_builtin_returns_navigation_record() {
+        let out = run_str(
+            r#"let nav = navigate("/dashboard")
+@out nav.path
+@out nav.status"#,
+        )
+        .unwrap();
+        assert_eq!(out, "/dashboard\nnavigated\n");
+    }
+
+    #[test]
+    fn fetch_domain_accepts_method_token_and_url() {
+        let out = run_str(
+            r#"let res = @fetch GET "https://api.example.test/data"
+@out res.status
+@out res.method
+@out res.url"#,
+        )
+        .unwrap();
+        assert_eq!(out, "200\nGET\nhttps://api.example.test/data\n");
+    }
+
     // ── request-state 도메인 (@param/@query/@header/@body/@request) ──
 
     fn eval_handler_src(src: &str, ctx: RequestCtx) -> Result<String, RuntimeError> {
@@ -4163,6 +6627,23 @@ mod tests {
     }
 
     #[test]
+    fn request_meta_includes_client_ip() {
+        let ctx = RequestCtx {
+            ip: "127.0.0.1".into(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @request.ip"#, ctx).unwrap();
+        assert_eq!(out, "127.0.0.1\n");
+    }
+
+    #[test]
+    fn response_domain_exposes_current_status() {
+        let ctx = RequestCtx::default();
+        let out = eval_handler_src(r#"@out @response.status"#, ctx).unwrap();
+        assert_eq!(out, "200\n");
+    }
+
+    #[test]
     fn request_missing_param_is_void() {
         // 없는 키 조회 → Value::Void. `??` 로 대체값 사용 가능.
         let ctx = RequestCtx::default();
@@ -4247,6 +6728,24 @@ mod tests {
         assert_eq!(stdout, "", "handler must stop at @respond");
         let resp = resp.expect("response recorded");
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn serve_html_value_records_raw_html_response() {
+        let (_, resp) = run_handler(
+            r#"{
+                @serve @html { @body { @h1 "Home" } }
+            }"#,
+            RequestCtx::default(),
+        );
+        let resp = resp.expect("response recorded");
+        assert_eq!(resp.status, 200);
+        let raw = resp.raw_body.expect("html raw body");
+        assert_eq!(raw.content_type, "text/html; charset=utf-8");
+        assert_eq!(
+            String::from_utf8(raw.bytes).unwrap(),
+            "<html><body><h1>Home</h1></body></html>"
+        );
     }
 
     #[test]
@@ -4981,6 +7480,645 @@ let n: Num = "42" as Num
         )
         .unwrap();
         assert_eq!(out, "43\n");
+    }
+
+    #[test]
+    fn cast_to_pattern_alias_rejects_bad_runtime_string() {
+        let err = run_str(
+            r#"type Email = "{string}@{string}.{string}"
+let email: Email = "not-an-email" as Email
+@out email"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("pattern"));
+    }
+
+    #[test]
+    fn cast_to_union_alias_tries_member_conversions() {
+        let out = run_str(
+            r#"type Id = int | string
+let id: Id = "42" as Id
+@out id + 1"#,
+        )
+        .unwrap();
+        assert_eq!(out, "43\n");
+    }
+
+    #[test]
+    fn db_upsert_updates_existing_row() {
+        let out = run_str(
+            r#"let first = @db.upsert User { @where email="a@orv.dev"; %data={ name: "Alice" } }
+let second = @db.upsert User { @where email="a@orv.dev"; %data={ name: "Alicia" } }
+let user = @db.find User { @where email="a@orv.dev" }
+@out user.name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "Alicia\n");
+    }
+
+    #[test]
+    fn db_search_returns_matching_rows() {
+        let out = run_str(
+            r#"let a = @db.create Product %data={ name: "Coffee", category: "drink" }
+let b = @db.create Product %data={ name: "Tea", category: "drink" }
+let c = @db.create Product %data={ name: "Cake", category: "food" }
+let hits = @db.search Product { @where category="drink" }
+@out hits.length"#,
+        )
+        .unwrap();
+        assert_eq!(out, "2\n");
+    }
+
+    #[test]
+    fn db_find_query_orders_skips_and_limits_comparison_matches() {
+        let out = run_str(
+            r#"let a = @db.create User %data={ name: "Ann", age: 20 }
+let b = @db.create User %data={ name: "Bea", age: 30 }
+let c = @db.create User %data={ name: "Cam", age: 40 }
+let hits = @db.find User {
+  @where age > 18
+  @order age=desc
+  @skip 1
+  @limit 1
+}
+@out hits.length
+@out hits[0].name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1\nBea\n");
+    }
+
+    #[test]
+    fn db_update_applies_increment_modifier() {
+        let out = run_str(
+            r#"let post = @db.create Post %data={ title: "Orv", likes: 1 }
+let _ = @db.update Post {
+  @where id=post.id
+  %inc={ likes: 2 }
+}
+let updated = @db.find Post { @where id=post.id }
+@out updated.likes"#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn db_find_projects_requested_fields() {
+        let out = run_str(
+            r#"let user = @db.create User %data={ name: "Ann", age: 20, email: "ann@orv.dev" }
+let hits = @db.find User {
+  @where age >= 18
+  @field name
+}
+@out hits[0].name
+@out hits[0]"#,
+        )
+        .unwrap();
+        assert_eq!(out, "Ann\n{ name: Ann }\n");
+    }
+
+    #[test]
+    fn db_count_and_sum_respect_query_filters() {
+        let out = run_str(
+            r#"let a = @db.create Post %data={ authorId: 1, likes: 2 }
+let b = @db.create Post %data={ authorId: 1, likes: 3 }
+let c = @db.create Post %data={ authorId: 2, likes: 10 }
+@out @db.count Post { @where authorId=1 }
+@out @db.sum Post { @where authorId=1; @field likes }"#,
+        )
+        .unwrap();
+        assert_eq!(out, "2\n5\n");
+    }
+
+    #[test]
+    fn db_search_accepts_rank_directive_as_stable_noop() {
+        let out = run_str(
+            r#"let a = @db.create Post %data={ title: "Orv language", body: "runtime" }
+let b = @db.create Post %data={ title: "Other", body: "misc" }
+let hits = @db.search Post {
+  @match title="Orv"
+  @rank bm25
+}
+@out hits.length
+@out hits[0].title"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1\nOrv language\n");
+    }
+
+    #[test]
+    fn db_search_near_orders_by_vector_distance_and_uses_k() {
+        let out = run_str(
+            r#"let far = @db.create Doc %data={ title: "far", embedding: [10, 10] }
+let near = @db.create Doc %data={ title: "near", embedding: [2, 1] }
+let mid = @db.create Doc %data={ title: "mid", embedding: [4, 4] }
+let query = [2, 2]
+let hits = @db.search Doc {
+  @near embedding=query k=2
+}
+@out hits.length
+@out hits[0].title
+@out hits[1].title"#,
+        )
+        .unwrap();
+        assert_eq!(out, "2\nnear\nmid\n");
+    }
+
+    #[test]
+    fn db_transaction_evaluates_body_and_returns_last_value() {
+        let out = run_str(
+            r#"let created = @db.transaction {
+  @db.create User %data={ name: "Tx" }
+}
+@out created.name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "Tx\n");
+    }
+
+    #[test]
+    fn db_transaction_accepts_hint_and_block_body() {
+        let out = run_str(
+            r#"let value = @db.transaction @hint isolation=serializable {
+  let x = 41
+  x + 1
+}
+@out value"#,
+        )
+        .unwrap();
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn db_schema_and_index_declarations_are_stable_noops() {
+        let out = run_str(
+            r#"@db.schema Post {
+  @shard key=authorId count=16
+  @replica count=2 strategy=async
+  @partition by=createdAt interval=1mo
+}
+@index fulltext Post fields=[title, content] lang=multi
+@out "ok""#,
+        )
+        .unwrap();
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn db_connect_returns_handle_and_analyze_is_noop() {
+        let out = run_str(
+            r#"let external = @db.connect "memory://local"
+@db.analyze()
+let created = external.create("User", { name: "Ada" })
+let found = external.find("User", { name: "Ada" })
+@out found.name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "Ada\n");
+    }
+
+    #[test]
+    fn db_transaction_rolls_back_on_error() {
+        let out = run_str(
+            r#"let account = @db.create Account %data={ balance: 10 }
+try {
+  @db.transaction {
+    @db.update Account { @where id=account.id; %data={ balance: 0 } }
+    throw "boom"
+  }
+} catch err {
+  @out "caught"
+}
+let found = @db.find Account { @where id=account.id }
+@out found.balance"#,
+        )
+        .unwrap();
+        assert_eq!(out, "caught\n10\n");
+    }
+
+    #[test]
+    fn cast_string_constraints_transform_and_validate() {
+        let out = run_str(
+            r#"let name = "  ALICE  " as string(trim, lower, min=3, max=10)
+@out name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "alice\n");
+    }
+
+    #[test]
+    fn cast_inline_object_constraints_transform_fields() {
+        let out = run_str(
+            r#"let form = { email: " USER@ORV.DEV " } as { email: string(trim, lower) }
+@out form.email"#,
+        )
+        .unwrap();
+        assert_eq!(out, "user@orv.dev\n");
+    }
+
+    #[test]
+    fn cast_array_unique_constraint_rejects_duplicates() {
+        let err = run_str(r#"let tags = ["a", "a"] as string[](unique)"#).unwrap_err();
+        assert!(err.message.contains("unique"));
+    }
+
+    #[test]
+    fn cast_alias_where_modulo_rejects_invalid_value() {
+        let err = run_str(
+            r"type EvenInt = int where $ % 2 == 0
+let n = 3 as EvenInt
+@out n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("where") || err.message.contains("%"));
+    }
+
+    #[test]
+    fn cast_alias_where_modulo_accepts_valid_value() {
+        let out = run_str(
+            r"type EvenInt = int where $ % 2 == 0
+let n = 4 as EvenInt
+@out n",
+        )
+        .unwrap();
+        assert_eq!(out, "4\n");
+    }
+
+    #[test]
+    fn cast_alias_where_contains_regex_validates_value() {
+        let out = run_str(
+            r#"type StrongPassword = string(min=8) where
+  $.contains(r"[A-Z]") &&
+  $.contains(r"[0-9]") &&
+  $.contains(r"[^a-zA-Z0-9]")
+let password = "Password1!" as StrongPassword
+@out password"#,
+        )
+        .unwrap();
+        assert_eq!(out, "Password1!\n");
+
+        let err = run_str(
+            r#"type StrongPassword = string(min=8) where
+  $.contains(r"[A-Z]") &&
+  $.contains(r"[0-9]") &&
+  $.contains(r"[^a-zA-Z0-9]")
+let password = "password1!" as StrongPassword
+@out password"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("contains"));
+    }
+
+    #[test]
+    fn struct_safe_parse_validates_and_transforms_fields() {
+        let out = run_str(
+            r#"struct SignupForm {
+  email: string(trim, lower)
+  age: int where $ >= 13
+}
+let good = SignupForm.safeParse({ email: " USER@ORV.DEV ", age: 15 })
+@out good.ok
+@out good.value.email
+let bad = SignupForm.safeParse({ email: "ok@orv.dev", age: 12 })
+@out bad.ok
+@out bad.error.length"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\nuser@orv.dev\nfalse\n1\n");
+    }
+
+    #[test]
+    fn type_validation_parse_errors_and_is_methods_run() {
+        let out = run_str(
+            r#"struct User {
+  name: string(min=2)
+  age: int
+}
+@out User.is({ name: "Al", age: 1 })
+@out User.errors({ name: "A", age: 1 }).length
+try {
+  let user = User.parse({ name: "A", age: 1 })
+  @out user.name
+} catch err {
+  @out err.length
+}"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\n1\n1\n");
+    }
+
+    #[test]
+    fn type_alias_safe_parse_uses_alias_constraints() {
+        let out = run_str(
+            r#"type StrongPassword = string(min=8) where
+  $.contains(r"[A-Z]") &&
+  $.contains(r"[0-9]") &&
+  $.contains(r"[^a-zA-Z0-9]")
+@out StrongPassword.safeParse("Password1!").ok
+@out StrongPassword.safeParse("password1!").error.length"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\n1\n");
+    }
+
+    #[test]
+    fn storage_chunk_merge_and_signed_url_flow_runs() {
+        let out = run_str(
+            r#"let _ = @storage.putChunk("upload-1", 0, "hello")
+let file = @storage.merge("upload-1", target="files/upload-1.txt")
+@out file.path
+@out @storage.signedUrl(file.path)"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "files/upload-1.txt\n/orv-storage/files/upload-1.txt?signed=1\n"
+        );
+    }
+
+    #[test]
+    fn job_enqueue_returns_queued_record() {
+        let out = run_str(
+            r#"let queued = @job.transcode.enqueue({ videoId: "v1" })
+@out queued.name
+@out queued.status
+@out queued.payload.videoId"#,
+        )
+        .unwrap();
+        assert_eq!(out, "transcode\nqueued\nv1\n");
+    }
+
+    #[test]
+    fn job_enqueue_records_status_in_builtin_job_table() {
+        let out = run_str(
+            r#"let queued = @job.transcode.enqueue({ videoId: "v1" })
+let stored = @db.find Job { @where name="transcode" }
+@out stored.status
+@out stored.payload.videoId"#,
+        )
+        .unwrap();
+        assert_eq!(out, "queued\nv1\n");
+    }
+
+    #[test]
+    fn job_declaration_runs_registered_handler_on_enqueue() {
+        let out = run_str(
+            r#"let meta = @db.create VideoMeta %data={ status: "pending" }
+@job transcode (payload: { videoId: int }) -> {
+  @db.update VideoMeta { @where id=payload.videoId; %data={ status: "ready" } }
+  "done"
+}
+let queued = @job.transcode.enqueue({ videoId: meta.id })
+let updated = @db.find VideoMeta { @where id=meta.id }
+@out updated.status
+@out queued.result"#,
+        )
+        .unwrap();
+        assert_eq!(out, "ready\ndone\n");
+    }
+
+    #[test]
+    fn job_retries_handler_until_success() {
+        let out = run_str(
+            r#"let state = @db.create RetryState %data={ tries: 0 }
+@job flaky retries=2 (id: int) -> {
+  let current = @db.find RetryState { @where id=id }
+  @db.update RetryState { @where id=id; %data={ tries: current.tries + 1 } }
+  let updated = @db.find RetryState { @where id=id }
+  if updated.tries < 3 {
+    throw "again"
+  }
+  "ok"
+}
+let handle = @job.flaky.enqueue(state.id)
+let final = @db.find RetryState { @where id=state.id }
+@out final.tries
+@out handle.status
+@out handle.result"#,
+        )
+        .unwrap();
+        assert_eq!(out, "3\ncompleted\nok\n");
+    }
+
+    #[test]
+    fn cron_declaration_records_schedule_in_builtin_cron_table() {
+        let out = run_str(
+            r#"@cron "0 9 * * *" {
+  @out "tick"
+}
+let cron = @db.find Cron { @where schedule="0 9 * * *" }
+@out cron.status"#,
+        )
+        .unwrap();
+        assert_eq!(out, "registered\n");
+    }
+
+    #[test]
+    fn cron_run_due_executes_registered_handlers() {
+        let out = run_str(
+            r#"@cron "* * * * *" {
+  @db.create Tick %data={ label: "ran" }
+}
+@out @db.count Tick
+@out @cron.runDue()
+@out @db.count Tick
+@out @cron.runDue()
+@out @db.count Tick"#,
+        )
+        .unwrap();
+        assert_eq!(out, "0\n1\n1\n1\n2\n");
+    }
+
+    #[test]
+    fn cron_run_due_records_failed_handler() {
+        let out = run_str(
+            r#"@cron "* * * * *" {
+  throw "cron failed"
+}
+try {
+  @cron.runDue()
+} catch err {
+  @out err
+}
+let run = @db.find CronRun { @where ok=false }
+@out run.error"#,
+        )
+        .unwrap();
+        assert_eq!(out, "cron failed\ncron failed\n");
+    }
+
+    #[test]
+    fn sync_open_and_connect_return_document_handles() {
+        let out = run_str(
+            r#"let opened = @sync.open("Doc", "42")
+let connected = @sync.connect("Doc", "/doc/42")
+@out opened.id
+@out connected.path"#,
+        )
+        .unwrap();
+        assert_eq!(out, "42\n/doc/42\n");
+    }
+
+    #[test]
+    fn mail_verify_and_media_stubs_return_useful_values() {
+        let out = run_str(
+            r"let ok = @mail.verify.dkim(@message)
+let camera = @media.camera({ audio: true, video: false })
+@out ok
+@out camera.kind
+@out @upload.id",
+        )
+        .unwrap();
+        assert_eq!(out, "true\ncamera\nupload-1\n");
+    }
+
+    #[test]
+    fn realtime_event_domains_are_stable_noops() {
+        let out = run_str(
+            r#"let ws = @ws /chat {
+  @connect { @emit welcome to=@socket.id { msg: "hi" } }
+  @on message { @emit message @packet }
+  @disconnect { @emit left @socket.id }
+}
+@socket.join("room-1")
+@emit notice in="room-1" { ok: true }
+@out ws.protocol
+@out ws.path
+@out @socket.id
+@out @packet.text"#,
+        )
+        .unwrap();
+        assert_eq!(out, "ws\n/chat\nsocket-1\n\n");
+    }
+
+    #[test]
+    fn push_and_offline_reference_stubs_return_useful_values() {
+        let out = run_str(
+            r#"let granted = @push.request()
+let sub = @push.subscribe(vapid="public-key")
+let sent = @push.send({ to: sub.endpoint, title: "Hi" })
+let store = @offline.store("posts")
+@out granted
+@out sub.endpoint
+@out sent.status
+@out store.name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "true\npush://subscription\nsent\nposts\n");
+    }
+
+    #[test]
+    fn cache_and_offline_store_methods_preserve_value_flow() {
+        let out = run_str(
+            r#"let cache = @cache.open("assets-v1")
+let saved = cache.put("/app.js", "code")
+let loaded = cache.get("/app.js")
+let store = @offline.store("assets")
+let local = store.put("logo", "blob")
+@out cache.name
+@out saved.status
+@out loaded.value
+@out local.key"#,
+        )
+        .unwrap();
+        assert_eq!(out, "assets-v1\nstored\ncode\nlogo\n");
+    }
+
+    #[test]
+    fn unsafe_block_evaluates_body_as_reference_runtime_boundary() {
+        let out = run_str(
+            r#"let value = @unsafe {
+  @out "inside"
+  "result"
+}
+@out value"#,
+        )
+        .unwrap();
+        assert_eq!(out, "inside\nresult\n");
+    }
+
+    #[test]
+    fn net_plugin_gpu_and_observability_reference_stubs_return_handles() {
+        let out = run_str(
+            r#"let tun = @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
+let written = @net.tun.write(tun, "packet")
+let plugin = @plugin.load("ext/markdown-preview.wasm")
+let activation = plugin.activate()
+let compute = @gpu.compute(file="shaders/blur.wgsl", workgroup=[16, 16, 1])
+let ctx = @gpu.context("canvas")
+let obs = @observability.configure({ service: "superapp" })
+@out tun.name
+@out written.bytes
+@out plugin.path
+@out activation.status
+@out compute.kind
+@out ctx.kind
+@out obs.service"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "orv0\n6\next/markdown-preview.wasm\nactivated\ncompute\ngpu.context\nsuperapp\n"
+        );
+    }
+
+    #[test]
+    fn reference_namespace_methods_accept_spec_parenless_form() {
+        let out = run_str(
+            r#"let plugin = @plugin.load "ext/markdown-preview.wasm"
+let compute = @gpu.compute file="shaders/blur.wgsl" workgroup=[16, 16, 1]
+let sent = @push.send { to: "u1", title: "Hi" }
+@out plugin.path
+@out compute.file
+@out sent.status"#,
+        )
+        .unwrap();
+        assert_eq!(out, "ext/markdown-preview.wasm\nshaders/blur.wgsl\nsent\n");
+    }
+
+    #[test]
+    fn plugin_discover_returns_candidate_list() {
+        let out = run_str(
+            r#"let plugins = @plugin.discover("./.orv/extensions")
+@out plugins.length
+@out plugins[0].path"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1\n./.orv/extensions/plugin.wasm\n");
+    }
+
+    #[test]
+    fn gpu_render_block_returns_handle_without_executing_commands() {
+        let out = run_str(
+            r##"let scene = @gpu.render {
+  @clear color="#000"
+  @draw mesh="cube"
+}
+@out scene.kind
+@out scene.commands"##,
+        )
+        .unwrap();
+        assert_eq!(out, "render\n2\n");
+    }
+
+    #[test]
+    fn declaration_style_reference_domains_are_stable_handles() {
+        let out = run_str(
+            r#"let obs = @observability {
+  service: "superapp"
+}
+let offline = @offline {
+  @cache "assets-v1" strategy=cache-first {}
+}
+let ffi = @ffi "C" {
+}
+@out obs.service
+@out offline.kind
+@out ffi.abi"#,
+        )
+        .unwrap();
+        assert_eq!(out, "superapp\noffline\nC\n");
     }
 
     // ── SPEC §6.4 tuple destructuring for in ──

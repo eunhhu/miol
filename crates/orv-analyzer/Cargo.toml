@@ -13,6 +13,7 @@ orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
 orv-resolve = { workspace = true }
 orv-syntax = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
