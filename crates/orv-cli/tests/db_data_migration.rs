@@ -139,3 +139,99 @@ fn db_migrate_applies_data_snapshot_and_rollback() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_backup_and_restore_round_trips_data_snapshot() {
+    let dir = temp_dir("db-backup-restore");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let data = dir.join("data.json");
+    let backup = dir.join("backup.json");
+    std::fs::write(
+        &data,
+        r#"{
+  "schema_version": 1,
+  "tables": {
+    "User": {
+      "next_id": 2,
+      "rows": [
+        {
+          "id": 1,
+          "email": "a@example.com"
+        }
+      ]
+    }
+  }
+}"#,
+    )
+    .expect("write data");
+
+    let backup_output = orv()
+        .args(["db", "backup"])
+        .arg("--data")
+        .arg(&data)
+        .arg("--out")
+        .arg(&backup)
+        .output()
+        .expect("run db backup");
+    assert!(
+        backup_output.status.success(),
+        "backup failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&backup_output.stdout),
+        String::from_utf8_lossy(&backup_output.stderr)
+    );
+
+    let backup_json = read_json(&backup);
+    assert_eq!(backup_json["schema_version"], 1);
+    assert_eq!(
+        backup_json["data"]["tables"]["User"]["rows"][0]["email"],
+        "a@example.com"
+    );
+    assert!(backup_json["data_hash"].as_str().expect("data hash").len() >= 16);
+
+    std::fs::write(
+        &data,
+        r#"{
+  "schema_version": 1,
+  "tables": {
+    "User": {
+      "next_id": 3,
+      "rows": [
+        {
+          "id": 2,
+          "email": "changed@example.com"
+        }
+      ]
+    }
+  }
+}"#,
+    )
+    .expect("overwrite data");
+
+    let restore_output = orv()
+        .args(["db", "restore"])
+        .arg("--backup")
+        .arg(&backup)
+        .arg("--data")
+        .arg(&data)
+        .output()
+        .expect("run db restore");
+    assert!(
+        restore_output.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore_output.stdout),
+        String::from_utf8_lossy(&restore_output.stderr)
+    );
+
+    let restored = read_json(&data);
+    assert_eq!(
+        restored["tables"]["User"]["rows"][0]["email"],
+        "a@example.com"
+    );
+    let rollback = read_json(&dir.join("data.json.rollback"));
+    assert_eq!(
+        rollback["tables"]["User"]["rows"][0]["email"],
+        "changed@example.com"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

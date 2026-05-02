@@ -192,6 +192,24 @@ enum DbCommand {
         #[arg(long)]
         data: Option<PathBuf>,
     },
+    /// @db.save JSON data snapshot을 local backup artifact로 저장한다.
+    Backup {
+        /// 백업할 @db.save JSON data snapshot 경로.
+        #[arg(long)]
+        data: PathBuf,
+        /// 쓸 backup artifact JSON 경로.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// local backup artifact에서 @db.save JSON data snapshot을 복원한다.
+    Restore {
+        /// 읽을 backup artifact JSON 경로.
+        #[arg(long)]
+        backup: PathBuf,
+        /// 복원할 @db.save JSON data snapshot 경로.
+        #[arg(long)]
+        data: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -377,6 +395,20 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            DbCommand::Backup { data, out } => match cmd_db_backup(&data, &out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Restore { backup, data } => match cmd_db_restore(&backup, &data) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -761,15 +793,57 @@ fn backup_json_for_rollback(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_db_backup(data: &Path, out: &Path) -> anyhow::Result<()> {
+    let snapshot = read_json_value(data)?;
+    validate_db_data_snapshot(&snapshot)?;
+    let backup = serde_json::json!({
+        "schema_version": 1,
+        "source": data.display().to_string(),
+        "data_hash": stable_json_hash(&snapshot)?,
+        "data": snapshot,
+    });
+    write_json_atomic(out, &backup)?;
+    println!("db backup: {} written", out.display());
+    Ok(())
+}
+
+fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
+    let backup = read_json_value(backup)?;
+    let version = backup
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("db backup schema_version must be an integer"))?;
+    if version != 1 {
+        anyhow::bail!("unsupported db backup schema_version {version}");
+    }
+    let snapshot = backup
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("db backup data snapshot is missing"))?;
+    validate_db_data_snapshot(snapshot)?;
+    backup_json_for_rollback(data)?;
+    write_json_atomic(data, snapshot)?;
+    println!("db data: {} restored", data.display());
+    Ok(())
+}
+
+fn validate_db_data_snapshot(snapshot: &serde_json::Value) -> anyhow::Result<()> {
+    snapshot
+        .get("tables")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("db data snapshot tables must be an object"))?;
+    Ok(())
+}
+
 fn migrated_db_data_snapshot(
     data: &Path,
     actions: &[serde_json::Value],
 ) -> anyhow::Result<serde_json::Value> {
     let mut snapshot = read_json_value(data)?;
+    validate_db_data_snapshot(&snapshot)?;
     let tables = snapshot
         .get_mut("tables")
         .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("db data snapshot tables must be an object"))?;
+        .expect("validated db data tables");
     for action in actions {
         let Some(kind) = action.get("kind").and_then(serde_json::Value::as_str) else {
             continue;
