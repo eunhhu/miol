@@ -1621,6 +1621,7 @@ impl DapSession {
                     "supportsSetVariable": true,
                     "supportsSetExpression": true,
                     "supportsModulesRequest": true,
+                    "supportsGotoTargetsRequest": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -1641,6 +1642,7 @@ impl DapSession {
             "setExceptionBreakpoints" => Ok(dap_set_exception_breakpoints_result(request)),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
+            "gotoTargets" => self.goto_targets_result(request),
             "threads" => Ok(serde_json::json!({
                 "threads": [
                     {
@@ -1661,6 +1663,7 @@ impl DapSession {
             "modules" => self.modules_result(request),
             "source" => self.source_result(request),
             "continue" => self.continue_result(),
+            "goto" => self.goto_result(request),
             "next" | "stepIn" | "stepOut" => self.step_result(),
             "pause" => self.pause_result(),
             "disconnect" | "terminate" => {
@@ -1950,6 +1953,44 @@ impl DapSession {
         }))
     }
 
+    fn goto_targets_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before gotoTargets"))?;
+        let path = dap_breakpoint_source_path(Some(launched), request)?;
+        let normalized = dap_normalize_path(&path);
+        let source = launched
+            .sources
+            .iter()
+            .find(|source| dap_normalize_path(&source.path) == normalized)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source `{}` is not part of the launched project",
+                    path.display()
+                )
+            })?;
+        let line = request
+            .pointer("/arguments/line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let end_line = request
+            .pointer("/arguments/endLine")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(line);
+        let verified_lines = dap_verified_breakpoint_lines(&path).unwrap_or_default();
+        Ok(serde_json::json!({
+            "targets": verified_lines
+                .into_iter()
+                .filter(|target_line| *target_line >= line && *target_line <= end_line)
+                .map(|target_line| dap_goto_target_json(source, target_line))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     fn stack_trace_result(&self) -> anyhow::Result<serde_json::Value> {
         let launched = self
             .launched
@@ -2194,6 +2235,40 @@ impl DapSession {
         Ok(serde_json::json!({
             "allThreadsContinued": false,
         }))
+    }
+
+    fn goto_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let target_id = request
+            .pointer("/arguments/targetId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("goto.arguments.targetId is required"))?;
+        let target_frame = {
+            let launched = self
+                .launched
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before goto"))?;
+            launched
+                .frames
+                .iter()
+                .enumerate()
+                .find_map(|(index, frame)| {
+                    (dap_goto_target_id(frame.source.reference, frame.line) == target_id)
+                        .then_some(index)
+                })
+        };
+        let Some(target_frame) = target_frame else {
+            anyhow::bail!("unknown goto targetId {target_id}");
+        };
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before goto"))?;
+        let line = launched.frames[target_frame].line;
+        launched.current_frame_index = target_frame;
+        launched.stopped_line = line;
+        launched.stopped_reason = "goto".to_string();
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
     }
 
     fn step_result(&mut self) -> anyhow::Result<serde_json::Value> {
@@ -3087,6 +3162,21 @@ fn dap_module_json(source: &DapSourceInfo) -> serde_json::Value {
         "isUserCode": true,
         "symbolStatus": "loaded",
     })
+}
+
+fn dap_goto_target_json(source: &DapSourceInfo, line: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": dap_goto_target_id(source.reference, line),
+        "label": format!("{}:{line}", source.name),
+        "line": line,
+        "column": 1,
+    })
+}
+
+const fn dap_goto_target_id(source_reference: u64, line: u64) -> u64 {
+    source_reference
+        .saturating_mul(1_000_000)
+        .saturating_add(line)
 }
 
 fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
@@ -5949,6 +6039,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsSetVariable"], true);
         assert_eq!(response["body"]["supportsSetExpression"], true);
         assert_eq!(response["body"]["supportsModulesRequest"], true);
+        assert_eq!(response["body"]["supportsGotoTargetsRequest"], true);
     }
 
     #[test]
@@ -6814,6 +6905,87 @@ function greet(user: User): string -> "hello"
         assert!(breakpoints
             .iter()
             .any(|breakpoint| breakpoint["line"] == 3 && breakpoint["column"] == 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_goto_targets_and_goto_move_to_executable_frame() {
+        let dir = temp_output_dir("dap-goto");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n\nlet third: int = 3\n")
+            .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 177,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let targets = session
+            .message_response(&serde_json::json!({
+                "seq": 178,
+                "type": "request",
+                "command": "gotoTargets",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "line": 1,
+                    "endLine": 3,
+                },
+            }))
+            .expect("gotoTargets response");
+        assert_eq!(targets["success"], true, "{targets}");
+        let target_id = targets["body"]["targets"]
+            .as_array()
+            .expect("targets")
+            .iter()
+            .find(|target| target["line"] == 3)
+            .and_then(|target| target["id"].as_u64())
+            .expect("line 3 target");
+        let goto = session
+            .message_response(&serde_json::json!({
+                "seq": 179,
+                "type": "request",
+                "command": "goto",
+                "arguments": {
+                    "threadId": 1,
+                    "targetId": target_id,
+                },
+            }))
+            .expect("goto response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 180,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        let target_lines = targets["body"]["targets"]
+            .as_array()
+            .expect("targets")
+            .iter()
+            .map(|target| target["line"].as_u64().expect("line"))
+            .collect::<Vec<_>>();
+        assert_eq!(target_lines, vec![1, 3]);
+        assert_eq!(goto["success"], true, "{goto}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "goto"
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
