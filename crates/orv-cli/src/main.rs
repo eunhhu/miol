@@ -2240,7 +2240,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("<title>orv editor</title>\n");
     html.push_str("<style>\n");
     html.push_str(":root{color-scheme:light;--bg:#f7f8fb;--ink:#18202f;--muted:#687386;--line:#d7dce5;--panel:#ffffff;--accent:#0f766e;--warn:#b45309;}\n");
-    html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
+    html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}.list{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}.list li{border-top:1px solid var(--line);padding-top:6px;color:var(--muted);word-break:break-word}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<main id=\"orv-editor\">\n");
     html.push_str(
@@ -2261,11 +2261,15 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("</header>\n<section class=\"workspace\">\n");
     write!(
         &mut html,
-        "<section class=\"panel\"><h2>Routes</h2><div class=\"metric\">{route_count}</div><p class=\"muted\">Graph-backed route panel entries.</p></section>"
+        "<section class=\"panel\"><h2>Routes</h2><div class=\"metric\">{route_count}</div><p class=\"muted\">Graph-backed route panel entries.</p><ul id=\"routes-list\" class=\"list\"></ul></section>"
     )?;
     write!(
         &mut html,
-        "<section class=\"panel\"><h2>Schema</h2><div class=\"metric\">{schema_count}</div><p class=\"muted\">Struct, enum, and type alias nodes.</p></section>"
+        "<section class=\"panel\"><h2>Schema</h2><div class=\"metric\">{schema_count}</div><p class=\"muted\">Struct, enum, and type alias nodes.</p><ul id=\"schema-list\" class=\"list\"></ul></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Domains</h2><div class=\"metric\">{domain_count}</div><p class=\"muted\">Project domain and define nodes.</p><ul id=\"domains-list\" class=\"list\"></ul></section>"
     )?;
     write!(
         &mut html,
@@ -2273,7 +2277,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     )?;
     write!(
         &mut html,
-        "<section class=\"panel\"><h2>Trace</h2><div class=\"metric\">{trace_count}</div><p class=\"muted\">Captured request frames linked to source and production origins.</p></section>"
+        "<section class=\"panel\"><h2>Trace</h2><div class=\"metric\">{trace_count}</div><p class=\"muted\">Captured request frames linked to source and production origins.</p><ul id=\"trace-list\" class=\"list\"></ul></section>"
     )?;
     html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
     write!(
@@ -2286,7 +2290,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("</main>\n");
     html.push_str("<script id=\"orv-editor-state\" type=\"application/json\">");
     html.push_str(&state_json);
-    html.push_str("</script>\n</body>\n</html>\n");
+    html.push_str("</script>\n");
+    html.push_str(
+        "<script>\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  put('trace-list', state.trace?.frames, frame => {\n    const request = frame.request || {};\n    const status = request.status == null ? '' : ` -> ${request.status}`;\n    return `${request.method || ''} ${request.path || ''}${status}`.trim() || frame.origin_id || 'request';\n  });\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
+    );
     Ok(html)
 }
 
@@ -18220,6 +18227,8 @@ define Auth() -> { @out "auth" }
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
         assert!(html.contains("id=\"orv-editor\""));
+        assert!(html.contains("id=\"routes-list\""));
+        assert!(html.contains("renderEditorState"));
         assert!(html.contains("Routes"));
         assert!(html.contains("Runtime"));
         assert_eq!(state["schema_version"], 1);
@@ -18282,6 +18291,8 @@ define Auth() -> { @out "auth" }
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
         assert!(html.contains("Trace"));
+        assert!(html.contains("id=\"trace-list\""));
+        assert!(html.contains("renderEditorState"));
         assert_eq!(state["trace"]["kind"], "orv.editor.trace");
         assert_eq!(state["trace"]["frames"][0]["origin_id"], route.id);
         assert_eq!(
