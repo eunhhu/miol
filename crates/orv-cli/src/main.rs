@@ -2616,27 +2616,27 @@ impl DapSession {
                     },
                 ],
             })),
-            "stackTrace" => self.stack_trace_result(),
+            "stackTrace" => self.stack_trace_result(request),
             "scopes" => self.scopes_result(),
             "variables" => self.variables_result(request),
             "setVariable" => self.set_variable_result(request),
             "evaluate" => self.evaluate_result(request),
             "setExpression" => self.set_expression_result(request),
             "completions" => self.completions_result(request),
-            "exceptionInfo" => self.exception_info_result(),
+            "exceptionInfo" => self.exception_info_result(request),
             "loadedSources" => self.loaded_sources_result(),
             "modules" => self.modules_result(request),
             "source" => self.source_result(request),
-            "continue" => self.continue_result(),
-            "reverseContinue" => self.reverse_continue_result(),
+            "continue" => self.continue_result(request),
+            "reverseContinue" => self.reverse_continue_result(request),
             "goto" => self.goto_result(request),
-            "stepBack" => self.step_back_result(),
+            "stepBack" => self.step_back_result(request),
             "restartFrame" => self.restart_frame_result(request),
-            "next" => self.next_result(),
+            "next" => self.next_result(request),
             "stepInTargets" => self.step_in_targets_result(request),
             "stepIn" => self.step_in_result(request),
-            "stepOut" => self.step_out_result(),
-            "pause" => self.pause_result(),
+            "stepOut" => self.step_out_result(request),
+            "pause" => self.pause_result(request),
             "terminateThreads" => self.terminate_threads_result(request),
             "disconnect" | "terminate" => {
                 self.queue_event("terminated", serde_json::json!({}));
@@ -2654,6 +2654,17 @@ impl DapSession {
     const fn next_response_seq(&mut self) -> u64 {
         self.next_seq += 1;
         self.next_seq
+    }
+
+    fn require_reference_thread(request: &serde_json::Value, command: &str) -> anyhow::Result<()> {
+        let thread_id = request
+            .pointer("/arguments/threadId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("{command}.arguments.threadId is required"))?;
+        if thread_id != 1 {
+            anyhow::bail!("unknown ORV thread id {thread_id}");
+        }
+        Ok(())
     }
 
     fn launch_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -3165,7 +3176,8 @@ impl DapSession {
         }))
     }
 
-    fn stack_trace_result(&self) -> anyhow::Result<serde_json::Value> {
+    fn stack_trace_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "stackTrace")?;
         let launched = self
             .launched
             .as_ref()
@@ -3382,7 +3394,11 @@ impl DapSession {
         }))
     }
 
-    fn exception_info_result(&self) -> anyhow::Result<serde_json::Value> {
+    fn exception_info_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "exceptionInfo")?;
         let launched = self
             .launched
             .as_ref()
@@ -3390,7 +3406,11 @@ impl DapSession {
         Ok(dap_exception_info_json(&launched.runtime))
     }
 
-    fn continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn continue_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "continue")?;
         if self.launch_is_long_running() {
             return self.continue_long_running_result();
         }
@@ -3455,7 +3475,11 @@ impl DapSession {
         }))
     }
 
-    fn reverse_continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn reverse_continue_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "reverseContinue")?;
         let target_frame = {
             let launched = self
                 .launched
@@ -3501,6 +3525,7 @@ impl DapSession {
     }
 
     fn goto_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "goto")?;
         let target_id = request
             .pointer("/arguments/targetId")
             .and_then(serde_json::Value::as_u64)
@@ -3534,7 +3559,11 @@ impl DapSession {
         Ok(serde_json::json!({}))
     }
 
-    fn step_back_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn step_back_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "stepBack")?;
         let target_frame = {
             let launched = self
                 .launched
@@ -3590,7 +3619,8 @@ impl DapSession {
         Ok(serde_json::json!({}))
     }
 
-    fn next_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn next_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "next")?;
         if self.launch_is_live() {
             return self.next_live_result();
         }
@@ -3632,7 +3662,11 @@ impl DapSession {
         Ok(serde_json::json!({}))
     }
 
-    fn step_out_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn step_out_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "stepOut")?;
         if self.launch_is_live() {
             return self.step_out_live_result();
         }
@@ -3698,6 +3732,7 @@ impl DapSession {
     }
 
     fn step_in_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "stepIn")?;
         if self.launch_is_live() {
             if request
                 .pointer("/arguments/targetId")
@@ -4005,7 +4040,8 @@ impl DapSession {
             .is_some_and(|launched| launched.long_running)
     }
 
-    fn pause_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn pause_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Self::require_reference_thread(request, "pause")?;
         let launched = self
             .launched
             .as_mut()
@@ -10483,6 +10519,44 @@ function greet(user: User): string -> "hello"
         assert!(stack["message"]
             .as_str()
             .is_some_and(|message| message.contains("launch is required")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_debug_control_rejects_unknown_thread_id() {
+        let dir = temp_output_dir("dap-debug-control-thread");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+
+        for command in ["continue", "next", "stepIn", "pause"] {
+            let mut session = DapSession::default();
+            session
+                .message_response(&serde_json::json!({
+                    "seq": 57,
+                    "type": "request",
+                    "command": "launch",
+                    "arguments": {
+                        "program": format!("file://{}", source.display()),
+                    },
+                }))
+                .expect("launch response");
+            let response = session
+                .message_response(&serde_json::json!({
+                    "seq": 58,
+                    "type": "request",
+                    "command": command,
+                    "arguments": {
+                        "threadId": 99,
+                    },
+                }))
+                .expect("debug control response");
+
+            assert_eq!(response["success"], false, "{command}: {response}");
+            assert!(response["message"]
+                .as_str()
+                .is_some_and(|message| { message.contains("unknown ORV thread id 99") }));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
