@@ -277,6 +277,14 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
     }
     if client_wasm {
         artifacts.push(BuildArtifact {
+            kind: "client_page".to_string(),
+            path: "pages/index.html".to_string(),
+        });
+        artifacts.push(BuildArtifact {
+            kind: "client_js".to_string(),
+            path: "client/app.js".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "client_wasm".to_string(),
             path: "client/app.wasm".to_string(),
         });
@@ -322,6 +330,16 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         });
     }
     if manifest.capabilities.client_wasm {
+        bundles.push(BundleTarget {
+            kind: "client_page".to_string(),
+            path: "pages/index.html".to_string(),
+            runtime_features: vec!["client_wasm".to_string()],
+        });
+        bundles.push(BundleTarget {
+            kind: "client_js".to_string(),
+            path: "client/app.js".to_string(),
+            runtime_features: vec!["client_wasm".to_string()],
+        });
         bundles.push(BundleTarget {
             kind: "client_wasm".to_string(),
             path: "client/app.wasm".to_string(),
@@ -1175,7 +1193,7 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
-    fn bundle_plan_declares_client_wasm_for_signal_html() {
+    fn bundle_plan_declares_client_bootstrap_targets_for_signal_html() {
         let program = lower(
             r#"let sig count: int = 0
 @out @html { @body { @p count } }"#,
@@ -1197,9 +1215,27 @@ function greet(name: string): string -> "hi {name}""#,
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == "client_wasm" && artifact.path == "client/app.wasm"));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "client_js" && artifact.path == "client/app.js"));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "client_page" && artifact.path == "pages/index.html"));
         assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "client_wasm"
                 && bundle.path == "client/app.wasm"
+                && bundle.runtime_features == vec!["client_wasm"]
+        }));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "client_js"
+                && bundle.path == "client/app.js"
+                && bundle.runtime_features == vec!["client_wasm"]
+        }));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "client_page"
+                && bundle.path == "pages/index.html"
                 && bundle.runtime_features == vec!["client_wasm"]
         }));
         assert!(!plan

@@ -5356,6 +5356,8 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
+            "client_page" => verify_client_page_target(bundle, &target)?,
+            "client_js" => verify_client_js_target(&target)?,
             "client_wasm" => verify_client_wasm_target(&target)?,
             _ => {}
         }
@@ -5404,6 +5406,51 @@ fn verify_static_page_target(bundle: &serde_json::Value, target: &Path) -> anyho
     }
     if !(trimmed.starts_with("<html") || trimmed.starts_with("<!doctype")) {
         anyhow::bail!("static_page bundle is not html: {}", target.display());
+    }
+    Ok(())
+}
+
+fn verify_client_page_target(bundle: &serde_json::Value, target: &Path) -> anyhow::Result<()> {
+    let runtime_features = bundle
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("client_page runtime_features must be an array"))?;
+    if !runtime_features
+        .iter()
+        .any(|feature| feature == "client_wasm")
+    {
+        anyhow::bail!("client_page bundle must declare client_wasm");
+    }
+    verify_client_page_file(target)
+}
+
+fn verify_client_page_file(target: &Path) -> anyhow::Result<()> {
+    let html = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    let trimmed = html.trim_start();
+    if trimmed.is_empty() {
+        anyhow::bail!("client_page bundle is empty: {}", target.display());
+    }
+    if !(trimmed.starts_with("<html") || trimmed.starts_with("<!doctype")) {
+        anyhow::bail!("client_page bundle is not html: {}", target.display());
+    }
+    if !html.contains("data-orv-client=\"wasm\"") {
+        anyhow::bail!("client_page bundle does not declare wasm bootstrap");
+    }
+    if !html.contains("type=\"module\"") || !html.contains("client/app.js") {
+        anyhow::bail!("client_page bundle does not load client/app.js");
+    }
+    Ok(())
+}
+
+fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
+    let source = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    if !source.contains("app.wasm") {
+        anyhow::bail!("client_js bundle does not reference app.wasm");
+    }
+    if !source.contains("WebAssembly.instantiate") {
+        anyhow::bail!("client_js bundle does not instantiate wasm");
     }
     Ok(())
 }
@@ -5513,11 +5560,6 @@ fn verify_deploy_client_target(
     let Some(client) = client.filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    let path = json_str(client, "wasm", "deploy client")?;
-    let target = dir.join(path);
-    if !target.is_file() {
-        anyhow::bail!("missing deploy client wasm: {}", target.display());
-    }
     let runtime_features = client
         .get("runtime_features")
         .and_then(serde_json::Value::as_array)
@@ -5528,7 +5570,24 @@ fn verify_deploy_client_target(
     {
         anyhow::bail!("deploy client target must declare client_wasm");
     }
-    verify_client_wasm_target(&target)
+    let page = json_str(client, "page", "deploy client")?;
+    let page_target = dir.join(page);
+    if !page_target.is_file() {
+        anyhow::bail!("missing deploy client page: {}", page_target.display());
+    }
+    verify_client_page_file(&page_target)?;
+    let loader = json_str(client, "loader", "deploy client")?;
+    let loader_target = dir.join(loader);
+    if !loader_target.is_file() {
+        anyhow::bail!("missing deploy client loader: {}", loader_target.display());
+    }
+    verify_client_js_target(&loader_target)?;
+    let wasm = json_str(client, "wasm", "deploy client")?;
+    let wasm_target = dir.join(wasm);
+    if !wasm_target.is_file() {
+        anyhow::bail!("missing deploy client wasm: {}", wasm_target.display());
+    }
+    verify_client_wasm_target(&wasm_target)
 }
 
 fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -5804,15 +5863,26 @@ fn run_static_build_with_writer<W: std::io::Write>(
         .get("bundles")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    if let Some(bundle) = bundles.iter().find(|bundle| {
+        bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+    }) {
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target = dir.join(path);
+        verify_static_page_target(bundle, &target)?;
+        let html = std::fs::read_to_string(&target)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+        writer.write_all(html.as_bytes())?;
+        return Ok(());
+    }
     let bundle = bundles
         .iter()
         .find(|bundle| {
-            bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+            bundle.get("kind").and_then(serde_json::Value::as_str) == Some("client_page")
         })
-        .ok_or_else(|| anyhow::anyhow!("build has no server launcher or static page target"))?;
+        .ok_or_else(|| anyhow::anyhow!("build has no server launcher or page target"))?;
     let path = json_str(bundle, "path", "bundle target")?;
     let target = dir.join(path);
-    verify_static_page_target(bundle, &target)?;
+    verify_client_page_target(bundle, &target)?;
     let html = std::fs::read_to_string(&target)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
     writer.write_all(html.as_bytes())?;
@@ -6019,6 +6089,9 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let graph = project_graph_json(&loaded.graph, &origin_map);
     let manifest = orv_compiler::build_manifest(entry.display().to_string(), &origin_map);
     let bundle_plan = orv_compiler::bundle_plan(&manifest);
+    let client_page_path = bundle_output_path(&bundle_plan, "client_page");
+    let client_js_path = bundle_output_path(&bundle_plan, "client_js");
+    let client_wasm_path = bundle_output_path(&bundle_plan, "client_wasm");
     let static_page = bundle_plan
         .bundles
         .iter()
@@ -6051,7 +6124,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     )?;
     write_json(
         &out.join("bundle-plan.json"),
-        &serde_json::to_value(bundle_plan)?,
+        &serde_json::to_value(&bundle_plan)?,
     )?;
     write_json(
         &out.join("origin-map.json"),
@@ -6073,7 +6146,13 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         write_text(&out.join(path), &html)?;
     }
     if manifest.capabilities.client_wasm {
-        write_client_wasm_placeholder(&out.join("client").join("app.wasm"))?;
+        let page_path = required_bundle_output_path(&client_page_path, "client_page")?;
+        let js_path = required_bundle_output_path(&client_js_path, "client_js")?;
+        let wasm_path = required_bundle_output_path(&client_wasm_path, "client_wasm")?;
+        write_client_wasm_placeholder(&out.join(wasm_path))?;
+        write_client_js_loader(&out.join(js_path))?;
+        let loader_src = relative_bundle_path(page_path, js_path);
+        write_client_page_shell(&out.join(page_path), &entry, &loader_src)?;
     }
     if profile.is_production() {
         write_prod_deploy_artifacts(
@@ -6081,12 +6160,32 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             &entry,
             &manifest,
             server_artifact.as_ref(),
-            static_page_path.as_deref(),
-            server_artifact_path,
+            ProdBuildTargets {
+                static_page_path: static_page_path.as_deref(),
+                client_page_path: client_page_path.as_deref(),
+                client_js_path: client_js_path.as_deref(),
+                client_wasm_path: client_wasm_path.as_deref(),
+                server_artifact_path,
+            },
         )?;
     }
     println!("build: wrote {}", out.display());
     Ok(())
+}
+
+fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
+    plan.bundles
+        .iter()
+        .find(|bundle| bundle.kind == kind)
+        .map(|bundle| normalized_artifact_path(&bundle.path))
+}
+
+fn required_bundle_output_path<'a>(
+    path: &'a Option<String>,
+    kind: &str,
+) -> anyhow::Result<&'a str> {
+    path.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing {kind} bundle target"))
 }
 
 const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
@@ -6100,20 +6199,83 @@ fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
 }
 
+fn write_client_js_loader(path: &Path) -> anyhow::Result<()> {
+    let script = r#"const wasmUrl = new URL("./app.wasm", import.meta.url);
+const root = document.querySelector('[data-orv-client="wasm"]');
+
+async function main() {
+  const response = await fetch(wasmUrl);
+  const bytes = await response.arrayBuffer();
+  await WebAssembly.instantiate(bytes, {});
+  if (root) {
+    root.dataset.orvStatus = "ready";
+  }
+}
+
+main().catch((error) => {
+  console.error("orv client bootstrap failed", error);
+  if (root) {
+    root.dataset.orvStatus = "error";
+  }
+});
+"#;
+    write_text(path, script)
+}
+
+fn write_client_page_shell(path: &Path, entry: &Path, loader_src: &str) -> anyhow::Result<()> {
+    let entry = html_attr_escape(&entry.display().to_string());
+    let loader_src = html_attr_escape(loader_src);
+    let html = format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="orv-runtime" content="client_wasm">
+</head>
+<body data-orv-client="wasm" data-orv-entry="{entry}">
+<div id="orv-root"></div>
+<script type="module" src="{loader_src}"></script>
+</body>
+</html>"#
+    );
+    write_text(path, &html)
+}
+
+fn relative_bundle_path(from: &str, to: &str) -> String {
+    let depth = from.split('/').count().saturating_sub(1);
+    format!("{}{}", "../".repeat(depth), to)
+}
+
+fn html_attr_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+struct ProdBuildTargets<'a> {
+    static_page_path: Option<&'a str>,
+    client_page_path: Option<&'a str>,
+    client_js_path: Option<&'a str>,
+    client_wasm_path: Option<&'a str>,
+    server_artifact_path: &'a str,
+}
+
 fn write_prod_deploy_artifacts(
     out: &Path,
     entry: &Path,
     manifest: &orv_compiler::BuildManifest,
     server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
-    static_page_path: Option<&str>,
-    server_artifact_path: &str,
+    targets: ProdBuildTargets<'_>,
 ) -> anyhow::Result<()> {
     let server = if let Some(server_artifact) = server_artifact {
         let entrypoint = "deploy/server.sh";
-        write_prod_server_entrypoint(out, server_artifact_path)?;
+        write_prod_server_entrypoint(out, targets.server_artifact_path)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
-            "artifact": server_artifact_path,
+            "artifact": targets.server_artifact_path,
             "entrypoint": entrypoint,
             "protocol": "http1",
             "routes": server_artifact.routes.clone(),
@@ -6121,15 +6283,19 @@ fn write_prod_deploy_artifacts(
     } else {
         serde_json::Value::Null
     };
-    let static_target = static_page_path.map_or(serde_json::Value::Null, |path| {
-        serde_json::json!({
-            "path": path,
-            "runtime_features": [],
-        })
-    });
+    let static_target = targets
+        .static_page_path
+        .map_or(serde_json::Value::Null, |path| {
+            serde_json::json!({
+                "path": path,
+                "runtime_features": [],
+            })
+        });
     let client = if manifest.capabilities.client_wasm {
         serde_json::json!({
-            "wasm": "client/app.wasm",
+            "page": targets.client_page_path.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
+            "loader": targets.client_js_path.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
+            "wasm": targets.client_wasm_path.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
             "runtime_features": ["client_wasm"],
         })
     } else {
@@ -11348,13 +11514,62 @@ entry = "src/main.orv"
             .expect("bundles")
             .iter()
             .any(|bundle| bundle["kind"] == "client_wasm" && bundle["path"] == "client/app.wasm"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles")
+            .iter()
+            .any(|bundle| bundle["kind"] == "client_js" && bundle["path"] == "client/app.js"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles")
+            .iter()
+            .any(|bundle| bundle["kind"] == "client_page" && bundle["path"] == "pages/index.html"));
+        assert!(!plan["bundles"]
+            .as_array()
+            .expect("bundles")
+            .iter()
+            .any(|bundle| bundle["kind"] == "static_page"));
         let wasm = std::fs::read(build_out.join("client").join("app.wasm")).expect("client wasm");
         assert_eq!(&wasm[..4], b"\0asm");
-        assert!(
-            !build_out.join("pages").join("index.html").is_file(),
-            "interactive page must not be emitted as zero-runtime static html"
-        );
+        let loader =
+            std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
+        assert!(loader.contains("WebAssembly.instantiate"));
+        assert!(loader.contains("app.wasm"));
+        let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
+            .expect("client page");
+        assert!(page.contains("data-orv-client=\"wasm\""));
+        assert!(page.contains("type=\"module\""));
+        assert!(page.contains("../client/app.js"));
         cmd_verify_build(&build_out).expect("verify build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_prod_records_client_bootstrap_targets() {
+        let out = temp_output_dir("build-prod-client");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+
+        let deploy =
+            read_json_value(&build_out.join("deploy").join("manifest.json")).expect("deploy");
+        assert_eq!(deploy["client"]["page"], "pages/index.html");
+        assert_eq!(deploy["client"]["loader"], "client/app.js");
+        assert_eq!(deploy["client"]["wasm"], "client/app.wasm");
+        assert!(deploy["client"]["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .iter()
+            .any(|feature| feature == "client_wasm"));
+        cmd_verify_build(&build_out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -11527,6 +11742,29 @@ entry = "src/main.orv"
             String::from_utf8(stdout).expect("stdout utf-8"),
             "<html><body><h1>Static</h1></body></html>"
         );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_build_prints_client_page_shell() {
+        let out = temp_output_dir("run-build-client-page");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let mut stdout = Vec::new();
+
+        run_build_with_writer(&build_out, &mut stdout).expect("run build");
+
+        let html = String::from_utf8(stdout).expect("stdout utf-8");
+        assert!(html.contains("data-orv-client=\"wasm\""));
+        assert!(html.contains("../client/app.js"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
