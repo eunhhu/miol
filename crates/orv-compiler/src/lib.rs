@@ -9,8 +9,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use orv_diagnostics::Span;
 use orv_hir::{
-    origin_fingerprint, origin_id, HirBlock, HirCatchClause, HirExpr, HirExprKind, HirFunctionBody,
-    HirLetKind, HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment, NameId,
+    origin_fingerprint, origin_id, BinaryOp, HirBlock, HirCatchClause, HirExpr, HirExprKind,
+    HirFunctionBody, HirLetKind, HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment,
+    NameId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +190,18 @@ pub struct ServerListenArtifact {
     pub name: String,
     /// Statically known port, if the listen expression is an integer literal.
     pub port: Option<u16>,
+    /// Environment variable backing the port expression, when statically known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<ServerListenEnvArtifact>,
+}
+
+/// Environment-driven server listen descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerListenEnvArtifact {
+    /// Environment variable name, for example `PORT`.
+    pub variable: String,
+    /// Statically known default port from `@env.PORT ?? "8080"`, when present.
+    pub default_port: Option<u16>,
 }
 
 /// Build capability summary.
@@ -616,11 +629,25 @@ fn listen_artifact(entry: &OriginEntry) -> ServerListenArtifact {
         origin_id: entry.id.clone(),
         name: entry.name.clone(),
         port: listen_port(&entry.name),
+        env: listen_env_from_name(&entry.name),
     }
 }
 
 fn listen_port(name: &str) -> Option<u16> {
     name.strip_prefix("port ")?.parse::<u16>().ok()
+}
+
+fn listen_env_from_name(name: &str) -> Option<ServerListenEnvArtifact> {
+    let rest = name.strip_prefix("port env ")?;
+    let (variable, default_port) = if let Some((variable, default)) = rest.split_once(" default ") {
+        (variable, default.parse::<u16>().ok())
+    } else {
+        (rest, None)
+    };
+    Some(ServerListenEnvArtifact {
+        variable: variable.to_string(),
+        default_port,
+    })
 }
 
 fn content_hash(source: &str) -> String {
@@ -1013,6 +1040,12 @@ fn call_name(callee: &HirExpr) -> String {
 }
 
 fn listen_name(expr: &HirExpr) -> String {
+    if let Some(env) = listen_env_from_expr(expr) {
+        if let Some(default_port) = env.default_port {
+            return format!("port env {} default {default_port}", env.variable);
+        }
+        return format!("port env {}", env.variable);
+    }
     match &expr.kind {
         HirExprKind::Integer(raw) => format!("port {raw}"),
         HirExprKind::Ident(ident) => format!("port {}", ident.name),
@@ -1022,6 +1055,53 @@ fn listen_name(expr: &HirExpr) -> String {
         | HirExprKind::TypeName(_) => format!("port {}", call_name(expr)),
         _ => "port <expr>".to_string(),
     }
+}
+
+fn listen_env_from_expr(expr: &HirExpr) -> Option<ServerListenEnvArtifact> {
+    let HirExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    if call_name(callee) != "int.from" || args.len() != 1 {
+        return None;
+    }
+    let arg = args.first()?;
+    let (env_expr, default_port) = match &arg.kind {
+        HirExprKind::Binary {
+            op: BinaryOp::Coalesce,
+            lhs,
+            rhs,
+        } => (lhs.as_ref(), string_port(rhs.as_ref())),
+        _ => (arg, None),
+    };
+    let variable = env_variable(env_expr)?;
+    Some(ServerListenEnvArtifact {
+        variable,
+        default_port,
+    })
+}
+
+fn env_variable(expr: &HirExpr) -> Option<String> {
+    let HirExprKind::Field { target, field, .. } = &expr.kind else {
+        return None;
+    };
+    let HirExprKind::Domain { name, args, .. } = &target.kind else {
+        return None;
+    };
+    if name == "env" && args.is_empty() {
+        Some(field.clone())
+    } else {
+        None
+    }
+}
+
+fn string_port(expr: &HirExpr) -> Option<u16> {
+    let HirExprKind::String(segments) = &expr.kind else {
+        return None;
+    };
+    let [HirStringSegment::Str(raw)] = segments.as_slice() else {
+        return None;
+    };
+    raw.parse::<u16>().ok()
 }
 
 #[cfg(test)]
@@ -1474,6 +1554,26 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.source_bundle.files[0]
             .content_hash
             .starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn server_runtime_artifact_records_env_listen_descriptor() {
+        let src = r#"@server {
+  @listen int.from(@env.PORT ?? "8080")
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(&manifest, &map, [("server.orv", src)]);
+
+        let listen = artifact.listen.as_ref().expect("listen descriptor");
+        assert_eq!(listen.port, None);
+        let env = listen.env.as_ref().expect("listen env descriptor");
+        assert_eq!(env.variable, "PORT");
+        assert_eq!(env.default_port, Some(8080));
     }
 
     #[test]

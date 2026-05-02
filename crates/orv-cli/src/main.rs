@@ -8413,22 +8413,37 @@ fn validate_prod_server_listen(
 }
 
 fn deploy_ports_value(listen: Option<&orv_compiler::ServerListenArtifact>) -> serde_json::Value {
-    deploy_exposed_port(listen).map_or_else(
-        || serde_json::json!([]),
-        |port| {
-            serde_json::json!([
-                {
-                    "container": port,
-                    "protocol": "tcp",
-                }
-            ])
-        },
-    )
+    let Some(listen) = listen else {
+        return serde_json::json!([]);
+    };
+    if let Some(port) = listen.port.filter(|port| *port > 0) {
+        return serde_json::json!([
+            {
+                "container": port,
+                "protocol": "tcp",
+            }
+        ]);
+    }
+    let Some(env) = &listen.env else {
+        return serde_json::json!([]);
+    };
+    let mut port = serde_json::json!({
+        "env": env.variable.clone(),
+        "protocol": "tcp",
+    });
+    if let Some(default_port) = env.default_port.filter(|port| *port > 0) {
+        port["default"] = serde_json::json!(default_port);
+    }
+    serde_json::json!([port])
 }
 
 fn deploy_exposed_port(listen: Option<&orv_compiler::ServerListenArtifact>) -> Option<u16> {
     listen
-        .and_then(|listen| listen.port)
+        .and_then(|listen| {
+            listen
+                .port
+                .or_else(|| listen.env.as_ref().and_then(|env| env.default_port))
+        })
         .filter(|port| *port > 0)
 }
 
@@ -9215,6 +9230,22 @@ mod tests {
             "@server { @listen 8080 @route GET /ping { @respond 200 { ok: true } } }\n",
         )
         .expect("write prod source");
+        (dir, path)
+    }
+
+    fn env_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_output_dir(name);
+        std::fs::create_dir_all(&dir).expect("create env prod source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen int.from(@env.PORT ?? "8080")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write env prod source");
         (dir, path)
     }
 
@@ -14995,6 +15026,34 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_prod_writes_env_listen_container_contract() {
+        let (src_dir, path) = env_prod_server_source("build-prod-env-listen-source");
+        let out = temp_output_dir("build-prod-env-listen");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy_manifest_path = out.join("deploy").join("manifest.json");
+        let deploy_container_path = out.join("deploy").join("container.json");
+        let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
+        let deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
+        let container = read_json_value(&deploy_container_path).expect("deploy container");
+
+        assert_eq!(deploy["server"]["listen"]["port"], serde_json::Value::Null);
+        assert_eq!(deploy["server"]["listen"]["env"]["variable"], "PORT");
+        assert_eq!(deploy["server"]["listen"]["env"]["default_port"], 8080);
+        assert_eq!(container["listen"], deploy["server"]["listen"]);
+        assert_eq!(container["ports"][0]["env"], "PORT");
+        assert_eq!(container["ports"][0]["default"], 8080);
+        assert_eq!(container["ports"][0]["protocol"], "tcp");
+        let dockerfile = std::fs::read_to_string(&deploy_dockerfile_path).expect("Dockerfile");
+        assert!(dockerfile.contains("EXPOSE 8080"));
+
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn build_prod_rejects_test_only_ephemeral_listen_port() {
         let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
         let out = temp_output_dir("build-prod-ephemeral-listen");
@@ -15068,6 +15127,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container listen does not match runtime artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_container_env_ports_mismatch() {
+        let (src_dir, path) = env_prod_server_source("deploy-container-env-ports-source");
+        let out = temp_output_dir("deploy-container-env-ports-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let container_path = out.join("deploy").join("container.json");
+        let mut container = read_json_value(&container_path).expect("container");
+        container["ports"][0]["env"] = serde_json::json!("HTTP_PORT");
+        write_json(&container_path, &container).expect("write corrupt container");
+
+        let err = cmd_verify_build(&out).expect_err("container ports mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy container ports do not match runtime artifact"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
