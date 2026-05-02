@@ -217,3 +217,85 @@ fn dap_attach_runtime_continue_serves_http_and_pause_resumes_transport() {
     assert_eq!(terminated["success"], true, "{terminated}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn dap_attach_runtime_in_process_serves_http_and_reports_transport() {
+    let dir = temp_dir("dap-in-process-transport");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let port = free_port();
+    let source = dir.join("app.orv");
+    std::fs::write(
+        &source,
+        format!(
+            r"@server {{
+  @listen {port}
+  @route GET /ping {{ @respond 200 {{ ok: true }} }}
+}}
+"
+        ),
+    )
+    .expect("write source");
+    let mut dap = start_dap();
+
+    let launch = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 11,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": format!("file://{}", source.display()),
+                "attachRuntime": true,
+                "attachRuntimeMode": "inProcess",
+            },
+        }),
+    );
+    assert_eq!(launch["success"], true, "{launch}");
+    assert_eq!(
+        launch["body"]["runtime"]["async"]["transport"]["kind"],
+        "in-process"
+    );
+    assert_eq!(
+        launch["body"]["runtime"]["async"]["transport"]["state"],
+        "detached"
+    );
+
+    let continued = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 12,
+            "type": "request",
+            "command": "continue",
+            "arguments": { "threadId": 1 },
+        }),
+    );
+    assert_eq!(continued["success"], true, "{continued}");
+    wait_for_http_ok(port);
+
+    let transport = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 13,
+            "type": "request",
+            "command": "evaluate",
+            "arguments": { "expression": "runtimeTransport" },
+        }),
+    );
+    assert_eq!(transport["success"], true, "{transport}");
+    assert_eq!(
+        transport["body"]["result"],
+        format!("in-process running 127.0.0.1:{port}")
+    );
+
+    let terminated = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 14,
+            "type": "request",
+            "command": "terminate",
+            "arguments": {},
+        }),
+    );
+    assert_eq!(terminated["success"], true, "{terminated}");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -2361,6 +2361,7 @@ struct DapLaunchState {
     path: PathBuf,
     uri: String,
     name: String,
+    program: orv_hir::HirProgram,
     node_count: usize,
     diagnostic_count: usize,
     stopped_line: u64,
@@ -2375,7 +2376,9 @@ struct DapLaunchState {
     live: Option<DapLiveState>,
     long_running: bool,
     attach_runtime_requested: bool,
+    attach_runtime_mode: DapRuntimeAttachMode,
     runtime_process: Option<DapRuntimeProcess>,
+    attached_server: Option<orv_runtime::server::AttachedServer>,
     async_runtime: Option<DapAsyncRuntimeState>,
 }
 
@@ -2407,6 +2410,7 @@ impl Drop for DapRuntimeProcess {
 
 impl Drop for DapLaunchState {
     fn drop(&mut self) {
+        self.attached_server = None;
         self.runtime_process = None;
     }
 }
@@ -2416,16 +2420,23 @@ impl DapLaunchState {
         if !self.attach_runtime_requested {
             return Ok(());
         }
+        match self.attach_runtime_mode {
+            DapRuntimeAttachMode::Process => self.ensure_child_runtime_process_running(),
+            DapRuntimeAttachMode::InProcess => self.ensure_in_process_runtime_running(),
+        }
+    }
+
+    fn ensure_child_runtime_process_running(&mut self) -> anyhow::Result<()> {
         if let Some(process) = self.runtime_process.as_mut() {
             if let Some(status) = process.child.try_wait()? {
                 let pid = process.pid();
                 self.runtime_process = None;
-                self.set_transport_state("exited", Some(pid));
+                self.set_transport_state("exited", Some(pid), None);
                 anyhow::bail!("runtime process exited with {status}");
             }
             let pid = process.pid();
             dap_send_process_signal(pid, "CONT")?;
-            self.set_transport_state("running", Some(pid));
+            self.set_transport_state("running", Some(pid), None);
             return Ok(());
         }
 
@@ -2441,7 +2452,20 @@ impl DapLaunchState {
             .map_err(|e| anyhow::anyhow!("failed to start runtime process: {e}"))?;
         let pid = child.id();
         self.runtime_process = Some(DapRuntimeProcess { child });
-        self.set_transport_state("running", Some(pid));
+        self.set_transport_state("running", Some(pid), None);
+        Ok(())
+    }
+
+    fn ensure_in_process_runtime_running(&mut self) -> anyhow::Result<()> {
+        if let Some(server) = &self.attached_server {
+            self.set_transport_state("running", None, Some(server.addr().to_string()));
+            return Ok(());
+        }
+        let server = orv_runtime::server::spawn_attached_server(self.program.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let address = server.addr().to_string();
+        self.attached_server = Some(server);
+        self.set_transport_state("running", None, Some(address));
         Ok(())
     }
 
@@ -2449,23 +2473,47 @@ impl DapLaunchState {
         if !self.attach_runtime_requested {
             return Ok(());
         }
+        match self.attach_runtime_mode {
+            DapRuntimeAttachMode::Process => self.suspend_child_runtime_process(),
+            DapRuntimeAttachMode::InProcess => {
+                self.suspend_in_process_runtime();
+                Ok(())
+            }
+        }
+    }
+
+    fn suspend_child_runtime_process(&mut self) -> anyhow::Result<()> {
         let Some(process) = self.runtime_process.as_mut() else {
-            self.set_transport_state("detached", None);
+            self.set_transport_state("detached", None, None);
             return Ok(());
         };
         if let Some(status) = process.child.try_wait()? {
             let pid = process.pid();
             self.runtime_process = None;
-            self.set_transport_state("exited", Some(pid));
+            self.set_transport_state("exited", Some(pid), None);
             anyhow::bail!("runtime process exited with {status}");
         }
         let pid = process.pid();
         dap_send_process_signal(pid, "STOP")?;
-        self.set_transport_state("suspended", Some(pid));
+        self.set_transport_state("suspended", Some(pid), None);
         Ok(())
     }
 
-    fn set_transport_state(&mut self, state: &str, process_id: Option<u32>) {
+    fn suspend_in_process_runtime(&mut self) {
+        let address = self
+            .attached_server
+            .as_ref()
+            .map(|server| server.addr().to_string());
+        self.attached_server = None;
+        self.set_transport_state("suspended", None, address);
+    }
+
+    fn set_transport_state(
+        &mut self,
+        state: &str,
+        process_id: Option<u32>,
+        address: Option<String>,
+    ) {
         let Some(async_runtime) = self.async_runtime.as_mut() else {
             return;
         };
@@ -2474,6 +2522,22 @@ impl DapLaunchState {
             .get_or_insert_with(DapAsyncTransportState::process_detached);
         transport.state = state.to_string();
         transport.process_id = process_id.map(u64::from);
+        transport.address = address;
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DapRuntimeAttachMode {
+    Process,
+    InProcess,
+}
+
+impl DapRuntimeAttachMode {
+    const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::InProcess => "inProcess",
+        }
     }
 }
 
@@ -2559,6 +2623,7 @@ struct DapAsyncTransportState {
     kind: String,
     state: String,
     process_id: Option<u64>,
+    address: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2590,8 +2655,35 @@ impl DapAsyncTransportState {
             kind: "process".to_string(),
             state: "detached".to_string(),
             process_id: None,
+            address: None,
         }
     }
+
+    fn in_process_detached() -> Self {
+        Self {
+            kind: "in-process".to_string(),
+            state: "detached".to_string(),
+            process_id: None,
+            address: None,
+        }
+    }
+}
+
+fn dap_attach_runtime_transport_if_requested(
+    async_runtime: &mut Option<DapAsyncRuntimeState>,
+    attach_runtime_requested: bool,
+    attach_runtime_mode: DapRuntimeAttachMode,
+) {
+    if !attach_runtime_requested {
+        return;
+    }
+    let Some(async_runtime) = async_runtime.as_mut() else {
+        return;
+    };
+    async_runtime.transport = Some(match attach_runtime_mode {
+        DapRuntimeAttachMode::Process => DapAsyncTransportState::process_detached(),
+        DapRuntimeAttachMode::InProcess => DapAsyncTransportState::in_process_detached(),
+    });
 }
 
 #[derive(Clone)]
@@ -2835,6 +2927,7 @@ impl DapSession {
             .collect();
         let live_requested = dap_launch_live(request);
         let attach_runtime_requested = dap_launch_attach_runtime(request);
+        let attach_runtime_mode = dap_launch_attach_runtime_mode(request)?;
         let (runtime, mut frames, live, long_running) = dap_launch_runtime_state(
             &lowered,
             diagnostic_count,
@@ -2843,27 +2936,22 @@ impl DapSession {
             live_requested,
         );
         let mut async_runtime = dap_async_runtime_state(&lowered.program, long_running);
-        if attach_runtime_requested {
-            if let Some(async_runtime) = async_runtime.as_mut() {
-                async_runtime.transport = Some(DapAsyncTransportState::process_detached());
-            }
-        }
+        dap_attach_runtime_transport_if_requested(
+            &mut async_runtime,
+            attach_runtime_requested,
+            attach_runtime_mode,
+        );
         let executable_lines = dap_launch_executable_lines(&entry_path, &frames);
         let current_frame_index = self.first_verified_breakpoint_frame(&frames).unwrap_or(0);
         let stopped_line = frames
             .get(current_frame_index)
             .map_or(executable_lines[0], |frame| frame.line);
-        let stopped_reason = if self.exception_filter_enabled(runtime.status.as_str()) {
-            "exception".to_string()
-        } else if let Some(reason) = self.breakpoint_frame_reason(&frames, current_frame_index) {
-            reason.to_string()
-        } else {
-            "entry".to_string()
-        };
+        let stopped_reason = self.launch_stopped_reason(&runtime, &frames, current_frame_index);
         self.launched = Some(DapLaunchState {
             path: entry_path.clone(),
             uri: entry_uri.clone(),
             name: entry_name.clone(),
+            program: lowered.program,
             node_count: loaded.graph.nodes.len(),
             diagnostic_count,
             stopped_line,
@@ -2878,7 +2966,9 @@ impl DapSession {
             live,
             long_running,
             attach_runtime_requested,
+            attach_runtime_mode,
             runtime_process: None,
+            attached_server: None,
             async_runtime: async_runtime.clone(),
         });
         if self
@@ -2909,6 +2999,21 @@ impl DapSession {
             "diagnostics": diagnostic_count,
             "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
         }))
+    }
+
+    fn launch_stopped_reason(
+        &self,
+        runtime: &DapRuntimeState,
+        frames: &[DapFrameState],
+        current_frame_index: usize,
+    ) -> String {
+        if self.exception_filter_enabled(runtime.status.as_str()) {
+            "exception".to_string()
+        } else if let Some(reason) = self.breakpoint_frame_reason(frames, current_frame_index) {
+            reason.to_string()
+        } else {
+            "entry".to_string()
+        }
     }
 
     fn set_exception_breakpoints_result(
@@ -2964,6 +3069,15 @@ impl DapSession {
                     .as_ref()
                     .is_some_and(|launched| launched.attach_runtime_requested)
             });
+        let attach_runtime_mode = if request.pointer("/arguments/attachRuntimeMode").is_some() {
+            dap_launch_attach_runtime_mode(request)?
+        } else {
+            self.launched
+                .as_ref()
+                .map_or(DapRuntimeAttachMode::Process, |launched| {
+                    launched.attach_runtime_mode
+                })
+        };
         let path = request
             .pointer("/arguments/program")
             .and_then(serde_json::Value::as_str)
@@ -2976,6 +3090,7 @@ impl DapSession {
                 "program": path.display().to_string(),
                 "live": live_requested,
                 "attachRuntime": attach_runtime_requested,
+                "attachRuntimeMode": attach_runtime_mode.protocol_name(),
             },
         });
         self.launch_result(&restart_request)
@@ -4773,6 +4888,9 @@ fn dap_async_transport_json(transport: &DapAsyncTransportState) -> serde_json::V
     if let Some(process_id) = transport.process_id {
         value["process_id"] = serde_json::json!(process_id);
     }
+    if let Some(address) = &transport.address {
+        value["address"] = serde_json::json!(address);
+    }
     value
 }
 
@@ -4785,10 +4903,13 @@ fn dap_async_routes_display(routes: &[DapAsyncRouteState]) -> String {
 }
 
 fn dap_async_transport_display(transport: &DapAsyncTransportState) -> String {
-    transport.process_id.map_or_else(
-        || format!("{} {}", transport.kind, transport.state),
-        |pid| format!("{} {} pid {pid}", transport.kind, transport.state),
-    )
+    if let Some(address) = &transport.address {
+        return format!("{} {} {address}", transport.kind, transport.state);
+    }
+    if let Some(pid) = transport.process_id {
+        return format!("{} {} pid {pid}", transport.kind, transport.state);
+    }
+    format!("{} {}", transport.kind, transport.state)
 }
 
 fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serde_json::Value> {
@@ -5995,6 +6116,19 @@ fn dap_launch_attach_runtime(request: &serde_json::Value) -> bool {
         .pointer("/arguments/attachRuntime")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn dap_launch_attach_runtime_mode(
+    request: &serde_json::Value,
+) -> anyhow::Result<DapRuntimeAttachMode> {
+    match request
+        .pointer("/arguments/attachRuntimeMode")
+        .and_then(serde_json::Value::as_str)
+    {
+        None | Some("process") => Ok(DapRuntimeAttachMode::Process),
+        Some("inProcess" | "in-process") => Ok(DapRuntimeAttachMode::InProcess),
+        Some(mode) => anyhow::bail!("unsupported attachRuntimeMode `{mode}`"),
+    }
 }
 
 fn dap_launch_executable_lines(entry_path: &Path, frames: &[DapFrameState]) -> Vec<u64> {

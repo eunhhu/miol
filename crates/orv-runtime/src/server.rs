@@ -26,8 +26,10 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -35,7 +37,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, NameId};
+use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, HirStmt, NameId};
 use tokio::net::TcpListener;
 
 use crate::interp::{
@@ -113,6 +115,159 @@ pub(crate) fn run_server(
     })?;
 
     Ok(Value::Void)
+}
+
+/// Handle for an in-process attached `@server` runtime.
+///
+/// Dropping the handle sends a graceful shutdown signal and joins the runtime
+/// thread before returning.
+pub struct AttachedServer {
+    addr: SocketAddr,
+    boot_output: Vec<u8>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+type AttachedStartup = Result<(SocketAddr, Vec<u8>, tokio::sync::oneshot::Sender<()>), String>;
+
+impl AttachedServer {
+    /// Bound socket address for the attached server.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Output produced while preparing the attached server.
+    #[must_use]
+    pub fn boot_output(&self) -> &[u8] {
+        &self.boot_output
+    }
+}
+
+impl Drop for AttachedServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Start the first `@server` expression in `program` on a dedicated in-process
+/// runtime thread.
+///
+/// This tooling entry point permits `@listen 0` so callers can request an
+/// ephemeral local port.
+///
+/// # Errors
+/// Returns a runtime error when the program does not contain an `@server`, when
+/// the server cannot prepare its routes/listen port, or when the listener fails
+/// to bind.
+pub fn spawn_attached_server(program: HirProgram) -> Result<AttachedServer, RuntimeError> {
+    let (startup_tx, startup_rx) = mpsc::sync_channel::<AttachedStartup>(1);
+    let handle = thread::spawn(move || attached_server_thread(&program, &startup_tx));
+    match startup_rx.recv() {
+        Ok(Ok((addr, boot_output, shutdown))) => Ok(AttachedServer {
+            addr,
+            boot_output,
+            shutdown: Some(shutdown),
+            handle: Some(handle),
+        }),
+        Ok(Err(message)) => {
+            let _ = handle.join();
+            Err(RuntimeError::native(message))
+        }
+        Err(err) => {
+            let _ = handle.join();
+            Err(RuntimeError::native(format!(
+                "attached server failed before startup: {err}"
+            )))
+        }
+    }
+}
+
+fn attached_server_thread(program: &HirProgram, startup: &mpsc::SyncSender<AttachedStartup>) {
+    if let Err(message) = run_attached_server_thread(program, startup) {
+        let _ = startup.send(Err(message));
+    }
+}
+
+fn run_attached_server_thread(
+    program: &HirProgram,
+    startup: &mpsc::SyncSender<AttachedStartup>,
+) -> Result<(), String> {
+    let mut boot_output = Vec::new();
+    let (port, entries, captured_env) =
+        attached_server_state(program, &mut boot_output).map_err(|e| e.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime init failed: {e}"))?;
+    runtime.block_on(async move {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("attached server bind failed: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("attached server local_addr failed: {e}"))?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        startup
+            .send(Ok((addr, boot_output, shutdown_tx)))
+            .map_err(|_| "attached server startup receiver dropped".to_string())?;
+        serve_loop(
+            listener,
+            Arc::new(entries),
+            Arc::new(captured_env),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn attached_server_state<W: std::io::Write>(
+    program: &HirProgram,
+    boot_writer: &mut W,
+) -> Result<PreparedServerState, RuntimeError> {
+    let server_idx = program
+        .items
+        .iter()
+        .position(|stmt| matches!(stmt, HirStmt::Expr(expr) if matches!(expr.kind, HirExprKind::Server { .. })))
+        .ok_or_else(|| RuntimeError::native("attached runtime requires an `@server` expression"))?;
+    let captured_env = if server_idx == 0 {
+        HashMap::new()
+    } else {
+        let prefix = HirProgram {
+            items: program.items[..server_idx].to_vec(),
+            span: program.items[0]
+                .span()
+                .join(program.items[server_idx - 1].span()),
+        };
+        run_with_writer_in_env(&prefix, HashMap::new(), boot_writer)?
+    };
+    let HirStmt::Expr(expr) = &program.items[server_idx] else {
+        return Err(RuntimeError::native("attached runtime expected expression"));
+    };
+    let HirExprKind::Server {
+        listen,
+        routes,
+        body_stmts,
+    } = &expr.kind
+    else {
+        return Err(RuntimeError::native("attached runtime expected server"));
+    };
+    prepare_server_state(
+        listen.as_deref(),
+        routes,
+        body_stmts,
+        captured_env,
+        boot_writer,
+        true,
+    )
 }
 
 /// SIGINT + (Unix) SIGTERM 둘 중 하나가 오면 resolve 되는 Future.
@@ -2133,6 +2288,33 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn attached_server_handle_serves_until_drop() {
+        let hir = lower_src(
+            r"@server {
+                @listen 0
+                @route GET /ping { @respond 200 { ok: true } }
+            }",
+        );
+        let server = spawn_attached_server(hir).expect("spawn attached server");
+        let addr = server.addr();
+
+        let (status, _, body) = send_request(addr, "GET", "/ping", None).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(status, 200);
+        assert_eq!(json["ok"], serde_json::json!(true));
+
+        drop(server);
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            TcpStream::connect(addr),
+        )
+        .await;
+        if let Ok(Ok(_)) = probe {
+            panic!("attached server still accepted connections after drop");
+        }
     }
 
     #[tokio::test]
