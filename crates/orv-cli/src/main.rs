@@ -3181,7 +3181,7 @@ impl DapLaunchState {
             Vec::new,
             orv_runtime::server::AttachedServer::request_frames,
         );
-        write_json(path, &dap_server_request_trace_json(&frames))
+        write_json(path, &orv_runtime::server::request_trace_json(&frames))
     }
 }
 
@@ -5758,38 +5758,8 @@ fn dap_server_request_frame_display(frame: &orv_runtime::server::ServerRequestFr
 }
 
 fn dap_server_request_trace_display(frames: &[orv_runtime::server::ServerRequestFrame]) -> String {
-    serde_json::to_string(&dap_server_request_trace_json(frames)).unwrap_or_else(|_| {
+    serde_json::to_string(&orv_runtime::server::request_trace_json(frames)).unwrap_or_else(|_| {
         "{\"schema_version\":1,\"kind\":\"orv.production.trace\",\"frames\":[]}".to_string()
-    })
-}
-
-fn dap_server_request_trace_json(
-    frames: &[orv_runtime::server::ServerRequestFrame],
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": 1,
-        "kind": "orv.production.trace",
-        "frame_count": frames.len(),
-        "frames": frames
-            .iter()
-            .map(dap_server_request_frame_json)
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn dap_server_request_frame_json(
-    frame: &orv_runtime::server::ServerRequestFrame,
-) -> serde_json::Value {
-    serde_json::json!({
-        "method": &frame.method,
-        "path": &frame.path,
-        "status": frame.status,
-        "route_method": frame.route_method.as_deref(),
-        "route_path": frame.route_path.as_deref(),
-        "route_origin_id": frame.route_origin_id.as_deref(),
-        "params": &frame.params,
-        "query": &frame.query,
-        "body": &frame.body,
     })
 }
 

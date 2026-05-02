@@ -741,6 +741,34 @@ fn record_request_frame(
     }
 }
 
+/// Build the shared production request trace JSON document.
+#[must_use]
+pub fn request_trace_json(frames: &[ServerRequestFrame]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.production.trace",
+        "frame_count": frames.len(),
+        "frames": frames
+            .iter()
+            .map(request_frame_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn request_frame_json(frame: &ServerRequestFrame) -> serde_json::Value {
+    serde_json::json!({
+        "method": &frame.method,
+        "path": &frame.path,
+        "status": frame.status,
+        "route_method": frame.route_method.as_deref(),
+        "route_path": frame.route_path.as_deref(),
+        "route_origin_id": frame.route_origin_id.as_deref(),
+        "params": &frame.params,
+        "query": &frame.query,
+        "body": &frame.body,
+    })
+}
+
 fn request_body_display(value: &Value) -> String {
     if matches!(value, Value::Void) {
         return String::new();
@@ -1060,6 +1088,36 @@ mod tests {
     use tokio::net::TcpStream;
 
     // --- 단위: match_route / parse_query / value_to_json ---
+
+    #[test]
+    fn request_trace_json_uses_production_trace_schema() {
+        let frame = ServerRequestFrame {
+            method: "GET".to_string(),
+            path: "/users/42".to_string(),
+            route_method: Some("GET".to_string()),
+            route_path: Some("/users/:id".to_string()),
+            route_origin_id: Some("ori_route_user".to_string()),
+            status: 200,
+            params: HashMap::from([("id".to_string(), "42".to_string())]),
+            query: HashMap::from([("tab".to_string(), "orders".to_string())]),
+            body: "{\"active\":true}".to_string(),
+        };
+
+        let trace = request_trace_json(&[frame]);
+
+        assert_eq!(trace["schema_version"], 1);
+        assert_eq!(trace["kind"], "orv.production.trace");
+        assert_eq!(trace["frame_count"], 1);
+        assert_eq!(trace["frames"][0]["method"], "GET");
+        assert_eq!(trace["frames"][0]["path"], "/users/42");
+        assert_eq!(trace["frames"][0]["status"], 200);
+        assert_eq!(trace["frames"][0]["route_method"], "GET");
+        assert_eq!(trace["frames"][0]["route_path"], "/users/:id");
+        assert_eq!(trace["frames"][0]["route_origin_id"], "ori_route_user");
+        assert_eq!(trace["frames"][0]["params"]["id"], "42");
+        assert_eq!(trace["frames"][0]["query"]["tab"], "orders");
+        assert_eq!(trace["frames"][0]["body"], "{\"active\":true}");
+    }
 
     #[test]
     fn match_route_static_equal() {
