@@ -6102,7 +6102,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
 fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(target)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
-    if bytes.len() < MINIMAL_WASM_MODULE.len() {
+    if bytes.len() < WASM_MODULE_HEADER.len() {
         anyhow::bail!("client_wasm bundle is too small: {}", target.display());
     }
     if &bytes[..4] != b"\0asm" {
@@ -6114,7 +6114,18 @@ fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
             target.display()
         );
     }
+    if !bytes_contains(&bytes, CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes())
+        || !bytes_contains(&bytes, b"source_bundle")
+    {
+        anyhow::bail!("client_wasm bundle does not declare ORV metadata");
+    }
     Ok(())
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
@@ -6974,15 +6985,47 @@ fn required_bundle_output_path<'a>(
         .ok_or_else(|| anyhow::anyhow!("missing {kind} bundle target"))
 }
 
-const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
+const CLIENT_WASM_CUSTOM_SECTION_PAYLOAD: &str = r#"{"schema_version":1,"runtime_features":["client_wasm"],"source_bundle":"../source-bundle.json"}"#;
 
 fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, MINIMAL_WASM_MODULE)
+    std::fs::write(path, client_wasm_placeholder_bytes())
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
+}
+
+fn client_wasm_placeholder_bytes() -> Vec<u8> {
+    let mut bytes = WASM_MODULE_HEADER.to_vec();
+    let mut custom_section = Vec::new();
+    push_wasm_u32_leb(
+        &mut custom_section,
+        CLIENT_WASM_CUSTOM_SECTION_NAME.len() as u32,
+    );
+    custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
+    custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_PAYLOAD.as_bytes());
+
+    bytes.push(0);
+    push_wasm_u32_leb(&mut bytes, custom_section.len() as u32);
+    bytes.extend(custom_section);
+    bytes
+}
+
+fn push_wasm_u32_leb(out: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
 }
 
 fn write_client_js_loader(path: &Path) -> anyhow::Result<()> {
@@ -12724,6 +12767,9 @@ entry = "src/main.orv"
             .any(|bundle| bundle["kind"] == "static_page"));
         let wasm = std::fs::read(build_out.join("client").join("app.wasm")).expect("client wasm");
         assert_eq!(&wasm[..4], b"\0asm");
+        let wasm_text = String::from_utf8_lossy(&wasm);
+        assert!(wasm_text.contains("orv.client"));
+        assert!(wasm_text.contains("source_bundle"));
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
         assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
