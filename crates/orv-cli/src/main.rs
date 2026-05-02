@@ -6116,18 +6116,85 @@ fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
             target.display()
         );
     }
-    if !bytes_contains(&bytes, CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes())
-        || !bytes_contains(&bytes, b"source_bundle")
+    let payload = client_wasm_custom_section_payload(&bytes)?
+        .ok_or_else(|| anyhow::anyhow!("client_wasm bundle does not declare ORV metadata"))?;
+    let payload = std::str::from_utf8(payload)
+        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not UTF-8: {e}"))?;
+    let metadata: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not JSON: {e}"))?;
+    if metadata
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
     {
-        anyhow::bail!("client_wasm bundle does not declare ORV metadata");
+        anyhow::bail!("client_wasm ORV metadata schema_version must be 1");
+    }
+    if metadata
+        .get("source_bundle")
+        .and_then(serde_json::Value::as_str)
+        != Some(CLIENT_WASM_SOURCE_BUNDLE_PATH)
+    {
+        anyhow::bail!("client_wasm ORV metadata source_bundle is invalid");
+    }
+    if !metadata
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|features| features.iter().any(|feature| feature == "client_wasm"))
+    {
+        anyhow::bail!("client_wasm ORV metadata must include client_wasm runtime feature");
     }
     Ok(())
 }
 
-fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+fn client_wasm_custom_section_payload(bytes: &[u8]) -> anyhow::Result<Option<&[u8]>> {
+    let mut offset = WASM_MODULE_HEADER.len();
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(bytes, &mut offset, bytes.len())? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid WASM section length"))?;
+        if section_end > bytes.len() {
+            anyhow::bail!("client_wasm bundle has invalid WASM section length");
+        }
+        if section_id == 0 {
+            let mut section_offset = offset;
+            let name_len = read_wasm_u32_leb(bytes, &mut section_offset, section_end)? as usize;
+            let name_end = section_offset.checked_add(name_len).ok_or_else(|| {
+                anyhow::anyhow!("client_wasm bundle has invalid custom section name")
+            })?;
+            if name_end > section_end {
+                anyhow::bail!("client_wasm bundle has invalid custom section name");
+            }
+            if &bytes[section_offset..name_end] == CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes() {
+                return Ok(Some(&bytes[name_end..section_end]));
+            }
+        }
+        offset = section_end;
+    }
+    Ok(None)
+}
+
+fn read_wasm_u32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0;
+    for _ in 0..5 {
+        if *offset >= limit {
+            anyhow::bail!("client_wasm bundle has truncated LEB128 length");
+        }
+        let byte = bytes[*offset];
+        *offset += 1;
+        if shift == 28 && (byte & 0xf0) != 0 {
+            anyhow::bail!("client_wasm bundle has invalid u32 LEB128 length");
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    anyhow::bail!("client_wasm bundle has invalid u32 LEB128 length")
 }
 
 fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
@@ -6989,6 +7056,7 @@ fn required_bundle_output_path<'a>(
 
 const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
+const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const CLIENT_WASM_CUSTOM_SECTION_PAYLOAD: &str = r#"{"schema_version":1,"runtime_features":["client_wasm"],"source_bundle":"../source-bundle.json"}"#;
 
 fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
@@ -7003,17 +7071,19 @@ fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
 fn client_wasm_placeholder_bytes() -> Vec<u8> {
     let mut bytes = WASM_MODULE_HEADER.to_vec();
     let mut custom_section = Vec::new();
-    push_wasm_u32_leb(
-        &mut custom_section,
-        CLIENT_WASM_CUSTOM_SECTION_NAME.len() as u32,
-    );
+    push_wasm_len(&mut custom_section, CLIENT_WASM_CUSTOM_SECTION_NAME.len());
     custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
     custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_PAYLOAD.as_bytes());
 
     bytes.push(0);
-    push_wasm_u32_leb(&mut bytes, custom_section.len() as u32);
+    push_wasm_len(&mut bytes, custom_section.len());
     bytes.extend(custom_section);
     bytes
+}
+
+fn push_wasm_len(out: &mut Vec<u8>, len: usize) {
+    let len = u32::try_from(len).expect("WASM section length fits in u32");
+    push_wasm_u32_leb(out, len);
 }
 
 fn push_wasm_u32_leb(out: &mut Vec<u8>, mut value: u32) {
@@ -12773,8 +12843,7 @@ entry = "src/main.orv"
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");
@@ -12871,6 +12940,39 @@ entry = "src/main.orv"
         cmd_build(&entry, &build_out).expect("build artifacts");
 
         cmd_verify_build(&build_out).expect("verify build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_wasm_without_orv_custom_section() {
+        let out = temp_output_dir("verify-build-client-wasm-section");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let mut wasm = WASM_MODULE_HEADER.to_vec();
+        let mut custom_section = Vec::new();
+        push_wasm_len(&mut custom_section, "not.orv".len());
+        custom_section.extend_from_slice(b"not.orv");
+        custom_section.extend_from_slice(br#"{"note":"orv.client source_bundle"}"#);
+        wasm.push(0);
+        push_wasm_len(&mut wasm, custom_section.len());
+        wasm.extend(custom_section);
+        std::fs::write(build_out.join("client").join("app.wasm"), wasm).expect("rewrite wasm");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client wasm");
+
+        assert!(
+            err.to_string().contains("ORV metadata"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 
