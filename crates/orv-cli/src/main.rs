@@ -6196,6 +6196,9 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("WebAssembly.instantiate") {
         anyhow::bail!("client_js bundle does not instantiate wasm");
     }
+    if !source.contains(CLIENT_WASM_START_EXPORT) {
+        anyhow::bail!("client_js bundle does not call {CLIENT_WASM_START_EXPORT}");
+    }
     Ok(())
 }
 
@@ -6241,7 +6244,60 @@ fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_wasm ORV metadata must include client_wasm runtime feature");
     }
+    if !client_wasm_exports_function(&bytes, CLIENT_WASM_START_EXPORT)? {
+        anyhow::bail!("client_wasm bundle must export `{CLIENT_WASM_START_EXPORT}`");
+    }
     Ok(())
+}
+
+fn client_wasm_exports_function(bytes: &[u8], name: &str) -> anyhow::Result<bool> {
+    let mut offset = WASM_MODULE_HEADER.len();
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(bytes, &mut offset, bytes.len())? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid WASM section length"))?;
+        if section_end > bytes.len() {
+            anyhow::bail!("client_wasm bundle has invalid WASM section length");
+        }
+        if section_id == 7 && wasm_export_section_has_function(bytes, offset, section_end, name)? {
+            return Ok(true);
+        }
+        offset = section_end;
+    }
+    Ok(false)
+}
+
+fn wasm_export_section_has_function(
+    bytes: &[u8],
+    mut offset: usize,
+    section_end: usize,
+    name: &str,
+) -> anyhow::Result<bool> {
+    let export_count = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+    for _ in 0..export_count {
+        let name_len = read_wasm_u32_leb(bytes, &mut offset, section_end)? as usize;
+        let name_end = offset
+            .checked_add(name_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid export name"))?;
+        if name_end > section_end {
+            anyhow::bail!("client_wasm bundle has invalid export name");
+        }
+        let export_name_matches = &bytes[offset..name_end] == name.as_bytes();
+        offset = name_end;
+        if offset >= section_end {
+            anyhow::bail!("client_wasm bundle has truncated export descriptor");
+        }
+        let kind = bytes[offset];
+        offset += 1;
+        let _index = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+        if export_name_matches && kind == 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn client_wasm_custom_section_payload(bytes: &[u8]) -> anyhow::Result<Option<&[u8]>> {
@@ -7155,6 +7211,7 @@ fn required_bundle_output_path<'a>(
 const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
+const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_CUSTOM_SECTION_PAYLOAD: &str = r#"{"schema_version":1,"runtime_features":["client_wasm"],"source_bundle":"../source-bundle.json"}"#;
 
 fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
@@ -7176,7 +7233,40 @@ fn client_wasm_placeholder_bytes() -> Vec<u8> {
     bytes.push(0);
     push_wasm_len(&mut bytes, custom_section.len());
     bytes.extend(custom_section);
+
+    let mut type_section = Vec::new();
+    push_wasm_u32_leb(&mut type_section, 1);
+    type_section.push(0x60);
+    push_wasm_u32_leb(&mut type_section, 0);
+    push_wasm_u32_leb(&mut type_section, 0);
+    push_wasm_section(&mut bytes, 1, &type_section);
+
+    let mut function_section = Vec::new();
+    push_wasm_u32_leb(&mut function_section, 1);
+    push_wasm_u32_leb(&mut function_section, 0);
+    push_wasm_section(&mut bytes, 3, &function_section);
+
+    let mut export_section = Vec::new();
+    push_wasm_u32_leb(&mut export_section, 1);
+    push_wasm_len(&mut export_section, CLIENT_WASM_START_EXPORT.len());
+    export_section.extend_from_slice(CLIENT_WASM_START_EXPORT.as_bytes());
+    export_section.push(0);
+    push_wasm_u32_leb(&mut export_section, 0);
+    push_wasm_section(&mut bytes, 7, &export_section);
+
+    let mut code_section = Vec::new();
+    push_wasm_u32_leb(&mut code_section, 1);
+    push_wasm_u32_leb(&mut code_section, 2);
+    push_wasm_u32_leb(&mut code_section, 0);
+    code_section.push(0x0b);
+    push_wasm_section(&mut bytes, 10, &code_section);
     bytes
+}
+
+fn push_wasm_section(out: &mut Vec<u8>, id: u8, section: &[u8]) {
+    out.push(id);
+    push_wasm_len(out, section.len());
+    out.extend_from_slice(section);
 }
 
 fn push_wasm_len(out: &mut Vec<u8>, len: usize) {
@@ -7213,7 +7303,10 @@ const root = document.querySelector('[data-orv-client="wasm"]');
 async function main() {
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
-  await WebAssembly.instantiate(bytes, {});
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  if (typeof instance.exports.orv_start === "function") {
+    instance.exports.orv_start();
+  }
   if (root) {
     root.dataset.orvStatus = "ready";
     root.dataset.orvSourceBundle = sourceBundleUrl.href;
@@ -13008,6 +13101,7 @@ entry = "src/main.orv"
         let wasm_text = String::from_utf8_lossy(&wasm);
         assert!(wasm_text.contains("orv.client"));
         assert!(wasm_text.contains("source_bundle"));
+        assert!(wasm_text.contains("orv_start"));
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
         assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
@@ -13015,6 +13109,7 @@ entry = "src/main.orv"
         assert!(loader.contains("../source-bundle.json"));
         assert!(loader.contains("runtimeFeatures"));
         assert!(loader.contains("WebAssembly.instantiate"));
+        assert!(loader.contains("orv_start"));
         assert!(loader.contains("app.wasm"));
         let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
             .expect("client page");
@@ -13096,6 +13191,70 @@ entry = "src/main.orv"
 
         assert!(
             err.to_string().contains("ORV metadata"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_wasm_without_start_export() {
+        let out = temp_output_dir("verify-build-client-wasm-export");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let mut wasm = WASM_MODULE_HEADER.to_vec();
+        let mut custom_section = Vec::new();
+        push_wasm_len(&mut custom_section, CLIENT_WASM_CUSTOM_SECTION_NAME.len());
+        custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
+        custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_PAYLOAD.as_bytes());
+        push_wasm_section(&mut wasm, 0, &custom_section);
+        std::fs::write(build_out.join("client").join("app.wasm"), wasm).expect("rewrite wasm");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client wasm");
+
+        assert!(
+            err.to_string().contains("orv_start"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_js_without_start_call() {
+        let out = temp_output_dir("verify-build-client-js-start");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let loader_path = build_out.join("client").join("app.js");
+        let loader = std::fs::read_to_string(&loader_path)
+            .expect("client loader")
+            .replace(
+                r#"  if (typeof instance.exports.orv_start === "function") {
+    instance.exports.orv_start();
+  }
+"#,
+                "",
+            );
+        std::fs::write(&loader_path, loader).expect("rewrite loader");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
+
+        assert!(
+            err.to_string().contains("orv_start"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
