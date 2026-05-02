@@ -244,7 +244,10 @@ enum DbCommand {
     Recover {
         /// 읽을 @db.wal JSONL 경로.
         #[arg(long)]
-        wal: PathBuf,
+        wal: Option<PathBuf>,
+        /// 읽을 WAL archive manifest JSON 경로.
+        #[arg(long)]
+        archive: Option<PathBuf>,
         /// 쓸 @db.save JSON data snapshot 경로.
         #[arg(long)]
         out: PathBuf,
@@ -500,12 +503,14 @@ fn main() -> ExitCode {
             },
             DbCommand::Recover {
                 wal,
+                archive,
                 out,
                 until_record,
                 until_unix_ms,
                 until_time,
-            } => match cmd_db_recover(
-                &wal,
+            } => match cmd_db_recover_from_inputs(
+                wal.as_deref(),
+                archive.as_deref(),
                 &out,
                 until_record,
                 until_unix_ms,
@@ -1024,6 +1029,25 @@ fn cmd_db_recover(
     Ok(())
 }
 
+fn cmd_db_recover_from_inputs(
+    wal: Option<&Path>,
+    archive: Option<&Path>,
+    out: &Path,
+    until_record: Option<usize>,
+    until_unix_ms: Option<u64>,
+    until_time: Option<&str>,
+) -> anyhow::Result<()> {
+    match (wal, archive) {
+        (Some(wal), None) => cmd_db_recover(wal, out, until_record, until_unix_ms, until_time),
+        (None, Some(archive)) => {
+            let wal = db_archive_manifest_wal_path(archive)?;
+            cmd_db_recover(&wal, out, until_record, until_unix_ms, until_time)
+        }
+        (Some(_), Some(_)) => anyhow::bail!("db recover accepts only one of --wal or --archive"),
+        (None, None) => anyhow::bail!("db recover requires --wal or --archive"),
+    }
+}
+
 fn cmd_db_archive(wal: &Path, out: &Path, target: Option<&str>) -> anyhow::Result<()> {
     let mut manifest = db_wal_archive_manifest(wal)?;
     let archive_target = target
@@ -1100,6 +1124,56 @@ fn db_wal_archive_manifest(wal: &Path) -> anyhow::Result<serde_json::Value> {
         },
         "records": records,
     }))
+}
+
+fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
+    let manifest = read_json_value(archive)?;
+    if manifest
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("db archive schema_version must be 1");
+    }
+    if manifest.get("kind").and_then(serde_json::Value::as_str) != Some("orv.db.wal_archive") {
+        anyhow::bail!("db archive kind must be orv.db.wal_archive");
+    }
+    if let Some(target_path) = manifest
+        .pointer("/target/wal/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        let wal_path = lsp_file_uri_path(target_path)?;
+        verify_db_archive_wal(&manifest, &wal_path)?;
+        return Ok(wal_path);
+    }
+    let wal_path = manifest
+        .pointer("/wal/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("db archive wal.path must be a string"))?;
+    let wal_path = PathBuf::from(wal_path);
+    verify_db_archive_wal(&manifest, &wal_path)?;
+    Ok(wal_path)
+}
+
+fn verify_db_archive_wal(manifest: &serde_json::Value, wal: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(wal)
+        .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
+    let expected_hash = manifest
+        .pointer("/wal/hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("db archive wal.hash must be a string"))?;
+    let actual_hash = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
+    if actual_hash != expected_hash {
+        anyhow::bail!("db archive WAL hash mismatch for {}", wal.display());
+    }
+    let expected_bytes = manifest
+        .pointer("/wal/byte_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("db archive wal.byte_count must be a number"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_bytes {
+        anyhow::bail!("db archive WAL byte count mismatch for {}", wal.display());
+    }
+    Ok(())
 }
 
 struct DbArchiveFileTarget {
@@ -13386,6 +13460,105 @@ entry = "src/main.orv"
         if let Err(err) = parsed {
             panic!("{}", err.render());
         }
+    }
+
+    #[test]
+    fn db_recover_archive_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "recover",
+            "--archive",
+            "target/archive.json",
+            "--out",
+            "target/data.json",
+            "--until-record",
+            "1",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_recover_archive_rejects_wal_hash_mismatch() {
+        let dir = temp_output_dir("db-recover-archive-hash");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let wal = dir.join("db.wal.jsonl");
+        let archive = dir.join("archive.json");
+        let target_dir = dir.join("archive-target");
+        let out = dir.join("data.json");
+        let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal).expect("open wal");
+        db.create_logged(
+            "users",
+            vec![(
+                "name".to_string(),
+                orv_runtime::Value::Str("Ada".to_string()),
+            )],
+        )
+        .expect("create user");
+        cmd_db_archive(
+            &wal,
+            &archive,
+            Some(&format!("file://{}", target_dir.display())),
+        )
+        .expect("archive wal");
+        let archived_wal = db_archive_manifest_wal_path(&archive).expect("archive wal path");
+        let tampered = std::fs::read_to_string(&archived_wal)
+            .expect("read archived wal")
+            .replace("Ada", "Eve");
+        std::fs::write(&archived_wal, tampered).expect("tamper archived wal");
+
+        let err = cmd_db_recover_from_inputs(None, Some(&archive), &out, None, None, None)
+            .expect_err("tampered archive recover");
+
+        assert!(err.to_string().contains("db archive WAL hash mismatch"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_recover_archive_uses_archived_wal_target() {
+        let dir = temp_output_dir("db-recover-archive-target");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let wal = dir.join("db.wal.jsonl");
+        let archive = dir.join("archive.json");
+        let target_dir = dir.join("archive-target");
+        let out = dir.join("data.json");
+        let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal).expect("open wal");
+        db.create_logged(
+            "users",
+            vec![(
+                "name".to_string(),
+                orv_runtime::Value::Str("Ada".to_string()),
+            )],
+        )
+        .expect("create first user");
+        db.create_logged(
+            "users",
+            vec![(
+                "name".to_string(),
+                orv_runtime::Value::Str("Grace".to_string()),
+            )],
+        )
+        .expect("create second user");
+        cmd_db_archive(
+            &wal,
+            &archive,
+            Some(&format!("file://{}", target_dir.display())),
+        )
+        .expect("archive wal");
+        std::fs::remove_file(&wal).expect("remove original wal");
+
+        cmd_db_recover_from_inputs(None, Some(&archive), &out, Some(1), None, None)
+            .expect("recover from archive");
+
+        let snapshot = read_json_value(&out).expect("snapshot");
+        let rows = snapshot["tables"]["users"]["rows"]
+            .as_array()
+            .expect("users rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Ada");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

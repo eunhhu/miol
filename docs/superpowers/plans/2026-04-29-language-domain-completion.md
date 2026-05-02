@@ -14,6 +14,8 @@
 
 **Dev/HMR delta (2026-05-03):** `orv dev --hmr` now emits `dev/session.json` with source hash watch inputs, bundle targets, and hot-reload/full-reload fallback strategy, and `orv verify-build` validates that session when present. Remaining HMR work is the persistent watch loop and browser/server transport.
 
+**DB archive delta (2026-05-03):** `orv db recover` now accepts `--archive <archive.json>` as an alternative to raw `--wal`, resolves file archive targets, and verifies archived WAL hash/byte count before replay. Remaining DB persistence work is remote archive targets, external adapters, and full crash matrix coverage.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure
