@@ -2440,15 +2440,23 @@ struct DapAsyncRuntimeState {
     state: String,
     resume_count: u64,
     pause_count: u64,
+    routes: Vec<DapAsyncRouteState>,
+}
+
+#[derive(Clone)]
+struct DapAsyncRouteState {
+    method: String,
+    path: String,
 }
 
 impl DapAsyncRuntimeState {
-    fn server() -> Self {
+    fn server(routes: Vec<DapAsyncRouteState>) -> Self {
         Self {
             kind: "server".to_string(),
             state: "paused".to_string(),
             resume_count: 0,
             pause_count: 0,
+            routes,
         }
     }
 }
@@ -2699,7 +2707,7 @@ impl DapSession {
             &sources,
             live_requested,
         );
-        let async_runtime = long_running.then(DapAsyncRuntimeState::server);
+        let async_runtime = dap_async_runtime_state(&lowered.program, long_running);
         let mut executable_lines = if frames.is_empty() {
             dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1])
         } else {
@@ -4410,6 +4418,42 @@ const fn dap_expr_has_long_running_runtime(expr: &orv_hir::HirExpr) -> bool {
     matches!(expr.kind, orv_hir::HirExprKind::Server { .. })
 }
 
+fn dap_async_runtime_state(
+    program: &orv_hir::HirProgram,
+    long_running: bool,
+) -> Option<DapAsyncRuntimeState> {
+    long_running.then(|| DapAsyncRuntimeState::server(dap_async_server_routes(program)))
+}
+
+fn dap_async_server_routes(program: &orv_hir::HirProgram) -> Vec<DapAsyncRouteState> {
+    program
+        .items
+        .iter()
+        .flat_map(|stmt| match stmt {
+            orv_hir::HirStmt::Expr(expr) => dap_expr_async_server_routes(expr),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn dap_expr_async_server_routes(expr: &orv_hir::HirExpr) -> Vec<DapAsyncRouteState> {
+    let orv_hir::HirExprKind::Server { routes, .. } = &expr.kind else {
+        return Vec::new();
+    };
+    routes
+        .iter()
+        .filter_map(|route| {
+            let orv_hir::HirExprKind::Route { method, path, .. } = &route.kind else {
+                return None;
+            };
+            Some(DapAsyncRouteState {
+                method: method.clone(),
+                path: path.clone(),
+            })
+        })
+        .collect()
+}
+
 fn dap_long_running_runtime_state(
     program: &orv_hir::HirProgram,
     files: &[SourceFile],
@@ -4466,9 +4510,18 @@ fn dap_runtime_json(
             "state": async_runtime.state,
             "resume_count": async_runtime.resume_count,
             "pause_count": async_runtime.pause_count,
+            "route_count": async_runtime.routes.len(),
+            "routes": async_runtime.routes.iter().map(dap_async_route_json).collect::<Vec<_>>(),
         });
     }
     value
+}
+
+fn dap_async_route_json(route: &DapAsyncRouteState) -> serde_json::Value {
+    serde_json::json!({
+        "method": route.method,
+        "path": route.path,
+    })
 }
 
 fn dap_runtime_frames(
@@ -11479,6 +11532,15 @@ let total: int = add(2, 3)
 
         assert_eq!(launch["success"], true, "{launch}");
         assert_eq!(launch["body"]["runtime"]["status"], "paused");
+        assert_eq!(launch["body"]["runtime"]["async"]["route_count"], 1);
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["routes"][0]["method"],
+            "GET"
+        );
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["routes"][0]["path"],
+            "/ping"
+        );
         assert_eq!(stack["success"], true, "{stack}");
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
         assert_eq!(stack["body"]["stackFrames"][0]["name"], "server runtime");
