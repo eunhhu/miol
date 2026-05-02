@@ -2455,6 +2455,8 @@ struct DapAsyncListenState {
     kind: String,
     display: String,
     port: Option<u64>,
+    variable: Option<String>,
+    default_port: Option<u64>,
 }
 
 impl DapAsyncRuntimeState {
@@ -4426,18 +4428,90 @@ fn dap_expr_async_server_listen(expr: &orv_hir::HirExpr) -> Option<DapAsyncListe
         return None;
     };
     let listen = listen.as_ref()?;
+    if let Some(listen) = dap_async_env_listen(listen) {
+        return Some(listen);
+    }
     match &listen.kind {
         orv_hir::HirExprKind::Integer(value) => Some(DapAsyncListenState {
             kind: "static".to_string(),
             display: value.clone(),
             port: value.parse::<u64>().ok(),
+            variable: None,
+            default_port: None,
         }),
         _ => Some(DapAsyncListenState {
             kind: "expression".to_string(),
             display: "<expression>".to_string(),
             port: None,
+            variable: None,
+            default_port: None,
         }),
     }
+}
+
+fn dap_async_env_listen(expr: &orv_hir::HirExpr) -> Option<DapAsyncListenState> {
+    let orv_hir::HirExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    if dap_hir_call_name(callee) != "int.from" || args.len() != 1 {
+        return None;
+    }
+    let arg = args.first()?;
+    let (env_expr, default_port) = match &arg.kind {
+        orv_hir::HirExprKind::Binary {
+            op: orv_hir::BinaryOp::Coalesce,
+            lhs,
+            rhs,
+        } => (lhs.as_ref(), dap_string_port(rhs.as_ref())),
+        _ => (arg, None),
+    };
+    let variable = dap_env_variable(env_expr)?;
+    let display = default_port.map_or_else(
+        || variable.clone(),
+        |port| format!("{variable} default {port}"),
+    );
+    Some(DapAsyncListenState {
+        kind: "env".to_string(),
+        display,
+        port: default_port,
+        variable: Some(variable),
+        default_port,
+    })
+}
+
+fn dap_hir_call_name(expr: &orv_hir::HirExpr) -> String {
+    match &expr.kind {
+        orv_hir::HirExprKind::Ident(ident) => ident.name.clone(),
+        orv_hir::HirExprKind::Field { target, field, .. } => {
+            format!("{}.{}", dap_hir_call_name(target), field)
+        }
+        orv_hir::HirExprKind::OptionalField { target, field, .. } => {
+            format!("{}?.{}", dap_hir_call_name(target), field)
+        }
+        orv_hir::HirExprKind::Domain { name, .. } => format!("@{name}"),
+        orv_hir::HirExprKind::TypeName(name) => name.clone(),
+        _ => "<expr>".to_string(),
+    }
+}
+
+fn dap_env_variable(expr: &orv_hir::HirExpr) -> Option<String> {
+    let orv_hir::HirExprKind::Field { target, field, .. } = &expr.kind else {
+        return None;
+    };
+    let orv_hir::HirExprKind::Domain { name, args, .. } = &target.kind else {
+        return None;
+    };
+    (name == "env" && args.is_empty()).then(|| field.clone())
+}
+
+fn dap_string_port(expr: &orv_hir::HirExpr) -> Option<u64> {
+    let orv_hir::HirExprKind::String(segments) = &expr.kind else {
+        return None;
+    };
+    let [orv_hir::HirStringSegment::Str(raw)] = segments.as_slice() else {
+        return None;
+    };
+    raw.parse::<u64>().ok()
 }
 
 fn dap_async_server_routes(program: &orv_hir::HirProgram) -> Vec<DapAsyncRouteState> {
@@ -4540,6 +4614,12 @@ fn dap_async_listen_json(listen: &DapAsyncListenState) -> serde_json::Value {
     });
     if let Some(port) = listen.port {
         value["port"] = serde_json::json!(port);
+    }
+    if let Some(variable) = &listen.variable {
+        value["variable"] = serde_json::json!(variable);
+    }
+    if let Some(default_port) = listen.default_port {
+        value["default_port"] = serde_json::json!(default_port);
     }
     value
 }
@@ -11977,6 +12057,57 @@ let total: int = add(2, 3)
             .expect("completion targets")
             .iter()
             .any(|target| target["label"] == "runtimeListen" && target["type"] == "property"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_exposes_env_listen_endpoint() {
+        let dir = temp_output_dir("dap-server-env-listen");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"@server {
+  @listen int.from(@env.PORT ?? "8080")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 240,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let listen = session
+            .message_response(&serde_json::json!({
+                "seq": 241,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "runtimeListen",
+                },
+            }))
+            .expect("listen evaluate response");
+
+        assert_eq!(launch["body"]["runtime"]["async"]["listen"]["kind"], "env");
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["listen"]["variable"],
+            "PORT"
+        );
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["listen"]["default_port"],
+            8080
+        );
+        assert_eq!(listen["success"], true, "{listen}");
+        assert_eq!(listen["body"]["result"], "PORT default 8080");
         let _ = std::fs::remove_dir_all(dir);
     }
 
