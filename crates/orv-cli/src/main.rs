@@ -7311,6 +7311,10 @@ fn verify_deploy_server_target(
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
+    let runtime_image = json_str(server, "runtime_image", "deploy server")?;
+    if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
+        anyhow::bail!("deploy server runtime_image must be {ORV_REFERENCE_RUNTIME_IMAGE}");
+    }
     let entrypoint_path = dir.join(entrypoint);
     if !entrypoint_path.is_file() {
         anyhow::bail!(
@@ -7343,6 +7347,7 @@ fn verify_deploy_server_target(
             entrypoint,
             routes_artifact,
             runtime: artifact.runtime.as_str(),
+            runtime_image,
             listen: artifact.listen.as_ref(),
         },
     )?;
@@ -7406,6 +7411,10 @@ fn verify_deploy_container_artifact(
     if json_str(&container, "runtime", "deploy container")? != contract.runtime {
         anyhow::bail!("deploy container runtime does not match runtime artifact");
     }
+    if json_str(&container, "runtime_image", "deploy container")? != contract.runtime_image {
+        let runtime_image = contract.runtime_image;
+        anyhow::bail!("deploy container runtime_image must be {runtime_image}");
+    }
     if json_str(&container, "protocol", "deploy container")? != "http1" {
         anyhow::bail!("deploy container protocol must be http1");
     }
@@ -7420,7 +7429,12 @@ fn verify_deploy_container_artifact(
     if command.first().and_then(serde_json::Value::as_str) != Some("./deploy/server.sh") {
         anyhow::bail!("deploy container command must start with ./deploy/server.sh");
     }
-    verify_deploy_dockerfile(dir, dockerfile_path, contract.listen)
+    verify_deploy_dockerfile(
+        dir,
+        dockerfile_path,
+        contract.runtime_image,
+        contract.listen,
+    )
 }
 
 struct DeployServerContract<'a> {
@@ -7428,6 +7442,7 @@ struct DeployServerContract<'a> {
     entrypoint: &'a str,
     routes_artifact: &'a str,
     runtime: &'a str,
+    runtime_image: &'a str,
     listen: Option<&'a orv_compiler::ServerListenArtifact>,
 }
 
@@ -7446,6 +7461,7 @@ fn verify_deploy_listen_value(
 fn verify_deploy_dockerfile(
     dir: &Path,
     path: &str,
+    runtime_image: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
 ) -> anyhow::Result<()> {
     let dockerfile_path = dir.join(path);
@@ -7454,6 +7470,10 @@ fn verify_deploy_dockerfile(
     }
     let dockerfile = std::fs::read_to_string(&dockerfile_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", dockerfile_path.display()))?;
+    let expected_runtime_image = format!("ARG ORV_RUNTIME_IMAGE={runtime_image}");
+    if !dockerfile.contains(&expected_runtime_image) {
+        anyhow::bail!("deploy Dockerfile must declare {expected_runtime_image}");
+    }
     if !dockerfile.contains("FROM ${ORV_RUNTIME_IMAGE}") {
         anyhow::bail!("deploy Dockerfile must use ORV_RUNTIME_IMAGE");
     }
@@ -8488,6 +8508,7 @@ fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<Str
 const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
+const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_CUSTOM_SECTION_PAYLOAD: &str = r#"{"schema_version":1,"runtime_features":["client_wasm"],"source_bundle":"../source-bundle.json"}"#;
 
@@ -8670,6 +8691,7 @@ fn write_prod_deploy_artifacts(
             "routes_artifact": routes_artifact,
             "container": container,
             "dockerfile": dockerfile,
+            "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
             "listen": server_artifact.listen.clone(),
             "routes": server_artifact.routes.clone(),
@@ -8740,6 +8762,7 @@ fn write_prod_container_artifacts(
         "entrypoint": entrypoint,
         "routes_artifact": routes_artifact,
         "runtime": server_artifact.runtime.clone(),
+        "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
         "protocol": "http1",
         "listen": server_artifact.listen.clone(),
         "ports": deploy_ports_value(server_artifact.listen.as_ref()),
@@ -8750,7 +8773,7 @@ fn write_prod_container_artifacts(
         .map(|port| format!("EXPOSE {port}\n"))
         .unwrap_or_default();
     let dockerfile = format!(
-        r#"ARG ORV_RUNTIME_IMAGE=ghcr.io/orv-lang/orv-reference:latest
+        r#"ARG ORV_RUNTIME_IMAGE={ORV_REFERENCE_RUNTIME_IMAGE}
 FROM ${{ORV_RUNTIME_IMAGE}}
 WORKDIR /app
 COPY . /app
@@ -15063,6 +15086,10 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
         assert_eq!(deploy["server"]["container"], "deploy/container.json");
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
+        assert_eq!(
+            deploy["server"]["runtime_image"],
+            "ghcr.io/orv-lang/orv-reference:latest"
+        );
         assert_eq!(deploy["server"]["listen"]["port"], 8080);
         assert!(deploy["server"]["routes"]
             .as_array()
@@ -15078,12 +15105,17 @@ entry = "src/main.orv"
         assert_eq!(container["routes_artifact"], "deploy/routes.json");
         assert_eq!(container["dockerfile"], "deploy/Dockerfile");
         assert_eq!(container["runtime"], "reference-interpreter");
+        assert_eq!(
+            container["runtime_image"],
+            deploy["server"]["runtime_image"]
+        );
         assert_eq!(container["protocol"], "http1");
         assert_eq!(container["listen"], deploy["server"]["listen"]);
         assert_eq!(container["ports"][0]["container"], 8080);
         assert_eq!(container["ports"][0]["protocol"], "tcp");
         assert_eq!(container["command"][0], "./deploy/server.sh");
         let dockerfile = std::fs::read_to_string(&deploy_dockerfile_path).expect("Dockerfile");
+        assert!(dockerfile.contains("ARG ORV_RUNTIME_IMAGE=ghcr.io/orv-lang/orv-reference:latest"));
         assert!(dockerfile.contains("FROM ${ORV_RUNTIME_IMAGE}"));
         assert!(dockerfile.contains("COPY . /app"));
         assert!(dockerfile.contains("EXPOSE 8080"));
@@ -15178,6 +15210,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_container_runtime_image_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-container-runtime-image-source");
+        let out = temp_output_dir("deploy-container-runtime-image-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let container_path = out.join("deploy").join("container.json");
+        let mut container = read_json_value(&container_path).expect("container");
+        container["runtime_image"] = serde_json::json!("example.invalid/orv:wrong");
+        write_json(&container_path, &container).expect("write corrupt container");
+
+        let err = cmd_verify_build(&out).expect_err("container runtime image mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy container runtime_image must be"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
