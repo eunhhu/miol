@@ -1751,6 +1751,7 @@ struct DapSession {
     next_seq: u64,
     launched: Option<DapLaunchState>,
     breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
+    function_breakpoints: Vec<DapFunctionBreakpoint>,
     pending_events: Vec<DapPendingEvent>,
 }
 
@@ -1787,6 +1788,14 @@ struct DapSourceInfo {
 struct DapBreakpoint {
     id: u64,
     line: u64,
+    verified: bool,
+    message: Option<String>,
+}
+
+#[derive(Clone)]
+struct DapFunctionBreakpoint {
+    id: u64,
+    name: String,
     verified: bool,
     message: Option<String>,
 }
@@ -1914,6 +1923,7 @@ impl DapSession {
                     "supportsEvaluateForHovers": true,
                     "supportsCompletionsRequest": true,
                     "supportsBreakpointLocationsRequest": true,
+                    "supportsFunctionBreakpoints": true,
                     "supportsExceptionInfoRequest": true,
                     "supportsRestartRequest": true,
                     "supportsSetVariable": true,
@@ -1940,6 +1950,7 @@ impl DapSession {
             "configurationDone" => self.configuration_done_result(),
             "setExceptionBreakpoints" => Ok(dap_set_exception_breakpoints_result(request)),
             "setBreakpoints" => self.set_breakpoints_result(request),
+            "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
             "gotoTargets" => self.goto_targets_result(request),
             "threads" => Ok(serde_json::json!({
@@ -2026,16 +2037,15 @@ impl DapSession {
             .get(current_frame_index)
             .map_or(executable_lines[0], |frame| frame.line);
         let stopped_reason = if runtime.status != "ok" {
-            "exception"
-        } else if frames
+            "exception".to_string()
+        } else if let Some(reason) = frames
             .get(current_frame_index)
-            .is_some_and(|frame| self.has_verified_breakpoint(&frame.source.path, frame.line))
+            .and_then(|frame| self.breakpoint_frame_reason(frame))
         {
-            "breakpoint"
+            reason.to_string()
         } else {
-            "entry"
-        }
-        .to_string();
+            "entry".to_string()
+        };
         self.launched = Some(DapLaunchState {
             path: entry_path.clone(),
             uri: entry_uri.clone(),
@@ -2251,6 +2261,52 @@ impl DapSession {
                 line,
                 end_line,
             ),
+        }))
+    }
+
+    fn set_function_breakpoints_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let breakpoints = request
+            .pointer("/arguments/breakpoints")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(Vec::new, |items| {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let name = breakpoint
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let verified = !name.is_empty();
+                        DapFunctionBreakpoint {
+                            id: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                            name: name.to_string(),
+                            verified,
+                            message: (!verified)
+                                .then(|| "function breakpoint name must not be empty".to_string()),
+                        }
+                    })
+                    .collect()
+            });
+        self.function_breakpoints = breakpoints.clone();
+        Ok(serde_json::json!({
+            "breakpoints": breakpoints
+                .iter()
+                .map(|breakpoint| {
+                    let mut value = serde_json::json!({
+                        "id": breakpoint.id,
+                        "verified": breakpoint.verified,
+                    });
+                    if let Some(message) = &breakpoint.message {
+                        value["message"] = serde_json::Value::String(message.clone());
+                    }
+                    value
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 
@@ -2509,15 +2565,25 @@ impl DapSession {
         );
         if let Some(index) = next_breakpoint {
             self.queue_frame_outputs(start_frame, index);
+            let stopped = self
+                .launched
+                .as_ref()
+                .and_then(|launched| launched.frames.get(index))
+                .map(|frame| {
+                    (
+                        frame.line,
+                        self.breakpoint_frame_reason(frame).unwrap_or("breakpoint"),
+                    )
+                });
             let launched = self
                 .launched
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
-            launched.current_frame_index = index;
-            if let Some(frame) = launched.frames.get(index) {
-                launched.stopped_line = frame.line;
+            if let Some((line, reason)) = stopped {
+                launched.stopped_line = line;
+                launched.stopped_reason = reason.to_string();
             }
-            launched.stopped_reason = "breakpoint".to_string();
+            launched.current_frame_index = index;
             self.queue_stopped_event();
             return Ok(serde_json::json!({
                 "allThreadsContinued": false,
@@ -2562,13 +2628,11 @@ impl DapSession {
                 .launched
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("launch is required before reverseContinue"))?;
-            launched.frames.get(target_frame).map_or("entry", |frame| {
-                if self.has_verified_breakpoint(&frame.source.path, frame.line) {
-                    "breakpoint"
-                } else {
-                    "entry"
-                }
-            })
+            launched
+                .frames
+                .get(target_frame)
+                .and_then(|frame| self.breakpoint_frame_reason(frame))
+                .unwrap_or("entry")
         };
         let launched = self
             .launched
@@ -2807,10 +2871,10 @@ impl DapSession {
     }
 
     fn first_verified_breakpoint_frame(&self, frames: &[DapFrameState]) -> Option<usize> {
-        frames.iter().enumerate().find_map(|(index, frame)| {
-            self.has_verified_breakpoint(&frame.source.path, frame.line)
-                .then_some(index)
-        })
+        frames
+            .iter()
+            .enumerate()
+            .find_map(|(index, frame)| self.breakpoint_frame_reason(frame).map(|_| index))
     }
 
     fn next_verified_breakpoint_frame(&self, launched: &DapLaunchState) -> Option<usize> {
@@ -2819,17 +2883,22 @@ impl DapSession {
             .iter()
             .enumerate()
             .skip(launched.current_frame_index.saturating_add(1))
-            .find_map(|(index, frame)| {
-                self.has_verified_breakpoint(&frame.source.path, frame.line)
-                    .then_some(index)
-            })
+            .find_map(|(index, frame)| self.breakpoint_frame_reason(frame).map(|_| index))
     }
 
     fn previous_verified_breakpoint_frame(&self, launched: &DapLaunchState) -> Option<usize> {
         (0..launched.current_frame_index).rev().find(|index| {
             let frame = &launched.frames[*index];
-            self.has_verified_breakpoint(&frame.source.path, frame.line)
+            self.breakpoint_frame_reason(frame).is_some()
         })
+    }
+
+    fn breakpoint_frame_reason(&self, frame: &DapFrameState) -> Option<&'static str> {
+        if self.has_verified_breakpoint(&frame.source.path, frame.line) {
+            return Some("breakpoint");
+        }
+        self.has_verified_function_breakpoint(frame)
+            .then_some("function breakpoint")
     }
 
     fn has_verified_breakpoint(&self, path: &Path, line: u64) -> bool {
@@ -2841,6 +2910,15 @@ impl DapSession {
                     .iter()
                     .any(|breakpoint| breakpoint.verified && breakpoint.line == line)
             })
+    }
+
+    fn has_verified_function_breakpoint(&self, frame: &DapFrameState) -> bool {
+        let Some(function_name) = frame.stack.last().map(|frame| frame.name.as_str()) else {
+            return false;
+        };
+        self.function_breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint.verified && breakpoint.name == function_name)
     }
 }
 
@@ -6600,6 +6678,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsEvaluateForHovers"], true);
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
+        assert_eq!(response["body"]["supportsFunctionBreakpoints"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
         assert_eq!(response["body"]["supportsRestartRequest"], true);
         assert_eq!(response["body"]["supportsSetVariable"], true);
@@ -6977,6 +7056,166 @@ function greet(user: User): string -> "hello"
             event["type"] == "event"
                 && event["event"] == "stopped"
                 && event["body"]["reason"] == "breakpoint"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_function_breakpoint_stops_inside_named_function() {
+        let dir = temp_output_dir("dap-function-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let breakpoints = session
+            .message_response(&serde_json::json!({
+                "seq": 190,
+                "type": "request",
+                "command": "setFunctionBreakpoints",
+                "arguments": {
+                    "breakpoints": [
+                        { "name": "add" },
+                    ],
+                },
+            }))
+            .expect("setFunctionBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 191,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 192,
+                "type": "request",
+                "command": "configurationDone",
+                "arguments": {},
+            }))
+            .expect("configurationDone response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 193,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(breakpoints["success"], true, "{breakpoints}");
+        assert_eq!(breakpoints["body"]["breakpoints"][0]["verified"], true);
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "function breakpoint"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_continue_stops_at_next_function_breakpoint_frame() {
+        let dir = temp_output_dir("dap-continue-function-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"let first: int = 1
+function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 194,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        { "line": 1 },
+                    ],
+                },
+            }))
+            .expect("setBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 195,
+                "type": "request",
+                "command": "setFunctionBreakpoints",
+                "arguments": {
+                    "breakpoints": [
+                        { "name": "add" },
+                    ],
+                },
+            }))
+            .expect("setFunctionBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 196,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 197,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 198,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "function breakpoint"
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
