@@ -162,6 +162,14 @@ enum DbCommand {
         #[arg(long)]
         applied: Option<PathBuf>,
     },
+    /// 현재 struct schema와 적용된 schema snapshot이 일치하는지 검증한다.
+    Verify {
+        /// 대상 소스 파일 경로.
+        file: PathBuf,
+        /// 검증할 적용 schema snapshot JSON 경로.
+        #[arg(long)]
+        schema: PathBuf,
+    },
     /// 현재 struct schema snapshot을 적용된 schema 파일로 저장한다.
     Apply {
         /// 대상 소스 파일 경로.
@@ -360,6 +368,13 @@ fn main() -> ExitCode {
         },
         Command::Db { command } => match command {
             DbCommand::Plan { file, applied } => match cmd_db_plan(&file, applied.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Verify { file, schema } => match cmd_db_verify(&file, &schema) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -692,6 +707,19 @@ fn orv_test_names(source: &str) -> Vec<String> {
 fn cmd_db_plan(path: &Path, applied: Option<&Path>) -> anyhow::Result<()> {
     let value = db_plan_json(path, applied)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_db_verify(path: &Path, schema: &Path) -> anyhow::Result<()> {
+    let plan = db_plan_json(path, Some(schema))?;
+    let actions = plan
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("db plan actions must be an array"))?;
+    if !actions.is_empty() {
+        anyhow::bail!("db schema drift: {} action(s)", actions.len());
+    }
+    println!("db schema: {} verified", schema.display());
     Ok(())
 }
 
@@ -9795,6 +9823,77 @@ entry = "src/main.orv"
             .contains_key("avatar"));
         let plan = db_plan_json(&original_source, Some(&schema)).expect("plan after rollback");
         assert_eq!(plan["actions"].as_array().expect("actions").len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_verify_accepts_current_schema_snapshot() {
+        let dir = temp_output_dir("db-verify-current");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write source");
+        let schema = dir.join("schema.json");
+
+        cmd_db_apply(&source, &schema).expect("apply schema");
+
+        cmd_db_verify(&source, &schema).expect("verify current schema");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_verify_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "verify",
+            "fixtures/e2e/hello.orv",
+            "--schema",
+            "target/schema.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_verify_rejects_schema_drift() {
+        let dir = temp_output_dir("db-verify-drift");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let original = dir.join("original.orv");
+        std::fs::write(
+            &original,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write original");
+        let changed = dir.join("changed.orv");
+        std::fs::write(
+            &changed,
+            r#"struct User {
+  id: int
+  email: string
+  avatar: string?
+}"#,
+        )
+        .expect("write changed");
+        let schema = dir.join("schema.json");
+
+        cmd_db_apply(&original, &schema).expect("apply schema");
+
+        let err = cmd_db_verify(&changed, &schema).expect_err("schema drift");
+        assert!(
+            err.to_string().contains("db schema drift: 1 action(s)"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
