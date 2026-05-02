@@ -30,6 +30,8 @@
 
 **DAP request trace JSON delta (2026-05-03):** In-process attached runtime request frames now expose `runtimeRequestTrace` through DAP variables/evaluate/completions as `orv.production.trace` JSON, so captured traffic can feed `orv editor trace` without scraping display strings. `launch.arguments.runtimeRequestTracePath` now flushes the same trace JSON file on pause/terminate/disconnect and exposes the path through variables/evaluate/completions. The trace JSON schema/file writer is now owned by `orv-runtime` and reused by DAP file/display surfaces instead of being duplicated inside the CLI.
 
+**Runtime request trace file delta (2026-05-03):** Normal `@server` runtime execution now honors `ORV_RUNTIME_REQUEST_TRACE_PATH` and writes the same `orv.production.trace` file on graceful shutdown, giving run/build/deploy processes a non-DAP production trace capture path. Remaining trace work is live streaming/transport and richer native editor consumption.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure

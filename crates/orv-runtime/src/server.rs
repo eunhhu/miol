@@ -54,6 +54,7 @@ use crate::interp::{
 /// 다룬다.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const ORV_ORIGIN_ID_HEADER: &str = "x-orv-origin-id";
+const ORV_RUNTIME_REQUEST_TRACE_PATH_ENV: &str = "ORV_RUNTIME_REQUEST_TRACE_PATH";
 
 /// `@server` 가 수집한 단일 라우트 — handler HIR 의 스냅샷.
 ///
@@ -118,6 +119,7 @@ pub(crate) fn run_server(
         .build()
         .map_err(|e| RuntimeError::native(format!("tokio runtime init failed: {e}")))?;
 
+    let request_trace_path = runtime_request_trace_path_from_env();
     runtime.block_on(async move {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let listener = TcpListener::bind(addr)
@@ -128,11 +130,12 @@ pub(crate) fn run_server(
         // SIGTERM 은 컨테이너/systemd 가 기본으로 보내는 신호라 SIGINT 만으로는
         // 프로덕션 배포에서 graceful 이 안 먹는다. Windows 타깃은 SIGTERM
         // 개념이 없으므로 `#[cfg(unix)]` 로 갈라친다.
-        serve_loop(
+        serve_loop_with_request_trace_file(
             listener,
             Arc::new(entries),
             Arc::new(captured_env),
             None,
+            request_trace_path,
             shutdown_signal(),
         )
         .await
@@ -394,6 +397,51 @@ where
     Ok((addr, handle, boot_buf))
 }
 
+#[cfg(test)]
+#[allow(clippy::future_not_send)]
+pub(crate) async fn spawn_for_test_with_request_trace_file<S>(
+    listen: Option<&HirExpr>,
+    routes: &[HirExpr],
+    body_stmts: &[orv_hir::HirStmt],
+    captured_env: HashMap<NameId, Value>,
+    request_trace_path: std::path::PathBuf,
+    shutdown: S,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>, Vec<u8>), RuntimeError>
+where
+    S: std::future::Future<Output = ()> + 'static,
+{
+    let mut boot_buf: Vec<u8> = Vec::new();
+    let (port, entries, captured_env) = prepare_server_state(
+        listen,
+        routes,
+        body_stmts,
+        captured_env,
+        &mut boot_buf,
+        true,
+    )?;
+
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| RuntimeError::native(format!("test bind failed: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| RuntimeError::native(format!("local_addr failed: {e}")))?;
+    let table = Arc::new(entries);
+    let captured_env = Arc::new(captured_env);
+    let handle = tokio::task::spawn_local(async move {
+        let _ = serve_loop_with_request_trace_file(
+            listener,
+            table,
+            captured_env,
+            None,
+            Some(request_trace_path),
+            shutdown,
+        )
+        .await;
+    });
+    Ok((addr, handle, boot_buf))
+}
+
 /// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 환경)`.
 type PreparedServerState = (u16, Vec<RouteEntry>, HashMap<NameId, Value>);
 
@@ -566,6 +614,46 @@ where
             eprintln!("connection error: {e}");
         }
     }
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_loop_with_request_trace_file<S>(
+    listener: TcpListener,
+    routes: Arc<Vec<RouteEntry>>,
+    captured_env: Arc<HashMap<NameId, Value>>,
+    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
+    request_trace_path: Option<std::path::PathBuf>,
+    shutdown: S,
+) -> Result<(), RuntimeError>
+where
+    S: std::future::Future<Output = ()>,
+{
+    let request_frames = request_frames.or_else(|| {
+        request_trace_path
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(Vec::new())))
+    });
+    serve_loop(
+        listener,
+        routes,
+        captured_env,
+        request_frames.clone(),
+        shutdown,
+    )
+    .await?;
+    if let (Some(path), Some(request_frames)) = (request_trace_path, request_frames) {
+        let frames = request_frames
+            .lock()
+            .map_or_else(|_| Vec::new(), |frames| frames.clone());
+        write_request_trace_file(&path, &frames)?;
+    }
+    Ok(())
+}
+
+fn runtime_request_trace_path_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os(ORV_RUNTIME_REQUEST_TRACE_PATH_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 async fn handle_request(
@@ -1579,6 +1667,57 @@ mod tests {
             assert_eq!(json["msg"], serde_json::json!("pong"));
 
             handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn writes_request_trace_file_on_graceful_shutdown() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                "@server {
+                    @listen 0
+                    @route GET /ping { @respond 200 { ok: true } }
+                }",
+            );
+            let dir = std::env::temp_dir()
+                .join(format!("orv-runtime-serve-trace-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let trace_path = dir.join("trace").join("requests.json");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (addr, handle, _boot) = spawn_for_test_with_request_trace_file(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                trace_path.clone(),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _ct, _body) = send_request(addr, "GET", "/ping", None).await;
+            assert_eq!(status, 200);
+            shutdown_tx.send(()).expect("shutdown send");
+            handle.await.expect("server task join");
+
+            let trace: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&trace_path).expect("read trace file"),
+            )
+            .expect("trace json");
+            assert_eq!(trace["kind"], "orv.production.trace");
+            assert_eq!(trace["frame_count"], 1);
+            assert_eq!(trace["frames"][0]["method"], "GET");
+            assert_eq!(trace["frames"][0]["path"], "/ping");
+            assert_eq!(trace["frames"][0]["status"], 200);
+            let _ = std::fs::remove_dir_all(&dir);
         })
         .await;
     }
