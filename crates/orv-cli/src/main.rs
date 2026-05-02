@@ -7311,6 +7311,7 @@ fn verify_deploy_server_target(
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
+    let compose = json_str(server, "compose", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
         anyhow::bail!("deploy server runtime_image must be {ORV_REFERENCE_RUNTIME_IMAGE}");
@@ -7350,6 +7351,13 @@ fn verify_deploy_server_target(
             runtime_image,
             listen: artifact.listen.as_ref(),
         },
+    )?;
+    verify_deploy_compose_artifact(
+        dir,
+        compose,
+        dockerfile,
+        runtime_image,
+        artifact.listen.as_ref(),
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
@@ -7435,6 +7443,39 @@ fn verify_deploy_container_artifact(
         contract.runtime_image,
         contract.listen,
     )
+}
+
+fn verify_deploy_compose_artifact(
+    dir: &Path,
+    path: &str,
+    dockerfile_path: &str,
+    runtime_image: &str,
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+) -> anyhow::Result<()> {
+    let compose_path = dir.join(path);
+    if !compose_path.is_file() {
+        anyhow::bail!("missing deploy compose file: {}", compose_path.display());
+    }
+    let compose = std::fs::read_to_string(&compose_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", compose_path.display()))?;
+    let dockerfile_line = format!("dockerfile: {dockerfile_path}");
+    if !compose.contains(&dockerfile_line) {
+        anyhow::bail!("deploy compose must use {dockerfile_path}");
+    }
+    let runtime_image_line = format!("ORV_RUNTIME_IMAGE: {runtime_image}");
+    if !compose.contains(&runtime_image_line) {
+        anyhow::bail!("deploy compose must set ORV_RUNTIME_IMAGE");
+    }
+    if let Some(port) = deploy_compose_port(listen) {
+        if !compose.contains(&port.binding) {
+            let display = port.display;
+            anyhow::bail!("deploy compose must publish {display}");
+        }
+        if !compose.contains(&port.environment) {
+            anyhow::bail!("deploy compose must configure PORT");
+        }
+    }
+    Ok(())
 }
 
 struct DeployServerContract<'a> {
@@ -8498,6 +8539,39 @@ fn deploy_exposed_port(listen: Option<&orv_compiler::ServerListenArtifact>) -> O
         .filter(|port| *port > 0)
 }
 
+struct DeployComposePort {
+    binding: String,
+    environment: String,
+    display: String,
+}
+
+fn deploy_compose_port(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+) -> Option<DeployComposePort> {
+    let listen = listen?;
+    if let Some(port) = listen.port.filter(|port| *port > 0) {
+        return Some(DeployComposePort {
+            binding: format!("\"{port}:{port}\""),
+            environment: format!("PORT: \"{port}\""),
+            display: port.to_string(),
+        });
+    }
+    let env = listen.env.as_ref()?;
+    let variable = &env.variable;
+    if let Some(default_port) = env.default_port.filter(|port| *port > 0) {
+        return Some(DeployComposePort {
+            binding: format!("\"${{{variable}:-{default_port}}}:{default_port}\""),
+            environment: format!("PORT: \"${{{variable}:-{default_port}}}\""),
+            display: default_port.to_string(),
+        });
+    }
+    Some(DeployComposePort {
+        binding: format!("\"${{{variable}}}:${{{variable}}}\""),
+        environment: format!("PORT: \"${{{variable}}}\""),
+        display: format!("${{{variable}}}"),
+    })
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
@@ -8674,6 +8748,7 @@ fn write_prod_deploy_artifacts(
         let routes_artifact = "deploy/routes.json";
         let container = "deploy/container.json";
         let dockerfile = "deploy/Dockerfile";
+        let compose = "deploy/compose.yaml";
         write_prod_server_entrypoint(out, targets.server_artifact_path)?;
         write_prod_routes_artifact(out, targets.server_artifact_path, server_artifact)?;
         write_prod_container_artifacts(
@@ -8684,6 +8759,7 @@ fn write_prod_deploy_artifacts(
             dockerfile,
             server_artifact,
         )?;
+        write_prod_compose_artifact(out, dockerfile, server_artifact)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "artifact": targets.server_artifact_path,
@@ -8691,6 +8767,7 @@ fn write_prod_deploy_artifacts(
             "routes_artifact": routes_artifact,
             "container": container,
             "dockerfile": dockerfile,
+            "compose": compose,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
             "listen": server_artifact.listen.clone(),
@@ -8781,6 +8858,33 @@ COPY . /app
 "#
     );
     write_text(&out.join(dockerfile_path), &dockerfile)
+}
+
+fn write_prod_compose_artifact(
+    out: &Path,
+    dockerfile_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let port = deploy_compose_port(server_artifact.listen.as_ref())
+        .map(|port| {
+            format!(
+                "    ports:\n      - {}\n    environment:\n      {}\n",
+                port.binding, port.environment
+            )
+        })
+        .unwrap_or_default();
+    let compose = format!(
+        r#"services:
+  orv-app:
+    build:
+      context: ..
+      dockerfile: {dockerfile_path}
+      args:
+        ORV_RUNTIME_IMAGE: {ORV_REFERENCE_RUNTIME_IMAGE}
+    image: orv-reference-app:latest
+{port}"#
+    );
+    write_text(&out.join("deploy").join("compose.yaml"), &compose)
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -15050,6 +15154,7 @@ entry = "src/main.orv"
         let deploy_manifest_path = out.join("deploy").join("manifest.json");
         let deploy_container_path = out.join("deploy").join("container.json");
         let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
+        let deploy_compose_path = out.join("deploy").join("compose.yaml");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         assert!(
@@ -15066,6 +15171,11 @@ entry = "src/main.orv"
             deploy_dockerfile_path.is_file(),
             "missing {}",
             deploy_dockerfile_path.display()
+        );
+        assert!(
+            deploy_compose_path.is_file(),
+            "missing {}",
+            deploy_compose_path.display()
         );
         assert!(
             deploy_routes_path.is_file(),
@@ -15086,6 +15196,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
         assert_eq!(deploy["server"]["container"], "deploy/container.json");
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
+        assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
         assert_eq!(
             deploy["server"]["runtime_image"],
             "ghcr.io/orv-lang/orv-reference:latest"
@@ -15120,6 +15231,11 @@ entry = "src/main.orv"
         assert!(dockerfile.contains("COPY . /app"));
         assert!(dockerfile.contains("EXPOSE 8080"));
         assert!(dockerfile.contains(r#"ENTRYPOINT ["./deploy/server.sh"]"#));
+        let compose = std::fs::read_to_string(&deploy_compose_path).expect("compose");
+        assert!(compose.contains("dockerfile: deploy/Dockerfile"));
+        assert!(compose.contains("ORV_RUNTIME_IMAGE: ghcr.io/orv-lang/orv-reference:latest"));
+        assert!(compose.contains(r#""8080:8080""#));
+        assert!(compose.contains(r#"PORT: "8080""#));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
         assert_eq!(routes["artifact"], "server/app.orv-runtime.json");
@@ -15142,6 +15258,7 @@ entry = "src/main.orv"
         let deploy_manifest_path = out.join("deploy").join("manifest.json");
         let deploy_container_path = out.join("deploy").join("container.json");
         let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
+        let deploy_compose_path = out.join("deploy").join("compose.yaml");
         let deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
         let container = read_json_value(&deploy_container_path).expect("deploy container");
 
@@ -15154,6 +15271,9 @@ entry = "src/main.orv"
         assert_eq!(container["ports"][0]["protocol"], "tcp");
         let dockerfile = std::fs::read_to_string(&deploy_dockerfile_path).expect("Dockerfile");
         assert!(dockerfile.contains("EXPOSE 8080"));
+        let compose = std::fs::read_to_string(&deploy_compose_path).expect("compose");
+        assert!(compose.contains(r#""${PORT:-8080}:8080""#));
+        assert!(compose.contains(r#"PORT: "${PORT:-8080}""#));
 
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(src_dir);
@@ -15230,6 +15350,24 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container runtime_image must be"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_compose_port_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-compose-port-source");
+        let out = temp_output_dir("deploy-compose-port-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let compose_path = out.join("deploy").join("compose.yaml");
+        let mut compose = std::fs::read_to_string(&compose_path).expect("compose");
+        compose = compose.replace(r#""8080:8080""#, r#""9090:9090""#);
+        write_text(&compose_path, &compose).expect("write corrupt compose");
+
+        let err = cmd_verify_build(&out).expect_err("compose port mismatch");
+
+        assert!(err.to_string().contains("deploy compose must publish 8080"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
