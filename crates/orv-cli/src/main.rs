@@ -2222,6 +2222,7 @@ struct DapLaunchState {
     files: Vec<SourceFile>,
     frames: Vec<DapFrameState>,
     current_frame_index: usize,
+    live_requested: bool,
     live: Option<DapLiveState>,
 }
 
@@ -2508,7 +2509,8 @@ impl DapSession {
                 dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
             })
             .collect();
-        let (runtime, mut frames, live) = if dap_launch_live(request) && diagnostic_count == 0 {
+        let live_requested = dap_launch_live(request);
+        let (runtime, mut frames, live) = if live_requested && diagnostic_count == 0 {
             dap_live_runtime_state(&lowered, &loaded.files, &sources)
         } else {
             let (runtime, frames) =
@@ -2550,6 +2552,7 @@ impl DapSession {
             files: loaded.files.clone(),
             frames: std::mem::take(&mut frames),
             current_frame_index,
+            live_requested,
             live,
         });
         if self
@@ -2589,6 +2592,14 @@ impl DapSession {
     }
 
     fn restart_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let live_requested = request
+            .pointer("/arguments/live")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                self.launched
+                    .as_ref()
+                    .is_some_and(|launched| launched.live_requested)
+            });
         let path = request
             .pointer("/arguments/program")
             .and_then(serde_json::Value::as_str)
@@ -2599,6 +2610,7 @@ impl DapSession {
         let restart_request = serde_json::json!({
             "arguments": {
                 "program": path.display().to_string(),
+                "live": live_requested,
             },
         });
         self.launch_result(&restart_request)
@@ -10506,6 +10518,56 @@ let total: int = add(2, 3)
         assert_eq!(moved_stack["body"]["stackFrames"][0]["line"], 2);
         assert_eq!(restart["success"], true, "{restart}");
         assert_eq!(restarted_stack["body"]["stackFrames"][0]["line"], 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_restart_preserves_live_launch_mode() {
+        let dir = temp_output_dir("dap-restart-live");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n@out \"after\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 215,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "live": true,
+                },
+            }))
+            .expect("launch response");
+        let _ = session.drain_pending_events();
+        let restart = session
+            .message_response(&serde_json::json!({
+                "seq": 216,
+                "type": "request",
+                "command": "restart",
+                "arguments": {},
+            }))
+            .expect("restart response");
+        let restart_events = session.drain_pending_events();
+        let restarted_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 217,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("restarted stack response");
+
+        assert_eq!(restart["success"], true, "{restart}");
+        assert_eq!(restart["body"]["runtime"]["status"], "running");
+        assert_eq!(restart["body"]["runtime"]["stdout"], "");
+        assert_eq!(restarted_stack["body"]["stackFrames"][0]["line"], 1);
+        assert!(restart_events
+            .iter()
+            .all(|event| { event["event"] != "output" || event["body"]["output"] != "after\n" }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
