@@ -242,6 +242,9 @@ enum DbCommand {
         /// 이 unix millisecond timestamp 이하 WAL record까지만 재생한다.
         #[arg(long)]
         until_unix_ms: Option<u64>,
+        /// 이 RFC3339 timestamp 이하 WAL record까지만 재생한다.
+        #[arg(long)]
+        until_time: Option<String>,
     },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
@@ -472,7 +475,14 @@ fn main() -> ExitCode {
                 out,
                 until_record,
                 until_unix_ms,
-            } => match cmd_db_recover(&wal, &out, until_record, until_unix_ms) {
+                until_time,
+            } => match cmd_db_recover(
+                &wal,
+                &out,
+                until_record,
+                until_unix_ms,
+                until_time.as_deref(),
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -921,12 +931,20 @@ fn cmd_db_recover(
     out: &Path,
     until_record: Option<usize>,
     until_unix_ms: Option<u64>,
+    until_time: Option<&str>,
 ) -> anyhow::Result<()> {
-    if until_record.is_some() && until_unix_ms.is_some() {
-        anyhow::bail!("db recover accepts only one of --until-record or --until-unix-ms");
+    let cutoff_count = usize::from(until_record.is_some())
+        + usize::from(until_unix_ms.is_some())
+        + usize::from(until_time.is_some());
+    if cutoff_count > 1 {
+        anyhow::bail!(
+            "db recover accepts only one of --until-record, --until-unix-ms, or --until-time"
+        );
     }
-    let db = if until_unix_ms.is_some() {
-        orv_runtime::db::InMemoryDb::load_wal_until_unix_ms(wal, until_unix_ms)
+    let until_time_unix_ms = until_time.map(parse_db_recover_time_unix_ms).transpose()?;
+    let timestamp_limit = until_unix_ms.or(until_time_unix_ms);
+    let db = if timestamp_limit.is_some() {
+        orv_runtime::db::InMemoryDb::load_wal_until_unix_ms(wal, timestamp_limit)
     } else {
         orv_runtime::db::InMemoryDb::load_wal_until_record(wal, until_record)
     }
@@ -935,27 +953,187 @@ fn cmd_db_recover(
     validate_db_data_snapshot(&snapshot)?;
     backup_json_for_rollback(out)?;
     write_json_atomic(out, &snapshot)?;
-    match (until_record, until_unix_ms) {
-        (Some(limit), None) => println!(
+    match (until_record, until_unix_ms, until_time) {
+        (Some(limit), None, None) => println!(
             "db recover: {} written from {} through record {}",
             out.display(),
             wal.display(),
             limit
         ),
-        (None, Some(limit)) => println!(
+        (None, Some(limit), None) => println!(
             "db recover: {} written from {} through unix ms {}",
             out.display(),
             wal.display(),
             limit
         ),
-        (None, None) => println!(
+        (None, None, Some(limit)) => println!(
+            "db recover: {} written from {} through time {}",
+            out.display(),
+            wal.display(),
+            limit
+        ),
+        (None, None, None) => println!(
             "db recover: {} written from {}",
             out.display(),
             wal.display()
         ),
-        (Some(_), Some(_)) => unreachable!("validated mutually exclusive recover limits"),
+        _ => unreachable!("validated mutually exclusive recover limits"),
     }
     Ok(())
+}
+
+fn parse_db_recover_time_unix_ms(input: &str) -> anyhow::Result<u64> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 20 {
+        anyhow::bail!("--until-time must be an RFC3339 timestamp like 2026-05-02T12:00:00Z");
+    }
+    expect_time_byte(bytes, 4, b'-')?;
+    expect_time_byte(bytes, 7, b'-')?;
+    if !matches!(bytes.get(10), Some(b'T' | b't')) {
+        anyhow::bail!("--until-time must separate date and time with `T`");
+    }
+    expect_time_byte(bytes, 13, b':')?;
+    expect_time_byte(bytes, 16, b':')?;
+
+    let year = i64::from(parse_time_digits(bytes, 0, 4, "year")?);
+    let month = parse_time_digits(bytes, 5, 7, "month")?;
+    let day = parse_time_digits(bytes, 8, 10, "day")?;
+    let hour = parse_time_digits(bytes, 11, 13, "hour")?;
+    let minute = parse_time_digits(bytes, 14, 16, "minute")?;
+    let second = parse_time_digits(bytes, 17, 19, "second")?;
+    validate_recover_time_parts(year, month, day, hour, minute, second)?;
+
+    let mut index = 19usize;
+    let mut millisecond = 0u32;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            if index - fraction_start < 3 {
+                millisecond = millisecond
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(bytes[index] - b'0'));
+            }
+            index += 1;
+        }
+        let fraction_digits = index.saturating_sub(fraction_start);
+        if fraction_digits == 0 {
+            anyhow::bail!("--until-time fractional seconds must contain digits");
+        }
+        for _ in fraction_digits..3 {
+            millisecond = millisecond.saturating_mul(10);
+        }
+    }
+
+    let offset_seconds = parse_recover_time_offset(bytes, index)?;
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)
+        .and_then(|value| value.checked_add(i64::from(hour) * 3_600))
+        .and_then(|value| value.checked_add(i64::from(minute) * 60))
+        .and_then(|value| value.checked_add(i64::from(second)))
+        .and_then(|value| value.checked_sub(offset_seconds))
+        .ok_or_else(|| anyhow::anyhow!("--until-time is out of supported range"))?;
+    let unix_ms = seconds
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(i64::from(millisecond)))
+        .ok_or_else(|| anyhow::anyhow!("--until-time is out of supported range"))?;
+    if unix_ms < 0 {
+        anyhow::bail!("--until-time must not be before the Unix epoch");
+    }
+    Ok(u64::try_from(unix_ms).unwrap_or(u64::MAX))
+}
+
+fn parse_time_digits(bytes: &[u8], start: usize, end: usize, label: &str) -> anyhow::Result<u32> {
+    let Some(slice) = bytes.get(start..end) else {
+        anyhow::bail!("--until-time is missing {label}");
+    };
+    let mut value = 0u32;
+    for byte in slice {
+        if !byte.is_ascii_digit() {
+            anyhow::bail!("--until-time has invalid {label}");
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u32::from(byte - b'0'));
+    }
+    Ok(value)
+}
+
+fn expect_time_byte(bytes: &[u8], index: usize, expected: u8) -> anyhow::Result<()> {
+    if bytes.get(index) != Some(&expected) {
+        anyhow::bail!("--until-time must be an RFC3339 timestamp like 2026-05-02T12:00:00Z");
+    }
+    Ok(())
+}
+
+fn validate_recover_time_parts(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> anyhow::Result<()> {
+    if !(1..=12).contains(&month) {
+        anyhow::bail!("--until-time month is out of range");
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        anyhow::bail!("--until-time day is out of range");
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        anyhow::bail!("--until-time clock is out of range");
+    }
+    Ok(())
+}
+
+fn parse_recover_time_offset(bytes: &[u8], index: usize) -> anyhow::Result<i64> {
+    match bytes.get(index) {
+        Some(b'Z' | b'z') if index + 1 == bytes.len() => Ok(0),
+        Some(sign @ (b'+' | b'-')) => {
+            if index + 6 != bytes.len() {
+                anyhow::bail!("--until-time timezone offset must use HH:MM");
+            }
+            expect_time_byte(bytes, index + 3, b':')?;
+            let hour = parse_time_digits(bytes, index + 1, index + 3, "timezone hour")?;
+            let minute = parse_time_digits(bytes, index + 4, index + 6, "timezone minute")?;
+            if hour > 23 || minute > 59 {
+                anyhow::bail!("--until-time timezone offset is out of range");
+            }
+            let offset = i64::from(hour) * 3_600 + i64::from(minute) * 60;
+            if *sign == b'+' {
+                Ok(offset)
+            } else {
+                Ok(-offset)
+            }
+        }
+        _ => anyhow::bail!("--until-time must end with `Z` or a timezone offset"),
+    }
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+const fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn cmd_db_squash(history: &Path, out: &Path) -> anyhow::Result<()> {
