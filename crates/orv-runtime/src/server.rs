@@ -69,6 +69,29 @@ struct RouteEntry {
     origin_id: String,
 }
 
+/// Captured metadata for one HTTP request handled by an attached runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerRequestFrame {
+    /// Request method after HTTP parsing.
+    pub method: String,
+    /// Normalized request path, without query string.
+    pub path: String,
+    /// Route method that matched the request.
+    pub route_method: Option<String>,
+    /// Route path pattern that matched the request.
+    pub route_path: Option<String>,
+    /// Origin id for the matched route.
+    pub route_origin_id: Option<String>,
+    /// HTTP response status returned to the client.
+    pub status: u16,
+    /// Captured path parameters.
+    pub params: HashMap<String, String>,
+    /// Captured query parameters.
+    pub query: HashMap<String, String>,
+    /// Compact request body display.
+    pub body: String,
+}
+
 /// 포트 번호와 라우트 테이블을 들고 hyper 서버를 기동한다.
 ///
 /// # Errors
@@ -109,6 +132,7 @@ pub(crate) fn run_server(
             listener,
             Arc::new(entries),
             Arc::new(captured_env),
+            None,
             shutdown_signal(),
         )
         .await
@@ -124,11 +148,20 @@ pub(crate) fn run_server(
 pub struct AttachedServer {
     addr: SocketAddr,
     boot_output: Vec<u8>,
+    request_frames: Arc<Mutex<Vec<ServerRequestFrame>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
-type AttachedStartup = Result<(SocketAddr, Vec<u8>, tokio::sync::oneshot::Sender<()>), String>;
+type AttachedStartup = Result<
+    (
+        SocketAddr,
+        Vec<u8>,
+        Arc<Mutex<Vec<ServerRequestFrame>>>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    String,
+>;
 
 impl AttachedServer {
     /// Bound socket address for the attached server.
@@ -141,6 +174,17 @@ impl AttachedServer {
     #[must_use]
     pub fn boot_output(&self) -> &[u8] {
         &self.boot_output
+    }
+
+    /// Request frames captured by this attached server so far.
+    ///
+    /// If the internal lock is poisoned, returns an empty vector. The debug
+    /// surface treats request frames as best-effort telemetry.
+    #[must_use]
+    pub fn request_frames(&self) -> Vec<ServerRequestFrame> {
+        self.request_frames
+            .lock()
+            .map_or_else(|_| Vec::new(), |frames| frames.clone())
     }
 }
 
@@ -169,9 +213,10 @@ pub fn spawn_attached_server(program: HirProgram) -> Result<AttachedServer, Runt
     let (startup_tx, startup_rx) = mpsc::sync_channel::<AttachedStartup>(1);
     let handle = thread::spawn(move || attached_server_thread(&program, &startup_tx));
     match startup_rx.recv() {
-        Ok(Ok((addr, boot_output, shutdown))) => Ok(AttachedServer {
+        Ok(Ok((addr, boot_output, request_frames, shutdown))) => Ok(AttachedServer {
             addr,
             boot_output,
+            request_frames,
             shutdown: Some(shutdown),
             handle: Some(handle),
         }),
@@ -213,13 +258,20 @@ fn run_attached_server_thread(
             .local_addr()
             .map_err(|e| format!("attached server local_addr failed: {e}"))?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let request_frames = Arc::new(Mutex::new(Vec::new()));
         startup
-            .send(Ok((addr, boot_output, shutdown_tx)))
+            .send(Ok((
+                addr,
+                boot_output,
+                Arc::clone(&request_frames),
+                shutdown_tx,
+            )))
             .map_err(|_| "attached server startup receiver dropped".to_string())?;
         serve_loop(
             listener,
             Arc::new(entries),
             Arc::new(captured_env),
+            Some(request_frames),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -337,7 +389,7 @@ where
     let table = Arc::new(entries);
     let captured_env = Arc::new(captured_env);
     let handle = tokio::task::spawn_local(async move {
-        let _ = serve_loop(listener, table, captured_env, shutdown).await;
+        let _ = serve_loop(listener, table, captured_env, None, shutdown).await;
     });
     Ok((addr, handle, boot_buf))
 }
@@ -453,6 +505,7 @@ async fn serve_loop<S>(
     listener: TcpListener,
     routes: Arc<Vec<RouteEntry>>,
     captured_env: Arc<HashMap<NameId, Value>>,
+    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
@@ -483,6 +536,7 @@ where
         let routes = Arc::clone(&routes);
         let captured_env = Arc::clone(&captured_env);
         let db = Arc::clone(&db);
+        let request_frames = request_frames.clone();
         let client_ip = peer.ip().to_string();
         // MVP: 커넥션 직렬 처리. tokio::task::spawn 은 `!Send` Future 를 못
         // 받고, spawn_local 은 LocalSet 안에서만 동작한다. 동시 요청 처리가
@@ -492,9 +546,12 @@ where
             let routes = Arc::clone(&routes);
             let captured_env = Arc::clone(&captured_env);
             let db = Arc::clone(&db);
+            let request_frames = request_frames.clone();
             let client_ip = client_ip.clone();
             async move {
-                Ok::<_, Infallible>(handle_request(req, routes, captured_env, db, client_ip).await)
+                Ok::<_, Infallible>(
+                    handle_request(req, routes, captured_env, db, client_ip, request_frames).await,
+                )
             }
         });
         // MVP: keep-alive 차단. `serve_connection().await` 는 연결이 닫힐 때
@@ -517,6 +574,7 @@ async fn handle_request(
     captured_env: Arc<HashMap<NameId, Value>>,
     db: Arc<Mutex<crate::db::InMemoryDb>>,
     client_ip: String,
+    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
 ) -> Response<Full<Bytes>> {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
@@ -532,48 +590,9 @@ async fn handle_request(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    // body 수집. MVP 는 raw string. JSON 자동 파싱은 SPEC §11.5 에 맞추어
-    // Content-Type 이 application/json 이면 Value::Object/Array 로 풀고
-    // 그 외는 Str. 바디 없음/빈 바디는 Value::Void.
-    //
-    // `Limited` 로 크기 상한을 걸어 거대 POST 의 메모리 폭주를 차단. 초과 시
-    // 413 응답.
-    let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
-    let body_bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            // `Limited` 의 제한 초과 에러도 이 경로로 내려온다. hyper 1.x 는
-            // 래퍼 에러 타입을 Box 로 감싸기 때문에 문자열 매칭으로 구분한다.
-            let msg = format!("{e}");
-            if msg.contains("length limit exceeded") {
-                return plain_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("request body exceeds {MAX_BODY_BYTES} bytes"),
-                );
-            }
-            return plain_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {msg}"),
-            );
-        }
-    };
-    // Content-Type 의 media type 은 RFC 7231 §3.1.1.1 에서 case-insensitive.
-    // `APPLICATION/JSON` 도 동일하게 JSON 경로로 흘러야 한다.
-    let is_json = headers
-        .get("content-type")
-        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
-        .unwrap_or(false);
-    let body_value = if body_bytes.is_empty() {
-        Value::Void
-    } else if is_json {
-        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-            Ok(json) => json_to_value(json),
-            Err(e) => {
-                return plain_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}"));
-            }
-        }
-    } else {
-        Value::Str(String::from_utf8_lossy(&body_bytes).into_owned())
+    let body_value = match request_body_value(req, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
     };
 
     // 라우트 매칭 — 선형 탐색. method 는 "*" wildcard 허용.
@@ -589,9 +608,29 @@ async fn handle_request(
     }
 
     let Some((entry, params)) = matched else {
-        return plain_response(StatusCode::NOT_FOUND, "Not Found".into());
+        let response = plain_response(StatusCode::NOT_FOUND, "Not Found".into());
+        record_request_frame(
+            request_frames.as_ref(),
+            ServerRequestFrame {
+                method,
+                path,
+                route_method: None,
+                route_path: None,
+                route_origin_id: None,
+                status: response.status().as_u16(),
+                params: HashMap::new(),
+                query,
+                body: request_body_display(&body_value),
+            },
+        );
+        return response;
     };
 
+    let frame_method = method.clone();
+    let frame_path = path.clone();
+    let frame_params = params.clone();
+    let frame_query = query.clone();
+    let frame_body = request_body_display(&body_value);
     let ctx = RequestCtx {
         method,
         path,
@@ -630,10 +669,83 @@ async fn handle_request(
         eprintln!("{w}");
     }
 
-    match outcome.response {
+    let response = match outcome.response {
         Some(resp) => response_from_respond(resp, Some(&entry.origin_id)),
         None => default_response(outcome.value, Some(&entry.origin_id)),
+    };
+    record_request_frame(
+        request_frames.as_ref(),
+        ServerRequestFrame {
+            method: frame_method,
+            path: frame_path,
+            route_method: Some(entry.method),
+            route_path: Some(entry.path),
+            route_origin_id: Some(entry.origin_id),
+            status: response.status().as_u16(),
+            params: frame_params,
+            query: frame_query,
+            body: frame_body,
+        },
+    );
+    response
+}
+
+async fn request_body_value(
+    req: Request<Incoming>,
+    headers: &HashMap<String, String>,
+) -> Result<Value, Response<Full<Bytes>>> {
+    // `Limited` 로 크기 상한을 걸어 거대 POST 의 메모리 폭주를 차단. 초과 시
+    // 413 응답.
+    let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
+    let body_bytes = match limited.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("length limit exceeded") {
+                return Err(plain_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+                ));
+            }
+            return Err(plain_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {msg}"),
+            ));
+        }
+    };
+    let is_json = headers
+        .get("content-type")
+        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
+        .unwrap_or(false);
+    if body_bytes.is_empty() {
+        Ok(Value::Void)
+    } else if is_json {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .map(json_to_value)
+            .map_err(|e| plain_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
+    } else {
+        Ok(Value::Str(
+            String::from_utf8_lossy(&body_bytes).into_owned(),
+        ))
     }
+}
+
+fn record_request_frame(
+    request_frames: Option<&Arc<Mutex<Vec<ServerRequestFrame>>>>,
+    frame: ServerRequestFrame,
+) {
+    if let Some(request_frames) = request_frames {
+        if let Ok(mut frames) = request_frames.lock() {
+            frames.push(frame);
+        }
+    }
+}
+
+fn request_body_display(value: &Value) -> String {
+    if matches!(value, Value::Void) {
+        return String::new();
+    }
+    serde_json::to_string(&value_to_json(value)).unwrap_or_default()
 }
 
 fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response<Full<Bytes>> {

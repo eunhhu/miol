@@ -99,14 +99,39 @@ fn wait_for_http_ok(port: u16) -> String {
     panic!("server did not answer /ping: {last_error}");
 }
 
+fn wait_for_http_response(port: u16, path: &str, expected_body: &[&str]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match http_get_path(port, path) {
+            Ok(response)
+                if response.contains("200 OK")
+                    && expected_body
+                        .iter()
+                        .all(|expected| response.contains(expected)) =>
+            {
+                return response;
+            }
+            Ok(response) => last_error = response,
+            Err(err) => last_error = err,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server did not answer {path}: {last_error}");
+}
+
 fn http_get(port: u16) -> Result<String, String> {
+    http_get_path(port, "/ping")
+}
+
+fn http_get_path(port: u16, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|e| e.to_string())?;
     write!(
         stream,
-        "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     )
     .map_err(|e| e.to_string())?;
     let mut response = String::new();
@@ -209,6 +234,111 @@ fn dap_attach_runtime_continue_serves_http_and_pause_resumes_transport() {
         &mut dap,
         &serde_json::json!({
             "seq": 6,
+            "type": "request",
+            "command": "terminate",
+            "arguments": {},
+        }),
+    );
+    assert_eq!(terminated["success"], true, "{terminated}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dap_attach_runtime_in_process_reports_request_frames() {
+    let dir = temp_dir("dap-in-process-request-frames");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let port = free_port();
+    let source = dir.join("app.orv");
+    std::fs::write(
+        &source,
+        format!(
+            r"@server {{
+  @listen {port}
+  @route GET /users/:id {{ @respond 200 {{ id: @param.id, debug: @query.debug }} }}
+}}
+"
+        ),
+    )
+    .expect("write source");
+    let mut dap = start_dap();
+
+    let launch = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 21,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": format!("file://{}", source.display()),
+                "attachRuntime": true,
+                "attachRuntimeMode": "inProcess",
+            },
+        }),
+    );
+    assert_eq!(launch["success"], true, "{launch}");
+
+    let continued = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 22,
+            "type": "request",
+            "command": "continue",
+            "arguments": { "threadId": 1 },
+        }),
+    );
+    assert_eq!(continued["success"], true, "{continued}");
+    wait_for_http_response(
+        port,
+        "/users/42?debug=true",
+        &["\"id\":\"42\"", "\"debug\":\"true\""],
+    );
+
+    let request_count = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 23,
+            "type": "request",
+            "command": "evaluate",
+            "arguments": { "expression": "runtimeRequestCount" },
+        }),
+    );
+    assert_eq!(request_count["success"], true, "{request_count}");
+    assert_eq!(request_count["body"]["result"], "1");
+
+    let last_request = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 24,
+            "type": "request",
+            "command": "evaluate",
+            "arguments": { "expression": "runtimeLastRequest" },
+        }),
+    );
+    assert_eq!(last_request["success"], true, "{last_request}");
+    assert_eq!(
+        last_request["body"]["result"],
+        "GET /users/42 -> 200 route GET /users/:id params id=42 query debug=true"
+    );
+
+    let request_frames = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 25,
+            "type": "request",
+            "command": "evaluate",
+            "arguments": { "expression": "runtimeRequestFrames" },
+        }),
+    );
+    assert_eq!(request_frames["success"], true, "{request_frames}");
+    assert_eq!(
+        request_frames["body"]["result"],
+        "#1 GET /users/42 -> 200 route GET /users/:id params id=42 query debug=true"
+    );
+
+    let terminated = dap_response(
+        &mut dap,
+        &serde_json::json!({
+            "seq": 26,
             "type": "request",
             "command": "terminate",
             "arguments": {},

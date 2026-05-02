@@ -3548,7 +3548,7 @@ impl DapSession {
             }),
         ];
         if let Some(async_runtime) = &launched.async_runtime {
-            variables.extend(dap_async_runtime_variables(async_runtime));
+            variables.extend(dap_async_runtime_variables(launched, async_runtime));
         }
         Ok(serde_json::json!({
             "variables": variables,
@@ -4912,7 +4912,11 @@ fn dap_async_transport_display(transport: &DapAsyncTransportState) -> String {
     format!("{} {}", transport.kind, transport.state)
 }
 
-fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serde_json::Value> {
+fn dap_async_runtime_variables(
+    launched: &DapLaunchState,
+    async_runtime: &DapAsyncRuntimeState,
+) -> Vec<serde_json::Value> {
+    let request_frames = dap_runtime_request_frames(launched);
     let mut variables = vec![
         serde_json::json!({
             "name": "runtimeKind",
@@ -4950,6 +4954,26 @@ fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serd
             "type": "string",
             "variablesReference": 0,
         }),
+        serde_json::json!({
+            "name": "runtimeRequestCount",
+            "value": request_frames.len().to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeLastRequest",
+            "value": request_frames
+                .last()
+                .map_or_else(String::new, dap_server_request_frame_display),
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeRequestFrames",
+            "value": dap_server_request_frames_display(&request_frames),
+            "type": "string",
+            "variablesReference": 0,
+        }),
     ];
     if let Some(listen) = &async_runtime.listen {
         variables.extend([
@@ -4984,6 +5008,59 @@ fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serd
         ]);
     }
     variables
+}
+
+fn dap_runtime_request_frames(
+    launched: &DapLaunchState,
+) -> Vec<orv_runtime::server::ServerRequestFrame> {
+    launched.attached_server.as_ref().map_or_else(
+        Vec::new,
+        orv_runtime::server::AttachedServer::request_frames,
+    )
+}
+
+fn dap_server_request_frames_display(frames: &[orv_runtime::server::ServerRequestFrame]) -> String {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            format!(
+                "#{} {}",
+                index.saturating_add(1),
+                dap_server_request_frame_display(frame)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn dap_server_request_frame_display(frame: &orv_runtime::server::ServerRequestFrame) -> String {
+    let mut parts = vec![format!(
+        "{} {} -> {}",
+        frame.method, frame.path, frame.status
+    )];
+    if let (Some(method), Some(path)) = (&frame.route_method, &frame.route_path) {
+        parts.push(format!("route {method} {path}"));
+    }
+    if !frame.params.is_empty() {
+        parts.push(format!("params {}", dap_string_map_display(&frame.params)));
+    }
+    if !frame.query.is_empty() {
+        parts.push(format!("query {}", dap_string_map_display(&frame.query)));
+    }
+    if !frame.body.is_empty() {
+        parts.push(format!("body {}", frame.body));
+    }
+    parts.join(" ")
+}
+
+fn dap_string_map_display(values: &HashMap<String, String>) -> String {
+    let mut entries = values
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join(",")
 }
 
 fn dap_runtime_frames(
@@ -5703,6 +5780,23 @@ fn dap_evaluate_async_runtime_value(
             dap_async_routes_display(&runtime.routes),
             "string".to_string(),
         )),
+        "runtimeRequestCount" => Some((
+            dap_runtime_request_frames(launched).len().to_string(),
+            "usize".to_string(),
+        )),
+        "runtimeLastRequest" => {
+            let frames = dap_runtime_request_frames(launched);
+            Some((
+                frames
+                    .last()
+                    .map_or_else(String::new, dap_server_request_frame_display),
+                "string".to_string(),
+            ))
+        }
+        "runtimeRequestFrames" => Some((
+            dap_server_request_frames_display(&dap_runtime_request_frames(launched)),
+            "string".to_string(),
+        )),
         "runtimeListen" => runtime
             .listen
             .as_ref()
@@ -5760,6 +5854,9 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimePauseCount",
                 "runtimeRouteCount",
                 "runtimeRoutes",
+                "runtimeRequestCount",
+                "runtimeLastRequest",
+                "runtimeRequestFrames",
                 "runtimeListen",
                 "runtimeListenPort",
                 "runtimeTransport",
