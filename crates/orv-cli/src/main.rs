@@ -1514,6 +1514,14 @@ struct DapFrameState {
     source: DapSourceInfo,
     line: u64,
     locals: Vec<DapVariable>,
+    stack: Vec<DapStackFrameState>,
+}
+
+#[derive(Clone)]
+struct DapStackFrameState {
+    name: String,
+    source: DapSourceInfo,
+    line: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1911,23 +1919,11 @@ impl DapSession {
             .launched
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("launch is required before stackTrace"))?;
-        let (source_name, source_path, source_uri, line) = dap_current_source_and_line(launched);
+        let frames = dap_stack_frames_json(launched);
+        let total_frames = frames.len();
         Ok(serde_json::json!({
-            "stackFrames": [
-                {
-                    "id": 1,
-                    "name": "orv entry",
-                    "source": {
-                        "name": source_name,
-                        "path": source_path,
-                        "sourceReference": 0,
-                        "uri": source_uri,
-                    },
-                    "line": line,
-                    "column": 1,
-                },
-            ],
-            "totalFrames": 1,
+            "stackFrames": frames,
+            "totalFrames": total_frames,
         }))
     }
 
@@ -2292,30 +2288,44 @@ fn dap_runtime_frames(
     frames
         .iter()
         .filter_map(|frame| {
-            let source = sources
-                .iter()
-                .find(|source| {
-                    files
-                        .iter()
-                        .find(|file| file.id == frame.span.file)
-                        .is_some_and(|file| {
-                            dap_normalize_path(&file.path) == dap_normalize_path(&source.path)
-                        })
-                })?
-                .clone();
+            let source = dap_source_for_span(frame.span, files, sources)?;
             let line = dap_span_line(frame.span, files)?;
             let locals = frame
                 .locals
                 .iter()
                 .map(|variable| dap_runtime_variable(variable, line))
                 .collect();
+            let stack = frame
+                .stack
+                .iter()
+                .filter_map(|stack_frame| {
+                    Some(DapStackFrameState {
+                        name: stack_frame.name.clone(),
+                        source: dap_source_for_span(stack_frame.span, files, sources)?,
+                        line: dap_span_line(stack_frame.span, files)?,
+                    })
+                })
+                .collect();
             Some(DapFrameState {
                 source,
                 line,
                 locals,
+                stack,
             })
         })
         .collect()
+}
+
+fn dap_source_for_span(
+    span: Span,
+    files: &[SourceFile],
+    sources: &[DapSourceInfo],
+) -> Option<DapSourceInfo> {
+    let file = files.iter().find(|file| file.id == span.file)?;
+    sources
+        .iter()
+        .find(|source| dap_normalize_path(&file.path) == dap_normalize_path(&source.path))
+        .cloned()
 }
 
 fn dap_runtime_variable(variable: &orv_runtime::DebugVariable, line: u64) -> DapVariable {
@@ -2393,6 +2403,67 @@ fn dap_current_source_and_line(launched: &DapLaunchState) -> (String, String, St
         launched.uri.clone(),
         launched.stopped_line,
     )
+}
+
+fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
+    let current_frame = launched.frames.get(launched.current_frame_index);
+    let (source_name, source_path, source_uri, line) = dap_current_source_and_line(launched);
+    let current_name = current_frame
+        .and_then(|frame| frame.stack.last())
+        .map_or_else(|| "orv entry".to_string(), |frame| frame.name.clone());
+    let mut frames = vec![dap_stack_frame_json(
+        1,
+        &current_name,
+        &source_name,
+        &source_path,
+        &source_uri,
+        line,
+    )];
+    if let Some(current_frame) = current_frame {
+        for (index, stack_frame) in current_frame.stack.iter().rev().skip(1).enumerate() {
+            frames.push(dap_stack_frame_json(
+                u64::try_from(index + 2).unwrap_or(u64::MAX),
+                &stack_frame.name,
+                &stack_frame.source.name,
+                &stack_frame.source.path.display().to_string(),
+                &stack_frame.source.uri,
+                stack_frame.line,
+            ));
+        }
+        if !current_frame.stack.is_empty() {
+            frames.push(dap_stack_frame_json(
+                u64::try_from(frames.len() + 1).unwrap_or(u64::MAX),
+                "orv entry",
+                &launched.name,
+                &launched.path.display().to_string(),
+                &launched.uri,
+                1,
+            ));
+        }
+    }
+    frames
+}
+
+fn dap_stack_frame_json(
+    id: u64,
+    name: &str,
+    source_name: &str,
+    source_path: &str,
+    source_uri: &str,
+    line: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "source": {
+            "name": source_name,
+            "path": source_path,
+            "sourceReference": 0,
+            "uri": source_uri,
+        },
+        "line": line,
+        "column": 1,
+    })
 }
 
 fn dap_current_locals(launched: &DapLaunchState) -> &[DapVariable] {
@@ -6113,6 +6184,62 @@ function greet(user: User): string -> "hello"
                 && event["body"]["reason"] == "step"
                 && event["body"]["threadId"] == 1
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_stack_trace_names_runtime_function_frame() {
+        let dir = temp_output_dir("dap-function-stack-frame");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 163,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 164,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 165,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert_eq!(stack["body"]["stackFrames"][1]["name"], "orv entry");
+        assert_eq!(stack["body"]["totalFrames"], 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

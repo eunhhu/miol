@@ -167,6 +167,8 @@ pub struct DebugFrame {
     pub span: orv_diagnostics::Span,
     /// Lexical bindings visible in the runtime environment at this point.
     pub locals: Vec<DebugVariable>,
+    /// Function/domain call stack active while this statement executed.
+    pub stack: Vec<DebugStackFrame>,
 }
 
 /// Runtime value for one debugger-visible binding.
@@ -176,6 +178,15 @@ pub struct DebugVariable {
     pub name: String,
     /// Runtime value captured for the binding.
     pub value: Value,
+}
+
+/// One runtime call-stack entry captured for debugger frames.
+#[derive(Clone, Debug)]
+pub struct DebugStackFrame {
+    /// Display name for the callable.
+    pub name: String,
+    /// Source span for the callable declaration.
+    pub span: orv_diagnostics::Span,
 }
 
 /// 런타임 에러.
@@ -573,6 +584,7 @@ struct Interp<'w, W: Write> {
 struct DebugTraceState {
     names: Vec<(NameId, String)>,
     frames: Vec<DebugFrame>,
+    stack: Vec<DebugStackFrame>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -636,6 +648,7 @@ impl<'w, W: Write> Interp<'w, W> {
             return;
         };
         let names = debug.names.clone();
+        let stack = debug.stack.clone();
         let locals = names
             .into_iter()
             .filter_map(|(id, name)| {
@@ -646,7 +659,26 @@ impl<'w, W: Write> Interp<'w, W> {
             })
             .collect();
         if let Some(debug) = &mut self.debug {
-            debug.frames.push(DebugFrame { span, locals });
+            debug.frames.push(DebugFrame {
+                span,
+                locals,
+                stack,
+            });
+        }
+    }
+
+    fn debug_push_call(&mut self, name: &str, span: orv_diagnostics::Span) {
+        if let Some(debug) = &mut self.debug {
+            debug.stack.push(DebugStackFrame {
+                name: name.to_string(),
+                span,
+            });
+        }
+    }
+
+    fn debug_pop_call(&mut self) {
+        if let Some(debug) = &mut self.debug {
+            debug.stack.pop();
         }
     }
 
@@ -2631,14 +2663,16 @@ impl<'w, W: Write> Interp<'w, W> {
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
-        let result_value = match &func.body {
-            HirFunctionBody::Block(b) => {
-                let ctl = self.eval_block_ctl(b)?;
+        self.debug_push_call(&func.name.name, func.span);
+        let result = match &func.body {
+            HirFunctionBody::Block(b) => self.eval_block_ctl(b).map(|ctl| {
                 self.pending_return = None;
                 ctl.into_value()
-            }
-            HirFunctionBody::Expr(e) => self.eval(e)?,
+            }),
+            HirFunctionBody::Expr(e) => self.eval(e),
         };
+        self.debug_pop_call();
+        let result_value = result?;
         self.html_buffer = saved_html;
         if self.response.is_some() {
             self.pending_return = Some(Value::Void);
@@ -2672,14 +2706,16 @@ impl<'w, W: Write> Interp<'w, W> {
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
-        let result_value = match &func.body {
-            HirFunctionBody::Block(b) => {
-                let ctl = self.eval_block_ctl(b)?;
+        self.debug_push_call(&func.name.name, func.span);
+        let result = match &func.body {
+            HirFunctionBody::Block(b) => self.eval_block_ctl(b).map(|ctl| {
                 self.pending_return = None;
                 ctl.into_value()
-            }
-            HirFunctionBody::Expr(e) => self.eval(e)?,
+            }),
+            HirFunctionBody::Expr(e) => self.eval(e),
         };
+        self.debug_pop_call();
+        let result_value = result?;
         self.html_buffer = saved_html;
         if self.response.is_some() {
             self.pending_return = Some(Value::Void);
