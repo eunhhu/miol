@@ -9,19 +9,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-orv-analyzer = { workspace = true }
-orv-core = { workspace = true }
 orv-diagnostics = { workspace = true }
-orv-project = { workspace = true }
-orv-resolve = { workspace = true }
-orv-syntax = { workspace = true }
 orv-hir = { workspace = true }
-orv-runtime = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
+orv-analyzer = { workspace = true }
+orv-resolve = { workspace = true }
+orv-syntax = { workspace = true }
 pretty_assertions = { workspace = true }
 
 [lints]

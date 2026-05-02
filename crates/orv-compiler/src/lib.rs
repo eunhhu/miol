@@ -2,19 +2,165 @@
 //!
 //! The production code generator is still a roadmap item. This crate currently
 //! owns small compiler artifacts that can be derived from HIR without emitting a
-//! server binary or client WASM bundle.
+//! server binary or client WASM bundle. HTML-only entries can plan a static page
+//! artifact with no shipped runtime features.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use orv_diagnostics::Span;
 use orv_hir::{
     origin_fingerprint, origin_id, HirBlock, HirCatchClause, HirExpr, HirExprKind, HirFunctionBody,
-    HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment,
+    HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment, NameId,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current origin map schema version.
-pub const ORIGIN_MAP_VERSION: u32 = 1;
+pub const ORIGIN_MAP_VERSION: u32 = 2;
+
+/// Current build manifest schema version.
+pub const BUILD_MANIFEST_VERSION: u32 = 1;
+
+/// Current bundle plan schema version.
+pub const BUNDLE_PLAN_VERSION: u32 = 1;
+
+/// Current server runtime artifact schema version.
+pub const SERVER_RUNTIME_ARTIFACT_VERSION: u32 = 1;
+
+/// Current server launch artifact schema version.
+pub const SERVER_LAUNCH_ARTIFACT_VERSION: u32 = 1;
+
+/// Minimal build artifact manifest.
+///
+/// This is the first compiler-facing build artifact. It records deterministic
+/// graph/origin outputs for downstream bundling without claiming production
+/// server or WASM code generation yet. HTML-only inputs may include a static
+/// page artifact path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildManifest {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Entry `.orv` file used for this artifact set.
+    pub entry: String,
+    /// Runtime model used by this build artifact.
+    pub runtime: String,
+    /// Files written into the artifact directory.
+    pub artifacts: Vec<BuildArtifact>,
+    /// Capability summary derived from compiler artifacts.
+    pub capabilities: BuildCapabilities,
+}
+
+/// One file emitted by `orv build`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildArtifact {
+    /// Artifact class, for example `origin_map`.
+    pub kind: String,
+    /// Relative path inside the build output directory.
+    pub path: String,
+}
+
+/// Planned production bundle outputs.
+///
+/// This is a contract for the future bundler. It is intentionally explicit so
+/// zero-overhead checks can compare planned outputs with required runtime
+/// features before code generation exists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundlePlan {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Bundle targets to produce.
+    pub bundles: Vec<BundleTarget>,
+}
+
+/// One planned bundle target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleTarget {
+    /// Bundle class, for example `server_runtime`.
+    pub kind: String,
+    /// Relative output path inside the build output directory.
+    pub path: String,
+    /// Runtime layers that this bundle needs.
+    pub runtime_features: Vec<String>,
+}
+
+/// Server runtime descriptor emitted by the initial bundler path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerRuntimeArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Entry `.orv` file used for this artifact set.
+    pub entry: String,
+    /// Runtime model used by this artifact.
+    pub runtime: String,
+    /// Runtime layers required by this server artifact.
+    pub runtime_features: Vec<String>,
+    /// HTTP route descriptors.
+    pub routes: Vec<ServerRouteArtifact>,
+    /// Source snapshot for reference runner hydration.
+    pub source_bundle: ServerSourceBundle,
+}
+
+/// Reference server launch descriptor.
+///
+/// Native server binaries are still roadmap work. This artifact gives deploy
+/// tooling a deterministic command/protocol contract for the current reference
+/// runner path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerLaunchArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Runtime model used by this launch descriptor.
+    pub runtime: String,
+    /// Relative server runtime artifact path.
+    pub artifact: String,
+    /// Command argv for launching the reference server artifact.
+    pub command: Vec<String>,
+    /// Transport protocol used by the reference runtime.
+    pub protocol: String,
+    /// HTTP route descriptors reachable through this launcher.
+    pub routes: Vec<ServerRouteArtifact>,
+}
+
+/// Source snapshot embedded in the reference runtime artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerSourceBundle {
+    /// Source files needed to rehydrate the project.
+    pub files: Vec<ServerSourceFile>,
+}
+
+/// One source file captured for reference runner hydration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerSourceFile {
+    /// File path as seen by the build.
+    pub path: String,
+    /// Stable content hash.
+    pub content_hash: String,
+    /// Source text.
+    pub source: String,
+}
+
+/// One compiled HTTP route descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerRouteArtifact {
+    /// HTTP method.
+    pub method: String,
+    /// Route path pattern.
+    pub path: String,
+    /// Origin id for production-to-code tracing.
+    pub origin_id: String,
+}
+
+/// Build capability summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildCapabilities {
+    /// Whether the input contains an executable server domain.
+    pub has_server: bool,
+    /// Number of compiled HTTP routes.
+    pub server_routes: usize,
+    /// Whether this artifact set includes client WASM.
+    pub client_wasm: bool,
+    /// Runtime layers required by the current artifact set.
+    pub runtime_features: Vec<String>,
+}
 
 /// Minimal source origin map for executable HIR nodes.
 ///
@@ -27,6 +173,8 @@ pub struct OriginMap {
     pub version: u32,
     /// Source-backed executable entries in HIR traversal order.
     pub entries: Vec<OriginEntry>,
+    /// Parent-child edges derived from HIR traversal.
+    pub edges: Vec<OriginEdge>,
 }
 
 /// One source-backed executable node.
@@ -44,6 +192,17 @@ pub struct OriginEntry {
     pub fingerprint: String,
 }
 
+/// Relationship between source-backed executable nodes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OriginEdge {
+    /// Parent origin id.
+    pub from: String,
+    /// Child origin id.
+    pub to: String,
+    /// Edge class, for example `contains` or `calls`.
+    pub kind: String,
+}
+
 /// Serializable source span.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OriginSpan {
@@ -59,43 +218,343 @@ pub struct OriginSpan {
 #[must_use]
 pub fn origin_map(program: &HirProgram) -> OriginMap {
     let mut collector = OriginCollector::default();
+    collector.index_top_level_functions(program);
     for stmt in &program.items {
         collector.visit_stmt(stmt);
     }
     OriginMap {
         version: ORIGIN_MAP_VERSION,
         entries: collector.entries,
+        edges: collector.edges,
     }
+}
+
+/// Build a deterministic manifest for compiler-emitted artifacts.
+#[must_use]
+pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> BuildManifest {
+    let server_routes = origin_map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "route")
+        .count();
+    let has_server = server_routes > 0
+        || origin_map
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "domain" && entry.name == "server");
+    let runtime_features = runtime_features(origin_map, has_server, server_routes);
+    let mut artifacts = vec![
+        BuildArtifact {
+            kind: "build_manifest".to_string(),
+            path: "build-manifest.json".to_string(),
+        },
+        BuildArtifact {
+            kind: "origin_map".to_string(),
+            path: "origin-map.json".to_string(),
+        },
+        BuildArtifact {
+            kind: "bundle_plan".to_string(),
+            path: "bundle-plan.json".to_string(),
+        },
+        BuildArtifact {
+            kind: "project_graph".to_string(),
+            path: "project-graph.json".to_string(),
+        },
+    ];
+    if has_static_page(has_server, &runtime_features) {
+        artifacts.push(BuildArtifact {
+            kind: "static_page".to_string(),
+            path: "pages/index.html".to_string(),
+        });
+    }
+    BuildManifest {
+        schema_version: BUILD_MANIFEST_VERSION,
+        entry: entry.into(),
+        runtime: "reference-interpreter".to_string(),
+        artifacts,
+        capabilities: BuildCapabilities {
+            has_server,
+            server_routes,
+            client_wasm: false,
+            runtime_features,
+        },
+    }
+}
+
+/// Build a deterministic bundle plan from manifest capabilities.
+#[must_use]
+pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
+    let mut bundles = Vec::new();
+    if manifest.capabilities.has_server {
+        bundles.push(BundleTarget {
+            kind: "server_runtime".to_string(),
+            path: "server/app.orv-runtime.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "server_launcher".to_string(),
+            path: "server/launch.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+    }
+    if has_static_page(
+        manifest.capabilities.has_server,
+        &manifest.capabilities.runtime_features,
+    ) {
+        bundles.push(BundleTarget {
+            kind: "static_page".to_string(),
+            path: "pages/index.html".to_string(),
+            runtime_features: Vec::new(),
+        });
+    }
+    if manifest.capabilities.client_wasm {
+        bundles.push(BundleTarget {
+            kind: "client_wasm".to_string(),
+            path: "client/app.wasm".to_string(),
+            runtime_features: vec!["client_wasm".to_string()],
+        });
+    }
+    BundlePlan {
+        schema_version: BUNDLE_PLAN_VERSION,
+        bundles,
+    }
+}
+
+fn has_static_page(has_server: bool, runtime_features: &[String]) -> bool {
+    !has_server
+        && runtime_features
+            .iter()
+            .any(|feature| feature == "html_renderer")
+}
+
+/// Build a server runtime descriptor from manifest capabilities and origins.
+#[must_use]
+pub fn server_runtime_artifact(
+    manifest: &BuildManifest,
+    origin_map: &OriginMap,
+    sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> ServerRuntimeArtifact {
+    let routes = origin_map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "route")
+        .filter_map(route_artifact)
+        .collect();
+    ServerRuntimeArtifact {
+        schema_version: SERVER_RUNTIME_ARTIFACT_VERSION,
+        entry: manifest.entry.clone(),
+        runtime: manifest.runtime.clone(),
+        runtime_features: manifest.capabilities.runtime_features.clone(),
+        routes,
+        source_bundle: ServerSourceBundle {
+            files: sources
+                .into_iter()
+                .map(|(path, source)| {
+                    let source = source.into();
+                    ServerSourceFile {
+                        path: path.into(),
+                        content_hash: content_hash(&source),
+                        source,
+                    }
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Build a reference server launch descriptor for a runtime artifact.
+#[must_use]
+pub fn server_launch_artifact(
+    artifact_path: impl Into<String>,
+    artifact: &ServerRuntimeArtifact,
+) -> ServerLaunchArtifact {
+    let artifact_path = artifact_path.into();
+    ServerLaunchArtifact {
+        schema_version: SERVER_LAUNCH_ARTIFACT_VERSION,
+        runtime: artifact.runtime.clone(),
+        artifact: artifact_path.clone(),
+        command: vec!["orv".to_string(), "run-artifact".to_string(), artifact_path],
+        protocol: "http1".to_string(),
+        routes: artifact.routes.clone(),
+    }
+}
+
+/// Verify that a server runtime artifact is internally consistent.
+///
+/// This checks the source bundle hashes and route descriptor shape. It does not
+/// replace type checking; it validates that an emitted artifact was not
+/// accidentally corrupted before a runner hydrates it.
+///
+/// # Errors
+///
+/// Returns all validation failures when source hashes do not match, source
+/// bundle files are missing paths, or route descriptors are incomplete.
+pub fn verify_server_runtime_artifact(artifact: &ServerRuntimeArtifact) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if artifact.source_bundle.files.is_empty() {
+        errors.push("source bundle is empty".to_string());
+    }
+    for file in &artifact.source_bundle.files {
+        if file.path.is_empty() {
+            errors.push("source bundle contains file with empty path".to_string());
+        }
+        let actual = content_hash(&file.source);
+        if file.content_hash != actual {
+            errors.push(format!(
+                "content hash mismatch for {}: expected {}, got {}",
+                file.path, file.content_hash, actual
+            ));
+        }
+    }
+    for route in &artifact.routes {
+        if route.method.is_empty() {
+            errors.push("route method is empty".to_string());
+        }
+        if route.path.is_empty() {
+            errors.push("route path is empty".to_string());
+        }
+        if route.origin_id.is_empty() {
+            errors.push(format!(
+                "route {} {} has empty origin id",
+                route.method, route.path
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn route_artifact(entry: &OriginEntry) -> Option<ServerRouteArtifact> {
+    let (method, path) = entry.name.split_once(' ')?;
+    Some(ServerRouteArtifact {
+        method: method.to_string(),
+        path: path.to_string(),
+        origin_id: entry.id.clone(),
+    })
+}
+
+fn content_hash(source: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usize) -> Vec<String> {
+    let mut features = BTreeSet::new();
+    if has_server {
+        features.insert("http_server");
+    }
+    if server_routes > 0 {
+        features.insert("router");
+    }
+    for entry in &origin_map.entries {
+        if entry.kind != "domain" {
+            continue;
+        }
+        match entry.name.as_str() {
+            "db" => {
+                features.insert("in_memory_db");
+            }
+            "html" => {
+                features.insert("html_renderer");
+            }
+            "out" => {
+                features.insert("console_io");
+            }
+            "serve" => {
+                features.insert("static_file_server");
+            }
+            _ => {}
+        }
+    }
+    features.into_iter().map(str::to_string).collect()
 }
 
 #[derive(Default)]
 struct OriginCollector {
     entries: Vec<OriginEntry>,
+    edges: Vec<OriginEdge>,
     seen: HashSet<String>,
+    seen_edges: HashSet<(String, String, String)>,
+    parents: Vec<String>,
+    function_origins: HashMap<NameId, String>,
 }
 
 impl OriginCollector {
-    fn push(&mut self, kind: &str, name: impl Into<String>, span: Span) {
+    fn index_top_level_functions(&mut self, program: &HirProgram) {
+        for stmt in &program.items {
+            if let HirStmt::Function(stmt) = stmt {
+                self.index_function_origin(stmt.name.id, &stmt.name.name, stmt.span);
+            }
+        }
+    }
+
+    fn index_function_origin(&mut self, id: NameId, name: &str, span: Span) {
+        if span.file != orv_diagnostics::FileId::DUMMY {
+            self.function_origins
+                .insert(id, origin_id("function", name, span));
+        }
+    }
+
+    fn push(&mut self, kind: &str, name: impl Into<String>, span: Span) -> Option<String> {
         if span.file == orv_diagnostics::FileId::DUMMY {
-            return;
+            return None;
         }
         let name = name.into();
         let fingerprint = origin_fingerprint(kind, &name, span);
         let id = origin_id(kind, &name, span);
-        if !self.seen.insert(id.clone()) {
+        if let Some(parent) = self.parents.last().cloned() {
+            self.push_edge(parent, id.clone(), "contains");
+        }
+        if self.seen.insert(id.clone()) {
+            self.entries.push(OriginEntry {
+                id: id.clone(),
+                kind: kind.to_string(),
+                name,
+                span: OriginSpan {
+                    file: span.file.index(),
+                    start: span.range.start,
+                    end: span.range.end,
+                },
+                fingerprint,
+            });
+        }
+        Some(id)
+    }
+
+    fn push_edge(&mut self, from: String, to: String, kind: &str) {
+        if from == to {
             return;
         }
-        self.entries.push(OriginEntry {
-            id,
-            kind: kind.to_string(),
-            name,
-            span: OriginSpan {
-                file: span.file.index(),
-                start: span.range.start,
-                end: span.range.end,
-            },
-            fingerprint,
-        });
+        let kind = kind.to_string();
+        if self
+            .seen_edges
+            .insert((from.clone(), to.clone(), kind.clone()))
+        {
+            self.edges.push(OriginEdge { from, to, kind });
+        }
+    }
+
+    fn with_origin(
+        &mut self,
+        kind: &str,
+        name: impl Into<String>,
+        span: Span,
+        f: impl FnOnce(&mut Self),
+    ) {
+        if let Some(id) = self.push(kind, name, span) {
+            self.parents.push(id);
+            f(self);
+            self.parents.pop();
+        } else {
+            f(self);
+        }
     }
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {
@@ -103,8 +562,10 @@ impl OriginCollector {
             HirStmt::Let(stmt) => self.visit_expr(&stmt.init),
             HirStmt::Const(stmt) => self.visit_expr(&stmt.init),
             HirStmt::Function(stmt) => {
-                self.push("function", stmt.name.name.clone(), stmt.span);
-                self.visit_function_body(&stmt.body);
+                self.index_function_origin(stmt.name.id, &stmt.name.name, stmt.span);
+                self.with_origin("function", stmt.name.name.clone(), stmt.span, |this| {
+                    this.visit_function_body(&stmt.body);
+                });
             }
             HirStmt::Struct(_) | HirStmt::Enum(_) | HirStmt::TypeAlias(_) | HirStmt::Import(_) => {}
             HirStmt::Return(stmt) => {
@@ -132,12 +593,14 @@ impl OriginCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match &expr.kind {
             HirExprKind::Out(inner) => {
-                self.push("domain", "out", expr.span);
-                self.visit_expr(inner);
+                self.with_origin("domain", "out", expr.span, |this| {
+                    this.visit_expr(inner);
+                });
             }
             HirExprKind::Html(block) => {
-                self.push("domain", "html", expr.span);
-                self.visit_block(block);
+                self.with_origin("domain", "html", expr.span, |this| {
+                    this.visit_block(block);
+                });
             }
             HirExprKind::Route {
                 method,
@@ -145,41 +608,55 @@ impl OriginCollector {
                 handler,
                 ..
             } => {
-                self.push("route", format!("{method} {path}"), expr.span);
-                self.visit_block(handler);
+                self.with_origin("route", format!("{method} {path}"), expr.span, |this| {
+                    this.visit_block(handler);
+                });
             }
             HirExprKind::Respond { status, payload } => {
-                self.push("domain", "respond", expr.span);
-                self.visit_expr(status);
-                self.visit_expr(payload);
+                self.with_origin("domain", "respond", expr.span, |this| {
+                    this.visit_expr(status);
+                    this.visit_expr(payload);
+                });
             }
             HirExprKind::Server {
                 listen,
                 routes,
                 body_stmts,
             } => {
-                self.push("domain", "server", expr.span);
-                if let Some(listen) = listen {
-                    self.visit_expr(listen);
-                }
-                for route in routes {
-                    self.visit_expr(route);
-                }
-                for stmt in body_stmts {
-                    self.visit_stmt(stmt);
-                }
+                self.with_origin("domain", "server", expr.span, |this| {
+                    if let Some(listen) = listen {
+                        this.visit_expr(listen);
+                    }
+                    for route in routes {
+                        this.visit_expr(route);
+                    }
+                    for stmt in body_stmts {
+                        this.visit_stmt(stmt);
+                    }
+                });
             }
             HirExprKind::Domain { name, args, .. } => {
-                self.push("domain", name.clone(), expr.span);
-                for arg in args {
-                    self.visit_expr(arg);
-                }
+                self.with_origin("domain", name.clone(), expr.span, |this| {
+                    for arg in args {
+                        this.visit_expr(arg);
+                    }
+                });
             }
             HirExprKind::Call { callee, args } => {
-                self.push("call", call_name(callee), expr.span);
-                self.visit_expr(callee);
-                for arg in args {
-                    self.visit_expr(arg);
+                let name = call_name(callee);
+                let call_id = origin_id("call", &name, expr.span);
+                self.with_origin("call", name, expr.span, |this| {
+                    this.visit_expr(callee);
+                    for arg in args {
+                        this.visit_expr(arg);
+                    }
+                });
+                if expr.span.file != orv_diagnostics::FileId::DUMMY {
+                    if let Some(target) =
+                        call_target(callee).and_then(|id| self.function_origins.get(&id).cloned())
+                    {
+                        self.push_edge(call_id, target, "calls");
+                    }
                 }
             }
             HirExprKind::String(segments) => {
@@ -192,7 +669,8 @@ impl OriginCollector {
             HirExprKind::Unary { expr, .. }
             | HirExprKind::Paren(expr)
             | HirExprKind::Throw(expr)
-            | HirExprKind::Await(expr) => self.visit_expr(expr),
+            | HirExprKind::Await(expr)
+            | HirExprKind::Cast { expr, .. } => self.visit_expr(expr),
             HirExprKind::Binary { lhs, rhs, .. } => {
                 self.visit_expr(lhs);
                 self.visit_expr(rhs);
@@ -267,7 +745,6 @@ impl OriginCollector {
                 self.visit_expr(target);
             }
             HirExprKind::Lambda { body, .. } => self.visit_function_body(body),
-            HirExprKind::Cast { expr, .. } => self.visit_expr(expr),
             HirExprKind::Try { try_block, catch } => {
                 self.visit_block(try_block);
                 if let Some(catch) = catch {
@@ -309,6 +786,13 @@ impl OriginCollector {
             }
             HirPattern::Wildcard => {}
         }
+    }
+}
+
+fn call_target(callee: &HirExpr) -> Option<NameId> {
+    match &callee.kind {
+        HirExprKind::Ident(ident) => Some(ident.id),
+        _ => None,
     }
 }
 
@@ -380,6 +864,90 @@ mod tests {
     }
 
     #[test]
+    fn origin_map_collects_traversal_parent_edges() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let server = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "domain" && entry.name == "server")
+            .expect("server origin");
+        let route = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let respond = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "domain" && entry.name == "respond")
+            .expect("respond origin");
+
+        assert!(map
+            .edges
+            .iter()
+            .any(|edge| edge.kind == "contains" && edge.from == server.id && edge.to == route.id));
+        assert!(map.edges.iter().any(|edge| {
+            edge.kind == "contains" && edge.from == route.id && edge.to == respond.id
+        }));
+    }
+
+    #[test]
+    fn origin_map_collects_call_target_edges() {
+        let program = lower(
+            r#"function greet(name: string): string -> "hi {name}"
+@out greet("orv")"#,
+        );
+        let map = origin_map(&program);
+        let function = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "function" && entry.name == "greet")
+            .expect("function origin");
+        let call = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "greet")
+            .expect("call origin");
+
+        assert!(map
+            .edges
+            .iter()
+            .any(|edge| edge.kind == "calls" && edge.from == call.id && edge.to == function.id));
+    }
+
+    #[test]
+    fn origin_map_collects_forward_call_target_edges() {
+        let program = lower(
+            r#"function useGreet(): string -> greet("orv")
+function greet(name: string): string -> "hi {name}""#,
+        );
+        let map = origin_map(&program);
+        let function = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "function" && entry.name == "greet")
+            .expect("function origin");
+        let call = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "greet")
+            .expect("call origin");
+
+        assert!(map
+            .edges
+            .iter()
+            .any(|edge| edge.kind == "calls" && edge.from == call.id && edge.to == function.id));
+    }
+
+    #[test]
     fn origin_map_ids_are_unique_and_stable() {
         let program = lower(
             r#"function greet(name: string): string -> "hi {name}"
@@ -402,5 +970,212 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.kind == "call" && entry.name == "greet"));
+    }
+
+    #[test]
+    fn build_manifest_declares_reference_artifacts_and_route_count() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("fixtures/e2e/hello.orv", &map);
+
+        assert_eq!(manifest.schema_version, BUILD_MANIFEST_VERSION);
+        assert_eq!(manifest.entry, "fixtures/e2e/hello.orv");
+        assert_eq!(manifest.runtime, "reference-interpreter");
+        assert_eq!(manifest.capabilities.server_routes, 1);
+        assert!(manifest.capabilities.has_server);
+        assert!(!manifest.capabilities.client_wasm);
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "origin_map" && artifact.path == "origin-map.json"));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "project_graph" && artifact.path == "project-graph.json"
+        }));
+    }
+
+    #[test]
+    fn build_manifest_declares_only_required_runtime_features() {
+        let program = lower(
+            r#"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 await @db.find("User", { name: "Ada" })
+  }
+}"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+
+        assert_eq!(
+            manifest.capabilities.runtime_features,
+            vec!["http_server", "in_memory_db", "router"]
+        );
+        assert!(!manifest
+            .capabilities
+            .runtime_features
+            .contains(&"html_renderer".to_string()));
+        assert!(!manifest
+            .capabilities
+            .runtime_features
+            .contains(&"static_file_server".to_string()));
+    }
+
+    #[test]
+    fn bundle_plan_declares_server_runtime_without_client_wasm() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        assert_eq!(plan.schema_version, BUNDLE_PLAN_VERSION);
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "server_runtime"
+                && bundle.path == "server/app.orv-runtime.json"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
+        assert!(!plan
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == "client_wasm"));
+    }
+
+    #[test]
+    fn bundle_plan_declares_server_launch_artifact() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "server_launcher"
+                && bundle.path == "server/launch.json"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
+    }
+
+    #[test]
+    fn build_manifest_declares_static_page_artifact_for_html_only() {
+        let program = lower(r#"@out @html { @body { @h1 "Home" } }"#);
+        let map = origin_map(&program);
+        let manifest = build_manifest("page.orv", &map);
+
+        assert!(!manifest.capabilities.has_server);
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "static_page" && artifact.path == "pages/index.html"
+        }));
+    }
+
+    #[test]
+    fn bundle_plan_declares_static_page_zero_runtime_for_html_only() {
+        let program = lower(r#"@out @html { @body { @h1 "Home" } }"#);
+        let map = origin_map(&program);
+        let manifest = build_manifest("page.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        let page = plan
+            .bundles
+            .iter()
+            .find(|bundle| bundle.kind == "static_page")
+            .expect("static page bundle");
+        assert_eq!(page.path, "pages/index.html");
+        assert!(page.runtime_features.is_empty());
+        assert!(!plan
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == "server_runtime"));
+        assert!(!plan
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == "client_wasm"));
+    }
+
+    #[test]
+    fn server_runtime_artifact_declares_routes_and_runtime_features() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(
+            &manifest,
+            &map,
+            [(
+                "server.orv",
+                r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+            )],
+        );
+
+        assert_eq!(artifact.schema_version, SERVER_RUNTIME_ARTIFACT_VERSION);
+        assert_eq!(artifact.entry, "server.orv");
+        assert_eq!(artifact.runtime, "reference-interpreter");
+        assert_eq!(artifact.routes.len(), 1);
+        assert_eq!(artifact.routes[0].method, "GET");
+        assert_eq!(artifact.routes[0].path, "/ping");
+        assert!(artifact.routes[0].origin_id.starts_with("ori_"));
+        assert_eq!(artifact.runtime_features, vec!["http_server", "router"]);
+        assert_eq!(artifact.source_bundle.files.len(), 1);
+        assert_eq!(artifact.source_bundle.files[0].path, "server.orv");
+        assert!(artifact.source_bundle.files[0]
+            .source
+            .contains("@route GET /ping"));
+        assert!(artifact.source_bundle.files[0]
+            .content_hash
+            .starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn server_runtime_artifact_verification_rejects_hash_mismatch() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let mut artifact = server_runtime_artifact(&manifest, &map, [("server.orv", "@server {}")]);
+        artifact.source_bundle.files[0]
+            .source
+            .push_str("\n@out \"changed\"");
+
+        let errors = verify_server_runtime_artifact(&artifact).expect_err("hash mismatch");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("content hash mismatch for server.orv")));
     }
 }

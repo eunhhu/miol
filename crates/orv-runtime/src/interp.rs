@@ -29,6 +29,7 @@ use orv_hir::{
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -1502,7 +1503,16 @@ impl<'w, W: Write> Interp<'w, W> {
             match self.eval_call_arg(arg) {
                 Ok(value) => last = value,
                 Err(err) => {
-                    *db.lock().unwrap() = snapshot;
+                    let rollback = {
+                        let mut guard = db.lock().unwrap();
+                        *guard = snapshot;
+                        guard.checkpoint_wal_if_enabled()
+                    };
+                    rollback.map_err(|rollback_err| {
+                        RuntimeError::native(format!(
+                            "db.transaction rollback failed: {rollback_err}; original error: {err}"
+                        ))
+                    })?;
                     return Err(err);
                 }
             }
@@ -1982,7 +1992,8 @@ impl<'w, W: Write> Interp<'w, W> {
             (
                 Value::Db(db),
                 m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
-                | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze"),
+                | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save"
+                | "load" | "wal" | "checkpoint"),
             ) => call_db_method(&db, m, args),
             (recv, m) => Err(RuntimeError::native(format!("no method `{m}` on {recv}"))),
         }
@@ -3871,7 +3882,8 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
         (
             Value::Db(_),
             "create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search" | "count"
-            | "sum" | "transaction" | "schema" | "connect" | "analyze",
+            | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save" | "load" | "wal"
+            | "checkpoint",
         ) => Ok(Value::BoundMethod {
             receiver: Box::new(t),
             method: field.to_string(),
@@ -4407,6 +4419,9 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 /// - `sum(table, filter, @field)` — 매칭 row 의 numeric field 합계.
 /// - `search(table, filter?)` — 현재는 query search alias.
 /// - `transaction(values...)` — 이미 평가된 body 값 중 마지막 값 반환.
+/// - `save(path)` / `load(path)` — JSON snapshot 파일로 저장/복구.
+/// - `wal(path)` — JSONL WAL 을 replay 하고 이후 mutation 을 append+fsync.
+/// - `checkpoint()` — 현재 DB 상태를 WAL snapshot record 한 줄로 압축.
 fn call_db_method(
     db: &Arc<Mutex<crate::db::InMemoryDb>>,
     method: &str,
@@ -4428,7 +4443,10 @@ fn call_db_method(
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
             let data = parsed.data.unwrap_or_default();
-            Ok(db.lock().unwrap().create(&table, data))
+            db.lock()
+                .unwrap()
+                .create_logged(&table, data)
+                .map_err(|e| RuntimeError::native(format!("db.create failed: {e}")))
         }
         "find" => {
             if args.is_empty() {
@@ -4463,12 +4481,16 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            Ok(Value::Int(db.lock().unwrap().update_query(
-                &table,
-                &parsed.query,
-                &parsed.data.unwrap_or_default(),
-                &parsed.inc,
-            )))
+            db.lock()
+                .unwrap()
+                .update_logged(
+                    &table,
+                    &parsed.query,
+                    &parsed.data.unwrap_or_default(),
+                    &parsed.inc,
+                )
+                .map(Value::Int)
+                .map_err(|e| RuntimeError::native(format!("db.update failed: {e}")))
         }
         "delete" => {
             if args.is_empty() {
@@ -4476,9 +4498,11 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            Ok(Value::Int(
-                db.lock().unwrap().delete_query(&table, &parsed.query),
-            ))
+            db.lock()
+                .unwrap()
+                .delete_logged(&table, &parsed.query)
+                .map(Value::Int)
+                .map_err(|e| RuntimeError::native(format!("db.delete failed: {e}")))
         }
         "upsert" => {
             if args.len() < 2 {
@@ -4491,12 +4515,14 @@ fn call_db_method(
             let data = parsed.data.unwrap_or_default();
             let mut db = db.lock().unwrap();
             if matches!(db.find_one_query(&table, &parsed.query), Value::Void) {
-                Ok(db.create(
+                db.create_logged(
                     &table,
                     merge_db_objects(&query_equality_fields(&parsed.query), &data),
-                ))
+                )
+                .map_err(|e| RuntimeError::native(format!("db.upsert failed: {e}")))
             } else {
-                db.update_query(&table, &parsed.query, &data, &parsed.inc);
+                db.update_logged(&table, &parsed.query, &data, &parsed.inc)
+                    .map_err(|e| RuntimeError::native(format!("db.upsert failed: {e}")))?;
                 Ok(db.find_one_query(&table, &parsed.query))
             }
         }
@@ -4539,6 +4565,44 @@ fn call_db_method(
         "schema" => Ok(Value::Void),
         "analyze" => Ok(Value::Void),
         "connect" => Ok(Value::Db(db.clone())),
+        "save" => {
+            let path = args
+                .first()
+                .ok_or_else(|| RuntimeError::native("`db.save` expects path"))?;
+            let path = require_str(path, "path")?;
+            db.lock()
+                .unwrap()
+                .save_snapshot(Path::new(&path))
+                .map_err(|e| RuntimeError::native(format!("db.save failed: {e}")))?;
+            Ok(Value::Void)
+        }
+        "load" => {
+            let path = args
+                .first()
+                .ok_or_else(|| RuntimeError::native("`db.load` expects path"))?;
+            let path = require_str(path, "path")?;
+            let restored = InMemoryDb::load_snapshot(Path::new(&path))
+                .map_err(|e| RuntimeError::native(format!("db.load failed: {e}")))?;
+            *db.lock().unwrap() = restored;
+            Ok(Value::Void)
+        }
+        "wal" => {
+            let path = args
+                .first()
+                .ok_or_else(|| RuntimeError::native("`db.wal` expects path"))?;
+            let path = require_str(path, "path")?;
+            let restored = InMemoryDb::load_wal(Path::new(&path))
+                .map_err(|e| RuntimeError::native(format!("db.wal failed: {e}")))?;
+            *db.lock().unwrap() = restored;
+            Ok(Value::Void)
+        }
+        "checkpoint" => {
+            db.lock()
+                .unwrap()
+                .checkpoint_wal()
+                .map_err(|e| RuntimeError::native(format!("db.checkpoint failed: {e}")))?;
+            Ok(Value::Void)
+        }
         other => Err(RuntimeError::native(format!("unknown db method `{other}`"))),
     }
 }
@@ -7679,6 +7743,100 @@ let found = external.find("User", { name: "Ada" })
     }
 
     #[test]
+    fn db_save_and_load_roundtrip_snapshot_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-{}-{unique}.json",
+            std::process::id()
+        ));
+        let src = format!(
+            r#"let created = @db.create User %data={{ name: "Ada" }}
+@db.save "{}"
+@db.delete User {{ @where id=created.id }}
+@db.load "{}"
+let found = @db.find User {{ @where name="Ada" }}
+@out found.name"#,
+            path.display(),
+            path.display()
+        );
+
+        let out = run_str(&src).unwrap();
+
+        assert_eq!(out, "Ada\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_wal_replays_mutations_between_runtime_runs() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-wal-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"@db.wal "{}"
+let created = @db.create User %data={{ name: "Ada" }}
+@db.update User {{ @where id=created.id; %data={{ age: 37 }} }}"#,
+            path.display()
+        );
+        let second = format!(
+            r#"@db.wal "{}"
+let found = @db.find User {{ @where name="Ada" }}
+@out found.age"#,
+            path.display()
+        );
+
+        run_str(&first).unwrap();
+        let out = run_str(&second).unwrap();
+
+        assert_eq!(out, "37\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_checkpoint_compacts_wal_and_preserves_row_ids() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-checkpoint-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"@db.wal "{}"
+let ada = @db.create User %data={{ name: "Ada" }}
+let bea = @db.create User %data={{ name: "Bea" }}
+@db.delete User {{ @where id=ada.id }}
+@db.checkpoint()"#,
+            path.display()
+        );
+        let second = format!(
+            r#"@db.wal "{}"
+let bea = @db.find User {{ @where name="Bea" }}
+let cam = @db.create User %data={{ name: "Cam" }}
+@out bea.id
+@out cam.id"#,
+            path.display()
+        );
+
+        run_str(&first).unwrap();
+        let wal = std::fs::read_to_string(&path).expect("read checkpointed wal");
+        assert_eq!(wal.lines().count(), 1);
+
+        let out = run_str(&second).unwrap();
+
+        assert_eq!(out, "2\n3\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn db_transaction_rolls_back_on_error() {
         let out = run_str(
             r#"let account = @db.create Account %data={ balance: 10 }
@@ -7695,6 +7853,44 @@ let found = @db.find Account { @where id=account.id }
         )
         .unwrap();
         assert_eq!(out, "caught\n10\n");
+    }
+
+    #[test]
+    fn db_wal_transaction_rollback_survives_replay() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-wal-rollback-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"@db.wal "{}"
+let account = @db.create Account %data={{ balance: 10 }}
+try {{
+  @db.transaction {{
+    @db.update Account {{ @where id=account.id; %data={{ balance: 0 }} }}
+    throw "boom"
+  }}
+}} catch err {{
+  @out err
+}}"#,
+            path.display()
+        );
+        let second = format!(
+            r#"@db.wal "{}"
+let account = @db.find Account {{ @where id=1 }}
+@out account.balance"#,
+            path.display()
+        );
+
+        let first_out = run_str(&first).unwrap();
+        let second_out = run_str(&second).unwrap();
+
+        assert_eq!(first_out, "boom\n");
+        assert_eq!(second_out, "10\n");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
