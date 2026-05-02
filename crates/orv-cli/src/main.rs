@@ -7259,8 +7259,9 @@ fn verify_deploy_server_target(
     let Some(server) = server.filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    let artifact = json_str(server, "artifact", "deploy server")?;
+    let artifact_path = json_str(server, "artifact", "deploy server")?;
     let entrypoint = json_str(server, "entrypoint", "deploy server")?;
+    let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
     let entrypoint_path = dir.join(entrypoint);
     if !entrypoint_path.is_file() {
         anyhow::bail!(
@@ -7273,9 +7274,16 @@ fn verify_deploy_server_target(
     if !script.contains("orv run-artifact") {
         anyhow::bail!("deploy server entrypoint must run `orv run-artifact`");
     }
-    let artifact = read_server_artifact(&dir.join(artifact))?;
+    let artifact = read_server_artifact(&dir.join(artifact_path))?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    verify_deploy_routes_artifact(
+        dir,
+        routes_artifact,
+        artifact_path,
+        artifact.runtime.as_str(),
+        &artifact,
+    )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
         anyhow::bail!("deploy server runtime does not match runtime artifact");
@@ -7285,6 +7293,41 @@ fn verify_deploy_server_target(
         if routes != &artifact_routes {
             anyhow::bail!("deploy server routes do not match runtime artifact");
         }
+    }
+    Ok(())
+}
+
+fn verify_deploy_routes_artifact(
+    dir: &Path,
+    path: &str,
+    artifact_path: &str,
+    runtime: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let routes_path = dir.join(path);
+    if !routes_path.is_file() {
+        anyhow::bail!("missing deploy routes artifact: {}", routes_path.display());
+    }
+    let routes = read_json_value(&routes_path)?;
+    if routes
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy routes schema_version must be 1");
+    }
+    if json_str(&routes, "artifact", "deploy routes")? != artifact_path {
+        anyhow::bail!("deploy routes artifact must be {artifact_path}");
+    }
+    if json_str(&routes, "runtime", "deploy routes")? != runtime {
+        anyhow::bail!("deploy routes runtime does not match runtime artifact");
+    }
+    if json_str(&routes, "protocol", "deploy routes")? != "http1" {
+        anyhow::bail!("deploy routes protocol must be http1");
+    }
+    let expected_routes = serde_json::to_value(&artifact.routes)?;
+    if routes.get("routes") != Some(&expected_routes) {
+        anyhow::bail!("deploy routes do not match runtime artifact");
     }
     Ok(())
 }
@@ -8363,11 +8406,14 @@ fn write_prod_deploy_artifacts(
 ) -> anyhow::Result<()> {
     let server = if let Some(server_artifact) = server_artifact {
         let entrypoint = "deploy/server.sh";
+        let routes_artifact = "deploy/routes.json";
         write_prod_server_entrypoint(out, targets.server_artifact_path)?;
+        write_prod_routes_artifact(out, targets.server_artifact_path, server_artifact)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "artifact": targets.server_artifact_path,
             "entrypoint": entrypoint,
+            "routes_artifact": routes_artifact,
             "protocol": "http1",
             "routes": server_artifact.routes.clone(),
         })
@@ -8404,6 +8450,21 @@ fn write_prod_deploy_artifacts(
         "client": client,
     });
     write_json(&out.join("deploy").join("manifest.json"), &deploy)
+}
+
+fn write_prod_routes_artifact(
+    out: &Path,
+    server_artifact_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let routes = serde_json::json!({
+        "schema_version": 1,
+        "artifact": server_artifact_path,
+        "runtime": server_artifact.runtime.clone(),
+        "protocol": "http1",
+        "routes": server_artifact.routes.clone(),
+    });
+    write_json(&out.join("deploy").join("routes.json"), &routes)
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -14593,11 +14654,17 @@ entry = "src/main.orv"
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
 
         let deploy_manifest_path = out.join("deploy").join("manifest.json");
+        let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         assert!(
             deploy_manifest_path.is_file(),
             "missing {}",
             deploy_manifest_path.display()
+        );
+        assert!(
+            deploy_routes_path.is_file(),
+            "missing {}",
+            deploy_routes_path.display()
         );
         assert!(
             server_entrypoint_path.is_file(),
@@ -14616,10 +14683,34 @@ entry = "src/main.orv"
             .expect("server routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        assert_eq!(deploy["server"]["routes_artifact"], "deploy/routes.json");
+        let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
+        assert_eq!(routes["schema_version"], 1);
+        assert_eq!(routes["artifact"], "server/app.orv-runtime.json");
+        assert!(json_routes_include(&routes["routes"], "GET", "/ping"));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
         cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_routes_mismatch() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("deploy-routes-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let routes_path = out.join("deploy").join("routes.json");
+        let mut routes = read_json_value(&routes_path).expect("routes");
+        routes["routes"][0]["path"] = serde_json::json!("/wrong");
+        write_json(&routes_path, &routes).expect("write corrupt routes");
+
+        let err = cmd_verify_build(&out).expect_err("routes mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy routes do not match runtime artifact"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
