@@ -1233,9 +1233,9 @@ let events = await audit.query {
 
 시스템 콜, 네이티브 라이브러리, 하드웨어 가속 바인딩이 필요할 때 사용한다. **FFI 영역은 orv 안전성 보증에서 제외된다.**
 
-현재 MVP에서 `@ffi`는 ABI 이름과 인수를 보존하는 레퍼런스 핸들만 반환한다. 네이티브 심볼 로딩, ABI 시그니처 검증, 타겟별 dead-code 처리, `orv.toml` allowlist, `@unsafe` 밖 호출 금지는 아직 구현되어 있지 않다. `@unsafe` 블록은 현재 내부 블록을 평가하는 구문 경계로만 동작한다.
+현재 MVP에서 `@ffi`는 ABI 이름과 인수를 보존하는 레퍼런스 핸들을 반환하고, `@ffi.load`/`@ffi.library` 같은 FFI method call은 `@unsafe` 블록 안에서만 실행된다. `@unsafe` 블록은 내부 블록을 평가하는 런타임 경계로 동작한다. 네이티브 심볼 로딩, ABI 시그니처 검증, 타겟별 dead-code 처리, `orv.toml` allowlist는 아직 구현되어 있지 않다.
 
-로드맵 안전성 규칙은 `@ffi` 블록으로 외부 심볼을 선언하고, 호출은 반드시 `@unsafe` 블록 안에서만 허용하는 것이다.
+안전성 규칙은 `@ffi` 블록으로 외부 심볼을 선언하고, 호출은 반드시 `@unsafe` 블록 안에서만 허용하는 것이다.
 
 ```orv
 @ffi "C" {
@@ -1243,7 +1243,7 @@ let events = await audit.query {
   function tun_write(fd: int, packet: Blob): int
 }
 
-// 로드맵 호출 규칙 — @unsafe 밖에서는 컴파일 에러
+// 호출 규칙 — @unsafe 밖에서는 에러
 @unsafe {
   let fd = tun_create("orv0")
   tun_write(fd, packet)

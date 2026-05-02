@@ -575,6 +575,8 @@ struct Interp<'w, W: Write> {
     job_handlers: HashMap<String, JobHandler>,
     /// SPEC §11.18 cron declarations registered in this interpreter.
     cron_handlers: Vec<CronHandler>,
+    /// Current `@unsafe` lexical/runtime boundary depth.
+    unsafe_depth: usize,
     /// Runtime-only bindings for domain handlers whose parameter names are not
     /// resolver-managed lexical declarations yet.
     dynamic_scopes: Vec<HashMap<String, Value>>,
@@ -617,6 +619,7 @@ impl<'w, W: Write> Interp<'w, W> {
             design_tokens: HashMap::new(),
             job_handlers: HashMap::new(),
             cron_handlers: Vec::new(),
+            unsafe_depth: 0,
             dynamic_scopes: Vec::new(),
             debug: None,
         }
@@ -2237,7 +2240,14 @@ impl<'w, W: Write> Interp<'w, W> {
             "plugin" | "plugin.host" => call_plugin_method(ns, method, args),
             "gpu" => call_gpu_method(method, args),
             "observability" => call_observability_method(method, args),
-            "ffi" => call_ffi_method(method, args),
+            "ffi" => {
+                if self.unsafe_depth == 0 {
+                    return Err(RuntimeError::native(format!(
+                        "ffi method `{method}` requires @unsafe boundary"
+                    )));
+                }
+                call_ffi_method(method, args)
+            }
             "audit" => call_audit_method(method, args),
             _ if ns.starts_with("job.") && method == "enqueue" => {
                 let name = ns.strip_prefix("job.").unwrap_or(ns).to_string();
@@ -2363,7 +2373,10 @@ impl<'w, W: Write> Interp<'w, W> {
     fn eval_unsafe_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
         for arg in args {
             if let HirExprKind::Block(block) = &arg.kind {
-                return self.eval_block(block);
+                self.unsafe_depth += 1;
+                let result = self.eval_block(block);
+                self.unsafe_depth -= 1;
+                return result;
             }
         }
         Ok(Value::Object(vec![(
@@ -8472,6 +8485,25 @@ let local = store.put("logo", "blob")
         )
         .unwrap();
         assert_eq!(out, "inside\nresult\n");
+    }
+
+    #[test]
+    fn ffi_methods_require_unsafe_boundary() {
+        let err = run_str(r#"let lib = @ffi.load("native")"#).unwrap_err();
+        assert!(err.message.contains("requires @unsafe"), "{}", err.message);
+    }
+
+    #[test]
+    fn ffi_methods_run_inside_unsafe_boundary() {
+        let out = run_str(
+            r#"let name = @unsafe {
+  let lib = @ffi.load("native")
+  lib.name
+}
+@out name"#,
+        )
+        .unwrap();
+        assert_eq!(out, "native\n");
     }
 
     #[test]
