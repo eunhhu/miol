@@ -1725,6 +1725,8 @@ fn editor_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
     diagnostics.extend(lsp_diagnostics_json(&loaded.diagnostics, &loaded.files));
     diagnostics.extend(lsp_diagnostics_json(&resolved.diagnostics, &loaded.files));
     diagnostics.extend(lsp_diagnostics_json(&lowered.diagnostics, &loaded.files));
+    let project_graph = project_graph_json(&loaded.graph, &origin_map);
+    let live_refresh = editor_live_refresh_json(&loaded.files, &project_graph)?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "entry": {
@@ -1732,7 +1734,8 @@ fn editor_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
             "uri": lsp_file_uri_for_path(path),
         },
         "diagnostics": diagnostics,
-        "project_graph": project_graph_json(&loaded.graph, &origin_map),
+        "project_graph": project_graph,
+        "live_refresh": live_refresh,
         "panels": {
             "files": editor_files_panel_json(&loaded.files, &loaded.graph),
             "routes": editor_routes_panel_json(&origin_map, &loaded.files),
@@ -1740,6 +1743,33 @@ fn editor_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
             "domains": editor_domains_panel_json(&loaded.graph, &loaded.files),
         },
     }))
+}
+
+fn editor_live_refresh_json(
+    files: &[SourceFile],
+    project_graph: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "strategy": "source-hash",
+        "project_graph_hash": stable_json_hash(project_graph)?,
+        "watch": {
+            "sources": editor_source_watch_json(files),
+        },
+    }))
+}
+
+fn editor_source_watch_json(files: &[SourceFile]) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "file": file.id.0,
+                "path": file.path.display().to_string(),
+                "uri": lsp_file_uri_for_path(&file.path),
+                "content_hash": format!("fnv1a64:{:016x}", fnv1a64(file.source.as_bytes())),
+            })
+        })
+        .collect()
 }
 
 fn editor_files_panel_json(files: &[SourceFile], graph: &ProjectGraph) -> Vec<serde_json::Value> {
@@ -17489,6 +17519,17 @@ define Auth() -> { @out "auth" }
             .expect("domains")
             .iter()
             .any(|item| item["kind"] == "define" && item["name"] == "Auth"));
+        assert_eq!(snapshot["live_refresh"]["strategy"], "source-hash");
+        assert!(snapshot["live_refresh"]["watch"]["sources"]
+            .as_array()
+            .expect("watch sources")
+            .iter()
+            .any(|source| source["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("app.orv"))
+                && source["content_hash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.starts_with("fnv1a64:"))));
         let _ = std::fs::remove_dir_all(dir);
     }
 
