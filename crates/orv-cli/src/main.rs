@@ -1752,6 +1752,7 @@ struct DapSession {
     launched: Option<DapLaunchState>,
     breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
     function_breakpoints: Vec<DapFunctionBreakpoint>,
+    data_breakpoints: Vec<DapDataBreakpoint>,
     pending_events: Vec<DapPendingEvent>,
 }
 
@@ -1796,6 +1797,14 @@ struct DapBreakpoint {
 struct DapFunctionBreakpoint {
     id: u64,
     name: String,
+    verified: bool,
+    message: Option<String>,
+}
+
+#[derive(Clone)]
+struct DapDataBreakpoint {
+    id: u64,
+    data_id: String,
     verified: bool,
     message: Option<String>,
 }
@@ -1924,6 +1933,7 @@ impl DapSession {
                     "supportsCompletionsRequest": true,
                     "supportsBreakpointLocationsRequest": true,
                     "supportsFunctionBreakpoints": true,
+                    "supportsDataBreakpoints": true,
                     "supportsExceptionInfoRequest": true,
                     "supportsRestartRequest": true,
                     "supportsSetVariable": true,
@@ -1951,6 +1961,8 @@ impl DapSession {
             "setExceptionBreakpoints" => Ok(dap_set_exception_breakpoints_result(request)),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
+            "dataBreakpointInfo" => self.data_breakpoint_info_result(request),
+            "setDataBreakpoints" => self.set_data_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
             "gotoTargets" => self.goto_targets_result(request),
             "threads" => Ok(serde_json::json!({
@@ -2038,10 +2050,7 @@ impl DapSession {
             .map_or(executable_lines[0], |frame| frame.line);
         let stopped_reason = if runtime.status != "ok" {
             "exception".to_string()
-        } else if let Some(reason) = frames
-            .get(current_frame_index)
-            .and_then(|frame| self.breakpoint_frame_reason(frame))
-        {
+        } else if let Some(reason) = self.breakpoint_frame_reason(&frames, current_frame_index) {
             reason.to_string()
         } else {
             "entry".to_string()
@@ -2293,6 +2302,92 @@ impl DapSession {
                     .collect()
             });
         self.function_breakpoints = breakpoints.clone();
+        Ok(serde_json::json!({
+            "breakpoints": breakpoints
+                .iter()
+                .map(|breakpoint| {
+                    let mut value = serde_json::json!({
+                        "id": breakpoint.id,
+                        "verified": breakpoint.verified,
+                    });
+                    if let Some(message) = &breakpoint.message {
+                        value["message"] = serde_json::Value::String(message.clone());
+                    }
+                    value
+                })
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn data_breakpoint_info_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before dataBreakpointInfo"))?;
+        let variables_reference = request
+            .pointer("/arguments/variablesReference")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("dataBreakpointInfo.arguments.variablesReference is required")
+            })?;
+        let name = request
+            .pointer("/arguments/name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("dataBreakpointInfo.arguments.name is required"))?;
+        if variables_reference != 2
+            || !dap_current_locals(launched)
+                .iter()
+                .any(|local| local.name == name)
+        {
+            return Ok(serde_json::json!({
+                "dataId": null,
+                "description": format!("no ORV local data breakpoint for {name}"),
+                "accessTypes": [],
+                "canPersist": false,
+            }));
+        }
+        Ok(serde_json::json!({
+            "dataId": format!("local:{name}"),
+            "description": format!("local {name}"),
+            "accessTypes": ["write", "readWrite"],
+            "canPersist": true,
+        }))
+    }
+
+    fn set_data_breakpoints_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let breakpoints = request
+            .pointer("/arguments/breakpoints")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(Vec::new, |items| {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let data_id = breakpoint
+                            .get("dataId")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let verified = dap_data_breakpoint_local_name(data_id).is_some();
+                        DapDataBreakpoint {
+                            id: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                            data_id: data_id.to_string(),
+                            verified,
+                            message: (!verified)
+                                .then(|| "unsupported ORV data breakpoint".to_string()),
+                        }
+                    })
+                    .collect()
+            });
+        self.data_breakpoints = breakpoints.clone();
         Ok(serde_json::json!({
             "breakpoints": breakpoints
                 .iter()
@@ -2565,16 +2660,15 @@ impl DapSession {
         );
         if let Some(index) = next_breakpoint {
             self.queue_frame_outputs(start_frame, index);
-            let stopped = self
-                .launched
-                .as_ref()
-                .and_then(|launched| launched.frames.get(index))
-                .map(|frame| {
+            let stopped = self.launched.as_ref().and_then(|launched| {
+                launched.frames.get(index).map(|frame| {
                     (
                         frame.line,
-                        self.breakpoint_frame_reason(frame).unwrap_or("breakpoint"),
+                        self.breakpoint_frame_reason(&launched.frames, index)
+                            .unwrap_or("breakpoint"),
                     )
-                });
+                })
+            });
             let launched = self
                 .launched
                 .as_mut()
@@ -2631,7 +2725,7 @@ impl DapSession {
             launched
                 .frames
                 .get(target_frame)
-                .and_then(|frame| self.breakpoint_frame_reason(frame))
+                .and_then(|_| self.breakpoint_frame_reason(&launched.frames, target_frame))
                 .unwrap_or("entry")
         };
         let launched = self
@@ -2874,7 +2968,7 @@ impl DapSession {
         frames
             .iter()
             .enumerate()
-            .find_map(|(index, frame)| self.breakpoint_frame_reason(frame).map(|_| index))
+            .find_map(|(index, _)| self.breakpoint_frame_reason(frames, index).map(|_| index))
     }
 
     fn next_verified_breakpoint_frame(&self, launched: &DapLaunchState) -> Option<usize> {
@@ -2883,22 +2977,33 @@ impl DapSession {
             .iter()
             .enumerate()
             .skip(launched.current_frame_index.saturating_add(1))
-            .find_map(|(index, frame)| self.breakpoint_frame_reason(frame).map(|_| index))
+            .find_map(|(index, _)| {
+                self.breakpoint_frame_reason(&launched.frames, index)
+                    .map(|_| index)
+            })
     }
 
     fn previous_verified_breakpoint_frame(&self, launched: &DapLaunchState) -> Option<usize> {
         (0..launched.current_frame_index).rev().find(|index| {
-            let frame = &launched.frames[*index];
-            self.breakpoint_frame_reason(frame).is_some()
+            self.breakpoint_frame_reason(&launched.frames, *index)
+                .is_some()
         })
     }
 
-    fn breakpoint_frame_reason(&self, frame: &DapFrameState) -> Option<&'static str> {
+    fn breakpoint_frame_reason(
+        &self,
+        frames: &[DapFrameState],
+        index: usize,
+    ) -> Option<&'static str> {
+        let frame = frames.get(index)?;
         if self.has_verified_breakpoint(&frame.source.path, frame.line) {
             return Some("breakpoint");
         }
-        self.has_verified_function_breakpoint(frame)
-            .then_some("function breakpoint")
+        if self.has_verified_function_breakpoint(frame) {
+            return Some("function breakpoint");
+        }
+        self.has_verified_data_breakpoint(frames, index)
+            .then_some("data breakpoint")
     }
 
     fn has_verified_breakpoint(&self, path: &Path, line: u64) -> bool {
@@ -2919,6 +3024,28 @@ impl DapSession {
         self.function_breakpoints
             .iter()
             .any(|breakpoint| breakpoint.verified && breakpoint.name == function_name)
+    }
+
+    fn has_verified_data_breakpoint(&self, frames: &[DapFrameState], index: usize) -> bool {
+        let Some(frame) = frames.get(index) else {
+            return false;
+        };
+        self.data_breakpoints
+            .iter()
+            .filter(|breakpoint| breakpoint.verified)
+            .any(|breakpoint| {
+                let Some(name) = dap_data_breakpoint_local_name(&breakpoint.data_id) else {
+                    return false;
+                };
+                let Some(current) = dap_frame_local_value(frame, name) else {
+                    return false;
+                };
+                let previous = frames[..index]
+                    .iter()
+                    .rev()
+                    .find_map(|frame| dap_frame_local_value(frame, name));
+                previous != Some(current)
+            })
     }
 }
 
@@ -3158,6 +3285,21 @@ fn dap_current_locals(launched: &DapLaunchState) -> &[DapVariable] {
         .frames
         .get(launched.current_frame_index)
         .map_or(&[], |frame| frame.locals.as_slice())
+}
+
+fn dap_data_breakpoint_local_name(data_id: &str) -> Option<&str> {
+    data_id
+        .strip_prefix("local:")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn dap_frame_local_value<'a>(frame: &'a DapFrameState, name: &str) -> Option<&'a str> {
+    frame
+        .locals
+        .iter()
+        .find(|local| local.name == name)
+        .map(|local| local.value.as_str())
 }
 
 fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_json::Value {
@@ -6679,6 +6821,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
         assert_eq!(response["body"]["supportsFunctionBreakpoints"], true);
+        assert_eq!(response["body"]["supportsDataBreakpoints"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
         assert_eq!(response["body"]["supportsRestartRequest"], true);
         assert_eq!(response["body"]["supportsSetVariable"], true);
@@ -7216,6 +7359,88 @@ let total: int = add(2, 3)
             event["type"] == "event"
                 && event["event"] == "stopped"
                 && event["body"]["reason"] == "function breakpoint"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_data_breakpoint_stops_when_local_changes() {
+        let dir = temp_output_dir("dap-data-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let mut total: int = 1\ntotal = total + 4\n")
+            .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 199,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let info = session
+            .message_response(&serde_json::json!({
+                "seq": 200,
+                "type": "request",
+                "command": "dataBreakpointInfo",
+                "arguments": {
+                    "variablesReference": 2,
+                    "name": "total",
+                },
+            }))
+            .expect("dataBreakpointInfo response");
+        let data_id = info["body"]["dataId"].as_str().expect("data id");
+        let set_data = session
+            .message_response(&serde_json::json!({
+                "seq": 201,
+                "type": "request",
+                "command": "setDataBreakpoints",
+                "arguments": {
+                    "breakpoints": [
+                        {
+                            "dataId": data_id,
+                            "accessType": "write",
+                        },
+                    ],
+                },
+            }))
+            .expect("setDataBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 202,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 203,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(info["success"], true, "{info}");
+        assert_eq!(info["body"]["dataId"], "local:total");
+        assert_eq!(set_data["success"], true, "{set_data}");
+        assert_eq!(set_data["body"]["breakpoints"][0]["verified"], true);
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "data breakpoint"
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
