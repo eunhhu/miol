@@ -29,6 +29,9 @@ pub const SERVER_RUNTIME_ARTIFACT_VERSION: u32 = 1;
 /// Current server launch artifact schema version.
 pub const SERVER_LAUNCH_ARTIFACT_VERSION: u32 = 1;
 
+/// Current build source bundle artifact schema version.
+pub const SOURCE_BUNDLE_ARTIFACT_VERSION: u32 = 1;
+
 /// Minimal build artifact manifest.
 ///
 /// This is the first compiler-facing build artifact. It records deterministic
@@ -130,6 +133,28 @@ pub struct ServerSourceBundle {
 /// One source file captured for reference runner hydration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServerSourceFile {
+    /// File path as seen by the build.
+    pub path: String,
+    /// Stable content hash.
+    pub content_hash: String,
+    /// Source text.
+    pub source: String,
+}
+
+/// Build-level source snapshot used by reveal tooling for all bundle types.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceBundleArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Entry `.orv` file used for this artifact set.
+    pub entry: String,
+    /// Source files needed to reveal production origins.
+    pub files: Vec<SourceBundleFile>,
+}
+
+/// One source file captured for build-level reveal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceBundleFile {
     /// File path as seen by the build.
     pub path: String,
     /// Stable content hash.
@@ -267,6 +292,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
         BuildArtifact {
             kind: "project_graph".to_string(),
             path: "project-graph.json".to_string(),
+        },
+        BuildArtifact {
+            kind: "source_bundle".to_string(),
+            path: "source-bundle.json".to_string(),
         },
     ];
     if has_static_page(has_server, &runtime_features) {
@@ -415,6 +444,28 @@ pub fn server_runtime_artifact(
     }
 }
 
+/// Build a source bundle artifact for production-to-code reveal.
+pub fn source_bundle_artifact(
+    entry: impl Into<String>,
+    sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> SourceBundleArtifact {
+    SourceBundleArtifact {
+        schema_version: SOURCE_BUNDLE_ARTIFACT_VERSION,
+        entry: entry.into(),
+        files: sources
+            .into_iter()
+            .map(|(path, source)| {
+                let source = source.into();
+                SourceBundleFile {
+                    path: path.into(),
+                    content_hash: content_hash(&source),
+                    source,
+                }
+            })
+            .collect(),
+    }
+}
+
 /// Build a reference server launch descriptor for a runtime artifact.
 #[must_use]
 pub fn server_launch_artifact(
@@ -470,6 +521,45 @@ pub fn verify_server_runtime_artifact(artifact: &ServerRuntimeArtifact) -> Resul
             errors.push(format!(
                 "route {} {} has empty origin id",
                 route.method, route.path
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Verify that a build source bundle artifact is internally consistent.
+///
+/// # Errors
+///
+/// Returns all validation failures when source hashes do not match or source
+/// bundle files are missing paths.
+pub fn verify_source_bundle_artifact(artifact: &SourceBundleArtifact) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if artifact.schema_version != SOURCE_BUNDLE_ARTIFACT_VERSION {
+        errors.push(format!(
+            "unsupported source bundle schema_version {}",
+            artifact.schema_version
+        ));
+    }
+    if artifact.entry.trim().is_empty() {
+        errors.push("source bundle entry is empty".to_string());
+    }
+    if artifact.files.is_empty() {
+        errors.push("source bundle is empty".to_string());
+    }
+    for file in &artifact.files {
+        if file.path.trim().is_empty() {
+            errors.push("source bundle contains file with empty path".to_string());
+        }
+        let actual = content_hash(&file.source);
+        if file.content_hash != actual {
+            errors.push(format!(
+                "content hash mismatch for {}: expected {}, got {}",
+                file.path, file.content_hash, actual
             ));
         }
     }
@@ -1077,6 +1167,9 @@ function greet(name: string): string -> "hi {name}""#,
             .any(|artifact| artifact.kind == "origin_map" && artifact.path == "origin-map.json"));
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "project_graph" && artifact.path == "project-graph.json"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "source_bundle" && artifact.path == "source-bundle.json"
         }));
     }
 

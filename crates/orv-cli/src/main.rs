@@ -1101,8 +1101,17 @@ fn lsp_reveal_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json::Va
     let path = json_str(source, "path", "reveal source")?;
     let start = json_u32(source, "start", "reveal source")?;
     let end = json_u32(source, "end", "reveal source")?;
-    let source_text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read reveal source {path}: {e}"))?;
+    let source_text = source
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .map_or_else(
+            || {
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("failed to read reveal source {path}: {e}"))
+            },
+            Ok,
+        )?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "origin": reveal.get("origin").cloned().unwrap_or(serde_json::Value::Null),
@@ -5332,6 +5341,11 @@ fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow
                 artifact_path.display()
             );
         }
+        if kind == "source_bundle" {
+            let source_bundle = read_source_bundle_artifact(&artifact_path)?;
+            orv_compiler::verify_source_bundle_artifact(&source_bundle)
+                .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+        }
     }
     Ok(())
 }
@@ -5607,10 +5621,11 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
     let graph = read_json_value(&dir.join("project-graph.json"))?;
     let file_paths = graph_file_paths(&graph);
     let server_artifacts = read_server_artifacts(dir)?;
+    let source_bundle = read_source_bundle_if_present(dir)?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "origin": entry,
-        "source": reveal_source(entry, &file_paths, &server_artifacts),
+        "source": reveal_source(entry, &file_paths, &server_artifacts, source_bundle.as_ref()),
         "project_graph": reveal_project_graph_node(&graph, origin_id),
         "production": {
             "routes": reveal_routes(origin_id, &server_artifacts),
@@ -5643,6 +5658,25 @@ fn read_server_artifacts(
     Ok(artifacts)
 }
 
+fn read_source_bundle_if_present(
+    dir: &Path,
+) -> anyhow::Result<Option<orv_compiler::SourceBundleArtifact>> {
+    let path = dir.join("source-bundle.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(read_source_bundle_artifact(&path)?))
+}
+
+fn read_source_bundle_artifact(path: &Path) -> anyhow::Result<orv_compiler::SourceBundleArtifact> {
+    let artifact: orv_compiler::SourceBundleArtifact =
+        serde_json::from_value(read_json_value(path)?)
+            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+    orv_compiler::verify_source_bundle_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    Ok(artifact)
+}
+
 fn graph_file_paths(graph: &serde_json::Value) -> HashMap<u32, String> {
     let mut paths = HashMap::new();
     let Some(nodes) = graph.get("nodes").and_then(serde_json::Value::as_array) else {
@@ -5669,6 +5703,7 @@ fn reveal_source(
     entry: &orv_compiler::OriginEntry,
     file_paths: &HashMap<u32, String>,
     server_artifacts: &[(String, orv_compiler::ServerRuntimeArtifact)],
+    source_bundle: Option<&orv_compiler::SourceBundleArtifact>,
 ) -> serde_json::Value {
     let mut path = file_paths.get(&entry.span.file).cloned();
     let mut source = None;
@@ -5678,6 +5713,12 @@ fn reveal_source(
                 path = Some(file.path.clone());
                 source = Some(file.source.clone());
                 break;
+            }
+        }
+        if source.is_none() {
+            if let Some(file) = source_bundle.and_then(|bundle| bundle.files.get(file_index)) {
+                path = Some(file.path.clone());
+                source = Some(file.source.clone());
             }
         }
     }
@@ -5695,6 +5736,7 @@ fn reveal_source(
         "start": entry.span.start,
         "end": entry.span.end,
         "snippet": snippet,
+        "content": source,
     })
 }
 
@@ -6140,6 +6182,13 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         .map(|(path, _)| normalized_artifact_path(&path.display().to_string()));
     let server_artifact_path = "server/app.orv-runtime.json";
     let server_launch_path = "server/launch.json";
+    let source_bundle = orv_compiler::source_bundle_artifact(
+        entry.display().to_string(),
+        loaded
+            .files
+            .iter()
+            .map(|file| (file.path.display().to_string(), file.source.clone())),
+    );
     let server_artifact = manifest.capabilities.has_server.then(|| {
         orv_compiler::server_runtime_artifact(
             &manifest,
@@ -6166,6 +6215,10 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         &serde_json::to_value(origin_map)?,
     )?;
     write_json(&out.join("project-graph.json"), &graph)?;
+    write_json(
+        &out.join("source-bundle.json"),
+        &serde_json::to_value(&source_bundle)?,
+    )?;
     if let Some(server_artifact) = &server_artifact {
         write_json(
             &out.join(server_artifact_path),
@@ -11293,6 +11346,7 @@ entry = "src/main.orv"
         let server_artifact_path = out.join("server").join("app.orv-runtime.json");
         let server_launch_path = out.join("server").join("launch.json");
         let graph_path = out.join("project-graph.json");
+        let source_bundle_path = out.join("source-bundle.json");
         assert!(
             manifest_path.is_file(),
             "missing {}",
@@ -11319,6 +11373,11 @@ entry = "src/main.orv"
             server_launch_path.display()
         );
         assert!(graph_path.is_file(), "missing {}", graph_path.display());
+        assert!(
+            source_bundle_path.is_file(),
+            "missing {}",
+            source_bundle_path.display()
+        );
 
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
@@ -11351,6 +11410,24 @@ entry = "src/main.orv"
             .iter()
             .any(|artifact| artifact["kind"] == "project_graph"
                 && artifact["path"] == "project-graph.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "source_bundle"
+                && artifact["path"] == "source-bundle.json"));
+        let source_bundle: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&source_bundle_path).expect("source bundle"),
+        )
+        .expect("source bundle json");
+        assert_eq!(source_bundle["schema_version"], 1);
+        assert!(source_bundle["files"]
+            .as_array()
+            .expect("source files")
+            .iter()
+            .any(|file| file["source"]
+                .as_str()
+                .is_some_and(|source| source.contains("@route GET /ping"))));
         let plan: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&bundle_plan_path).expect("plan"))
                 .expect("bundle plan json");
@@ -11731,6 +11808,39 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn reveal_origin_uses_build_source_bundle_when_original_client_source_is_missing() {
+        let out = temp_output_dir("reveal-client-source-bundle");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(build_out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let signal = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "signal" && entry.name == "count")
+            .expect("signal origin");
+        std::fs::remove_file(&entry).expect("remove original source");
+
+        let reveal = reveal_origin_json(&build_out, &signal.id).expect("reveal origin");
+
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("let sig count")));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn lsp_reveal_returns_location_for_build_origin() {
         let dir = temp_output_dir("lsp-reveal");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -11774,6 +11884,43 @@ entry = "src/main.orv"
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_reveal_uses_build_source_bundle_when_original_source_is_missing() {
+        let dir = temp_output_dir("lsp-reveal-source-bundle");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("page.orv");
+        std::fs::write(
+            &path,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let signal = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "signal" && entry.name == "count")
+            .expect("signal origin");
+        std::fs::remove_file(&path).expect("remove source");
+
+        let reveal = lsp_reveal_json(&out, &signal.id).expect("lsp reveal");
+
+        assert_eq!(reveal["origin"]["kind"], "signal");
+        assert_eq!(reveal["location"]["range"]["start"]["line"], 0);
+        assert!(reveal["production"]["client"]
+            .as_array()
+            .expect("client targets")
+            .iter()
+            .any(|target| target["kind"] == "client_wasm"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
