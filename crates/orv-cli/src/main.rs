@@ -25,8 +25,8 @@ use codespan_reporting::term::termcolor::WriteColor;
 use orv_diagnostics::{FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
 use orv_syntax::ast::{
-    BinaryOp as AstBinaryOp, ConstraintValue, Expr, ExprKind, Program, Stmt, StringSegment,
-    TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
+    BinaryOp as AstBinaryOp, Block, ConstraintValue, Expr, ExprKind, FunctionBody, Program, Stmt,
+    StringSegment, TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
 };
 
 #[derive(Parser)]
@@ -1791,6 +1791,7 @@ struct DapBreakpoint {
     line: u64,
     verified: bool,
     condition: Option<String>,
+    hit_condition: Option<String>,
     message: Option<String>,
 }
 
@@ -1934,6 +1935,7 @@ impl DapSession {
                     "supportsCompletionsRequest": true,
                     "supportsBreakpointLocationsRequest": true,
                     "supportsConditionalBreakpoints": true,
+                    "supportsHitConditionalBreakpoints": true,
                     "supportsFunctionBreakpoints": true,
                     "supportsDataBreakpoints": true,
                     "supportsExceptionInfoRequest": true,
@@ -2224,6 +2226,12 @@ impl DapSession {
                             verified,
                             condition: breakpoint
                                 .get("condition")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|condition| !condition.is_empty())
+                                .map(str::to_string),
+                            hit_condition: breakpoint
+                                .get("hitCondition")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::trim)
                                 .filter(|condition| !condition.is_empty())
@@ -3004,7 +3012,7 @@ impl DapSession {
         index: usize,
     ) -> Option<&'static str> {
         let frame = frames.get(index)?;
-        if self.has_verified_line_breakpoint(frame) {
+        if self.has_verified_line_breakpoint(frames, index) {
             return Some("breakpoint");
         }
         if self.has_verified_function_breakpoint(frame) {
@@ -3014,7 +3022,10 @@ impl DapSession {
             .then_some("data breakpoint")
     }
 
-    fn has_verified_line_breakpoint(&self, frame: &DapFrameState) -> bool {
+    fn has_verified_line_breakpoint(&self, frames: &[DapFrameState], index: usize) -> bool {
+        let Some(frame) = frames.get(index) else {
+            return false;
+        };
         let normalized = dap_normalize_path(&frame.source.path);
         self.breakpoints
             .get(&normalized)
@@ -3023,8 +3034,35 @@ impl DapSession {
                     breakpoint.verified
                         && breakpoint.line == frame.line
                         && dap_breakpoint_condition_matches(frame, breakpoint.condition.as_deref())
+                        && self.line_breakpoint_hit_condition_matches(
+                            frames,
+                            index,
+                            &normalized,
+                            breakpoint,
+                        )
                 })
             })
+    }
+
+    fn line_breakpoint_hit_condition_matches(
+        &self,
+        frames: &[DapFrameState],
+        index: usize,
+        normalized_path: &Path,
+        breakpoint: &DapBreakpoint,
+    ) -> bool {
+        let Some(hit_condition) = breakpoint.hit_condition.as_deref() else {
+            return true;
+        };
+        let hit_count = frames[..=index]
+            .iter()
+            .filter(|frame| {
+                dap_normalize_path(&frame.source.path) == normalized_path
+                    && frame.line == breakpoint.line
+                    && dap_breakpoint_condition_matches(frame, breakpoint.condition.as_deref())
+            })
+            .count();
+        dap_hit_condition_matches(hit_condition, hit_count)
     }
 
     fn has_verified_function_breakpoint(&self, frame: &DapFrameState) -> bool {
@@ -3379,6 +3417,34 @@ fn dap_normalize_condition_literal(value: &str) -> String {
 
 fn dap_condition_value_truthy(value: &str) -> bool {
     !matches!(value, "" | "false" | "0" | "0.0" | "void" | "\"\"")
+}
+
+fn dap_hit_condition_matches(condition: &str, hit_count: usize) -> bool {
+    let condition = condition.trim();
+    if let Some(modulo) = condition
+        .strip_prefix('%')
+        .and_then(|value| value.trim_start_matches('=').trim().parse::<usize>().ok())
+    {
+        return modulo > 0 && hit_count.is_multiple_of(modulo);
+    }
+    for op in [">=", "<=", ">", "<", "==", "="] {
+        if let Some((_, right)) = condition.split_once(op) {
+            let Some(expected) = right.trim().parse::<usize>().ok() else {
+                return false;
+            };
+            return match op {
+                ">=" => hit_count >= expected,
+                "<=" => hit_count <= expected,
+                ">" => hit_count > expected,
+                "<" => hit_count < expected,
+                "==" | "=" => hit_count == expected,
+                _ => false,
+            };
+        }
+    }
+    condition
+        .parse::<usize>()
+        .is_ok_and(|expected| hit_count == expected)
 }
 
 fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_json::Value {
@@ -3792,17 +3858,196 @@ fn dap_verified_breakpoint_lines(path: &Path) -> anyhow::Result<Vec<u64>> {
             Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
         })
         .collect::<Vec<_>>();
-    lines.extend(loaded.program.items.iter().filter_map(|stmt| {
-        let span = stmt.span();
-        if span.file != file.id {
-            return None;
-        }
-        let start = byte_position(&file.source, span.range.start);
-        Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
-    }));
+    for stmt in &loaded.program.items {
+        dap_collect_stmt_breakpoint_lines(stmt, file.id, &loaded.files, &mut lines);
+    }
     lines.sort_unstable();
     lines.dedup();
     Ok(lines)
+}
+
+fn dap_collect_stmt_breakpoint_lines(
+    stmt: &Stmt,
+    file_id: FileId,
+    files: &[SourceFile],
+    lines: &mut Vec<u64>,
+) {
+    dap_push_span_line(stmt.span(), file_id, files, lines);
+    match stmt {
+        Stmt::Let(stmt) => dap_collect_expr_breakpoint_lines(&stmt.init, file_id, files, lines),
+        Stmt::Const(stmt) => dap_collect_expr_breakpoint_lines(&stmt.init, file_id, files, lines),
+        Stmt::Function(stmt) => {
+            dap_collect_function_body_breakpoint_lines(&stmt.body, file_id, files, lines);
+        }
+        Stmt::Enum(stmt) => {
+            for variant in &stmt.variants {
+                dap_collect_expr_breakpoint_lines(&variant.value, file_id, files, lines);
+            }
+        }
+        Stmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                dap_collect_expr_breakpoint_lines(value, file_id, files, lines);
+            }
+        }
+        Stmt::Expr(expr) => dap_collect_expr_breakpoint_lines(expr, file_id, files, lines),
+        Stmt::Struct(_) | Stmt::TypeAlias(_) | Stmt::Import(_) => {}
+    }
+}
+
+fn dap_collect_function_body_breakpoint_lines(
+    body: &FunctionBody,
+    file_id: FileId,
+    files: &[SourceFile],
+    lines: &mut Vec<u64>,
+) {
+    match body {
+        FunctionBody::Block(block) => {
+            dap_collect_block_breakpoint_lines(block, file_id, files, lines);
+        }
+        FunctionBody::Expr(expr) => dap_collect_expr_breakpoint_lines(expr, file_id, files, lines),
+    }
+}
+
+fn dap_collect_block_breakpoint_lines(
+    block: &Block,
+    file_id: FileId,
+    files: &[SourceFile],
+    lines: &mut Vec<u64>,
+) {
+    for stmt in &block.stmts {
+        dap_collect_stmt_breakpoint_lines(stmt, file_id, files, lines);
+    }
+}
+
+fn dap_collect_expr_breakpoint_lines(
+    expr: &Expr,
+    file_id: FileId,
+    files: &[SourceFile],
+    lines: &mut Vec<u64>,
+) {
+    dap_push_span_line(expr.span, file_id, files, lines);
+    match &expr.kind {
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::Await(expr)
+        | ExprKind::Throw(expr)
+        | ExprKind::Cast { expr, .. } => {
+            dap_collect_expr_breakpoint_lines(expr, file_id, files, lines);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            dap_collect_expr_breakpoint_lines(lhs, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(rhs, file_id, files, lines);
+        }
+        ExprKind::Domain { args, .. } | ExprKind::Tuple(args) | ExprKind::Array(args) => {
+            for arg in args {
+                dap_collect_expr_breakpoint_lines(arg, file_id, files, lines);
+            }
+        }
+        ExprKind::Block(block) => dap_collect_block_breakpoint_lines(block, file_id, files, lines),
+        ExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => {
+            dap_collect_expr_breakpoint_lines(cond, file_id, files, lines);
+            dap_collect_block_breakpoint_lines(then, file_id, files, lines);
+            if let Some(else_branch) = else_branch {
+                dap_collect_expr_breakpoint_lines(else_branch, file_id, files, lines);
+            }
+        }
+        ExprKind::When { scrutinee, arms } => {
+            dap_collect_expr_breakpoint_lines(scrutinee, file_id, files, lines);
+            for arm in arms {
+                dap_collect_expr_breakpoint_lines(&arm.body, file_id, files, lines);
+            }
+        }
+        ExprKind::Assign { value, .. } => {
+            dap_collect_expr_breakpoint_lines(value, file_id, files, lines);
+        }
+        ExprKind::Call { callee, args } => {
+            dap_collect_expr_breakpoint_lines(callee, file_id, files, lines);
+            for arg in args {
+                dap_collect_expr_breakpoint_lines(arg, file_id, files, lines);
+            }
+        }
+        ExprKind::AssignField { object, value, .. } => {
+            dap_collect_expr_breakpoint_lines(object, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(value, file_id, files, lines);
+        }
+        ExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => {
+            dap_collect_expr_breakpoint_lines(object, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(index, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(value, file_id, files, lines);
+        }
+        ExprKind::For { iter, body, .. } => {
+            dap_collect_expr_breakpoint_lines(iter, file_id, files, lines);
+            dap_collect_block_breakpoint_lines(body, file_id, files, lines);
+        }
+        ExprKind::While { cond, body } => {
+            dap_collect_expr_breakpoint_lines(cond, file_id, files, lines);
+            dap_collect_block_breakpoint_lines(body, file_id, files, lines);
+        }
+        ExprKind::Range { start, end, .. } => {
+            dap_collect_expr_breakpoint_lines(start, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(end, file_id, files, lines);
+        }
+        ExprKind::Object(fields) | ExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                dap_collect_expr_breakpoint_lines(&field.value, file_id, files, lines);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            dap_collect_expr_breakpoint_lines(target, file_id, files, lines);
+            dap_collect_expr_breakpoint_lines(index, file_id, files, lines);
+        }
+        ExprKind::Slice { target, start, end } => {
+            dap_collect_expr_breakpoint_lines(target, file_id, files, lines);
+            if let Some(start) = start {
+                dap_collect_expr_breakpoint_lines(start, file_id, files, lines);
+            }
+            if let Some(end) = end {
+                dap_collect_expr_breakpoint_lines(end, file_id, files, lines);
+            }
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            dap_collect_expr_breakpoint_lines(target, file_id, files, lines);
+        }
+        ExprKind::Lambda { body, .. } => {
+            dap_collect_function_body_breakpoint_lines(body, file_id, files, lines);
+        }
+        ExprKind::Try { try_block, catch } => {
+            dap_collect_block_breakpoint_lines(try_block, file_id, files, lines);
+            if let Some(catch) = catch {
+                dap_collect_block_breakpoint_lines(&catch.body, file_id, files, lines);
+            }
+        }
+        ExprKind::Integer(_)
+        | ExprKind::Float(_)
+        | ExprKind::String(_)
+        | ExprKind::Regex { .. }
+        | ExprKind::True
+        | ExprKind::False
+        | ExprKind::Void
+        | ExprKind::Ident(_)
+        | ExprKind::TypeName(_)
+        | ExprKind::Break
+        | ExprKind::Continue => {}
+    }
+}
+
+fn dap_push_span_line(span: Span, file_id: FileId, files: &[SourceFile], lines: &mut Vec<u64>) {
+    if span.file != file_id {
+        return;
+    }
+    let Some(file) = files.iter().find(|file| file.id == span.file) else {
+        return;
+    };
+    let start = byte_position(&file.source, span.range.start);
+    lines.push(u64::try_from(start.0 + 1).unwrap_or(u64::MAX));
 }
 
 fn dap_following_executable_line(lines: &[u64], current: u64) -> Option<u64> {
@@ -6900,6 +7145,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
         assert_eq!(response["body"]["supportsConditionalBreakpoints"], true);
+        assert_eq!(response["body"]["supportsHitConditionalBreakpoints"], true);
         assert_eq!(response["body"]["supportsFunctionBreakpoints"], true);
         assert_eq!(response["body"]["supportsDataBreakpoints"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
@@ -7259,6 +7505,72 @@ function greet(user: User): string -> "hello"
 
         assert_eq!(stack["success"], true, "{stack}");
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_hit_condition_breakpoint_stops_on_requested_hit() {
+        let dir = temp_output_dir("dap-hit-condition-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function bump(value: int): int -> {
+  let result: int = value + 1
+  result
+}
+let first: int = bump(0)
+let second: int = bump(1)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 207,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 2,
+                            "hitCondition": "2",
+                        },
+                    ],
+                },
+            }))
+            .expect("setBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 208,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 209,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 2,
+                },
+            }))
+            .expect("locals response");
+
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert!(
+            vars.iter()
+                .any(|var| var["name"] == "result" && var["value"] == "2"),
+            "{locals}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
