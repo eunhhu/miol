@@ -1620,6 +1620,7 @@ impl DapSession {
                     "supportsRestartRequest": true,
                     "supportsSetVariable": true,
                     "supportsSetExpression": true,
+                    "supportsModulesRequest": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -1657,6 +1658,7 @@ impl DapSession {
             "completions" => self.completions_result(request),
             "exceptionInfo" => self.exception_info_result(),
             "loadedSources" => self.loaded_sources_result(),
+            "modules" => self.modules_result(request),
             "source" => self.source_result(request),
             "continue" => self.continue_result(),
             "next" | "stepIn" | "stepOut" => self.step_result(),
@@ -1807,6 +1809,35 @@ impl DapSession {
                 .iter()
                 .map(dap_source_json)
                 .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn modules_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before modules"))?;
+        let start = request
+            .pointer("/arguments/startModule")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let total = launched.sources.len();
+        let available = total.saturating_sub(start);
+        let module_count = request
+            .pointer("/arguments/moduleCount")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(available);
+        Ok(serde_json::json!({
+            "modules": launched
+                .sources
+                .iter()
+                .skip(start)
+                .take(module_count)
+                .map(dap_module_json)
+                .collect::<Vec<_>>(),
+            "totalModules": total,
         }))
     }
 
@@ -3045,6 +3076,16 @@ fn dap_source_json(source: &DapSourceInfo) -> serde_json::Value {
         "path": source.path.display().to_string(),
         "sourceReference": source.reference,
         "uri": source.uri,
+    })
+}
+
+fn dap_module_json(source: &DapSourceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": source.reference,
+        "name": source.name,
+        "path": source.path.display().to_string(),
+        "isUserCode": true,
+        "symbolStatus": "loaded",
     })
 }
 
@@ -5907,6 +5948,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsRestartRequest"], true);
         assert_eq!(response["body"]["supportsSetVariable"], true);
         assert_eq!(response["body"]["supportsSetExpression"], true);
+        assert_eq!(response["body"]["supportsModulesRequest"], true);
     }
 
     #[test]
@@ -6681,6 +6723,54 @@ let total: int = add(2, 3)
         assert!(sources
             .iter()
             .any(|item| item["name"] == "user.orv" && item["path"].as_str().is_some()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_modules_returns_project_sources_after_launch() {
+        let dir = temp_output_dir("dap-modules");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(
+            &source,
+            "import models.user.User\nlet u: User = { id: 1 }\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 175,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let modules = session
+            .message_response(&serde_json::json!({
+                "seq": 176,
+                "type": "request",
+                "command": "modules",
+                "arguments": {
+                    "startModule": 0,
+                    "moduleCount": 1,
+                },
+            }))
+            .expect("modules response");
+
+        assert_eq!(modules["success"], true, "{modules}");
+        assert_eq!(modules["body"]["totalModules"], 2);
+        let items = modules["body"]["modules"].as_array().expect("modules");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "app.orv");
+        assert_eq!(items[0]["id"], 1);
+        assert_eq!(items[0]["isUserCode"], true);
+        assert!(items[0]["path"].as_str().is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
