@@ -2148,7 +2148,7 @@ impl<'w, W: Write> Interp<'w, W> {
                 Value::Db(db),
                 m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
                 | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save"
-                | "load" | "wal" | "checkpoint"),
+                | "load" | "wal" | "checkpoint" | "savepoint" | "rollback"),
             ) => call_db_method(&db, m, args),
             (recv, m) => Err(RuntimeError::native(format!("no method `{m}` on {recv}"))),
         }
@@ -4056,7 +4056,7 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
             Value::Db(_),
             "create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search" | "count"
             | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save" | "load" | "wal"
-            | "checkpoint",
+            | "checkpoint" | "savepoint" | "rollback",
         ) => Ok(Value::BoundMethod {
             receiver: Box::new(t),
             method: field.to_string(),
@@ -4595,6 +4595,7 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 /// - `save(path)` / `load(path)` — JSON snapshot 파일로 저장/복구.
 /// - `wal(path)` — JSONL WAL 을 replay 하고 이후 mutation 을 append+fsync.
 /// - `checkpoint()` — 현재 DB 상태를 WAL snapshot record 한 줄로 압축.
+/// - `savepoint()` / `rollback(savepoint)` — in-memory savepoint capture/restore.
 fn call_db_method(
     db: &Arc<Mutex<crate::db::InMemoryDb>>,
     method: &str,
@@ -4774,6 +4775,26 @@ fn call_db_method(
                 .unwrap()
                 .checkpoint_wal()
                 .map_err(|e| RuntimeError::native(format!("db.checkpoint failed: {e}")))?;
+            Ok(Value::Void)
+        }
+        "savepoint" => {
+            let savepoint = db.lock().unwrap().savepoint();
+            Ok(Value::Db(Arc::new(Mutex::new(savepoint))))
+        }
+        "rollback" => {
+            let savepoint = args
+                .first()
+                .ok_or_else(|| RuntimeError::native("`db.rollback` expects savepoint"))?;
+            let Value::Db(savepoint) = savepoint else {
+                return Err(RuntimeError::native(format!(
+                    "`db.rollback` expects savepoint, got {savepoint}"
+                )));
+            };
+            let savepoint = savepoint.lock().unwrap().clone();
+            db.lock()
+                .unwrap()
+                .restore_savepoint(&savepoint)
+                .map_err(|e| RuntimeError::native(format!("db.rollback failed: {e}")))?;
             Ok(Value::Void)
         }
         other => Err(RuntimeError::native(format!("unknown db method `{other}`"))),
@@ -8026,6 +8047,52 @@ let found = @db.find Account { @where id=account.id }
         )
         .unwrap();
         assert_eq!(out, "caught\n10\n");
+    }
+
+    #[test]
+    fn db_savepoint_rolls_back_in_memory_state() {
+        let out = run_str(
+            r"let account = @db.create Account %data={ balance: 10 }
+let point = @db.savepoint()
+@db.update Account { @where id=account.id; %data={ balance: 0 } }
+@db.rollback(point)
+let found = @db.find Account { @where id=account.id }
+@out found.balance",
+        )
+        .unwrap();
+        assert_eq!(out, "10\n");
+    }
+
+    #[test]
+    fn db_wal_savepoint_rollback_survives_replay() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-wal-savepoint-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"@db.wal "{}"
+let account = @db.create Account %data={{ balance: 10 }}
+let point = @db.savepoint()
+@db.update Account {{ @where id=account.id; %data={{ balance: 0 }} }}
+@db.rollback(point)"#,
+            path.display()
+        );
+        let second = format!(
+            r#"@db.wal "{}"
+let account = @db.find Account {{ @where id=1 }}
+@out account.balance"#,
+            path.display()
+        );
+
+        run_str(&first).unwrap();
+        let second_out = run_str(&second).unwrap();
+
+        assert_eq!(second_out, "10\n");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

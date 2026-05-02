@@ -522,6 +522,25 @@ impl InMemoryDb {
         })
     }
 
+    /// Capture a lightweight in-memory savepoint.
+    #[must_use]
+    pub fn savepoint(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            wal_path: None,
+        }
+    }
+
+    /// Restore table state from a savepoint while preserving this DB's WAL path.
+    ///
+    /// # Errors
+    /// Returns an error when the WAL-backed DB cannot checkpoint the restored
+    /// state.
+    pub fn restore_savepoint(&mut self, savepoint: &Self) -> Result<(), DbSnapshotError> {
+        self.tables.clone_from(&savepoint.tables);
+        self.checkpoint_wal_if_enabled()
+    }
+
     /// Load a DB by replaying a JSONL WAL. Missing WAL means empty DB.
     ///
     /// # Errors
