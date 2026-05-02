@@ -546,6 +546,22 @@ impl InMemoryDb {
     /// # Errors
     /// Returns an error when the WAL cannot be read, parsed, or replayed.
     pub fn load_wal(path: &Path) -> Result<Self, DbSnapshotError> {
+        Self::load_wal_records(path, None)
+    }
+
+    /// Load a DB by replaying at most `until_record` complete WAL records.
+    /// Missing WAL means empty DB.
+    ///
+    /// # Errors
+    /// Returns an error when the WAL cannot be read, parsed, or replayed.
+    pub fn load_wal_until_record(
+        path: &Path,
+        until_record: Option<usize>,
+    ) -> Result<Self, DbSnapshotError> {
+        Self::load_wal_records(path, until_record)
+    }
+
+    fn load_wal_records(path: &Path, until_record: Option<usize>) -> Result<Self, DbSnapshotError> {
         let mut db = Self {
             tables: HashMap::new(),
             wal_path: Some(path.to_path_buf()),
@@ -562,9 +578,13 @@ impl InMemoryDb {
         };
         let lines = source.lines().collect::<Vec<_>>();
         let has_complete_tail = source.ends_with('\n');
+        let mut replayed_records = 0usize;
         for (line_index, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
+            }
+            if until_record.is_some_and(|limit| replayed_records >= limit) {
+                break;
             }
             let record: serde_json::Value = match serde_json::from_str(line) {
                 Ok(record) => record,
@@ -583,6 +603,7 @@ impl InMemoryDb {
             replay_wal_record(&mut db, &record).map_err(|err| {
                 DbSnapshotError::Invalid(format!("wal line {}: {err}", line_index + 1))
             })?;
+            replayed_records += 1;
         }
         Ok(db)
     }

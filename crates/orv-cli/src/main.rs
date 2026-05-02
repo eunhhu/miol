@@ -228,6 +228,18 @@ enum DbCommand {
         #[arg(long)]
         data: PathBuf,
     },
+    /// JSONL WAL을 재생해 @db.save JSON data snapshot으로 복구한다.
+    Recover {
+        /// 읽을 @db.wal JSONL 경로.
+        #[arg(long)]
+        wal: PathBuf,
+        /// 쓸 @db.save JSON data snapshot 경로.
+        #[arg(long)]
+        out: PathBuf,
+        /// 처음 N개 complete WAL record까지만 재생한다.
+        #[arg(long)]
+        until_record: Option<usize>,
+    },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
         /// 읽을 migration history JSON 경로.
@@ -446,6 +458,17 @@ fn main() -> ExitCode {
                 }
             },
             DbCommand::Restore { backup, data } => match cmd_db_restore(&backup, &data) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Recover {
+                wal,
+                out,
+                until_record,
+            } => match cmd_db_recover(&wal, &out, until_record) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -886,6 +909,29 @@ fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
     backup_json_for_rollback(data)?;
     write_json_atomic(data, snapshot)?;
     println!("db data: {} restored", data.display());
+    Ok(())
+}
+
+fn cmd_db_recover(wal: &Path, out: &Path, until_record: Option<usize>) -> anyhow::Result<()> {
+    let db = orv_runtime::db::InMemoryDb::load_wal_until_record(wal, until_record)
+        .map_err(|e| anyhow::anyhow!("db wal recover failed: {e}"))?;
+    let snapshot = db.snapshot_json();
+    validate_db_data_snapshot(&snapshot)?;
+    backup_json_for_rollback(out)?;
+    write_json_atomic(out, &snapshot)?;
+    match until_record {
+        Some(limit) => println!(
+            "db recover: {} written from {} through record {}",
+            out.display(),
+            wal.display(),
+            limit
+        ),
+        None => println!(
+            "db recover: {} written from {}",
+            out.display(),
+            wal.display()
+        ),
+    }
     Ok(())
 }
 
