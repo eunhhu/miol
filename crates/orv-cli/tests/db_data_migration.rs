@@ -454,3 +454,60 @@ fn db_archive_writes_wal_manifest() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_archive_file_target_copies_wal_and_manifest() {
+    let dir = temp_dir("db-archive-file-target");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let target = dir.join("archive-target");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg(format!("file://{}", target.display()))
+        .output()
+        .expect("run db archive");
+
+    assert!(
+        output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let uploaded_wal = target.join("db.wal.jsonl");
+    let uploaded_manifest = target.join("archive.json");
+    assert_eq!(
+        std::fs::read_to_string(&uploaded_wal).expect("uploaded wal"),
+        std::fs::read_to_string(&wal).expect("source wal")
+    );
+    let manifest = read_json(&archive);
+    assert_eq!(manifest["target"]["kind"], "file");
+    assert_eq!(
+        manifest["target"]["uri"],
+        format!("file://{}", target.display())
+    );
+    assert_eq!(
+        manifest["target"]["wal"]["path"],
+        format!("file://{}", uploaded_wal.display())
+    );
+    assert_eq!(
+        manifest["target"]["manifest"]["path"],
+        format!("file://{}", uploaded_manifest.display())
+    );
+    let uploaded = read_json(&uploaded_manifest);
+    assert_eq!(uploaded["target"], manifest["target"]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

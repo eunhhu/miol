@@ -254,6 +254,9 @@ enum DbCommand {
         /// 쓸 WAL archive manifest JSON 경로.
         #[arg(long)]
         out: PathBuf,
+        /// WAL/archive manifest를 복사할 archive target URI. 현재 file:// target을 지원한다.
+        #[arg(long)]
+        target: Option<String>,
     },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
@@ -498,13 +501,15 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            DbCommand::Archive { wal, out } => match cmd_db_archive(&wal, &out) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
+            DbCommand::Archive { wal, out, target } => {
+                match cmd_db_archive(&wal, &out, target.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
             DbCommand::Squash { history, out } => match cmd_db_squash(&history, &out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -998,9 +1003,18 @@ fn cmd_db_recover(
     Ok(())
 }
 
-fn cmd_db_archive(wal: &Path, out: &Path) -> anyhow::Result<()> {
-    let manifest = db_wal_archive_manifest(wal)?;
+fn cmd_db_archive(wal: &Path, out: &Path, target: Option<&str>) -> anyhow::Result<()> {
+    let mut manifest = db_wal_archive_manifest(wal)?;
+    let archive_target = target
+        .map(|target| db_archive_file_target(target, wal, out))
+        .transpose()?;
+    if let Some(target) = &archive_target {
+        manifest["target"] = db_archive_file_target_json(target);
+    }
     write_json_atomic(out, &manifest)?;
+    if let Some(target) = &archive_target {
+        copy_db_archive_to_file_target(wal, out, target)?;
+    }
     println!(
         "db archive: {} written from {}",
         out.display(),
@@ -1065,6 +1079,72 @@ fn db_wal_archive_manifest(wal: &Path) -> anyhow::Result<serde_json::Value> {
         },
         "records": records,
     }))
+}
+
+struct DbArchiveFileTarget {
+    uri: String,
+    wal_path: PathBuf,
+    manifest_path: PathBuf,
+}
+
+fn db_archive_file_target(
+    target: &str,
+    wal: &Path,
+    manifest: &Path,
+) -> anyhow::Result<DbArchiveFileTarget> {
+    if !target.starts_with("file://") {
+        anyhow::bail!("unsupported db archive target `{target}`");
+    }
+    let target_dir = lsp_file_uri_path(target)?;
+    let wal_name = wal
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("WAL path must include a file name"))?;
+    let manifest_name = manifest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("archive manifest path must include a file name"))?;
+    Ok(DbArchiveFileTarget {
+        uri: target.to_string(),
+        wal_path: target_dir.join(wal_name),
+        manifest_path: target_dir.join(manifest_name),
+    })
+}
+
+fn db_archive_file_target_json(target: &DbArchiveFileTarget) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "file",
+        "uri": target.uri.clone(),
+        "wal": {
+            "path": lsp_file_uri_for_path(&target.wal_path),
+        },
+        "manifest": {
+            "path": lsp_file_uri_for_path(&target.manifest_path),
+        },
+    })
+}
+
+fn copy_db_archive_to_file_target(
+    wal: &Path,
+    manifest: &Path,
+    target: &DbArchiveFileTarget,
+) -> anyhow::Result<()> {
+    if let Some(parent) = target.wal_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create archive target {}: {e}", parent.display())
+        })?;
+    }
+    std::fs::copy(wal, &target.wal_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to copy WAL to archive target {}: {e}",
+            target.wal_path.display()
+        )
+    })?;
+    std::fs::copy(manifest, &target.manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to copy archive manifest to target {}: {e}",
+            target.manifest_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn parse_db_recover_time_unix_ms(input: &str) -> anyhow::Result<u64> {
