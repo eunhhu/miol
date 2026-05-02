@@ -6084,6 +6084,12 @@ fn verify_client_page_file(target: &Path) -> anyhow::Result<()> {
 fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(target)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    if !source.contains("ORV_CLIENT_BOOTSTRAP") {
+        anyhow::bail!("client_js bundle does not declare ORV bootstrap metadata");
+    }
+    if !source.contains("sourceBundleUrl") || !source.contains("../source-bundle.json") {
+        anyhow::bail!("client_js bundle does not reference source bundle metadata");
+    }
     if !source.contains("app.wasm") {
         anyhow::bail!("client_js bundle does not reference app.wasm");
     }
@@ -6980,7 +6986,15 @@ fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
 }
 
 fn write_client_js_loader(path: &Path) -> anyhow::Result<()> {
-    let script = r#"const wasmUrl = new URL("./app.wasm", import.meta.url);
+    let script = r#"export const ORV_CLIENT_BOOTSTRAP = Object.freeze({
+  schemaVersion: 1,
+  runtimeFeatures: ["client_wasm"],
+  wasmUrl: "./app.wasm",
+  sourceBundleUrl: "../source-bundle.json",
+});
+
+const wasmUrl = new URL(ORV_CLIENT_BOOTSTRAP.wasmUrl, import.meta.url);
+const sourceBundleUrl = new URL(ORV_CLIENT_BOOTSTRAP.sourceBundleUrl, import.meta.url);
 const root = document.querySelector('[data-orv-client="wasm"]');
 
 async function main() {
@@ -6989,6 +7003,7 @@ async function main() {
   await WebAssembly.instantiate(bytes, {});
   if (root) {
     root.dataset.orvStatus = "ready";
+    root.dataset.orvSourceBundle = sourceBundleUrl.href;
   }
 }
 
@@ -12711,6 +12726,10 @@ entry = "src/main.orv"
         assert_eq!(&wasm[..4], b"\0asm");
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
+        assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
+        assert!(loader.contains("sourceBundleUrl"));
+        assert!(loader.contains("../source-bundle.json"));
+        assert!(loader.contains("runtimeFeatures"));
         assert!(loader.contains("WebAssembly.instantiate"));
         assert!(loader.contains("app.wasm"));
         let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
