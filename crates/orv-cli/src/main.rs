@@ -18,6 +18,7 @@
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
 
@@ -197,6 +198,14 @@ enum EditorCommand {
     Runtime {
         /// 대상 파일 경로.
         file: PathBuf,
+    },
+    /// first-party editor static UI artifact를 출력한다.
+    Export {
+        /// 대상 파일 경로.
+        file: PathBuf,
+        /// 출력 디렉터리.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -596,6 +605,13 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::Export { file, out } => match cmd_editor_export(&file, &out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -678,6 +694,24 @@ fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let value = editor_runtime_json(&entry)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_export(path: &Path, out: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let state = editor_export_state_json(&entry)?;
+    write_json(&out.join("state.json"), &state)?;
+    write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "kind": "orv.editor.export",
+            "entry": entry.display().to_string(),
+            "out": out.display().to_string(),
+            "files": ["index.html", "state.json"],
+        }))?
+    );
     Ok(())
 }
 
@@ -2046,6 +2080,101 @@ fn editor_runtime_stack_json(frame: &DapStackFrameState) -> serde_json::Value {
         "source": dap_source_json(&frame.source),
         "line": frame.line,
     })
+}
+
+fn editor_export_state_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.export",
+        "snapshot": editor_snapshot_json(path)?,
+        "runtime": editor_runtime_json(path)?,
+    }))
+}
+
+fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
+    let entry = state
+        .pointer("/snapshot/entry/path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("app.orv");
+    let file_count = json_array_count(state.pointer("/snapshot/panels/files"));
+    let route_count = json_array_count(state.pointer("/snapshot/panels/routes"));
+    let schema_count = json_array_count(state.pointer("/snapshot/panels/schema"));
+    let domain_count = json_array_count(state.pointer("/snapshot/panels/domains"));
+    let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
+    let runtime_status = state
+        .pointer("/runtime/runtime/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let stdout = state
+        .pointer("/runtime/runtime/stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let state_json = serde_json::to_string(state)?.replace("</", "<\\/");
+    let mut html = String::new();
+    html.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
+    html.push_str("<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    html.push_str("<title>orv editor</title>\n");
+    html.push_str("<style>\n");
+    html.push_str(":root{color-scheme:light;--bg:#f7f8fb;--ink:#18202f;--muted:#687386;--line:#d7dce5;--panel:#ffffff;--accent:#0f766e;--warn:#b45309;}\n");
+    html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
+    html.push_str("</style>\n</head>\n<body>\n");
+    html.push_str("<main id=\"orv-editor\">\n");
+    html.push_str(
+        "<aside class=\"sidebar\"><div class=\"brand\">orv editor</div><nav class=\"nav\">",
+    );
+    write!(&mut html, "<span>Files<b>{file_count}</b></span>")?;
+    write!(&mut html, "<span>Routes<b>{route_count}</b></span>")?;
+    write!(&mut html, "<span>Schema<b>{schema_count}</b></span>")?;
+    write!(&mut html, "<span>Domains<b>{domain_count}</b></span>")?;
+    html.push_str("</nav></aside>\n");
+    html.push_str("<header class=\"topbar\">");
+    write!(
+        &mut html,
+        "<h1>{}</h1><p>First-party editor export backed by shared ProjectGraph.</p>",
+        html_escape_text(entry)
+    )?;
+    html.push_str("</header>\n<section class=\"workspace\">\n");
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Routes</h2><div class=\"metric\">{route_count}</div><p class=\"muted\">Graph-backed route panel entries.</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Schema</h2><div class=\"metric\">{schema_count}</div><p class=\"muted\">Struct, enum, and type alias nodes.</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Diagnostics</h2><div class=\"metric\">{diagnostic_count}</div><p class=\"muted\">Project loader, resolver, and analyzer diagnostics.</p></section>"
+    )?;
+    html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
+    write!(
+        &mut html,
+        "<div class=\"metric\">{}</div><p class=\"muted\">Reference runtime status.</p><pre>{}</pre>",
+        html_escape_text(runtime_status),
+        html_escape_text(stdout)
+    )?;
+    html.push_str("</section>\n</section>\n");
+    html.push_str("</main>\n");
+    html.push_str("<script id=\"orv-editor-state\" type=\"application/json\">");
+    html.push_str(&state_json);
+    html.push_str("</script>\n</body>\n</html>\n");
+    Ok(html)
+}
+
+fn json_array_count(value: Option<&serde_json::Value>) -> usize {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn lsp_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -16458,6 +16587,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_export_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "export",
+            "src/main.orv",
+            "--out",
+            "target/orv-editor",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -17670,6 +17814,35 @@ define Auth() -> { @out "auth" }
             "editor-runtime-ready\n"
         );
         assert!(!runtime["frames"].as_array().expect("frames").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_writes_static_editor_shell_and_state() {
+        let dir = temp_output_dir("editor-export");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "struct User { id: int }\n@out \"editor-export-ready\"\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+
+        cmd_editor_export(&path, &out).expect("editor export");
+
+        let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let state = read_json_value(&out.join("state.json")).expect("editor state");
+        assert!(html.contains("id=\"orv-editor\""));
+        assert!(html.contains("Routes"));
+        assert!(html.contains("Runtime"));
+        assert_eq!(state["schema_version"], 1);
+        assert_eq!(state["snapshot"]["schema_version"], 1);
+        assert_eq!(state["runtime"]["runtime"]["status"], "ok");
+        assert_eq!(
+            state["runtime"]["runtime"]["stdout"],
+            "editor-export-ready\n"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

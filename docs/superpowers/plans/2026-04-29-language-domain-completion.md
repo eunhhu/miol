@@ -26,7 +26,7 @@
 
 **DAP exception filter delta (2026-05-03):** `orv dap serve --stdio` now stores `setExceptionBreakpoints` diagnostics/runtime selections and only marks launch stops as `exception` when the active filter covers the runtime status. Remaining DAP work is richer editor UI wiring.
 
-**Editor snapshot/reveal/runtime delta (2026-05-03):** `orv editor snapshot <file>` now emits first-party editor bootstrap JSON with diagnostics, shared ProjectGraph, graph-backed Files/Routes/Schema/Domains panel inputs, and source-hash live refresh watch sources. `orv editor reveal <dir> <origin-id>` now converts build artifact origins into first-party editor focus/source/production navigation payloads. `orv editor runtime <file>` now reuses DAP trace/runtime helpers to emit runtime status/stdout/frame inspection pane JSON. Remaining editor work is native UI rendering and live production trace capture/navigation.
+**Editor snapshot/reveal/runtime/export delta (2026-05-03):** `orv editor snapshot <file>` now emits first-party editor bootstrap JSON with diagnostics, shared ProjectGraph, graph-backed Files/Routes/Schema/Domains panel inputs, and source-hash live refresh watch sources. `orv editor reveal <dir> <origin-id>` now converts build artifact origins into first-party editor focus/source/production navigation payloads. `orv editor runtime <file>` now reuses DAP trace/runtime helpers to emit runtime status/stdout/frame inspection pane JSON. `orv editor export <file> --out <dir>` now writes `state.json` plus a static `index.html` editor shell artifact. Remaining editor work is interactive/native UI rendering and live production trace capture/navigation.
 
 ---
 
