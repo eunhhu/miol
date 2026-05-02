@@ -322,3 +322,43 @@ fn db_recover_replays_wal_until_unix_ms_into_snapshot() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_recover_rejects_multiple_cutoffs() {
+    let dir = temp_dir("db-recover-cutoff-conflict");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let data = dir.join("data.json");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let recover = orv()
+        .args(["db", "recover"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&data)
+        .arg("--until-record")
+        .arg("1")
+        .arg("--until-unix-ms")
+        .arg("1000")
+        .output()
+        .expect("run db recover");
+
+    assert!(
+        !recover.status.success(),
+        "recover unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&recover.stdout),
+        String::from_utf8_lossy(&recover.stderr)
+    );
+    assert!(String::from_utf8_lossy(&recover.stderr).contains(
+        "db recover accepts only one of --until-record or --until-unix-ms"
+    ));
+    assert!(!data.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
