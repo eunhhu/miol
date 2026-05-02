@@ -3586,6 +3586,7 @@ impl DapSession {
                     "supportsStepInTargetsRequest": true,
                     "supportsRestartFrame": true,
                     "supportsPauseRequest": true,
+                    "supportsCancelRequest": true,
                     "supportsOrvRuntimeAttach": true,
                     "supportsOrvRuntimeTracePath": true,
                     "exceptionBreakpointFilters": [
@@ -3605,6 +3606,7 @@ impl DapSession {
             "launch" => self.launch_result(request),
             "restart" => self.restart_result(request),
             "configurationDone" => self.configuration_done_result(),
+            "cancel" => Ok(serde_json::json!({})),
             "setExceptionBreakpoints" => self.set_exception_breakpoints_result(request),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
@@ -11816,8 +11818,27 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsStepInTargetsRequest"], true);
         assert_eq!(response["body"]["supportsRestartFrame"], true);
         assert_eq!(response["body"]["supportsPauseRequest"], true);
+        assert_eq!(response["body"]["supportsCancelRequest"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
+    }
+
+    #[test]
+    fn dap_cancel_request_is_accepted() {
+        let response = dap_protocol_response(&serde_json::json!({
+            "seq": 66,
+            "type": "request",
+            "command": "cancel",
+            "arguments": {
+                "requestId": 1,
+                "progressId": "orv-progress",
+            },
+        }));
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 66);
+        assert_eq!(response["command"], "cancel");
+        assert_eq!(response["success"], true);
     }
 
     #[test]
