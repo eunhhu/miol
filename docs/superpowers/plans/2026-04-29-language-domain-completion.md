@@ -24,6 +24,8 @@
 
 **Server listen artifact delta (2026-05-03):** origin maps now include `listen` nodes, server runtime artifacts preserve listen origin/static/env port descriptors, `server/launch.json` must match that listen descriptor during `orv verify-build`, and prod builds reject static test-only `@listen 0`. Remaining deployment work is native runtime images.
 
+**DAP exception filter delta (2026-05-03):** `orv dap serve --stdio` now stores `setExceptionBreakpoints` diagnostics/runtime selections and only marks launch stops as `exception` when the active filter covers the runtime status. Remaining DAP work is real async accept-loop attachment and editor UI wiring.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure

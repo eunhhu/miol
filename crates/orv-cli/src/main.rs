@@ -17,7 +17,7 @@
 //! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -2342,6 +2342,7 @@ struct DapSession {
     breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
     function_breakpoints: Vec<DapFunctionBreakpoint>,
     data_breakpoints: Vec<DapDataBreakpoint>,
+    exception_filters: Option<HashSet<String>>,
     pending_events: Vec<DapPendingEvent>,
 }
 
@@ -2589,7 +2590,7 @@ impl DapSession {
             "launch" => self.launch_result(request),
             "restart" => self.restart_result(request),
             "configurationDone" => self.configuration_done_result(),
-            "setExceptionBreakpoints" => Ok(dap_set_exception_breakpoints_result(request)),
+            "setExceptionBreakpoints" => self.set_exception_breakpoints_result(request),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
             "dataBreakpointInfo" => self.data_breakpoint_info_result(request),
@@ -2691,7 +2692,7 @@ impl DapSession {
         let stopped_line = frames
             .get(current_frame_index)
             .map_or(executable_lines[0], |frame| frame.line);
-        let stopped_reason = if matches!(runtime.status.as_str(), "diagnostics" | "error") {
+        let stopped_reason = if self.exception_filter_enabled(runtime.status.as_str()) {
             "exception".to_string()
         } else if let Some(reason) = self.breakpoint_frame_reason(&frames, current_frame_index) {
             reason.to_string()
@@ -2745,6 +2746,36 @@ impl DapSession {
             "diagnostics": diagnostic_count,
             "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
         }))
+    }
+
+    fn set_exception_breakpoints_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let filters = request
+            .pointer("/arguments/filters")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(HashSet::new, |filters| {
+                filters
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|filter| matches!(*filter, "orv.diagnostics" | "orv.runtime"))
+                    .map(str::to_string)
+                    .collect()
+            });
+        self.exception_filters = Some(filters);
+        Ok(dap_set_exception_breakpoints_result(request))
+    }
+
+    fn exception_filter_enabled(&self, runtime_status: &str) -> bool {
+        let filter = match runtime_status {
+            "diagnostics" => "orv.diagnostics",
+            "error" => "orv.runtime",
+            _ => return false,
+        };
+        self.exception_filters
+            .as_ref()
+            .is_none_or(|filters| filters.contains(filter))
     }
 
     fn configuration_done_result(&mut self) -> anyhow::Result<serde_json::Value> {
@@ -9949,6 +9980,50 @@ function greet(user: User): string -> "hello"
         );
         assert_eq!(response["body"]["breakpoints"][1]["verified"], true);
         assert_eq!(response["body"]["breakpoints"][1]["filter"], "orv.runtime");
+    }
+
+    #[test]
+    fn dap_set_exception_breakpoints_empty_filters_disable_diagnostic_stop_reason() {
+        let dir = temp_output_dir("dap-exception-filters-empty");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let bad: int = \"wrong\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 68,
+                "type": "request",
+                "command": "setExceptionBreakpoints",
+                "arguments": {
+                    "filters": [],
+                },
+            }))
+            .expect("setExceptionBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 69,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 70,
+                "type": "request",
+                "command": "configurationDone",
+                "arguments": {},
+            }))
+            .expect("configurationDone response");
+        let events = session.drain_pending_events();
+
+        assert!(events
+            .iter()
+            .any(|event| { event["event"] == "stopped" && event["body"]["reason"] == "entry" }));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
