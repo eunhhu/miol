@@ -2048,16 +2048,21 @@ fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Val
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("trace JSON must contain frames array"))?;
     let mut editor_frames = Vec::with_capacity(frames.len());
+    let mut status_counts = EditorTraceStatusCounts::default();
     for (index, frame) in frames.iter().enumerate() {
         let origin_id = editor_trace_frame_origin_id(frame);
         let navigation = match origin_id {
             Some(origin_id) => editor_reveal_json(dir, origin_id)?,
             None => serde_json::Value::Null,
         };
+        let request = editor_trace_request_json(frame);
+        let summary = editor_trace_summary_json(&request, origin_id);
+        status_counts.record(request.get("status").and_then(serde_json::Value::as_u64));
         editor_frames.push(serde_json::json!({
             "index": index,
             "origin_id": origin_id,
-            "request": editor_trace_request_json(frame),
+            "request": request,
+            "summary": summary,
             "navigation": navigation,
         }));
     }
@@ -2069,9 +2074,107 @@ fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Val
             "path": trace.display().to_string(),
             "kind": trace_value.get("kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
             "frame_count": editor_frames.len(),
+            "status_counts": editor_trace_status_counts_json(&status_counts),
         },
         "frames": editor_frames,
     }))
+}
+
+#[derive(Default)]
+struct EditorTraceStatusCounts {
+    total: usize,
+    ok: usize,
+    redirect: usize,
+    client_error: usize,
+    server_error: usize,
+    other: usize,
+}
+
+impl EditorTraceStatusCounts {
+    fn record(&mut self, status: Option<u64>) {
+        self.total += 1;
+        match editor_trace_status_class(status) {
+            "ok" => self.ok += 1,
+            "redirect" => self.redirect += 1,
+            "client_error" => self.client_error += 1,
+            "server_error" => self.server_error += 1,
+            _ => self.other += 1,
+        }
+    }
+}
+
+fn editor_trace_status_counts_json(counts: &EditorTraceStatusCounts) -> serde_json::Value {
+    serde_json::json!({
+        "total": counts.total,
+        "ok": counts.ok,
+        "redirect": counts.redirect,
+        "client_error": counts.client_error,
+        "server_error": counts.server_error,
+        "other": counts.other,
+    })
+}
+
+fn editor_trace_summary_json(
+    request: &serde_json::Value,
+    origin_id: Option<&str>,
+) -> serde_json::Value {
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let path = request
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let status = request.get("status").and_then(serde_json::Value::as_u64);
+    serde_json::json!({
+        "label": editor_trace_request_label(method, path, status),
+        "route": editor_trace_route_label(request),
+        "status": status,
+        "status_class": editor_trace_status_class(status),
+        "origin_id": origin_id,
+    })
+}
+
+fn editor_trace_request_label(method: &str, path: &str, status: Option<u64>) -> String {
+    let request = match (method.is_empty(), path.is_empty()) {
+        (true, true) => "request".to_string(),
+        (true, false) => path.to_string(),
+        (false, true) => method.to_string(),
+        (false, false) => format!("{method} {path}"),
+    };
+    if let Some(status) = status {
+        format!("{request} -> {status}")
+    } else {
+        request
+    }
+}
+
+fn editor_trace_route_label(request: &serde_json::Value) -> Option<String> {
+    let method = request
+        .get("route_method")
+        .and_then(serde_json::Value::as_str)
+        .filter(|method| !method.is_empty());
+    let path = request
+        .get("route_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty());
+    match (method, path) {
+        (Some(method), Some(path)) => Some(format!("{method} {path}")),
+        (Some(method), None) => Some(method.to_string()),
+        (None, Some(path)) => Some(path.to_string()),
+        (None, None) => None,
+    }
+}
+
+const fn editor_trace_status_class(status: Option<u64>) -> &'static str {
+    match status {
+        Some(200..=299) => "ok",
+        Some(300..=399) => "redirect",
+        Some(400..=499) => "client_error",
+        Some(500..=599) => "server_error",
+        _ => "other",
+    }
 }
 
 fn editor_trace_frame_origin_id(frame: &serde_json::Value) -> Option<&str> {
@@ -2299,7 +2402,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str(&state_json);
     html.push_str("</script>\n");
     html.push_str(
-        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const lines = [\n    `${request.method || ''} ${request.path || ''}`.trim(),\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const traceFrames = state.trace?.frames || [];\n  put('trace-list', traceFrames, frame => {\n    const request = frame.request || {};\n    const status = request.status == null ? '' : ` -> ${request.status}`;\n    return `${request.method || ''} ${request.path || ''}${status}`.trim() || frame.origin_id || 'request';\n  }, renderTraceDetail);\n  renderTraceDetail(traceFrames[0]);\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
+        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const traceFrames = state.trace?.frames || [];\n  put('trace-list', traceFrames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n  renderTraceDetail(traceFrames[0]);\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
     );
     Ok(html)
 }
@@ -18386,6 +18489,43 @@ entry = "src/main.orv"
         assert!(trace["frames"][0]["navigation"]["source"]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("@route GET /ping")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_trace_summarizes_request_statuses_for_panels() {
+        let dir = temp_output_dir("editor-trace-status-summary");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let trace_path = dir.join("production-trace.json");
+        write_json(
+            &trace_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "orv.production.trace",
+                "frames": [
+                    { "method": "GET", "path": "/ok", "status": 200 },
+                    { "method": "GET", "path": "/missing", "status": 404 },
+                    { "method": "POST", "path": "/checkout", "status": 503 }
+                ],
+            }),
+        )
+        .expect("write trace");
+
+        let trace = editor_trace_json(&dir, &trace_path).expect("editor trace");
+
+        assert_eq!(trace["trace"]["status_counts"]["total"], 3);
+        assert_eq!(trace["trace"]["status_counts"]["ok"], 1);
+        assert_eq!(trace["trace"]["status_counts"]["client_error"], 1);
+        assert_eq!(trace["trace"]["status_counts"]["server_error"], 1);
+        assert_eq!(trace["frames"][0]["summary"]["label"], "GET /ok -> 200");
+        assert_eq!(
+            trace["frames"][1]["summary"]["status_class"],
+            "client_error"
+        );
+        assert_eq!(
+            trace["frames"][2]["summary"]["status_class"],
+            "server_error"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

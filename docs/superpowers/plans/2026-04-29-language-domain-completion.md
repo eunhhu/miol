@@ -32,6 +32,8 @@
 
 **Runtime request trace file delta (2026-05-03):** Normal `@server` runtime execution now honors `orv run-artifact/run-build --trace <path>` and `ORV_RUNTIME_REQUEST_TRACE_PATH`, writing the same `orv.production.trace` file on graceful shutdown so run/build/deploy processes have a non-DAP production trace capture path. Remaining trace work is live streaming/transport and richer native editor consumption.
 
+**Editor trace summary delta (2026-05-03):** `orv editor trace` now adds per-frame request labels, route/status classes, and aggregate status buckets so the exported editor shell can render captured traffic without recomputing request summaries in UI code.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure
