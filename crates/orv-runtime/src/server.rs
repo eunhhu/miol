@@ -755,6 +755,33 @@ pub fn request_trace_json(frames: &[ServerRequestFrame]) -> serde_json::Value {
     })
 }
 
+/// Write captured request frames as an `orv.production.trace` JSON file.
+///
+/// # Errors
+/// Returns a runtime error if a parent directory cannot be created or if the
+/// JSON file cannot be serialized/written.
+pub fn write_request_trace_file(
+    path: &std::path::Path,
+    frames: &[ServerRequestFrame],
+) -> Result<(), RuntimeError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            RuntimeError::native(format!(
+                "failed to create request trace directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&request_trace_json(frames))
+        .map_err(|e| RuntimeError::native(format!("failed to encode request trace JSON: {e}")))?;
+    std::fs::write(path, bytes).map_err(|e| {
+        RuntimeError::native(format!(
+            "failed to write request trace file {}: {e}",
+            path.display()
+        ))
+    })
+}
+
 fn request_frame_json(frame: &ServerRequestFrame) -> serde_json::Value {
     serde_json::json!({
         "method": &frame.method,
@@ -1117,6 +1144,35 @@ mod tests {
         assert_eq!(trace["frames"][0]["params"]["id"], "42");
         assert_eq!(trace["frames"][0]["query"]["tab"], "orders");
         assert_eq!(trace["frames"][0]["body"], "{\"active\":true}");
+    }
+
+    #[test]
+    fn write_request_trace_file_creates_parent_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("orv-runtime-trace-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("trace").join("requests.json");
+        let frame = ServerRequestFrame {
+            method: "POST".to_string(),
+            path: "/orders".to_string(),
+            route_method: Some("POST".to_string()),
+            route_path: Some("/orders".to_string()),
+            route_origin_id: Some("ori_route_order".to_string()),
+            status: 201,
+            params: HashMap::new(),
+            query: HashMap::new(),
+            body: "{\"sku\":\"book\"}".to_string(),
+        };
+
+        write_request_trace_file(&path, &[frame]).expect("write trace");
+
+        let trace: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read trace file"))
+                .expect("trace json");
+        assert_eq!(trace["kind"], "orv.production.trace");
+        assert_eq!(trace["frames"][0]["method"], "POST");
+        assert_eq!(trace["frames"][0]["status"], 201);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

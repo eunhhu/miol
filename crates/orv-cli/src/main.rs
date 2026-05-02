@@ -3181,7 +3181,8 @@ impl DapLaunchState {
             Vec::new,
             orv_runtime::server::AttachedServer::request_frames,
         );
-        write_json(path, &orv_runtime::server::request_trace_json(&frames))
+        orv_runtime::server::write_request_trace_file(path, &frames)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
