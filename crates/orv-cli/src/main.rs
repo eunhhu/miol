@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use codespan_reporting::files::SimpleFiles;
@@ -2374,6 +2374,8 @@ struct DapLaunchState {
     live_requested: bool,
     live: Option<DapLiveState>,
     long_running: bool,
+    attach_runtime_requested: bool,
+    runtime_process: Option<DapRuntimeProcess>,
     async_runtime: Option<DapAsyncRuntimeState>,
 }
 
@@ -2384,6 +2386,107 @@ struct DapPendingEvent {
 
 struct DapLiveState {
     stepper: orv_runtime::DebugStepper<Vec<u8>>,
+}
+
+struct DapRuntimeProcess {
+    child: Child,
+}
+
+impl DapRuntimeProcess {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for DapRuntimeProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for DapLaunchState {
+    fn drop(&mut self) {
+        self.runtime_process = None;
+    }
+}
+
+impl DapLaunchState {
+    fn ensure_runtime_process_running(&mut self) -> anyhow::Result<()> {
+        if !self.attach_runtime_requested {
+            return Ok(());
+        }
+        if let Some(process) = self.runtime_process.as_mut() {
+            if let Some(status) = process.child.try_wait()? {
+                let pid = process.pid();
+                self.runtime_process = None;
+                self.set_transport_state("exited", Some(pid));
+                anyhow::bail!("runtime process exited with {status}");
+            }
+            let pid = process.pid();
+            dap_send_process_signal(pid, "CONT")?;
+            self.set_transport_state("running", Some(pid));
+            return Ok(());
+        }
+
+        let exe =
+            std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe failed: {e}"))?;
+        let child = ProcessCommand::new(&exe)
+            .arg("run")
+            .arg(&self.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start runtime process: {e}"))?;
+        let pid = child.id();
+        self.runtime_process = Some(DapRuntimeProcess { child });
+        self.set_transport_state("running", Some(pid));
+        Ok(())
+    }
+
+    fn suspend_runtime_process(&mut self) -> anyhow::Result<()> {
+        if !self.attach_runtime_requested {
+            return Ok(());
+        }
+        let Some(process) = self.runtime_process.as_mut() else {
+            self.set_transport_state("detached", None);
+            return Ok(());
+        };
+        if let Some(status) = process.child.try_wait()? {
+            let pid = process.pid();
+            self.runtime_process = None;
+            self.set_transport_state("exited", Some(pid));
+            anyhow::bail!("runtime process exited with {status}");
+        }
+        let pid = process.pid();
+        dap_send_process_signal(pid, "STOP")?;
+        self.set_transport_state("suspended", Some(pid));
+        Ok(())
+    }
+
+    fn set_transport_state(&mut self, state: &str, process_id: Option<u32>) {
+        let Some(async_runtime) = self.async_runtime.as_mut() else {
+            return;
+        };
+        let transport = async_runtime
+            .transport
+            .get_or_insert_with(DapAsyncTransportState::process_detached);
+        transport.state = state.to_string();
+        transport.process_id = process_id.map(u64::from);
+    }
+}
+
+fn dap_send_process_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
+    let status = ProcessCommand::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to signal runtime process {pid}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("failed to signal runtime process {pid} with {signal}: {status}");
+    }
+    Ok(())
 }
 
 enum DapLiveAdvance {
@@ -2442,12 +2545,20 @@ struct DapAsyncRuntimeState {
     pause_count: u64,
     listen: Option<DapAsyncListenState>,
     routes: Vec<DapAsyncRouteState>,
+    transport: Option<DapAsyncTransportState>,
 }
 
 #[derive(Clone)]
 struct DapAsyncRouteState {
     method: String,
     path: String,
+}
+
+#[derive(Clone)]
+struct DapAsyncTransportState {
+    kind: String,
+    state: String,
+    process_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -2468,6 +2579,17 @@ impl DapAsyncRuntimeState {
             pause_count: 0,
             listen,
             routes,
+            transport: None,
+        }
+    }
+}
+
+impl DapAsyncTransportState {
+    fn process_detached() -> Self {
+        Self {
+            kind: "process".to_string(),
+            state: "detached".to_string(),
+            process_id: None,
         }
     }
 }
@@ -2711,6 +2833,7 @@ impl DapSession {
             })
             .collect();
         let live_requested = dap_launch_live(request);
+        let attach_runtime_requested = dap_launch_attach_runtime(request);
         let (runtime, mut frames, live, long_running) = dap_launch_runtime_state(
             &lowered,
             diagnostic_count,
@@ -2718,17 +2841,13 @@ impl DapSession {
             &sources,
             live_requested,
         );
-        let async_runtime = dap_async_runtime_state(&lowered.program, long_running);
-        let mut executable_lines = if frames.is_empty() {
-            dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1])
-        } else {
-            frames.iter().map(|frame| frame.line).collect::<Vec<_>>()
-        };
-        if executable_lines.is_empty() {
-            executable_lines.push(1);
+        let mut async_runtime = dap_async_runtime_state(&lowered.program, long_running);
+        if attach_runtime_requested {
+            if let Some(async_runtime) = async_runtime.as_mut() {
+                async_runtime.transport = Some(DapAsyncTransportState::process_detached());
+            }
         }
-        executable_lines.sort_unstable();
-        executable_lines.dedup();
+        let executable_lines = dap_launch_executable_lines(&entry_path, &frames);
         let current_frame_index = self.first_verified_breakpoint_frame(&frames).unwrap_or(0);
         let stopped_line = frames
             .get(current_frame_index)
@@ -2757,6 +2876,8 @@ impl DapSession {
             live_requested,
             live,
             long_running,
+            attach_runtime_requested,
+            runtime_process: None,
             async_runtime: async_runtime.clone(),
         });
         if self
@@ -2834,6 +2955,14 @@ impl DapSession {
                     .as_ref()
                     .is_some_and(|launched| launched.live_requested)
             });
+        let attach_runtime_requested = request
+            .pointer("/arguments/attachRuntime")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                self.launched
+                    .as_ref()
+                    .is_some_and(|launched| launched.attach_runtime_requested)
+            });
         let path = request
             .pointer("/arguments/program")
             .and_then(serde_json::Value::as_str)
@@ -2845,6 +2974,7 @@ impl DapSession {
             "arguments": {
                 "program": path.display().to_string(),
                 "live": live_requested,
+                "attachRuntime": attach_runtime_requested,
             },
         });
         self.launch_result(&restart_request)
@@ -3872,17 +4002,11 @@ impl DapSession {
     }
 
     fn continue_long_running_result(&mut self) -> anyhow::Result<serde_json::Value> {
-        self.queue_event(
-            "continued",
-            serde_json::json!({
-                "threadId": 1,
-                "allThreadsContinued": false,
-            }),
-        );
         let launched = self
             .launched
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
+        launched.ensure_runtime_process_running()?;
         launched.runtime.status = "running".to_string();
         if let Some(async_runtime) = launched.async_runtime.as_mut() {
             if async_runtime.state != "running" {
@@ -3890,6 +4014,13 @@ impl DapSession {
             }
             async_runtime.state = "running".to_string();
         }
+        self.queue_event(
+            "continued",
+            serde_json::json!({
+                "threadId": 1,
+                "allThreadsContinued": false,
+            }),
+        );
         Ok(serde_json::json!({
             "allThreadsContinued": false,
         }))
@@ -4041,6 +4172,7 @@ impl DapSession {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
         if launched.long_running {
+            launched.suspend_runtime_process()?;
             launched.runtime.status = "paused".to_string();
             if let Some(async_runtime) = launched.async_runtime.as_mut() {
                 if async_runtime.state != "paused" {
@@ -4602,6 +4734,7 @@ fn dap_runtime_json(
             "listen": async_runtime.listen.as_ref().map(dap_async_listen_json),
             "route_count": async_runtime.routes.len(),
             "routes": async_runtime.routes.iter().map(dap_async_route_json).collect::<Vec<_>>(),
+            "transport": async_runtime.transport.as_ref().map(dap_async_transport_json),
         });
     }
     value
@@ -4631,12 +4764,30 @@ fn dap_async_route_json(route: &DapAsyncRouteState) -> serde_json::Value {
     })
 }
 
+fn dap_async_transport_json(transport: &DapAsyncTransportState) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "kind": transport.kind,
+        "state": transport.state,
+    });
+    if let Some(process_id) = transport.process_id {
+        value["process_id"] = serde_json::json!(process_id);
+    }
+    value
+}
+
 fn dap_async_routes_display(routes: &[DapAsyncRouteState]) -> String {
     routes
         .iter()
         .map(|route| format!("{} {}", route.method, route.path))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn dap_async_transport_display(transport: &DapAsyncTransportState) -> String {
+    transport.process_id.map_or_else(
+        || format!("{} {}", transport.kind, transport.state),
+        |pid| format!("{} {} pid {pid}", transport.kind, transport.state),
+    )
 }
 
 fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serde_json::Value> {
@@ -4689,6 +4840,22 @@ fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serd
             serde_json::json!({
                 "name": "runtimeListenPort",
                 "value": listen.port.map_or_else(String::new, |port| port.to_string()),
+                "type": "usize",
+                "variablesReference": 0,
+            }),
+        ]);
+    }
+    if let Some(transport) = &async_runtime.transport {
+        variables.extend([
+            serde_json::json!({
+                "name": "runtimeTransport",
+                "value": dap_async_transport_display(transport),
+                "type": "string",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "runtimeProcessId",
+                "value": transport.process_id.map_or_else(String::new, |pid| pid.to_string()),
                 "type": "usize",
                 "variablesReference": 0,
             }),
@@ -5426,6 +5593,18 @@ fn dap_evaluate_async_runtime_value(
                 "usize".to_string(),
             )
         }),
+        "runtimeTransport" => runtime
+            .transport
+            .as_ref()
+            .map(|transport| (dap_async_transport_display(transport), "string".to_string())),
+        "runtimeProcessId" => runtime.transport.as_ref().map(|transport| {
+            (
+                transport
+                    .process_id
+                    .map_or_else(String::new, |pid| pid.to_string()),
+                "usize".to_string(),
+            )
+        }),
         _ => None,
     }
 }
@@ -5461,6 +5640,8 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimeRoutes",
                 "runtimeListen",
                 "runtimeListenPort",
+                "runtimeTransport",
+                "runtimeProcessId",
             ]
             .into_iter()
             .filter(|expression| expression.starts_with(prefix))
@@ -5806,6 +5987,27 @@ fn dap_launch_live(request: &serde_json::Value) -> bool {
         .pointer("/arguments/live")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn dap_launch_attach_runtime(request: &serde_json::Value) -> bool {
+    request
+        .pointer("/arguments/attachRuntime")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn dap_launch_executable_lines(entry_path: &Path, frames: &[DapFrameState]) -> Vec<u64> {
+    let mut executable_lines = if frames.is_empty() {
+        dap_verified_breakpoint_lines(entry_path).unwrap_or_else(|_| vec![1])
+    } else {
+        frames.iter().map(|frame| frame.line).collect::<Vec<_>>()
+    };
+    if executable_lines.is_empty() {
+        executable_lines.push(1);
+    }
+    executable_lines.sort_unstable();
+    executable_lines.dedup();
+    executable_lines
 }
 
 fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
