@@ -355,9 +355,8 @@ fn db_recover_rejects_multiple_cutoffs() {
         String::from_utf8_lossy(&recover.stdout),
         String::from_utf8_lossy(&recover.stderr)
     );
-    assert!(String::from_utf8_lossy(&recover.stderr).contains(
-        "db recover accepts only one of --until-record or --until-unix-ms"
-    ));
+    assert!(String::from_utf8_lossy(&recover.stderr)
+        .contains("db recover accepts only one of --until-record or --until-unix-ms"));
     assert!(!data.exists());
 
     let _ = std::fs::remove_dir_all(dir);
