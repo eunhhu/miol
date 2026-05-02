@@ -6964,6 +6964,10 @@ fn verify_dev_watch_session_if_present(dir: &Path, plan: &serde_json::Value) -> 
     if json_str(loop_config, "run", "dev watch session loop")? != "build-verify-run" {
         anyhow::bail!("dev watch session loop run must be build-verify-run");
     }
+    let hmr = loop_config
+        .get("hmr")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("dev watch session loop hmr must be a boolean"))?;
     let interval_ms = loop_config
         .get("interval_ms")
         .and_then(serde_json::Value::as_u64)
@@ -6974,6 +6978,14 @@ fn verify_dev_watch_session_if_present(dir: &Path, plan: &serde_json::Value) -> 
     let reload = session
         .get("reload")
         .ok_or_else(|| anyhow::anyhow!("dev watch session reload must be an object"))?;
+    let expected_strategy = if hmr && bundle_plan_has_client_target(plan)? {
+        "hot-reload"
+    } else {
+        "full-reload"
+    };
+    if json_str(reload, "strategy", "dev watch session reload")? != expected_strategy {
+        anyhow::bail!("dev watch session reload strategy must be {expected_strategy}");
+    }
     if json_str(reload, "fallback", "dev watch session reload")? != "full-reload" {
         anyhow::bail!("dev watch session reload fallback must be full-reload");
     }
@@ -6983,7 +6995,23 @@ fn verify_dev_watch_session_if_present(dir: &Path, plan: &serde_json::Value) -> 
     if json_str(transport, "kind", "dev watch session transport")? != "manifest" {
         anyhow::bail!("dev watch session transport kind must be manifest");
     }
+    if json_str(transport, "path", "dev watch session transport")? != "dev/watch.json" {
+        anyhow::bail!("dev watch session transport path must be dev/watch.json");
+    }
     Ok(())
+}
+
+fn bundle_plan_has_client_target(plan: &serde_json::Value) -> anyhow::Result<bool> {
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    Ok(bundles.iter().any(|target| {
+        matches!(
+            target.get("kind").and_then(serde_json::Value::as_str),
+            Some("client_page" | "client_js" | "client_wasm")
+        )
+    }))
 }
 
 fn verify_dev_watch_set(
@@ -14746,6 +14774,30 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("dev watch session loop interval_ms must be positive"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_invalid_dev_watch_transport_path() {
+        let out = temp_output_dir("verify-build-dev-watch-transport");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, "@out @html { @body { @h1 \"Watch\" } }").expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, false, true, &mut stdout)
+            .expect("dev watch");
+        let session_path = build_out.join("dev").join("watch.json");
+        let mut session = read_json_value(&session_path).expect("dev watch session");
+        session["transport"]["path"] = serde_json::json!("tmp/watch.json");
+        write_json(&session_path, &session).expect("write corrupt dev watch session");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid dev watch transport");
+
+        assert!(err
+            .to_string()
+            .contains("dev watch session transport path must be dev/watch.json"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
