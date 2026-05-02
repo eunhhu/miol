@@ -2208,7 +2208,6 @@ struct DapSession {
     pending_events: Vec<DapPendingEvent>,
 }
 
-#[derive(Clone)]
 struct DapLaunchState {
     path: PathBuf,
     uri: String,
@@ -2220,13 +2219,26 @@ struct DapLaunchState {
     executable_lines: Vec<u64>,
     runtime: DapRuntimeState,
     sources: Vec<DapSourceInfo>,
+    files: Vec<SourceFile>,
     frames: Vec<DapFrameState>,
     current_frame_index: usize,
+    live: Option<DapLiveState>,
 }
 
 struct DapPendingEvent {
     event: String,
     body: serde_json::Value,
+}
+
+struct DapLiveState {
+    stepper: orv_runtime::DebugStepper<Vec<u8>>,
+}
+
+enum DapLiveAdvance {
+    Frame { index: usize, output: String },
+    Skipped,
+    Done,
+    Error { message: String },
 }
 
 #[derive(Clone)]
@@ -2496,8 +2508,13 @@ impl DapSession {
                 dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
             })
             .collect();
-        let (runtime, mut frames) =
-            dap_runtime_state(&lowered, diagnostic_count, &loaded.files, &sources);
+        let (runtime, mut frames, live) = if dap_launch_live(request) && diagnostic_count == 0 {
+            dap_live_runtime_state(&lowered, &loaded.files, &sources)
+        } else {
+            let (runtime, frames) =
+                dap_runtime_state(&lowered, diagnostic_count, &loaded.files, &sources);
+            (runtime, frames, None)
+        };
         let mut executable_lines = if frames.is_empty() {
             dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1])
         } else {
@@ -2530,8 +2547,10 @@ impl DapSession {
             executable_lines,
             runtime: runtime.clone(),
             sources,
+            files: loaded.files.clone(),
             frames: std::mem::take(&mut frames),
             current_frame_index,
+            live,
         });
         if self
             .launched
@@ -3119,6 +3138,9 @@ impl DapSession {
     }
 
     fn continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        if self.launch_is_live() {
+            return self.continue_live_result();
+        }
         let (next_breakpoint, start_frame, has_frames) = {
             let launched = self
                 .launched
@@ -3313,6 +3335,9 @@ impl DapSession {
     }
 
     fn next_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        if self.launch_is_live() {
+            return self.next_live_result();
+        }
         let (start_frame, target_frame) = {
             let launched = self
                 .launched
@@ -3352,6 +3377,9 @@ impl DapSession {
     }
 
     fn step_out_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        if self.launch_is_live() {
+            return self.step_out_live_result();
+        }
         let (start_frame, target_frame) = {
             let launched = self
                 .launched
@@ -3414,6 +3442,9 @@ impl DapSession {
     }
 
     fn step_in_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        if self.launch_is_live() {
+            return self.step_in_live_result();
+        }
         if let Some(target_id) = request
             .pointer("/arguments/targetId")
             .and_then(serde_json::Value::as_u64)
@@ -3486,6 +3517,199 @@ impl DapSession {
         launched.stopped_reason = "step".to_string();
         self.queue_stopped_event();
         Ok(serde_json::json!({}))
+    }
+
+    fn continue_live_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.queue_event(
+            "continued",
+            serde_json::json!({
+                "threadId": 1,
+                "allThreadsContinued": false,
+            }),
+        );
+        loop {
+            match self.advance_live_frame()? {
+                DapLiveAdvance::Frame { index, output } => {
+                    self.queue_stdout_output(&output);
+                    let stopped = self.launched.as_ref().and_then(|launched| {
+                        launched.frames.get(index).and_then(|frame| {
+                            self.breakpoint_frame_reason(&launched.frames, index)
+                                .map(|reason| (frame.line, reason.to_string()))
+                        })
+                    });
+                    if let Some((line, reason)) = stopped {
+                        let launched = self
+                            .launched
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
+                        launched.current_frame_index = index;
+                        launched.stopped_line = line;
+                        launched.stopped_reason = reason;
+                        self.queue_stopped_event();
+                        return Ok(serde_json::json!({
+                            "allThreadsContinued": false,
+                        }));
+                    }
+                }
+                DapLiveAdvance::Skipped => {}
+                DapLiveAdvance::Done => {
+                    self.queue_event("terminated", serde_json::json!({}));
+                    self.launched = None;
+                    return Ok(serde_json::json!({
+                        "allThreadsContinued": false,
+                    }));
+                }
+                DapLiveAdvance::Error { message } => {
+                    self.queue_event(
+                        "output",
+                        serde_json::json!({
+                            "category": "stderr",
+                            "output": message,
+                        }),
+                    );
+                    if let Some(launched) = self.launched.as_mut() {
+                        launched.stopped_reason = "exception".to_string();
+                    }
+                    self.queue_stopped_event();
+                    return Ok(serde_json::json!({
+                        "allThreadsContinued": false,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn next_live_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let current_depth = self
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.frames.get(launched.current_frame_index))
+            .map(|frame| frame.stack.len())
+            .ok_or_else(|| anyhow::anyhow!("no current runtime frame"))?;
+        self.advance_live_until(|frame| frame.stack.len() <= current_depth, "step")
+    }
+
+    fn step_in_live_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.advance_live_until(|_| true, "step")
+    }
+
+    fn step_out_live_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let current_depth = self
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.frames.get(launched.current_frame_index))
+            .map(|frame| frame.stack.len())
+            .ok_or_else(|| anyhow::anyhow!("no current runtime frame"))?;
+        if current_depth == 0 {
+            anyhow::bail!("no caller frame");
+        }
+        self.advance_live_until(|frame| frame.stack.len() < current_depth, "step")
+    }
+
+    fn advance_live_until(
+        &mut self,
+        mut is_target: impl FnMut(&DapFrameState) -> bool,
+        stopped_reason: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        loop {
+            match self.advance_live_frame()? {
+                DapLiveAdvance::Frame { index, output } => {
+                    self.queue_stdout_output(&output);
+                    let target = self
+                        .launched
+                        .as_ref()
+                        .and_then(|launched| launched.frames.get(index))
+                        .is_some_and(&mut is_target);
+                    if target {
+                        let launched = self.launched.as_mut().ok_or_else(|| {
+                            anyhow::anyhow!("launch is required before debug control")
+                        })?;
+                        launched.current_frame_index = index;
+                        if let Some(frame) = launched.frames.get(index) {
+                            launched.stopped_line = frame.line;
+                        }
+                        launched.stopped_reason = stopped_reason.to_string();
+                        self.queue_stopped_event();
+                        return Ok(serde_json::json!({}));
+                    }
+                }
+                DapLiveAdvance::Skipped => {}
+                DapLiveAdvance::Done => {
+                    self.launched = None;
+                    self.queue_event("terminated", serde_json::json!({}));
+                    return Ok(serde_json::json!({}));
+                }
+                DapLiveAdvance::Error { message } => {
+                    self.queue_event(
+                        "output",
+                        serde_json::json!({
+                            "category": "stderr",
+                            "output": message,
+                        }),
+                    );
+                    if let Some(launched) = self.launched.as_mut() {
+                        launched.stopped_reason = "exception".to_string();
+                    }
+                    self.queue_stopped_event();
+                    return Ok(serde_json::json!({}));
+                }
+            }
+        }
+    }
+
+    fn advance_live_frame(&mut self) -> anyhow::Result<DapLiveAdvance> {
+        let step = {
+            let launched = self
+                .launched
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+            let live = launched
+                .live
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("launch is not in live debug mode"))?;
+            live.stepper.step()
+        };
+        match step {
+            Ok(Some(debug_frame)) => {
+                let launched = self
+                    .launched
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+                let frames = dap_runtime_frames(&[debug_frame], &launched.files, &launched.sources);
+                let Some(frame) = frames.into_iter().next() else {
+                    return Ok(DapLiveAdvance::Skipped);
+                };
+                let output = frame.output.clone();
+                launched.runtime.stdout.push_str(&output);
+                launched.frames.push(frame);
+                Ok(DapLiveAdvance::Frame {
+                    index: launched.frames.len().saturating_sub(1),
+                    output,
+                })
+            }
+            Ok(None) => {
+                if let Some(launched) = self.launched.as_mut() {
+                    launched.runtime.status = "ok".to_string();
+                    launched.live = None;
+                }
+                Ok(DapLiveAdvance::Done)
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(launched) = self.launched.as_mut() {
+                    launched.runtime.status = "error".to_string();
+                    launched.runtime.error.clone_from(&message);
+                    launched.live = None;
+                }
+                Ok(DapLiveAdvance::Error { message })
+            }
+        }
+    }
+
+    fn launch_is_live(&self) -> bool {
+        self.launched
+            .as_ref()
+            .is_some_and(|launched| launched.live.is_some())
     }
 
     fn pause_result(&mut self) -> anyhow::Result<serde_json::Value> {
@@ -3776,6 +4000,37 @@ fn dap_runtime_state(
         runtime,
         dap_runtime_frames(debug.frames.as_slice(), files, sources),
     )
+}
+
+fn dap_live_runtime_state(
+    lowered: &orv_analyzer::LowerResult,
+    files: &[SourceFile],
+    sources: &[DapSourceInfo],
+) -> (DapRuntimeState, Vec<DapFrameState>, Option<DapLiveState>) {
+    let mut stepper = orv_runtime::DebugStepper::new(lowered.program.clone(), Vec::new());
+    let mut runtime = DapRuntimeState {
+        status: "running".to_string(),
+        stdout: String::new(),
+        error: String::new(),
+    };
+    match stepper.step() {
+        Ok(Some(debug_frame)) => {
+            let frames = dap_runtime_frames(&[debug_frame], files, sources);
+            for frame in &frames {
+                runtime.stdout.push_str(&frame.output);
+            }
+            (runtime, frames, Some(DapLiveState { stepper }))
+        }
+        Ok(None) => {
+            runtime.status = "ok".to_string();
+            (runtime, Vec::new(), None)
+        }
+        Err(err) => {
+            runtime.status = "error".to_string();
+            runtime.error = err.to_string();
+            (runtime, Vec::new(), None)
+        }
+    }
 }
 
 fn dap_runtime_json(runtime: &DapRuntimeState) -> serde_json::Value {
@@ -4834,6 +5089,13 @@ const fn dap_goto_target_id(source_reference: u64, line: u64) -> u64 {
     source_reference
         .saturating_mul(1_000_000)
         .saturating_add(line)
+}
+
+fn dap_launch_live(request: &serde_json::Value) -> bool {
+    request
+        .pointer("/arguments/live")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
@@ -9423,6 +9685,141 @@ let total: int = add(2, 3)
                 && event["body"]["reason"] == "step"
                 && event["body"]["threadId"] == 1
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_live_launch_defers_output_until_next_step() {
+        let dir = temp_output_dir("dap-live-launch");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n@out \"second\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 208,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "live": true,
+                },
+            }))
+            .expect("launch response");
+        let launch_events = session.drain_pending_events();
+        let first_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 209,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first stack response");
+        let next = session
+            .message_response(&serde_json::json!({
+                "seq": 210,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let next_events = session.drain_pending_events();
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["runtime"]["status"], "running");
+        assert_eq!(launch["body"]["runtime"]["stdout"], "");
+        assert!(launch_events
+            .iter()
+            .all(|event| { event["event"] != "output" || event["body"]["output"] != "second\n" }));
+        assert_eq!(first_stack["body"]["stackFrames"][0]["line"], 1);
+        assert_eq!(next["success"], true, "{next}");
+        assert!(next_events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "output"
+                && event["body"]["category"] == "stdout"
+                && event["body"]["output"] == "second\n"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_live_continue_stops_at_breakpoint_before_program_end() {
+        let dir = temp_output_dir("dap-live-continue-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let first: int = 1\n@out \"middle\"\nlet third: int = 3\nlet done: int = 4\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 211,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 3,
+                        },
+                    ],
+                },
+            }))
+            .expect("setBreakpoints response");
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 212,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "live": true,
+                },
+            }))
+            .expect("launch response");
+        let _ = session.drain_pending_events();
+        let continue_response = session
+            .message_response(&serde_json::json!({
+                "seq": 213,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 214,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(launch["body"]["runtime"]["status"], "running");
+        assert_eq!(continue_response["success"], true, "{continue_response}");
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "breakpoint"
+        }));
+        assert!(events.iter().all(|event| event["event"] != "terminated"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

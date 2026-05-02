@@ -26,7 +26,7 @@ use orv_hir::{
     HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
     HirTypeRefKind, NameId, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
@@ -189,6 +189,95 @@ pub struct DebugStackFrame {
     pub name: String,
     /// Source span for the callable declaration.
     pub span: orv_diagnostics::Span,
+}
+
+/// Incremental debugger runner for a single HIR program.
+///
+/// Unlike [`run_with_debug`], this runner keeps interpreter state alive and
+/// executes only until the next debugger-visible frame is available.
+pub struct DebugStepper<W: Write> {
+    program: HirProgram,
+    interp: Interp<W>,
+    next_item: usize,
+    pending_frames: VecDeque<DebugFrame>,
+    pending_error: Option<RuntimeError>,
+    completed: bool,
+}
+
+impl<W: Write> DebugStepper<W> {
+    /// Create a stepper from a lowered program and writer.
+    #[must_use]
+    pub fn new(program: HirProgram, writer: W) -> Self {
+        let mut interp = Interp::new_with_env(writer, HashMap::new());
+        interp.debug = Some(DebugTraceState::default());
+        Self {
+            program,
+            interp,
+            next_item: 0,
+            pending_frames: VecDeque::new(),
+            pending_error: None,
+            completed: false,
+        }
+    }
+
+    /// Execute until the next debugger frame is available.
+    ///
+    /// `Ok(None)` means the program has completed. If a runtime error happens
+    /// after one or more frames were captured, those frames are returned first
+    /// and the stored error is returned by a later call.
+    ///
+    /// # Errors
+    /// Returns the runtime error raised by the interpreted program once all
+    /// debugger frames captured before that error have been drained.
+    pub fn step(&mut self) -> Result<Option<DebugFrame>, RuntimeError> {
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(Some(frame));
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if self.completed {
+            return Ok(None);
+        }
+        while self.next_item < self.program.items.len() {
+            let item_index = self.next_item;
+            self.next_item += 1;
+            let is_last = item_index + 1 == self.program.items.len();
+            let result = self
+                .interp
+                .exec_stmt(&self.program.items[item_index], is_last);
+            self.drain_debug_frames();
+            match result {
+                Ok(()) => {
+                    if let Some(frame) = self.pending_frames.pop_front() {
+                        return Ok(Some(frame));
+                    }
+                }
+                Err(error) => {
+                    self.completed = true;
+                    if let Some(frame) = self.pending_frames.pop_front() {
+                        self.pending_error = Some(error);
+                        return Ok(Some(frame));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.completed = true;
+        Ok(None)
+    }
+
+    /// Return the writer currently owned by this stepper.
+    #[must_use]
+    pub const fn writer(&self) -> &W {
+        &self.interp.writer
+    }
+
+    fn drain_debug_frames(&mut self) {
+        if let Some(debug) = &mut self.interp.debug {
+            self.pending_frames.extend(debug.frames.drain(..));
+        }
+    }
 }
 
 /// 런타임 에러.
@@ -504,9 +593,9 @@ pub(crate) fn eval_expr_in_env<W: Write>(
     interp.eval(expr)
 }
 
-struct Interp<'w, W: Write> {
+struct Interp<W: Write> {
     env: HashMap<NameId, Value>,
-    writer: &'w mut W,
+    writer: W,
     pending_return: Option<Value>,
     loop_signal: LoopSignal,
     /// A3 하이브리드: handler 진입 시점에 보유하고 있던 env 키들. 이후
@@ -592,8 +681,8 @@ struct DebugTraceState {
     output: String,
 }
 
-impl<'w, W: Write> Interp<'w, W> {
-    fn new_with_env(writer: &'w mut W, env: HashMap<NameId, Value>) -> Self {
+impl<W: Write> Interp<W> {
+    fn new_with_env(writer: W, env: HashMap<NameId, Value>) -> Self {
         Self {
             env,
             writer,
@@ -5755,6 +5844,13 @@ mod tests {
     use orv_syntax::{lex, parse_with_newlines};
 
     fn run_str(src: &str) -> Result<String, RuntimeError> {
+        let hir = lower_src(src);
+        let mut buf = Vec::new();
+        run_with_writer(&hir, &mut buf)?;
+        Ok(String::from_utf8(buf).unwrap())
+    }
+
+    fn lower_src(src: &str) -> orv_hir::HirProgram {
         let lx = lex(src, FileId(0));
         assert!(
             lx.diagnostics.is_empty(),
@@ -5773,16 +5869,36 @@ mod tests {
             "resolve errors: {:?}",
             resolved.diagnostics
         );
-        let hir = lower(&pr.program, &resolved);
-        let mut buf = Vec::new();
-        run_with_writer(&hir, &mut buf)?;
-        Ok(String::from_utf8(buf).unwrap())
+        lower(&pr.program, &resolved)
     }
 
     #[test]
     fn explicit_out_prints_string() {
         let out = run_str(r#"@out "Hello, Orv!""#).unwrap();
         assert_eq!(out, "Hello, Orv!\n");
+    }
+
+    #[test]
+    fn debug_stepper_executes_one_visible_frame_at_a_time() {
+        let hir = lower_src(
+            r#"let first: int = 1
+@out "second"
+let third: int = 3
+"#,
+        );
+        let mut stepper = DebugStepper::new(hir, Vec::new());
+
+        let first = stepper.step().expect("first step").expect("first frame");
+        assert!(first.locals.iter().any(|local| local.name == "first"));
+        assert_eq!(stepper.writer(), b"");
+
+        let second = stepper.step().expect("second step").expect("second frame");
+        assert_eq!(second.output, "second\n");
+        assert_eq!(stepper.writer(), b"second\n");
+
+        let third = stepper.step().expect("third step").expect("third frame");
+        assert!(third.locals.iter().any(|local| local.name == "third"));
+        assert!(stepper.step().expect("done").is_none());
     }
 
     #[test]
