@@ -1618,6 +1618,8 @@ impl DapSession {
                     "supportsBreakpointLocationsRequest": true,
                     "supportsExceptionInfoRequest": true,
                     "supportsRestartRequest": true,
+                    "supportsSetVariable": true,
+                    "supportsSetExpression": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -1649,7 +1651,9 @@ impl DapSession {
             "stackTrace" => self.stack_trace_result(),
             "scopes" => self.scopes_result(),
             "variables" => self.variables_result(request),
+            "setVariable" => self.set_variable_result(request),
             "evaluate" => self.evaluate_result(request),
+            "setExpression" => self.set_expression_result(request),
             "completions" => self.completions_result(request),
             "exceptionInfo" => self.exception_info_result(),
             "loadedSources" => self.loaded_sources_result(),
@@ -2044,6 +2048,51 @@ impl DapSession {
         }))
     }
 
+    fn set_variable_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let variables_reference = request
+            .pointer("/arguments/variablesReference")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("setVariable.arguments.variablesReference is required")
+            })?;
+        if variables_reference != 2 {
+            anyhow::bail!("setVariable currently supports only Locals variablesReference");
+        }
+        let name = request
+            .pointer("/arguments/name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("setVariable.arguments.name is required"))?;
+        let value = request
+            .pointer("/arguments/value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("setVariable.arguments.value is required"))?;
+        let variable = self.set_current_local_value(name, value)?;
+        Ok(dap_set_value_json(&variable))
+    }
+
+    fn set_expression_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let expression = request
+            .pointer("/arguments/expression")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|expression| !expression.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("setExpression.arguments.expression is required"))?;
+        let value = request
+            .pointer("/arguments/value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("setExpression.arguments.value is required"))?;
+        let variable = self.set_current_local_value(expression, value)?;
+        Ok(dap_set_value_json(&variable))
+    }
+
     fn completions_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let launched = self
             .launched
@@ -2199,6 +2248,24 @@ impl DapSession {
             event: event.to_string(),
             body,
         });
+    }
+
+    fn set_current_local_value(&mut self, name: &str, value: &str) -> anyhow::Result<DapVariable> {
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before setting variables"))?;
+        let frame = launched
+            .frames
+            .get_mut(launched.current_frame_index)
+            .ok_or_else(|| anyhow::anyhow!("no current runtime frame"))?;
+        let variable = frame
+            .locals
+            .iter_mut()
+            .find(|variable| variable.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown local variable `{name}`"))?;
+        variable.value = value.to_string();
+        Ok(variable.clone())
     }
 
     fn queue_current_frame_output(&mut self) {
@@ -2579,6 +2646,14 @@ fn dap_exception_info_json(runtime: &DapRuntimeState) -> serde_json::Value {
 fn dap_variable_json(variable: &DapVariable) -> serde_json::Value {
     serde_json::json!({
         "name": variable.name,
+        "value": variable.value,
+        "type": variable.value_type,
+        "variablesReference": variable.variables_reference,
+    })
+}
+
+fn dap_set_value_json(variable: &DapVariable) -> serde_json::Value {
+    serde_json::json!({
         "value": variable.value,
         "type": variable.value_type,
         "variablesReference": variable.variables_reference,
@@ -5830,6 +5905,8 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
         assert_eq!(response["body"]["supportsRestartRequest"], true);
+        assert_eq!(response["body"]["supportsSetVariable"], true);
+        assert_eq!(response["body"]["supportsSetExpression"], true);
     }
 
     #[test]
@@ -7022,6 +7099,120 @@ function greet(user: User): string -> "hello"
         assert!(vars
             .iter()
             .any(|var| var["name"] == "ready" && var["value"] == "true" && var["type"] == "bool"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_set_variable_updates_current_local_and_evaluate() {
+        let dir = temp_output_dir("dap-set-variable");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 168,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let set_variable = session
+            .message_response(&serde_json::json!({
+                "seq": 169,
+                "type": "request",
+                "command": "setVariable",
+                "arguments": {
+                    "variablesReference": 2,
+                    "name": "answer",
+                    "value": "99",
+                },
+            }))
+            .expect("setVariable response");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 170,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 2,
+                },
+            }))
+            .expect("locals response");
+        let evaluate = session
+            .message_response(&serde_json::json!({
+                "seq": 171,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "answer",
+                    "context": "repl",
+                },
+            }))
+            .expect("evaluate response");
+
+        assert_eq!(set_variable["success"], true, "{set_variable}");
+        assert_eq!(set_variable["body"]["value"], "99");
+        assert_eq!(set_variable["body"]["type"], "int");
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "answer" && var["value"] == "99" && var["type"] == "int"));
+        assert_eq!(evaluate["body"]["result"], "99");
+        assert_eq!(evaluate["body"]["type"], "int");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_set_expression_updates_current_local() {
+        let dir = temp_output_dir("dap-set-expression");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let name = \"Ada\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 172,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let set_expression = session
+            .message_response(&serde_json::json!({
+                "seq": 173,
+                "type": "request",
+                "command": "setExpression",
+                "arguments": {
+                    "expression": "name",
+                    "value": "\"Grace\"",
+                    "frameId": 1,
+                },
+            }))
+            .expect("setExpression response");
+        let evaluate = session
+            .message_response(&serde_json::json!({
+                "seq": 174,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "name",
+                    "context": "repl",
+                },
+            }))
+            .expect("evaluate response");
+
+        assert_eq!(set_expression["success"], true, "{set_expression}");
+        assert_eq!(set_expression["body"]["value"], "\"Grace\"");
+        assert_eq!(set_expression["body"]["type"], "string");
+        assert_eq!(evaluate["body"]["result"], "\"Grace\"");
+        assert_eq!(evaluate["body"]["type"], "string");
         let _ = std::fs::remove_dir_all(dir);
     }
 
