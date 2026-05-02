@@ -5567,6 +5567,12 @@ fn dap_async_runtime_variables(
             "type": "string",
             "variablesReference": 0,
         }),
+        serde_json::json!({
+            "name": "runtimeRequestTrace",
+            "value": dap_server_request_trace_display(&request_frames),
+            "type": "json",
+            "variablesReference": 0,
+        }),
     ];
     if let Some(listen) = &async_runtime.listen {
         variables.extend([
@@ -5645,6 +5651,42 @@ fn dap_server_request_frame_display(frame: &orv_runtime::server::ServerRequestFr
         parts.push(format!("body {}", frame.body));
     }
     parts.join(" ")
+}
+
+fn dap_server_request_trace_display(frames: &[orv_runtime::server::ServerRequestFrame]) -> String {
+    serde_json::to_string(&dap_server_request_trace_json(frames)).unwrap_or_else(|_| {
+        "{\"schema_version\":1,\"kind\":\"orv.production.trace\",\"frames\":[]}".to_string()
+    })
+}
+
+fn dap_server_request_trace_json(
+    frames: &[orv_runtime::server::ServerRequestFrame],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.production.trace",
+        "frame_count": frames.len(),
+        "frames": frames
+            .iter()
+            .map(dap_server_request_frame_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn dap_server_request_frame_json(
+    frame: &orv_runtime::server::ServerRequestFrame,
+) -> serde_json::Value {
+    serde_json::json!({
+        "method": &frame.method,
+        "path": &frame.path,
+        "status": frame.status,
+        "route_method": frame.route_method.as_deref(),
+        "route_path": frame.route_path.as_deref(),
+        "route_origin_id": frame.route_origin_id.as_deref(),
+        "params": &frame.params,
+        "query": &frame.query,
+        "body": &frame.body,
+    })
 }
 
 fn dap_string_map_display(values: &HashMap<String, String>) -> String {
@@ -6390,6 +6432,10 @@ fn dap_evaluate_async_runtime_value(
             dap_server_request_frames_display(&dap_runtime_request_frames(launched)),
             "string".to_string(),
         )),
+        "runtimeRequestTrace" => Some((
+            dap_server_request_trace_display(&dap_runtime_request_frames(launched)),
+            "json".to_string(),
+        )),
         "runtimeListen" => runtime
             .listen
             .as_ref()
@@ -6450,6 +6496,7 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimeRequestCount",
                 "runtimeLastRequest",
                 "runtimeRequestFrames",
+                "runtimeRequestTrace",
                 "runtimeListen",
                 "runtimeListenPort",
                 "runtimeTransport",
@@ -10805,6 +10852,19 @@ mod tests {
         path
     }
 
+    fn send_raw_http(address: &str, path: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(address).expect("connect attached server");
+        std::io::Write::write_all(
+            &mut stream,
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("write http request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read http response");
+        response
+    }
+
     fn prod_server_source(name: &str) -> (PathBuf, PathBuf) {
         let dir = temp_output_dir(name);
         std::fs::create_dir_all(&dir).expect("create prod source dir");
@@ -13010,6 +13070,112 @@ let total: int = add(2, 3)
             .expect("completion targets")
             .iter()
             .any(|target| target["label"] == "runtimeRoutes" && target["type"] == "property"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_in_process_runtime_exposes_request_trace_json() {
+        let dir = temp_output_dir("dap-runtime-request-trace");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 236,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "attachRuntime": true,
+                    "attachRuntimeMode": "inProcess",
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 237,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let address = session
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.async_runtime.as_ref())
+            .and_then(|runtime| runtime.transport.as_ref())
+            .and_then(|transport| transport.address.clone())
+            .expect("in-process runtime address");
+
+        let response = send_raw_http(&address, "/ping");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 238,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+        let trace = session
+            .message_response(&serde_json::json!({
+                "seq": 239,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "runtimeRequestTrace",
+                },
+            }))
+            .expect("trace evaluate response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 240,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "runtimeRequestT",
+                    "column": 16,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(
+                |variable| variable["name"] == "runtimeRequestTrace" && variable["type"] == "json"
+            ));
+        assert_eq!(trace["success"], true, "{trace}");
+        let trace_json: serde_json::Value =
+            serde_json::from_str(trace["body"]["result"].as_str().expect("trace json string"))
+                .expect("trace json");
+        assert_eq!(trace_json["schema_version"], 1);
+        assert_eq!(trace_json["kind"], "orv.production.trace");
+        assert_eq!(trace_json["frames"][0]["method"], "GET");
+        assert_eq!(trace_json["frames"][0]["path"], "/ping");
+        assert_eq!(trace_json["frames"][0]["status"], 200);
+        assert!(trace_json["frames"][0]["route_origin_id"]
+            .as_str()
+            .is_some_and(|origin| origin.starts_with("ori_")));
+        assert!(completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets")
+            .iter()
+            .any(|target| target["label"] == "runtimeRequestTrace"));
+        drop(session);
         let _ = std::fs::remove_dir_all(dir);
     }
 
