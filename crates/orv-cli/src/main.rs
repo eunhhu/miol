@@ -3476,6 +3476,7 @@ impl DapSession {
                     "supportsRestartFrame": true,
                     "supportsPauseRequest": true,
                     "supportsOrvRuntimeAttach": true,
+                    "supportsOrvRuntimeTracePath": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -11702,6 +11703,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsRestartFrame"], true);
         assert_eq!(response["body"]["supportsPauseRequest"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
+        assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
     }
 
     #[test]
