@@ -6,7 +6,8 @@
 //! `orv origins <file>`은 HIR 기반 origin map JSON을 출력한다. `orv graph
 //! <file>`은 AST 기반 `ProjectGraph` v1과 HIR origin map JSON을 출력하고,
 //! `orv build <file-or-orv.toml> --out <dir>`은 초기 build artifact directory 를 생성한다.
-//! `--prod`는 같은 artifact에 deploy manifest와 reference server entrypoint를 추가한다.
+//! `--prod`는 같은 artifact에 deploy manifest, route inventory, reference container
+//! contract, reference server entrypoint를 추가한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
@@ -707,6 +708,14 @@ orv verify-build dist\n\
 ```sh\n\
 orv run-build dist\n\
 ```\n\
+\n\
+## Deploy artifacts\n\
+\n\
+- `deploy/manifest.json`\n\
+- `deploy/container.json`\n\
+- `deploy/Dockerfile`\n\
+- `deploy/routes.json`\n\
+- `deploy/server.sh`\n\
 \n\
 ## Routes\n\
 \n\
@@ -7262,6 +7271,8 @@ fn verify_deploy_server_target(
     let artifact_path = json_str(server, "artifact", "deploy server")?;
     let entrypoint = json_str(server, "entrypoint", "deploy server")?;
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
+    let container = json_str(server, "container", "deploy server")?;
+    let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let entrypoint_path = dir.join(entrypoint);
     if !entrypoint_path.is_file() {
         anyhow::bail!(
@@ -7284,6 +7295,15 @@ fn verify_deploy_server_target(
         artifact.runtime.as_str(),
         &artifact,
     )?;
+    verify_deploy_container_artifact(
+        dir,
+        container,
+        dockerfile,
+        artifact_path,
+        entrypoint,
+        routes_artifact,
+        artifact.runtime.as_str(),
+    )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
         anyhow::bail!("deploy server runtime does not match runtime artifact");
@@ -7293,6 +7313,80 @@ fn verify_deploy_server_target(
         if routes != &artifact_routes {
             anyhow::bail!("deploy server routes do not match runtime artifact");
         }
+    }
+    Ok(())
+}
+
+fn verify_deploy_container_artifact(
+    dir: &Path,
+    path: &str,
+    dockerfile_path: &str,
+    artifact_path: &str,
+    entrypoint: &str,
+    routes_artifact: &str,
+    runtime: &str,
+) -> anyhow::Result<()> {
+    let container_path = dir.join(path);
+    if !container_path.is_file() {
+        anyhow::bail!(
+            "missing deploy container artifact: {}",
+            container_path.display()
+        );
+    }
+    let container = read_json_value(&container_path)?;
+    if container
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy container schema_version must be 1");
+    }
+    if json_str(&container, "kind", "deploy container")? != "reference-server-container" {
+        anyhow::bail!("deploy container kind must be reference-server-container");
+    }
+    if json_str(&container, "artifact", "deploy container")? != artifact_path {
+        anyhow::bail!("deploy container artifact must be {artifact_path}");
+    }
+    if json_str(&container, "entrypoint", "deploy container")? != entrypoint {
+        anyhow::bail!("deploy container entrypoint must be {entrypoint}");
+    }
+    if json_str(&container, "routes_artifact", "deploy container")? != routes_artifact {
+        anyhow::bail!("deploy container routes_artifact must be {routes_artifact}");
+    }
+    if json_str(&container, "dockerfile", "deploy container")? != dockerfile_path {
+        anyhow::bail!("deploy container dockerfile must be {dockerfile_path}");
+    }
+    if json_str(&container, "runtime", "deploy container")? != runtime {
+        anyhow::bail!("deploy container runtime does not match runtime artifact");
+    }
+    if json_str(&container, "protocol", "deploy container")? != "http1" {
+        anyhow::bail!("deploy container protocol must be http1");
+    }
+    let command = container
+        .get("command")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy container command must be an array"))?;
+    if command.first().and_then(serde_json::Value::as_str) != Some("./deploy/server.sh") {
+        anyhow::bail!("deploy container command must start with ./deploy/server.sh");
+    }
+    verify_deploy_dockerfile(dir, dockerfile_path)
+}
+
+fn verify_deploy_dockerfile(dir: &Path, path: &str) -> anyhow::Result<()> {
+    let dockerfile_path = dir.join(path);
+    if !dockerfile_path.is_file() {
+        anyhow::bail!("missing deploy Dockerfile: {}", dockerfile_path.display());
+    }
+    let dockerfile = std::fs::read_to_string(&dockerfile_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", dockerfile_path.display()))?;
+    if !dockerfile.contains("FROM ${ORV_RUNTIME_IMAGE}") {
+        anyhow::bail!("deploy Dockerfile must use ORV_RUNTIME_IMAGE");
+    }
+    if !dockerfile.contains("COPY . /app") {
+        anyhow::bail!("deploy Dockerfile must copy build output into /app");
+    }
+    if !dockerfile.contains(r#"ENTRYPOINT ["./deploy/server.sh"]"#) {
+        anyhow::bail!("deploy Dockerfile must run ./deploy/server.sh");
     }
     Ok(())
 }
@@ -8407,13 +8501,25 @@ fn write_prod_deploy_artifacts(
     let server = if let Some(server_artifact) = server_artifact {
         let entrypoint = "deploy/server.sh";
         let routes_artifact = "deploy/routes.json";
+        let container = "deploy/container.json";
+        let dockerfile = "deploy/Dockerfile";
         write_prod_server_entrypoint(out, targets.server_artifact_path)?;
         write_prod_routes_artifact(out, targets.server_artifact_path, server_artifact)?;
+        write_prod_container_artifacts(
+            out,
+            targets.server_artifact_path,
+            entrypoint,
+            routes_artifact,
+            dockerfile,
+            server_artifact,
+        )?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "artifact": targets.server_artifact_path,
             "entrypoint": entrypoint,
             "routes_artifact": routes_artifact,
+            "container": container,
+            "dockerfile": dockerfile,
             "protocol": "http1",
             "routes": server_artifact.routes.clone(),
         })
@@ -8465,6 +8571,37 @@ fn write_prod_routes_artifact(
         "routes": server_artifact.routes.clone(),
     });
     write_json(&out.join("deploy").join("routes.json"), &routes)
+}
+
+fn write_prod_container_artifacts(
+    out: &Path,
+    server_artifact_path: &str,
+    entrypoint: &str,
+    routes_artifact: &str,
+    dockerfile_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let container = serde_json::json!({
+        "schema_version": 1,
+        "kind": "reference-server-container",
+        "dockerfile": dockerfile_path,
+        "artifact": server_artifact_path,
+        "entrypoint": entrypoint,
+        "routes_artifact": routes_artifact,
+        "runtime": server_artifact.runtime.clone(),
+        "protocol": "http1",
+        "command": ["./deploy/server.sh"],
+    });
+    write_json(&out.join("deploy").join("container.json"), &container)?;
+    write_text(
+        &out.join(dockerfile_path),
+        r#"ARG ORV_RUNTIME_IMAGE=ghcr.io/orv-lang/orv-reference:latest
+FROM ${ORV_RUNTIME_IMAGE}
+WORKDIR /app
+COPY . /app
+ENTRYPOINT ["./deploy/server.sh"]
+"#,
+    )
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -14654,12 +14791,24 @@ entry = "src/main.orv"
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
 
         let deploy_manifest_path = out.join("deploy").join("manifest.json");
+        let deploy_container_path = out.join("deploy").join("container.json");
+        let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         assert!(
             deploy_manifest_path.is_file(),
             "missing {}",
             deploy_manifest_path.display()
+        );
+        assert!(
+            deploy_container_path.is_file(),
+            "missing {}",
+            deploy_container_path.display()
+        );
+        assert!(
+            deploy_dockerfile_path.is_file(),
+            "missing {}",
+            deploy_dockerfile_path.display()
         );
         assert!(
             deploy_routes_path.is_file(),
@@ -14678,12 +14827,28 @@ entry = "src/main.orv"
         assert_eq!(deploy["source_bundle"], "source-bundle.json");
         assert_eq!(deploy["server"]["artifact"], "server/app.orv-runtime.json");
         assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
+        assert_eq!(deploy["server"]["container"], "deploy/container.json");
+        assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
         assert!(deploy["server"]["routes"]
             .as_array()
             .expect("server routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
         assert_eq!(deploy["server"]["routes_artifact"], "deploy/routes.json");
+        let container = read_json_value(&deploy_container_path).expect("deploy container");
+        assert_eq!(container["schema_version"], 1);
+        assert_eq!(container["kind"], "reference-server-container");
+        assert_eq!(container["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(container["entrypoint"], "deploy/server.sh");
+        assert_eq!(container["routes_artifact"], "deploy/routes.json");
+        assert_eq!(container["dockerfile"], "deploy/Dockerfile");
+        assert_eq!(container["runtime"], "reference-interpreter");
+        assert_eq!(container["protocol"], "http1");
+        assert_eq!(container["command"][0], "./deploy/server.sh");
+        let dockerfile = std::fs::read_to_string(&deploy_dockerfile_path).expect("Dockerfile");
+        assert!(dockerfile.contains("FROM ${ORV_RUNTIME_IMAGE}"));
+        assert!(dockerfile.contains("COPY . /app"));
+        assert!(dockerfile.contains(r#"ENTRYPOINT ["./deploy/server.sh"]"#));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
         assert_eq!(routes["artifact"], "server/app.orv-runtime.json");
@@ -14711,6 +14876,25 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy routes do not match runtime artifact"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_container_mismatch() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("deploy-container-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let container_path = out.join("deploy").join("container.json");
+        let mut container = read_json_value(&container_path).expect("container");
+        container["artifact"] = serde_json::json!("server/wrong.orv-runtime.json");
+        write_json(&container_path, &container).expect("write corrupt container");
+
+        let err = cmd_verify_build(&out).expect_err("container mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy container artifact must be server/app.orv-runtime.json"));
         let _ = std::fs::remove_dir_all(&out);
     }
 

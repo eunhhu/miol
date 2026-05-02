@@ -20,6 +20,8 @@
 
 **Deploy route inventory delta (2026-05-03):** `orv build --prod` now writes `deploy/routes.json` for server builds and `orv verify-build` checks that it matches the server runtime artifact, giving deploy/reveal tooling a standalone route inventory before native bundling.
 
+**Deploy container contract delta (2026-05-03):** `orv build --prod` now writes `deploy/container.json` and `deploy/Dockerfile` for server builds, and `orv verify-build` checks that the container contract points at the same runtime artifact, route inventory, entrypoint, and reference server command. Remaining production deploy work is native server binaries and real runtime images.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure
