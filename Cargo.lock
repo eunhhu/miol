@@ -861,6 +861,7 @@ dependencies = [
  "orv-compiler",
  "orv-core",
  "orv-diagnostics",
+ "orv-hir",
  "orv-project",
  "orv-resolve",
  "orv-runtime",

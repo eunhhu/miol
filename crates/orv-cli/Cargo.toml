@@ -18,6 +18,7 @@ orv-diagnostics = { workspace = true }
 orv-syntax = { workspace = true }
 orv-resolve = { workspace = true }
 orv-analyzer = { workspace = true }
+orv-hir = { workspace = true }
 orv-compiler = { workspace = true }
 orv-project = { workspace = true }
 orv-runtime = { workspace = true }

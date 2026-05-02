@@ -2301,6 +2301,7 @@ struct DapLaunchState {
     current_frame_index: usize,
     live_requested: bool,
     live: Option<DapLiveState>,
+    long_running: bool,
 }
 
 struct DapPendingEvent {
@@ -2490,6 +2491,7 @@ impl DapSession {
                     "supportsStepBack": true,
                     "supportsStepInTargetsRequest": true,
                     "supportsRestartFrame": true,
+                    "supportsPauseRequest": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -2587,13 +2589,13 @@ impl DapSession {
             })
             .collect();
         let live_requested = dap_launch_live(request);
-        let (runtime, mut frames, live) = if live_requested && diagnostic_count == 0 {
-            dap_live_runtime_state(&lowered, &loaded.files, &sources)
-        } else {
-            let (runtime, frames) =
-                dap_runtime_state(&lowered, diagnostic_count, &loaded.files, &sources);
-            (runtime, frames, None)
-        };
+        let (runtime, mut frames, live, long_running) = dap_launch_runtime_state(
+            &lowered,
+            diagnostic_count,
+            &loaded.files,
+            &sources,
+            live_requested,
+        );
         let mut executable_lines = if frames.is_empty() {
             dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1])
         } else {
@@ -2608,7 +2610,7 @@ impl DapSession {
         let stopped_line = frames
             .get(current_frame_index)
             .map_or(executable_lines[0], |frame| frame.line);
-        let stopped_reason = if runtime.status != "ok" {
+        let stopped_reason = if matches!(runtime.status.as_str(), "diagnostics" | "error") {
             "exception".to_string()
         } else if let Some(reason) = self.breakpoint_frame_reason(&frames, current_frame_index) {
             reason.to_string()
@@ -2631,6 +2633,7 @@ impl DapSession {
             current_frame_index,
             live_requested,
             live,
+            long_running,
         });
         if self
             .launched
@@ -3227,6 +3230,9 @@ impl DapSession {
     }
 
     fn continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        if self.launch_is_long_running() {
+            return self.continue_long_running_result();
+        }
         if self.launch_is_live() {
             return self.continue_live_result();
         }
@@ -3675,6 +3681,24 @@ impl DapSession {
         }
     }
 
+    fn continue_long_running_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.queue_event(
+            "continued",
+            serde_json::json!({
+                "threadId": 1,
+                "allThreadsContinued": false,
+            }),
+        );
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
+        launched.runtime.status = "running".to_string();
+        Ok(serde_json::json!({
+            "allThreadsContinued": false,
+        }))
+    }
+
     fn next_live_result(&mut self) -> anyhow::Result<serde_json::Value> {
         let current_depth = self
             .launched
@@ -3808,11 +3832,20 @@ impl DapSession {
             .is_some_and(|launched| launched.live.is_some())
     }
 
+    fn launch_is_long_running(&self) -> bool {
+        self.launched
+            .as_ref()
+            .is_some_and(|launched| launched.long_running)
+    }
+
     fn pause_result(&mut self) -> anyhow::Result<serde_json::Value> {
         let launched = self
             .launched
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+        if launched.long_running {
+            launched.runtime.status = "paused".to_string();
+        }
         launched.stopped_reason = "pause".to_string();
         self.queue_stopped_event();
         Ok(serde_json::json!({}))
@@ -4098,6 +4131,30 @@ fn dap_runtime_state(
     )
 }
 
+fn dap_launch_runtime_state(
+    lowered: &orv_analyzer::LowerResult,
+    diagnostic_count: usize,
+    files: &[SourceFile],
+    sources: &[DapSourceInfo],
+    live_requested: bool,
+) -> (
+    DapRuntimeState,
+    Vec<DapFrameState>,
+    Option<DapLiveState>,
+    bool,
+) {
+    if diagnostic_count == 0 && dap_program_has_long_running_runtime(&lowered.program) {
+        let (runtime, frames) = dap_long_running_runtime_state(&lowered.program, files, sources);
+        return (runtime, frames, None, true);
+    }
+    if live_requested && diagnostic_count == 0 {
+        let (runtime, frames, live) = dap_live_runtime_state(lowered, files, sources);
+        return (runtime, frames, live, false);
+    }
+    let (runtime, frames) = dap_runtime_state(lowered, diagnostic_count, files, sources);
+    (runtime, frames, None, false)
+}
+
 fn dap_live_runtime_state(
     lowered: &orv_analyzer::LowerResult,
     files: &[SourceFile],
@@ -4127,6 +4184,62 @@ fn dap_live_runtime_state(
             (runtime, Vec::new(), None)
         }
     }
+}
+
+fn dap_program_has_long_running_runtime(program: &orv_hir::HirProgram) -> bool {
+    program.items.iter().any(dap_stmt_has_long_running_runtime)
+}
+
+const fn dap_stmt_has_long_running_runtime(stmt: &orv_hir::HirStmt) -> bool {
+    match stmt {
+        orv_hir::HirStmt::Expr(expr) => dap_expr_has_long_running_runtime(expr),
+        _ => false,
+    }
+}
+
+const fn dap_expr_has_long_running_runtime(expr: &orv_hir::HirExpr) -> bool {
+    matches!(expr.kind, orv_hir::HirExprKind::Server { .. })
+}
+
+fn dap_long_running_runtime_state(
+    program: &orv_hir::HirProgram,
+    files: &[SourceFile],
+    sources: &[DapSourceInfo],
+) -> (DapRuntimeState, Vec<DapFrameState>) {
+    let frames = program
+        .items
+        .iter()
+        .filter(|stmt| dap_stmt_has_long_running_runtime(stmt))
+        .filter_map(|stmt| dap_long_running_frame(stmt.span(), files, sources))
+        .collect::<Vec<_>>();
+    (
+        DapRuntimeState {
+            status: "paused".to_string(),
+            stdout: String::new(),
+            error: String::new(),
+        },
+        frames,
+    )
+}
+
+fn dap_long_running_frame(
+    span: Span,
+    files: &[SourceFile],
+    sources: &[DapSourceInfo],
+) -> Option<DapFrameState> {
+    let source = dap_source_for_span(span, files, sources)?;
+    let line = dap_span_line(span, files)?;
+    Some(DapFrameState {
+        source: source.clone(),
+        line,
+        locals: Vec::new(),
+        stack: vec![DapStackFrameState {
+            name: "server runtime".to_string(),
+            source,
+            line,
+        }],
+        output: String::new(),
+    })
 }
 
 fn dap_runtime_json(runtime: &DapRuntimeState) -> serde_json::Value {
@@ -9058,6 +9171,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsStepBack"], true);
         assert_eq!(response["body"]["supportsStepInTargetsRequest"], true);
         assert_eq!(response["body"]["supportsRestartFrame"], true);
+        assert_eq!(response["body"]["supportsPauseRequest"], true);
     }
 
     #[test]
@@ -10144,6 +10258,154 @@ let total: int = add(2, 3)
             .as_str()
             .is_some_and(|message| message.contains("targetId is unavailable in live debug mode")));
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_server_state_uses_server_frame_without_runtime() {
+        let dir = temp_output_dir("dap-long-running-server-state");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"@server {
+  @listen 0
+  @route GET /ping { @respond 200 { ok: true } }
+}
+",
+        )
+        .expect("write source");
+        let loaded = orv_project::load_project(&source).expect("load project");
+        let resolved = orv_resolve::resolve(&loaded.program);
+        let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+        let sources = loaded
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
+            })
+            .collect::<Vec<_>>();
+
+        let (runtime, frames) =
+            dap_long_running_runtime_state(&lowered.program, &loaded.files, &sources);
+
+        assert!(dap_program_has_long_running_runtime(&lowered.program));
+        assert_eq!(runtime.status, "paused");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].line, 1);
+        assert_eq!(frames[0].stack[0].name, "server runtime");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_launch_server_program_reports_paused_long_running_runtime() {
+        let dir = temp_output_dir("dap-server-long-running-launch");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"@server {
+  @listen 0
+  @route GET /ping { @respond 200 { ok: true } }
+}
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 221,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 222,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["runtime"]["status"], "paused");
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "server runtime");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_continue_and_pause_queue_events() {
+        let dir = temp_output_dir("dap-server-long-running-pause");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"@server {
+  @listen 0
+  @route GET /ping { @respond 200 { ok: true } }
+}
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 223,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let _ = session.drain_pending_events();
+        let continue_response = session
+            .message_response(&serde_json::json!({
+                "seq": 224,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let continue_events = session.drain_pending_events();
+        let pause = session
+            .message_response(&serde_json::json!({
+                "seq": 225,
+                "type": "request",
+                "command": "pause",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("pause response");
+        let pause_events = session.drain_pending_events();
+
+        assert_eq!(continue_response["success"], true, "{continue_response}");
+        assert!(continue_events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "continued"
+                && event["body"]["threadId"] == 1
+        }));
+        assert_eq!(pause["success"], true, "{pause}");
+        assert!(pause_events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "pause"
+                && event["body"]["threadId"] == 1
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
