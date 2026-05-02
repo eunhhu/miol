@@ -106,6 +106,16 @@ pub(crate) fn run_server(
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
 ) -> Result<Value, RuntimeError> {
+    run_server_with_request_trace_path(listen, routes, body_stmts, captured_env, None)
+}
+
+pub(crate) fn run_server_with_request_trace_path(
+    listen: Option<&HirExpr>,
+    routes: &[HirExpr],
+    body_stmts: &[orv_hir::HirStmt],
+    captured_env: HashMap<NameId, Value>,
+    request_trace_path: Option<std::path::PathBuf>,
+) -> Result<Value, RuntimeError> {
     let mut stdout = std::io::stdout().lock();
     let (port, entries, captured_env) =
         prepare_server_state(listen, routes, body_stmts, captured_env, &mut stdout, false)?;
@@ -119,7 +129,7 @@ pub(crate) fn run_server(
         .build()
         .map_err(|e| RuntimeError::native(format!("tokio runtime init failed: {e}")))?;
 
-    let request_trace_path = runtime_request_trace_path_from_env();
+    let request_trace_path = request_trace_path.or_else(runtime_request_trace_path_from_env);
     runtime.block_on(async move {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let listener = TcpListener::bind(addr)

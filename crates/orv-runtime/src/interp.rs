@@ -29,7 +29,7 @@ use orv_hir::{
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -469,6 +469,13 @@ enum LoopSignal {
     Break,
 }
 
+/// Runtime execution options shared by direct CLI runs and future launchers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeOptions {
+    /// Optional path for `@server` request trace capture.
+    pub request_trace_path: Option<PathBuf>,
+}
+
 /// HIR 프로그램을 stdout 에 실행한다.
 ///
 /// # Errors
@@ -484,6 +491,18 @@ pub fn run(program: &HirProgram) -> Result<(), RuntimeError> {
 /// `run` 과 동일.
 pub fn run_with_writer<W: Write>(program: &HirProgram, writer: &mut W) -> Result<(), RuntimeError> {
     run_with_writer_in_env(program, HashMap::new(), writer).map(|_| ())
+}
+
+/// Run a program with explicit runtime options.
+///
+/// # Errors
+/// `run_with_writer` 과 동일.
+pub fn run_with_writer_with_options<W: Write>(
+    program: &HirProgram,
+    writer: &mut W,
+    options: RuntimeOptions,
+) -> Result<(), RuntimeError> {
+    run_with_writer_in_env_with_options(program, HashMap::new(), writer, options).map(|_| ())
 }
 
 /// Run a program with debugger snapshots enabled.
@@ -517,7 +536,16 @@ pub(crate) fn run_with_writer_in_env<W: Write>(
     env: HashMap<NameId, Value>,
     writer: &mut W,
 ) -> Result<HashMap<NameId, Value>, RuntimeError> {
-    let mut interp = Interp::new_with_env(writer, env);
+    run_with_writer_in_env_with_options(program, env, writer, RuntimeOptions::default())
+}
+
+pub(crate) fn run_with_writer_in_env_with_options<W: Write>(
+    program: &HirProgram,
+    env: HashMap<NameId, Value>,
+    writer: &mut W,
+    options: RuntimeOptions,
+) -> Result<HashMap<NameId, Value>, RuntimeError> {
+    let mut interp = Interp::new_with_env_and_options(writer, env, options);
     interp.run(program)?;
     Ok(interp.env)
 }
@@ -671,6 +699,7 @@ struct Interp<W: Write> {
     dynamic_scopes: Vec<HashMap<String, Value>>,
     /// Optional debugger trace collector.
     debug: Option<DebugTraceState>,
+    runtime_options: RuntimeOptions,
 }
 
 #[derive(Default)]
@@ -683,6 +712,14 @@ struct DebugTraceState {
 
 impl<W: Write> Interp<W> {
     fn new_with_env(writer: W, env: HashMap<NameId, Value>) -> Self {
+        Self::new_with_env_and_options(writer, env, RuntimeOptions::default())
+    }
+
+    fn new_with_env_and_options(
+        writer: W,
+        env: HashMap<NameId, Value>,
+        options: RuntimeOptions,
+    ) -> Self {
         Self {
             env,
             writer,
@@ -711,6 +748,7 @@ impl<W: Write> Interp<W> {
             unsafe_depth: 0,
             dynamic_scopes: Vec::new(),
             debug: None,
+            runtime_options: options,
         }
     }
 
@@ -983,7 +1021,13 @@ impl<W: Write> Interp<W> {
                 // server::run_server 내부의 current_thread 런타임 + block_on
                 // 으로 흡수한다. HIR 값(특히 Rc 기반 Value)이 !Send 라
                 // current_thread 가 자연스럽다.
-                crate::server::run_server(listen.as_deref(), routes, body_stmts, self.env.clone())
+                crate::server::run_server_with_request_trace_path(
+                    listen.as_deref(),
+                    routes,
+                    body_stmts,
+                    self.env.clone(),
+                    self.runtime_options.request_trace_path.clone(),
+                )
             }
             HirExprKind::Respond { status, payload } => {
                 // @respond 는 route handler 안에서만 의미가 있다. 그 외
@@ -5870,6 +5914,19 @@ mod tests {
             resolved.diagnostics
         );
         lower(&pr.program, &resolved)
+    }
+
+    #[test]
+    fn run_with_writer_accepts_runtime_options() {
+        let hir = lower_src(r#"@out "with options""#);
+        let mut buf = Vec::new();
+        let options = RuntimeOptions {
+            request_trace_path: Some(std::path::PathBuf::from("target/request-trace.json")),
+        };
+
+        run_with_writer_with_options(&hir, &mut buf, options).expect("run with options");
+
+        assert_eq!(String::from_utf8(buf).expect("utf-8"), "with options\n");
     }
 
     #[test]

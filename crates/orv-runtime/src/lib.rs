@@ -10,7 +10,7 @@ pub mod interp;
 pub mod server;
 
 pub use interp::{
-    run, run_handler_with_request, run_with_debug, run_with_writer, DebugFrame, DebugRun,
-    DebugStackFrame, DebugStepper, DebugVariable, HandlerOutcome, RequestCtx, ResponseCtx,
-    RuntimeError, Value,
+    run, run_handler_with_request, run_with_debug, run_with_writer, run_with_writer_with_options,
+    DebugFrame, DebugRun, DebugStackFrame, DebugStepper, DebugVariable, HandlerOutcome, RequestCtx,
+    ResponseCtx, RuntimeError, RuntimeOptions, Value,
 };

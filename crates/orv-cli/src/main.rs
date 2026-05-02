@@ -101,11 +101,17 @@ enum Command {
     RunArtifact {
         /// 실행할 artifact JSON 경로.
         file: PathBuf,
+        /// graceful shutdown 때 쓸 production request trace JSON 경로.
+        #[arg(long)]
+        trace: Option<PathBuf>,
     },
     /// build artifact 디렉터리의 server launcher를 실행한다.
     RunBuild {
         /// 실행할 build artifact 디렉터리.
         dir: PathBuf,
+        /// graceful shutdown 때 쓸 production request trace JSON 경로.
+        #[arg(long)]
+        trace: Option<PathBuf>,
     },
     /// build artifact를 생성/검증한 뒤 reference dev runtime으로 실행한다.
     Dev {
@@ -444,14 +450,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::RunArtifact { file } => match cmd_run_artifact(&file) {
+        Command::RunArtifact { file, trace } => match cmd_run_artifact(&file, trace.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             }
         },
-        Command::RunBuild { dir } => match cmd_run_build(&dir) {
+        Command::RunBuild { dir, trace } => match cmd_run_build(&dir, trace.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -8975,8 +8981,8 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains(routes_artifact) {
         anyhow::bail!("deploy runbook must reference {routes_artifact}");
     }
-    if !runbook.contains("ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json") {
-        anyhow::bail!("deploy runbook must document request trace capture env");
+    if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
+        anyhow::bail!("deploy runbook must document request trace capture command");
     }
     if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document editor trace navigation command");
@@ -9427,14 +9433,14 @@ fn cmd_check_build(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run_artifact(path: &Path) -> anyhow::Result<()> {
+fn cmd_run_artifact(path: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    run_artifact_with_writer(path, &mut stdout)
+    run_artifact_with_writer_with_trace(path, trace, &mut stdout)
 }
 
-fn cmd_run_build(dir: &Path) -> anyhow::Result<()> {
+fn cmd_run_build(dir: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    run_build_with_writer(dir, &mut stdout)
+    run_build_with_writer_with_trace(dir, trace, &mut stdout)
 }
 
 fn cmd_dev(path: &Path, out: &Path, hmr: bool, watch: bool) -> anyhow::Result<()> {
@@ -9579,6 +9585,14 @@ fn json_string_field<'a>(
 }
 
 fn run_build_with_writer<W: std::io::Write>(dir: &Path, writer: &mut W) -> anyhow::Result<()> {
+    run_build_with_writer_with_trace(dir, None, writer)
+}
+
+fn run_build_with_writer_with_trace<W: std::io::Write>(
+    dir: &Path,
+    trace: Option<&Path>,
+    writer: &mut W,
+) -> anyhow::Result<()> {
     let plan_path = dir.join("bundle-plan.json");
     if plan_path.is_file() {
         let plan = read_json_value(&plan_path)?;
@@ -9586,7 +9600,7 @@ fn run_build_with_writer<W: std::io::Write>(dir: &Path, writer: &mut W) -> anyho
             let launch_path = dir.join(launcher);
             verify_server_launcher_target(dir, &launch_path)?;
             let launch = read_server_launch_artifact(&launch_path)?;
-            return run_artifact_with_writer(&dir.join(launch.artifact), writer);
+            return run_artifact_with_writer_with_trace(&dir.join(launch.artifact), trace, writer);
         }
         return run_static_build_with_writer(dir, writer);
     }
@@ -9594,7 +9608,7 @@ fn run_build_with_writer<W: std::io::Write>(dir: &Path, writer: &mut W) -> anyho
     if launch_path.is_file() {
         verify_server_launcher_target(dir, &launch_path)?;
         let launch = read_server_launch_artifact(&launch_path)?;
-        return run_artifact_with_writer(&dir.join(launch.artifact), writer);
+        return run_artifact_with_writer_with_trace(&dir.join(launch.artifact), trace, writer);
     }
     run_static_build_with_writer(dir, writer)
 }
@@ -9648,11 +9662,23 @@ fn run_static_build_with_writer<W: std::io::Write>(
 }
 
 fn run_artifact_with_writer<W: std::io::Write>(path: &Path, writer: &mut W) -> anyhow::Result<()> {
+    run_artifact_with_writer_with_trace(path, None, writer)
+}
+
+fn run_artifact_with_writer_with_trace<W: std::io::Write>(
+    path: &Path,
+    trace: Option<&Path>,
+    writer: &mut W,
+) -> anyhow::Result<()> {
     let artifact = read_server_artifact(path)?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
     let lowered = lower_artifact_entry(&artifact)?;
-    orv_runtime::run_with_writer(&lowered.program, writer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let options = orv_runtime::RuntimeOptions {
+        request_trace_path: trace.map(Path::to_path_buf),
+    };
+    orv_runtime::run_with_writer_with_options(&lowered.program, writer, options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -10455,7 +10481,7 @@ fn write_prod_deploy_runbook(
 ## Request Trace
 
 ```sh
-ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json ./deploy/server.sh
+./deploy/server.sh --trace deploy/request-trace.json
 orv editor trace . --trace deploy/request-trace.json
 ```
 
@@ -17014,11 +17040,43 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn run_artifact_trace_option_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "run-artifact",
+            "target/orv-build-test/server/app.orv-runtime.json",
+            "--trace",
+            "target/orv-request-trace.json",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::RunArtifact { trace, .. } = parsed.command else {
+            panic!("expected run-artifact command");
+        };
+        assert_eq!(trace, Some(PathBuf::from("target/orv-request-trace.json")));
+    }
+
+    #[test]
     fn run_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "run-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
             panic!("{}", err.render());
         }
+    }
+
+    #[test]
+    fn run_build_trace_option_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "run-build",
+            "target/orv-build-test",
+            "--trace",
+            "target/orv-request-trace.json",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::RunBuild { trace, .. } = parsed.command else {
+            panic!("expected run-build command");
+        };
+        assert_eq!(trace, Some(PathBuf::from("target/orv-request-trace.json")));
     }
 
     #[test]
@@ -17414,7 +17472,7 @@ entry = "src/main.orv"
         let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
         assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
         assert!(runbook.contains("PORT=8080"));
-        assert!(runbook.contains("ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json"));
+        assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("- GET /ping"));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
