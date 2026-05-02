@@ -193,6 +193,11 @@ enum EditorCommand {
         /// reveal 할 origin id.
         origin_id: String,
     },
+    /// 현재 파일의 first-party editor runtime inspection JSON을 출력한다.
+    Runtime {
+        /// 대상 파일 경로.
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -584,6 +589,13 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::Runtime { file } => match cmd_editor_runtime(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -658,6 +670,13 @@ fn cmd_editor_snapshot(path: &Path) -> anyhow::Result<()> {
 
 fn cmd_editor_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
     let value = editor_reveal_json(dir, origin_id)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let value = editor_runtime_json(&entry)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -1934,6 +1953,98 @@ fn editor_reveal_focus_json(
         "origin_id": origin_id,
         "panel": panel,
         "node_id": project_graph.get("id").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn editor_runtime_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    let diagnostic_count =
+        loaded.diagnostics.len() + resolved.diagnostics.len() + lowered.diagnostics.len();
+    let sources = editor_dap_sources(&loaded.files);
+    let (runtime, frames, _live, long_running) =
+        dap_launch_runtime_state(&lowered, diagnostic_count, &loaded.files, &sources, false);
+    let async_runtime = dap_async_runtime_state(&lowered.program, long_running);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "entry": {
+            "path": path.display().to_string(),
+            "uri": lsp_file_uri_for_path(path),
+        },
+        "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
+        "frames": editor_runtime_frames_json(&frames),
+        "panels": {
+            "runtime": editor_runtime_panel_json(&runtime, async_runtime.as_ref(), &frames),
+        },
+    }))
+}
+
+fn editor_dap_sources(files: &[SourceFile]) -> Vec<DapSourceInfo> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
+        })
+        .collect()
+}
+
+fn editor_runtime_panel_json(
+    runtime: &DapRuntimeState,
+    async_runtime: Option<&DapAsyncRuntimeState>,
+    frames: &[DapFrameState],
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": runtime.status,
+        "stdout": runtime.stdout,
+        "error": runtime.error,
+        "frame_count": frames.len(),
+        "async": async_runtime.map(editor_async_runtime_json),
+    })
+}
+
+fn editor_async_runtime_json(runtime: &DapAsyncRuntimeState) -> serde_json::Value {
+    serde_json::json!({
+        "kind": runtime.kind,
+        "state": runtime.state,
+        "listen": runtime.listen.as_ref().map(dap_async_listen_json),
+        "route_count": runtime.routes.len(),
+        "routes": runtime.routes.iter().map(dap_async_route_json).collect::<Vec<_>>(),
+    })
+}
+
+fn editor_runtime_frames_json(frames: &[DapFrameState]) -> Vec<serde_json::Value> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            serde_json::json!({
+                "index": index,
+                "source": dap_source_json(&frame.source),
+                "line": frame.line,
+                "locals": frame.locals.iter().map(editor_runtime_variable_json).collect::<Vec<_>>(),
+                "stack": frame.stack.iter().map(editor_runtime_stack_json).collect::<Vec<_>>(),
+                "output": frame.output,
+            })
+        })
+        .collect()
+}
+
+fn editor_runtime_variable_json(variable: &DapVariable) -> serde_json::Value {
+    serde_json::json!({
+        "name": variable.name,
+        "value": variable.value,
+        "type": variable.value_type,
+        "line": variable.line,
+    })
+}
+
+fn editor_runtime_stack_json(frame: &DapStackFrameState) -> serde_json::Value {
+    serde_json::json!({
+        "name": frame.name,
+        "source": dap_source_json(&frame.source),
+        "line": frame.line,
     })
 }
 
@@ -16339,6 +16450,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_runtime_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "editor", "runtime", "src/main.orv"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -17530,6 +17649,27 @@ define Auth() -> { @out "auth" }
                 && source["content_hash"]
                     .as_str()
                     .is_some_and(|hash| hash.starts_with("fnv1a64:"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_runtime_outputs_reference_runtime_inspection_panel() {
+        let dir = temp_output_dir("editor-runtime");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(&path, "@out \"editor-runtime-ready\"\n").expect("write source");
+
+        let runtime = editor_runtime_json(&path).expect("editor runtime");
+
+        assert_eq!(runtime["schema_version"], 1);
+        assert_eq!(runtime["runtime"]["status"], "ok");
+        assert_eq!(runtime["runtime"]["stdout"], "editor-runtime-ready\n");
+        assert_eq!(runtime["panels"]["runtime"]["status"], "ok");
+        assert_eq!(
+            runtime["panels"]["runtime"]["stdout"],
+            "editor-runtime-ready\n"
+        );
+        assert!(!runtime["frames"].as_array().expect("frames").is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
