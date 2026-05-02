@@ -5614,6 +5614,7 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
         "project_graph": reveal_project_graph_node(&graph, origin_id),
         "production": {
             "routes": reveal_routes(origin_id, &server_artifacts),
+            "client": reveal_client_targets(dir, entry)?,
         },
     }))
 }
@@ -5750,6 +5751,40 @@ fn reveal_routes(
         }
     }
     routes
+}
+
+fn reveal_client_targets(
+    dir: &Path,
+    entry: &orv_compiler::OriginEntry,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    if !matches!(entry.kind.as_str(), "signal" | "await") {
+        return Ok(Vec::new());
+    }
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for bundle in bundles {
+        let kind = bundle
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(kind, "client_page" | "client_js" | "client_wasm") {
+            continue;
+        }
+        let path = json_str(bundle, "path", "bundle target")?;
+        targets.push(serde_json::json!({
+            "kind": kind,
+            "path": path,
+            "exists": dir.join(path).is_file(),
+            "runtime_features": bundle
+                .get("runtime_features")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        }));
+    }
+    Ok(targets)
 }
 
 fn json_str<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> anyhow::Result<&'a str> {
@@ -11643,6 +11678,55 @@ entry = "src/main.orv"
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reveal_origin_links_client_signal_to_client_bundle_targets() {
+        let out = temp_output_dir("reveal-client-origin");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(build_out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let signal = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "signal" && entry.name == "count")
+            .expect("signal origin");
+
+        let reveal = reveal_origin_json(&build_out, &signal.id).expect("reveal origin");
+
+        assert_eq!(reveal["origin"]["kind"], "signal");
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("let sig count")));
+        let client = reveal["production"]["client"]
+            .as_array()
+            .expect("client targets");
+        assert!(client
+            .iter()
+            .any(|target| target["kind"] == "client_page" && target["path"] == "pages/index.html"));
+        assert!(client
+            .iter()
+            .any(|target| target["kind"] == "client_js" && target["path"] == "client/app.js"));
+        assert!(client
+            .iter()
+            .any(|target| target["kind"] == "client_wasm" && target["path"] == "client/app.wasm"));
+        assert!(reveal["production"]["routes"]
+            .as_array()
+            .expect("routes")
+            .is_empty());
         let _ = std::fs::remove_dir_all(&out);
     }
 
