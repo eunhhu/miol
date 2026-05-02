@@ -98,6 +98,9 @@ pub struct ServerRuntimeArtifact {
     pub runtime_features: Vec<String>,
     /// HTTP route descriptors.
     pub routes: Vec<ServerRouteArtifact>,
+    /// Source-backed listen descriptor, when the server declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<ServerListenArtifact>,
     /// Source snapshot for reference runner hydration.
     pub source_bundle: ServerSourceBundle,
 }
@@ -121,6 +124,9 @@ pub struct ServerLaunchArtifact {
     pub protocol: String,
     /// HTTP route descriptors reachable through this launcher.
     pub routes: Vec<ServerRouteArtifact>,
+    /// Source-backed listen descriptor used by the reference server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<ServerListenArtifact>,
 }
 
 /// Source snapshot embedded in the reference runtime artifact.
@@ -172,6 +178,17 @@ pub struct ServerRouteArtifact {
     pub path: String,
     /// Origin id for production-to-code tracing.
     pub origin_id: String,
+}
+
+/// One compiled server listen descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerListenArtifact {
+    /// Origin id for production-to-code tracing.
+    pub origin_id: String,
+    /// Human-readable listen expression summary.
+    pub name: String,
+    /// Statically known port, if the listen expression is an integer literal.
+    pub port: Option<u16>,
 }
 
 /// Build capability summary.
@@ -422,12 +439,18 @@ pub fn server_runtime_artifact(
         .filter(|entry| entry.kind == "route")
         .filter_map(route_artifact)
         .collect();
+    let listen = origin_map
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "listen")
+        .map(listen_artifact);
     ServerRuntimeArtifact {
         schema_version: SERVER_RUNTIME_ARTIFACT_VERSION,
         entry: manifest.entry.clone(),
         runtime: manifest.runtime.clone(),
         runtime_features: manifest.capabilities.runtime_features.clone(),
         routes,
+        listen,
         source_bundle: ServerSourceBundle {
             files: sources
                 .into_iter()
@@ -480,6 +503,7 @@ pub fn server_launch_artifact(
         command: vec!["orv".to_string(), "run-artifact".to_string(), artifact_path],
         protocol: "http1".to_string(),
         routes: artifact.routes.clone(),
+        listen: artifact.listen.clone(),
     }
 }
 
@@ -522,6 +546,14 @@ pub fn verify_server_runtime_artifact(artifact: &ServerRuntimeArtifact) -> Resul
                 "route {} {} has empty origin id",
                 route.method, route.path
             ));
+        }
+    }
+    if let Some(listen) = &artifact.listen {
+        if listen.origin_id.is_empty() {
+            errors.push("listen origin_id is empty".to_string());
+        }
+        if listen.name.is_empty() {
+            errors.push("listen name is empty".to_string());
         }
     }
     if errors.is_empty() {
@@ -577,6 +609,18 @@ fn route_artifact(entry: &OriginEntry) -> Option<ServerRouteArtifact> {
         path: path.to_string(),
         origin_id: entry.id.clone(),
     })
+}
+
+fn listen_artifact(entry: &OriginEntry) -> ServerListenArtifact {
+    ServerListenArtifact {
+        origin_id: entry.id.clone(),
+        name: entry.name.clone(),
+        port: listen_port(&entry.name),
+    }
+}
+
+fn listen_port(name: &str) -> Option<u16> {
+    name.strip_prefix("port ")?.parse::<u16>().ok()
 }
 
 fn content_hash(source: &str) -> String {
@@ -776,7 +820,9 @@ impl OriginCollector {
             } => {
                 self.with_origin("domain", "server", expr.span, |this| {
                     if let Some(listen) = listen {
-                        this.visit_expr(listen);
+                        this.with_origin("listen", listen_name(listen), listen.span, |this| {
+                            this.visit_expr(listen);
+                        });
                     }
                     for route in routes {
                         this.visit_expr(route);
@@ -966,6 +1012,18 @@ fn call_name(callee: &HirExpr) -> String {
     }
 }
 
+fn listen_name(expr: &HirExpr) -> String {
+    match &expr.kind {
+        HirExprKind::Integer(raw) => format!("port {raw}"),
+        HirExprKind::Ident(ident) => format!("port {}", ident.name),
+        HirExprKind::Field { .. }
+        | HirExprKind::OptionalField { .. }
+        | HirExprKind::Domain { .. }
+        | HirExprKind::TypeName(_) => format!("port {}", call_name(expr)),
+        _ => "port <expr>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1068,7 @@ mod tests {
             .collect();
         assert_eq!(map.version, ORIGIN_MAP_VERSION);
         assert!(names.contains(&"server"), "{names:?}");
+        assert!(names.contains(&"port 8080"), "{names:?}");
         assert!(names.contains(&"GET /ping"), "{names:?}");
         assert!(names.contains(&"respond"), "{names:?}");
         assert!(map
@@ -1039,12 +1098,20 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
             .expect("route origin");
+        let listen = map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "listen" && entry.name == "port 8080")
+            .expect("listen origin");
         let respond = map
             .entries
             .iter()
             .find(|entry| entry.kind == "domain" && entry.name == "respond")
             .expect("respond origin");
 
+        assert!(map.edges.iter().any(|edge| {
+            edge.kind == "contains" && edge.from == server.id && edge.to == listen.id
+        }));
         assert!(map
             .edges
             .iter()
@@ -1395,6 +1462,9 @@ function greet(name: string): string -> "hi {name}""#,
         assert_eq!(artifact.routes[0].method, "GET");
         assert_eq!(artifact.routes[0].path, "/ping");
         assert!(artifact.routes[0].origin_id.starts_with("ori_"));
+        let listen = artifact.listen.as_ref().expect("listen descriptor");
+        assert_eq!(listen.port, Some(8080));
+        assert!(listen.origin_id.starts_with("ori_"));
         assert_eq!(artifact.runtime_features, vec!["http_server", "router"]);
         assert_eq!(artifact.source_bundle.files.len(), 1);
         assert_eq!(artifact.source_bundle.files[0].path, "server.orv");

@@ -6764,6 +6764,9 @@ fn verify_server_launcher_target(dir: &Path, target: &Path) -> anyhow::Result<()
     if launch.routes != artifact.routes {
         anyhow::bail!("server launcher routes do not match runtime artifact");
     }
+    if launch.listen != artifact.listen {
+        anyhow::bail!("server launcher listen does not match runtime artifact");
+    }
     Ok(())
 }
 
@@ -14748,6 +14751,10 @@ entry = "src/main.orv"
         .expect("server artifact json");
         assert_eq!(server_artifact["schema_version"], 1);
         assert_eq!(server_artifact["runtime"], "reference-interpreter");
+        assert_eq!(server_artifact["listen"]["port"], 0);
+        assert!(server_artifact["listen"]["origin_id"]
+            .as_str()
+            .is_some_and(|origin| origin.starts_with("ori_")));
         assert!(server_artifact["routes"]
             .as_array()
             .expect("routes array")
@@ -14771,6 +14778,7 @@ entry = "src/main.orv"
         assert_eq!(launch["runtime"], "reference-interpreter");
         assert_eq!(launch["artifact"], "server/app.orv-runtime.json");
         assert_eq!(launch["protocol"], "http1");
+        assert_eq!(launch["listen"], server_artifact["listen"]);
         assert_eq!(launch["command"][0], "orv");
         assert_eq!(launch["command"][1], "run-artifact");
         assert_eq!(launch["command"][2], "server/app.orv-runtime.json");
@@ -14895,6 +14903,25 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_server_launcher_listen_mismatch() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("server-launch-listen-mismatch");
+
+        cmd_build(&path, &out).expect("build");
+        let launch_path = out.join("server").join("launch.json");
+        let mut launch = read_json_value(&launch_path).expect("launch");
+        launch["listen"]["port"] = serde_json::json!(1234);
+        write_json(&launch_path, &launch).expect("write corrupt launch");
+
+        let err = cmd_verify_build(&out).expect_err("listen mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("server launcher listen does not match runtime artifact"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -15525,6 +15552,7 @@ entry = "src/main.orv"
             ],
             protocol: "http1".to_string(),
             routes: Vec::new(),
+            listen: None,
         };
         write_json(
             &out.join("server").join("launch.json"),
