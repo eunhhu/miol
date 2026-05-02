@@ -1790,6 +1790,7 @@ struct DapBreakpoint {
     id: u64,
     line: u64,
     verified: bool,
+    condition: Option<String>,
     message: Option<String>,
 }
 
@@ -1932,6 +1933,7 @@ impl DapSession {
                     "supportsEvaluateForHovers": true,
                     "supportsCompletionsRequest": true,
                     "supportsBreakpointLocationsRequest": true,
+                    "supportsConditionalBreakpoints": true,
                     "supportsFunctionBreakpoints": true,
                     "supportsDataBreakpoints": true,
                     "supportsExceptionInfoRequest": true,
@@ -2220,6 +2222,12 @@ impl DapSession {
                             id: u64::try_from(index + 1).unwrap_or(u64::MAX),
                             line,
                             verified,
+                            condition: breakpoint
+                                .get("condition")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|condition| !condition.is_empty())
+                                .map(str::to_string),
                             message: (!verified)
                                 .then(|| "no executable ORV node on this line".to_string()),
                         }
@@ -2996,7 +3004,7 @@ impl DapSession {
         index: usize,
     ) -> Option<&'static str> {
         let frame = frames.get(index)?;
-        if self.has_verified_breakpoint(&frame.source.path, frame.line) {
+        if self.has_verified_line_breakpoint(frame) {
             return Some("breakpoint");
         }
         if self.has_verified_function_breakpoint(frame) {
@@ -3006,14 +3014,16 @@ impl DapSession {
             .then_some("data breakpoint")
     }
 
-    fn has_verified_breakpoint(&self, path: &Path, line: u64) -> bool {
-        let normalized = dap_normalize_path(path);
+    fn has_verified_line_breakpoint(&self, frame: &DapFrameState) -> bool {
+        let normalized = dap_normalize_path(&frame.source.path);
         self.breakpoints
             .get(&normalized)
             .is_some_and(|breakpoints| {
-                breakpoints
-                    .iter()
-                    .any(|breakpoint| breakpoint.verified && breakpoint.line == line)
+                breakpoints.iter().any(|breakpoint| {
+                    breakpoint.verified
+                        && breakpoint.line == frame.line
+                        && dap_breakpoint_condition_matches(frame, breakpoint.condition.as_deref())
+                })
             })
     }
 
@@ -3300,6 +3310,75 @@ fn dap_frame_local_value<'a>(frame: &'a DapFrameState, name: &str) -> Option<&'a
         .iter()
         .find(|local| local.name == name)
         .map(|local| local.value.as_str())
+}
+
+fn dap_breakpoint_condition_matches(frame: &DapFrameState, condition: Option<&str>) -> bool {
+    let Some(condition) = condition
+        .map(str::trim)
+        .filter(|condition| !condition.is_empty())
+    else {
+        return true;
+    };
+    match condition {
+        "true" => return true,
+        "false" => return false,
+        _ => {}
+    }
+    for op in ["==", "!=", ">=", "<=", ">", "<"] {
+        if let Some((left, right)) = condition.split_once(op) {
+            return dap_compare_breakpoint_condition(frame, left.trim(), op, right.trim());
+        }
+    }
+    dap_frame_local_value(frame, condition).is_some_and(dap_condition_value_truthy)
+}
+
+fn dap_compare_breakpoint_condition(
+    frame: &DapFrameState,
+    left: &str,
+    op: &str,
+    right: &str,
+) -> bool {
+    let Some(left_value) = dap_frame_local_value(frame, left) else {
+        return false;
+    };
+    if matches!(op, ">" | "<" | ">=" | "<=") {
+        let Some(result) = dap_compare_condition_numbers(left_value, op, right) else {
+            return false;
+        };
+        return result;
+    }
+    let right_value = dap_normalize_condition_literal(right);
+    match op {
+        "==" => left_value == right_value,
+        "!=" => left_value != right_value,
+        _ => false,
+    }
+}
+
+fn dap_compare_condition_numbers(left: &str, op: &str, right: &str) -> Option<bool> {
+    let left = left.parse::<f64>().ok()?;
+    let right = right.parse::<f64>().ok()?;
+    Some(match op {
+        ">" => left > right,
+        "<" => left < right,
+        ">=" => left >= right,
+        "<=" => left <= right,
+        _ => return None,
+    })
+}
+
+fn dap_normalize_condition_literal(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let decoded = serde_json::from_str::<String>(trimmed)
+            .unwrap_or_else(|_| trimmed.trim_matches('"').to_string());
+        return serde_json::to_string(&decoded).unwrap_or(decoded);
+    }
+    trimmed.to_string()
+}
+
+fn dap_condition_value_truthy(value: &str) -> bool {
+    !matches!(value, "" | "false" | "0" | "0.0" | "void" | "\"\"")
 }
 
 fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_json::Value {
@@ -6820,6 +6899,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsEvaluateForHovers"], true);
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
+        assert_eq!(response["body"]["supportsConditionalBreakpoints"], true);
         assert_eq!(response["body"]["supportsFunctionBreakpoints"], true);
         assert_eq!(response["body"]["supportsDataBreakpoints"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
@@ -7119,6 +7199,66 @@ function greet(user: User): string -> "hello"
         assert!(!events
             .iter()
             .any(|event| event["type"] == "event" && event["event"] == "terminated"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_conditional_breakpoint_skips_false_condition_frame() {
+        let dir = temp_output_dir("dap-conditional-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let mut total: int = 1\ntotal = total + 4\ntotal = total + 4\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 204,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 2,
+                            "condition": "total == 9",
+                        },
+                        {
+                            "line": 3,
+                            "condition": "total == 9",
+                        },
+                    ],
+                },
+            }))
+            .expect("setBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 205,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 206,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 
