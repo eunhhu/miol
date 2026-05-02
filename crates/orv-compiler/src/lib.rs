@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use orv_diagnostics::Span;
 use orv_hir::{
     origin_fingerprint, origin_id, HirBlock, HirCatchClause, HirExpr, HirExprKind, HirFunctionBody,
-    HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment, NameId,
+    HirLetKind, HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment, NameId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -242,7 +242,15 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             .entries
             .iter()
             .any(|entry| entry.kind == "domain" && entry.name == "server");
-    let runtime_features = runtime_features(origin_map, has_server, server_routes);
+    let mut runtime_features = runtime_features(origin_map, has_server, server_routes);
+    let client_wasm = requires_client_wasm(origin_map, has_server, &runtime_features);
+    if client_wasm
+        && !runtime_features
+            .iter()
+            .any(|feature| feature == "client_wasm")
+    {
+        runtime_features.push("client_wasm".to_string());
+    }
     let mut artifacts = vec![
         BuildArtifact {
             kind: "build_manifest".to_string(),
@@ -267,6 +275,12 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "pages/index.html".to_string(),
         });
     }
+    if client_wasm {
+        artifacts.push(BuildArtifact {
+            kind: "client_wasm".to_string(),
+            path: "client/app.wasm".to_string(),
+        });
+    }
     BuildManifest {
         schema_version: BUILD_MANIFEST_VERSION,
         entry: entry.into(),
@@ -275,7 +289,7 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
         capabilities: BuildCapabilities {
             has_server,
             server_routes,
-            client_wasm: false,
+            client_wasm,
             runtime_features,
         },
     }
@@ -325,6 +339,27 @@ fn has_static_page(has_server: bool, runtime_features: &[String]) -> bool {
         && runtime_features
             .iter()
             .any(|feature| feature == "html_renderer")
+        && !runtime_features
+            .iter()
+            .any(|feature| feature == "client_wasm")
+}
+
+fn requires_client_wasm(
+    origin_map: &OriginMap,
+    has_server: bool,
+    runtime_features: &[String],
+) -> bool {
+    let has_html = runtime_features
+        .iter()
+        .any(|feature| feature == "html_renderer");
+    let has_signal = has_html
+        && origin_map
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "signal");
+    let html_await =
+        has_html && !has_server && origin_map.entries.iter().any(|entry| entry.kind == "await");
+    has_signal || html_await
 }
 
 /// Build a server runtime descriptor from manifest capabilities and origins.
@@ -559,7 +594,15 @@ impl OriginCollector {
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
-            HirStmt::Let(stmt) => self.visit_expr(&stmt.init),
+            HirStmt::Let(stmt) => {
+                if stmt.kind == HirLetKind::Signal {
+                    self.with_origin("signal", stmt.name.name.clone(), stmt.span, |this| {
+                        this.visit_expr(&stmt.init);
+                    });
+                } else {
+                    self.visit_expr(&stmt.init);
+                }
+            }
             HirStmt::Const(stmt) => self.visit_expr(&stmt.init),
             HirStmt::Function(stmt) => {
                 self.index_function_origin(stmt.name.id, &stmt.name.name, stmt.span);
@@ -666,10 +709,14 @@ impl OriginCollector {
                     }
                 }
             }
+            HirExprKind::Await(expr) => {
+                self.with_origin("await", "await", expr.span, |this| {
+                    this.visit_expr(expr);
+                });
+            }
             HirExprKind::Unary { expr, .. }
             | HirExprKind::Paren(expr)
             | HirExprKind::Throw(expr)
-            | HirExprKind::Await(expr)
             | HirExprKind::Cast { expr, .. } => self.visit_expr(expr),
             HirExprKind::Binary { lhs, rhs, .. } => {
                 self.visit_expr(lhs);
@@ -973,6 +1020,21 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn origin_map_records_signal_and_await_client_markers() {
+        let program = lower(
+            r#"let sig count: int = 0
+@out await count"#,
+        );
+        let map = origin_map(&program);
+
+        assert!(map
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "signal" && entry.name == "count"));
+        assert!(map.entries.iter().any(|entry| entry.kind == "await"));
+    }
+
+    #[test]
     fn build_manifest_declares_reference_artifacts_and_route_count() {
         let program = lower(
             r"@server {
@@ -1106,6 +1168,65 @@ function greet(name: string): string -> "hi {name}""#,
             .bundles
             .iter()
             .any(|bundle| bundle.kind == "server_runtime"));
+        assert!(!plan
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == "client_wasm"));
+    }
+
+    #[test]
+    fn bundle_plan_declares_client_wasm_for_signal_html() {
+        let program = lower(
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("page.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        assert!(manifest.capabilities.client_wasm);
+        assert!(manifest
+            .capabilities
+            .runtime_features
+            .contains(&"client_wasm".to_string()));
+        assert!(!manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "static_page"));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "client_wasm" && artifact.path == "client/app.wasm"));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "client_wasm"
+                && bundle.path == "client/app.wasm"
+                && bundle.runtime_features == vec!["client_wasm"]
+        }));
+        assert!(!plan
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == "static_page"));
+    }
+
+    #[test]
+    fn bundle_plan_keeps_signal_without_html_out_of_client_wasm() {
+        let program = lower(
+            r#"let sig count: int = 0
+@out count"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("page.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        assert!(!manifest.capabilities.client_wasm);
+        assert!(!manifest
+            .capabilities
+            .runtime_features
+            .contains(&"client_wasm".to_string()));
+        assert!(!manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "client_wasm"));
         assert!(!plan
             .bundles
             .iter()

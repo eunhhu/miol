@@ -2,7 +2,7 @@
 
 ## 개요
 
-orv는 Rust workspace로 구성된 10개 크레이트의 파이프라인 아키텍처를 따른다. 현재 구현은 `.orv` 소스를 로드/파싱/해석/분석한 뒤 HIR을 레퍼런스 tree-walking 런타임으로 실행하는 MVP다. `orv-compiler`는 HIR 기반 origin map과 build manifest artifact를 생성할 수 있고, `@server` 런타임은 매칭된 route origin id를 HTTP 응답 헤더로 노출한다. `orv init`은 최소 `orv.toml`/`src/main.orv` 프로젝트를 만들고, source-entry CLI는 단일 파일뿐 아니라 `orv.toml` `[project].entry`와 프로젝트 디렉터리 입력도 받는다. `orv build`는 현재 manifest/origin-map/project-graph/source-bundled server runtime artifact JSON과 reference server launch artifact 디렉터리를 만들며, HTML-only entry는 zero-runtime `pages/index.html` 정적 페이지도 출력한다. `orv build --prod`는 여기에 `deploy/manifest.json`과 `deploy/server.sh` reference server entrypoint를 추가한다. CLI는 build directory target, deploy manifest, server artifact 검증, artifact 재분석, reference runtime 실행, build directory launch 실행, build artifact origin reveal을 할 수 있다. native 서버 바이너리와 클라이언트 WASM/JS 번들 출력은 아직 구현되지 않은 컴파일러 로드맵이다.
+orv는 Rust workspace로 구성된 10개 크레이트의 파이프라인 아키텍처를 따른다. 현재 구현은 `.orv` 소스를 로드/파싱/해석/분석한 뒤 HIR을 레퍼런스 tree-walking 런타임으로 실행하는 MVP다. `orv-compiler`는 HIR 기반 origin map과 build manifest artifact를 생성할 수 있고, `@server` 런타임은 매칭된 route origin id를 HTTP 응답 헤더로 노출한다. `orv init`은 최소 `orv.toml`/`src/main.orv` 프로젝트를 만들고, source-entry CLI는 단일 파일뿐 아니라 `orv.toml` `[project].entry`와 프로젝트 디렉터리 입력도 받는다. `orv build`는 현재 manifest/origin-map/project-graph/source-bundled server runtime artifact JSON과 reference server launch artifact 디렉터리를 만들며, HTML-only entry는 zero-runtime `pages/index.html` 정적 페이지도 출력한다. `let sig` 또는 HTML await가 필요한 client entry는 `client/app.wasm` 최소 WASM module placeholder로 client bundle 계약을 고정한다. `orv build --prod`는 여기에 `deploy/manifest.json`과 `deploy/server.sh` reference server entrypoint를 추가한다. CLI는 build directory target, deploy manifest, server/client artifact 검증, artifact 재분석, reference runtime 실행, build directory launch 실행, build artifact origin reveal을 할 수 있다. native 서버 바이너리와 실제 클라이언트 WASM/JS 코드젠은 아직 구현되지 않은 컴파일러 로드맵이다.
 
 이 문서는 **현재 구현 구조와 데이터 흐름**을 설명하는 문서다. 언어 문법과 의미론의 공식 기준은 `docs/SPEC.md`이며, 이 문서는 그 사양을 구현 관점에서 해설한다.
 
@@ -133,10 +133,10 @@ HIR → origin map JSON
 ### 4.6단계: 초기 build artifact (orv-compiler + orv-cli)
 
 ```
-HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.json + project-graph.json + server/app.orv-runtime.json + server/launch.json | pages/index.html
+HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.json + project-graph.json + server/app.orv-runtime.json + server/launch.json | pages/index.html | client/app.wasm
 ```
 
-현재 `orv build <file-or-orv.toml> --out <dir>`은 native 프로덕션 바이너리를 만들지 않고 deterministic build artifact directory를 생성한다. `build-manifest.json`은 `reference-interpreter` runtime, artifact 목록, 서버 route 수, client WASM 포함 여부(`false`), HIR origin map에서 추론한 `runtime_features`를 기록한다. 예를 들어 서버 route는 `http_server`/`router`, `@db` 사용은 `in_memory_db`, `@html` 사용은 `html_renderer`, `@serve` 사용은 `static_file_server`를 요구한다. `bundle-plan.json`은 이 capability에서 future bundler가 만들 target을 선언하며, 현재 서버 입력은 `server/app.orv-runtime.json`과 `server/launch.json` output으로 이어진다. Server 없는 HTML-only entry는 `static_page` target과 `pages/index.html`을 만들고, 이 target의 `runtime_features`는 빈 배열이라 배포 산출물에 런타임 계층을 싣지 않는 zero-runtime 계약을 시작한다. `orv build --prod`는 `deploy/manifest.json`에 prod profile, runtime features, server/static targets를 기록하고, 서버가 있으면 `deploy/server.sh` entrypoint를 만들어 `orv run-artifact` 기반 reference server 배포 실행 경로를 고정한다. `orv verify-build <dir>`은 manifest artifact path, bundle target path, deploy manifest/entrypoint, server runtime artifact/launcher 검증, static page zero-runtime/HTML shape를 검사한다. 이 server artifact는 entry/runtime/runtime_features, route method/path/origin id, source bundle path/source/content hash를 담아 production-to-code 추적과 future runner hydration 계약을 고정한다. `server/launch.json`은 reference runner 명령(`orv run-artifact server/app.orv-runtime.json`), HTTP/1 protocol, route 목록을 담아 native binary 전 단계의 배포 실행 계약을 고정한다. `orv run-build <dir>`은 `bundle-plan.json`의 target을 기준으로 launcher 계약을 검증한 뒤 `server/app.orv-runtime.json`을 실행하고, server 없는 static page build에서는 verified zero-runtime HTML을 stdout으로 출력한다. `orv dev <file-or-orv.toml> --out <dir>`은 현재 build, verify-build, run-build를 순서대로 묶는 reference dev bootstrap이다. `orv verify-artifact <file>`은 source hash와 route descriptor shape를 검증하고, `orv check-artifact <file>`은 artifact source bundle을 import 포함 in-memory project로 다시 lex/parse/resolve/lower 하며, `orv run-artifact <file>`은 같은 source bundle을 재수화해 reference runtime으로 실행한다. `orv reveal <dir> <origin-id>`는 `origin-map.json`, `project-graph.json`, server runtime artifact를 결합해 해당 origin의 source snippet, graph node, route artifact를 보여준다. `origin-map.json`과 `project-graph.json`은 `orv origins`/`orv graph`와 같은 compiler/source graph 정보를 보존한다. 이 단계는 production bundler가 사용할 zero-overhead 입력 계약을 먼저 고정하는 목적이다.
+현재 `orv build <file-or-orv.toml> --out <dir>`은 native 프로덕션 바이너리를 만들지 않고 deterministic build artifact directory를 생성한다. `build-manifest.json`은 `reference-interpreter` runtime, artifact 목록, 서버 route 수, client WASM 포함 여부, HIR origin map에서 추론한 `runtime_features`를 기록한다. 예를 들어 서버 route는 `http_server`/`router`, `@db` 사용은 `in_memory_db`, `@html` 사용은 `html_renderer`, `let sig` 또는 HTML await는 `client_wasm`, `@serve` 사용은 `static_file_server`를 요구한다. `bundle-plan.json`은 이 capability에서 future bundler가 만들 target을 선언하며, 현재 서버 입력은 `server/app.orv-runtime.json`과 `server/launch.json` output으로 이어진다. Server 없는 HTML-only entry는 `static_page` target과 `pages/index.html`을 만들고, 이 target의 `runtime_features`는 빈 배열이라 배포 산출물에 런타임 계층을 싣지 않는 zero-runtime 계약을 시작한다. Interactive HTML entry는 zero-runtime static page 대신 `client_wasm` target과 유효한 최소 WASM module인 `client/app.wasm`을 출력해 future WASM bundler path를 검증한다. `orv build --prod`는 `deploy/manifest.json`에 prod profile, runtime features, server/static/client targets를 기록하고, 서버가 있으면 `deploy/server.sh` entrypoint를 만들어 `orv run-artifact` 기반 reference server 배포 실행 경로를 고정한다. `orv verify-build <dir>`은 manifest artifact path, bundle target path, deploy manifest/entrypoint, server runtime artifact/launcher 검증, static page zero-runtime/HTML shape, client WASM magic/version을 검사한다. 이 server artifact는 entry/runtime/runtime_features, route method/path/origin id, source bundle path/source/content hash를 담아 production-to-code 추적과 future runner hydration 계약을 고정한다. `server/launch.json`은 reference runner 명령(`orv run-artifact server/app.orv-runtime.json`), HTTP/1 protocol, route 목록을 담아 native binary 전 단계의 배포 실행 계약을 고정한다. `orv run-build <dir>`은 `bundle-plan.json`의 target을 기준으로 launcher 계약을 검증한 뒤 `server/app.orv-runtime.json`을 실행하고, server 없는 static page build에서는 verified zero-runtime HTML을 stdout으로 출력한다. `orv dev <file-or-orv.toml> --out <dir>`은 현재 build, verify-build, run-build를 순서대로 묶는 reference dev bootstrap이다. `orv verify-artifact <file>`은 source hash와 route descriptor shape를 검증하고, `orv check-artifact <file>`은 artifact source bundle을 import 포함 in-memory project로 다시 lex/parse/resolve/lower 하며, `orv run-artifact <file>`은 같은 source bundle을 재수화해 reference runtime으로 실행한다. `orv reveal <dir> <origin-id>`는 `origin-map.json`, `project-graph.json`, server runtime artifact를 결합해 해당 origin의 source snippet, graph node, route artifact를 보여준다. `origin-map.json`과 `project-graph.json`은 `orv origins`/`orv graph`와 같은 compiler/source graph 정보를 보존한다. 이 단계는 production bundler가 사용할 zero-overhead 입력 계약을 먼저 고정하는 목적이다.
 
 ### 로드맵: 의미 기반 프로젝트 그래프 확장
 
@@ -165,7 +165,7 @@ HIR + 프로젝트 그래프 → 최적화된 출력 코드
 최적화된 코드 → 실행 가능 번들
 ```
 
-서버 바이너리와 클라이언트 WASM 생성은 아직 구현되어 있지 않다.
+서버 네이티브 바이너리와 실제 클라이언트 WASM/JS 코드젠은 아직 구현되어 있지 않다. 현재는 `let sig` 또는 client-side HTML await가 필요한 entry에서 유효한 최소 WASM module인 `client/app.wasm`을 출력해 bundle/verify/deploy 계약을 먼저 고정한다.
 
 ## 로드맵 번들 출력 구조
 
@@ -212,8 +212,8 @@ dist/
 - `orv origins <file>` — HIR 기반 origin map JSON 출력
 - `orv graph <file>` — AST ProjectGraph v1 + HIR origin map/edge JSON 출력
 - `orv test <path> --filter <name> --list` — `.orv` 파일을 찾아 `test "name"` 블록이 있는 파일을 reference runtime 으로 실행하거나 발견 목록 JSON 출력
-- `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact 또는 HTML-only static page 출력, prod profile이면 deploy manifest/entrypoint 추가
-- `orv verify-build <dir>` — build manifest/plan target 존재, server artifact, static page zero-runtime shape 검증
+- `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact, HTML-only static page, 또는 client WASM placeholder 출력, prod profile이면 deploy manifest/entrypoint 추가
+- `orv verify-build <dir>` — build manifest/plan target 존재, server artifact, static page zero-runtime shape, client WASM magic/version 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증
 - `orv check-artifact <file>` — server runtime artifact source bundle 재분석
 - `orv run-artifact <file>` — server runtime artifact source bundle 재수화 + reference runtime 실행
@@ -221,7 +221,7 @@ dist/
 - `orv dev <file-or-orv.toml> --out <dir>` — build + verify-build + run-build reference dev bootstrap
 
 로드맵 커맨드:
-- native 서버 바이너리 + 클라이언트 WASM/JS 번들 빌드
+- native 서버 바이너리 + 실제 클라이언트 WASM/JS 코드젠/글루 번들 빌드
 - `orv dev --watch/--hmr` — 변경 감지, hot reload, HMR 개발 서버
 - 이름별 단일 test case 실행/async test isolation — 전체 test runner 확장
 

@@ -5356,6 +5356,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
+            "client_wasm" => verify_client_wasm_target(&target)?,
             _ => {}
         }
     }
@@ -5407,6 +5408,24 @@ fn verify_static_page_target(bundle: &serde_json::Value, target: &Path) -> anyho
     Ok(())
 }
 
+fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    if bytes.len() < MINIMAL_WASM_MODULE.len() {
+        anyhow::bail!("client_wasm bundle is too small: {}", target.display());
+    }
+    if &bytes[..4] != b"\0asm" {
+        anyhow::bail!("client_wasm bundle has invalid magic: {}", target.display());
+    }
+    if &bytes[4..8] != b"\x01\0\0\0" {
+        anyhow::bail!(
+            "client_wasm bundle has unsupported version: {}",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
 fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
     let deploy_manifest = dir.join("deploy").join("manifest.json");
     if !deploy_manifest.is_file() {
@@ -5424,7 +5443,8 @@ fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
         anyhow::bail!("deploy manifest profile must be prod");
     }
     verify_deploy_server_target(dir, deploy.get("server"))?;
-    verify_deploy_static_target(dir, deploy.get("static"))
+    verify_deploy_static_target(dir, deploy.get("static"))?;
+    verify_deploy_client_target(dir, deploy.get("client"))
 }
 
 fn verify_deploy_server_target(
@@ -5484,6 +5504,31 @@ fn verify_deploy_static_target(
         anyhow::bail!("deploy static target must be zero-runtime");
     }
     Ok(())
+}
+
+fn verify_deploy_client_target(
+    dir: &Path,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(client) = client.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let path = json_str(client, "wasm", "deploy client")?;
+    let target = dir.join(path);
+    if !target.is_file() {
+        anyhow::bail!("missing deploy client wasm: {}", target.display());
+    }
+    let runtime_features = client
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy client runtime_features must be an array"))?;
+    if !runtime_features
+        .iter()
+        .any(|feature| feature == "client_wasm")
+    {
+        anyhow::bail!("deploy client target must declare client_wasm");
+    }
+    verify_client_wasm_target(&target)
 }
 
 fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -6027,6 +6072,9 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
     }
+    if manifest.capabilities.client_wasm {
+        write_client_wasm_placeholder(&out.join("client").join("app.wasm"))?;
+    }
     if profile.is_production() {
         write_prod_deploy_artifacts(
             out,
@@ -6039,6 +6087,17 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     }
     println!("build: wrote {}", out.display());
     Ok(())
+}
+
+const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+
+fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, MINIMAL_WASM_MODULE)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
 }
 
 fn write_prod_deploy_artifacts(
@@ -6068,6 +6127,14 @@ fn write_prod_deploy_artifacts(
             "runtime_features": [],
         })
     });
+    let client = if manifest.capabilities.client_wasm {
+        serde_json::json!({
+            "wasm": "client/app.wasm",
+            "runtime_features": ["client_wasm"],
+        })
+    } else {
+        serde_json::Value::Null
+    };
     let deploy = serde_json::json!({
         "schema_version": 1,
         "profile": "prod",
@@ -6076,6 +6143,7 @@ fn write_prod_deploy_artifacts(
         "runtime_features": manifest.capabilities.runtime_features.clone(),
         "server": server,
         "static": static_target,
+        "client": client,
     });
     write_json(&out.join("deploy").join("manifest.json"), &deploy)
 }
@@ -11249,6 +11317,44 @@ entry = "src/main.orv"
             .iter()
             .any(|bundle| bundle["kind"] == "server_runtime"));
 
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_wasm_for_signal_html_entry() {
+        let out = temp_output_dir("build-client-wasm");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let manifest = read_json_value(&build_out.join("build-manifest.json")).expect("manifest");
+        assert_eq!(manifest["capabilities"]["client_wasm"], true);
+        assert!(manifest["capabilities"]["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .iter()
+            .any(|feature| feature == "client_wasm"));
+        let plan = read_json_value(&build_out.join("bundle-plan.json")).expect("plan");
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles")
+            .iter()
+            .any(|bundle| bundle["kind"] == "client_wasm" && bundle["path"] == "client/app.wasm"));
+        let wasm = std::fs::read(build_out.join("client").join("app.wasm")).expect("client wasm");
+        assert_eq!(&wasm[..4], b"\0asm");
+        assert!(
+            !build_out.join("pages").join("index.html").is_file(),
+            "interactive page must not be emitted as zero-runtime static html"
+        );
+        cmd_verify_build(&build_out).expect("verify build");
         let _ = std::fs::remove_dir_all(&out);
     }
 
