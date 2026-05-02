@@ -222,6 +222,15 @@ enum DbCommand {
         #[arg(long)]
         data: PathBuf,
     },
+    /// migration history JSON을 하나의 squashed action artifact로 압축한다.
+    Squash {
+        /// 읽을 migration history JSON 경로.
+        #[arg(long)]
+        history: PathBuf,
+        /// 쓸 squashed migration JSON 경로.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -424,6 +433,13 @@ fn main() -> ExitCode {
                 }
             },
             DbCommand::Restore { backup, data } => match cmd_db_restore(&backup, &data) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Squash { history, out } => match cmd_db_squash(&history, &out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -857,6 +873,37 @@ fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
     backup_json_for_rollback(data)?;
     write_json_atomic(data, snapshot)?;
     println!("db data: {} restored", data.display());
+    Ok(())
+}
+
+fn cmd_db_squash(history: &Path, out: &Path) -> anyhow::Result<()> {
+    let history_value = read_json_value(history)?;
+    let entries = history_value
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("db history entries must be an array"))?;
+    let mut actions = Vec::new();
+    for entry in entries {
+        let entry_actions = entry
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("db history entry actions must be an array"))?;
+        actions.extend(entry_actions.iter().cloned());
+    }
+    let schema_hash = entries
+        .last()
+        .and_then(|entry| entry.get("schema_hash"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let squashed = serde_json::json!({
+        "schema_version": 1,
+        "source_history": history.display().to_string(),
+        "entries": entries.len(),
+        "schema_hash": schema_hash,
+        "actions": actions,
+    });
+    write_json_atomic(out, &squashed)?;
+    println!("db squash: {} written", out.display());
     Ok(())
 }
 
@@ -9895,6 +9942,68 @@ entry = "src/main.orv"
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_squash_writes_compacted_history_actions() {
+        let dir = temp_output_dir("db-squash");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let first_source = dir.join("first.orv");
+        std::fs::write(
+            &first_source,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write first");
+        let second_source = dir.join("second.orv");
+        std::fs::write(
+            &second_source,
+            r#"struct User {
+  id: int
+  email: string
+  avatar: string?
+}"#,
+        )
+        .expect("write second");
+        let schema = dir.join("schema.json");
+        let history = dir.join("history.json");
+        let squashed = dir.join("squashed.json");
+
+        cmd_db_apply_with_history(&first_source, &schema, Some(&history))
+            .expect("apply first schema");
+        cmd_db_apply_with_history(&second_source, &schema, Some(&history))
+            .expect("apply second schema");
+
+        cmd_db_squash(&history, &squashed).expect("squash history");
+
+        let value = read_json_value(&squashed).expect("read squashed");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["entries"], 2);
+        assert!(value["schema_hash"].as_str().expect("schema hash").len() >= 16);
+        assert!(value["actions"]
+            .as_array()
+            .expect("actions")
+            .iter()
+            .any(|action| action["kind"] == "add_field" && action["field"] == "avatar"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_squash_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "squash",
+            "--history",
+            "target/history.json",
+            "--out",
+            "target/squashed.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
     }
 
     #[test]
