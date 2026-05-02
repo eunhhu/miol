@@ -3053,7 +3053,7 @@ mock-server = "0.2.0"
 | `orv origins <file>` | HIR 기반 origin map JSON 출력 |
 | `orv graph <file>` | AST ProjectGraph v1 + HIR origin map/edge JSON 출력 |
 | `orv build <file-or-orv.toml> --out <dir> [--prod]` | 초기 build manifest + bundle plan + origin map + project graph + source bundle + server runtime/launch artifact, HTML-only static page, 또는 client page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/container/Dockerfile/entrypoint 추가 |
-| `orv verify-build <dir>` | build manifest/plan target, source bundle hash, deploy route inventory/container/Dockerfile, server runtime/launch artifact, static page zero-runtime shape, client page/JS/WASM metadata와 `orv_start` bootstrap, optional dev HMR/watch session 검증 |
+| `orv verify-build <dir>` | build manifest/plan target, source bundle hash, deploy route inventory/container/ports/Dockerfile, server runtime/launch artifact, static page zero-runtime shape, client page/JS/WASM metadata와 `orv_start` bootstrap, optional dev HMR/watch session 검증 |
 | `orv verify-artifact <file>` | server runtime artifact source hash/route descriptor 검증 |
 | `orv check-artifact <file>` | server runtime artifact source bundle 재분석 |
 | `orv check-build <dir>` | build-level source bundle 재분석 |

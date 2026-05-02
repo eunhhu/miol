@@ -7307,15 +7307,23 @@ fn verify_deploy_server_target(
         dir,
         container,
         dockerfile,
-        artifact_path,
-        entrypoint,
-        routes_artifact,
-        artifact.runtime.as_str(),
+        &DeployServerContract {
+            artifact_path,
+            entrypoint,
+            routes_artifact,
+            runtime: artifact.runtime.as_str(),
+            listen: artifact.listen.as_ref(),
+        },
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
         anyhow::bail!("deploy server runtime does not match runtime artifact");
     }
+    verify_deploy_listen_value(
+        server.get("listen"),
+        artifact.listen.as_ref(),
+        "deploy server",
+    )?;
     if let Some(routes) = server.get("routes") {
         let artifact_routes = serde_json::to_value(&artifact.routes)?;
         if routes != &artifact_routes {
@@ -7329,10 +7337,7 @@ fn verify_deploy_container_artifact(
     dir: &Path,
     path: &str,
     dockerfile_path: &str,
-    artifact_path: &str,
-    entrypoint: &str,
-    routes_artifact: &str,
-    runtime: &str,
+    contract: &DeployServerContract<'_>,
 ) -> anyhow::Result<()> {
     let container_path = dir.join(path);
     if !container_path.is_file() {
@@ -7352,23 +7357,30 @@ fn verify_deploy_container_artifact(
     if json_str(&container, "kind", "deploy container")? != "reference-server-container" {
         anyhow::bail!("deploy container kind must be reference-server-container");
     }
-    if json_str(&container, "artifact", "deploy container")? != artifact_path {
+    if json_str(&container, "artifact", "deploy container")? != contract.artifact_path {
+        let artifact_path = contract.artifact_path;
         anyhow::bail!("deploy container artifact must be {artifact_path}");
     }
-    if json_str(&container, "entrypoint", "deploy container")? != entrypoint {
+    if json_str(&container, "entrypoint", "deploy container")? != contract.entrypoint {
+        let entrypoint = contract.entrypoint;
         anyhow::bail!("deploy container entrypoint must be {entrypoint}");
     }
-    if json_str(&container, "routes_artifact", "deploy container")? != routes_artifact {
+    if json_str(&container, "routes_artifact", "deploy container")? != contract.routes_artifact {
+        let routes_artifact = contract.routes_artifact;
         anyhow::bail!("deploy container routes_artifact must be {routes_artifact}");
     }
     if json_str(&container, "dockerfile", "deploy container")? != dockerfile_path {
         anyhow::bail!("deploy container dockerfile must be {dockerfile_path}");
     }
-    if json_str(&container, "runtime", "deploy container")? != runtime {
+    if json_str(&container, "runtime", "deploy container")? != contract.runtime {
         anyhow::bail!("deploy container runtime does not match runtime artifact");
     }
     if json_str(&container, "protocol", "deploy container")? != "http1" {
         anyhow::bail!("deploy container protocol must be http1");
+    }
+    verify_deploy_listen_value(container.get("listen"), contract.listen, "deploy container")?;
+    if container.get("ports") != Some(&deploy_ports_value(contract.listen)) {
+        anyhow::bail!("deploy container ports do not match runtime artifact");
     }
     let command = container
         .get("command")
@@ -7377,10 +7389,34 @@ fn verify_deploy_container_artifact(
     if command.first().and_then(serde_json::Value::as_str) != Some("./deploy/server.sh") {
         anyhow::bail!("deploy container command must start with ./deploy/server.sh");
     }
-    verify_deploy_dockerfile(dir, dockerfile_path)
+    verify_deploy_dockerfile(dir, dockerfile_path, contract.listen)
 }
 
-fn verify_deploy_dockerfile(dir: &Path, path: &str) -> anyhow::Result<()> {
+struct DeployServerContract<'a> {
+    artifact_path: &'a str,
+    entrypoint: &'a str,
+    routes_artifact: &'a str,
+    runtime: &'a str,
+    listen: Option<&'a orv_compiler::ServerListenArtifact>,
+}
+
+fn verify_deploy_listen_value(
+    actual: Option<&serde_json::Value>,
+    expected: Option<&orv_compiler::ServerListenArtifact>,
+    label: &str,
+) -> anyhow::Result<()> {
+    let expected = serde_json::to_value(expected)?;
+    if actual != Some(&expected) {
+        anyhow::bail!("{label} listen does not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_deploy_dockerfile(
+    dir: &Path,
+    path: &str,
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+) -> anyhow::Result<()> {
     let dockerfile_path = dir.join(path);
     if !dockerfile_path.is_file() {
         anyhow::bail!("missing deploy Dockerfile: {}", dockerfile_path.display());
@@ -7392,6 +7428,12 @@ fn verify_deploy_dockerfile(dir: &Path, path: &str) -> anyhow::Result<()> {
     }
     if !dockerfile.contains("COPY . /app") {
         anyhow::bail!("deploy Dockerfile must copy build output into /app");
+    }
+    if let Some(port) = deploy_exposed_port(listen) {
+        let expected = format!("EXPOSE {port}");
+        if !dockerfile.contains(&expected) {
+            anyhow::bail!("deploy Dockerfile must expose {port}");
+        }
     }
     if !dockerfile.contains(r#"ENTRYPOINT ["./deploy/server.sh"]"#) {
         anyhow::bail!("deploy Dockerfile must run ./deploy/server.sh");
@@ -8303,15 +8345,14 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
     }
-    if manifest.capabilities.client_wasm {
-        let page_path = required_bundle_output_path(&client_page_path, "client_page")?;
-        let js_path = required_bundle_output_path(&client_js_path, "client_js")?;
-        let wasm_path = required_bundle_output_path(&client_wasm_path, "client_wasm")?;
-        write_client_wasm_placeholder(&out.join(wasm_path))?;
-        write_client_js_loader(&out.join(js_path))?;
-        let loader_src = relative_bundle_path(page_path, js_path);
-        write_client_page_shell(&out.join(page_path), &entry, &loader_src)?;
-    }
+    write_client_bundle_artifacts(
+        out,
+        &entry,
+        manifest.capabilities.client_wasm,
+        client_page_path.as_deref(),
+        client_js_path.as_deref(),
+        client_wasm_path.as_deref(),
+    )?;
     if profile.is_production() {
         write_prod_deploy_artifacts(
             out,
@@ -8331,6 +8372,29 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     Ok(())
 }
 
+fn write_client_bundle_artifacts(
+    out: &Path,
+    entry: &Path,
+    enabled: bool,
+    client_page_path: Option<&str>,
+    client_js_path: Option<&str>,
+    client_wasm_path: Option<&str>,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let page_path =
+        client_page_path.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?;
+    let js_path =
+        client_js_path.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
+    let wasm_path =
+        client_wasm_path.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
+    write_client_wasm_placeholder(&out.join(wasm_path))?;
+    write_client_js_loader(&out.join(js_path))?;
+    let loader_src = relative_bundle_path(page_path, js_path);
+    write_client_page_shell(&out.join(page_path), entry, &loader_src)
+}
+
 fn validate_prod_server_listen(
     server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
 ) -> anyhow::Result<()> {
@@ -8348,19 +8412,31 @@ fn validate_prod_server_listen(
     Ok(())
 }
 
+fn deploy_ports_value(listen: Option<&orv_compiler::ServerListenArtifact>) -> serde_json::Value {
+    deploy_exposed_port(listen).map_or_else(
+        || serde_json::json!([]),
+        |port| {
+            serde_json::json!([
+                {
+                    "container": port,
+                    "protocol": "tcp",
+                }
+            ])
+        },
+    )
+}
+
+fn deploy_exposed_port(listen: Option<&orv_compiler::ServerListenArtifact>) -> Option<u16> {
+    listen
+        .and_then(|listen| listen.port)
+        .filter(|port| *port > 0)
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
         .find(|bundle| bundle.kind == kind)
         .map(|bundle| normalized_artifact_path(&bundle.path))
-}
-
-fn required_bundle_output_path<'a>(
-    path: &'a Option<String>,
-    kind: &str,
-) -> anyhow::Result<&'a str> {
-    path.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing {kind} bundle target"))
 }
 
 const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
@@ -8549,6 +8625,7 @@ fn write_prod_deploy_artifacts(
             "container": container,
             "dockerfile": dockerfile,
             "protocol": "http1",
+            "listen": server_artifact.listen.clone(),
             "routes": server_artifact.routes.clone(),
         })
     } else {
@@ -8618,18 +8695,23 @@ fn write_prod_container_artifacts(
         "routes_artifact": routes_artifact,
         "runtime": server_artifact.runtime.clone(),
         "protocol": "http1",
+        "listen": server_artifact.listen.clone(),
+        "ports": deploy_ports_value(server_artifact.listen.as_ref()),
         "command": ["./deploy/server.sh"],
     });
     write_json(&out.join("deploy").join("container.json"), &container)?;
-    write_text(
-        &out.join(dockerfile_path),
+    let expose = deploy_exposed_port(server_artifact.listen.as_ref())
+        .map(|port| format!("EXPOSE {port}\n"))
+        .unwrap_or_default();
+    let dockerfile = format!(
         r#"ARG ORV_RUNTIME_IMAGE=ghcr.io/orv-lang/orv-reference:latest
-FROM ${ORV_RUNTIME_IMAGE}
+FROM ${{ORV_RUNTIME_IMAGE}}
 WORKDIR /app
 COPY . /app
-ENTRYPOINT ["./deploy/server.sh"]
-"#,
-    )
+{expose}ENTRYPOINT ["./deploy/server.sh"]
+"#
+    );
+    write_text(&out.join(dockerfile_path), &dockerfile)
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -14875,6 +14957,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
         assert_eq!(deploy["server"]["container"], "deploy/container.json");
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
+        assert_eq!(deploy["server"]["listen"]["port"], 8080);
         assert!(deploy["server"]["routes"]
             .as_array()
             .expect("server routes")
@@ -14890,10 +14973,14 @@ entry = "src/main.orv"
         assert_eq!(container["dockerfile"], "deploy/Dockerfile");
         assert_eq!(container["runtime"], "reference-interpreter");
         assert_eq!(container["protocol"], "http1");
+        assert_eq!(container["listen"], deploy["server"]["listen"]);
+        assert_eq!(container["ports"][0]["container"], 8080);
+        assert_eq!(container["ports"][0]["protocol"], "tcp");
         assert_eq!(container["command"][0], "./deploy/server.sh");
         let dockerfile = std::fs::read_to_string(&deploy_dockerfile_path).expect("Dockerfile");
         assert!(dockerfile.contains("FROM ${ORV_RUNTIME_IMAGE}"));
         assert!(dockerfile.contains("COPY . /app"));
+        assert!(dockerfile.contains("EXPOSE 8080"));
         assert!(dockerfile.contains(r#"ENTRYPOINT ["./deploy/server.sh"]"#));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
@@ -14957,6 +15044,30 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_container_listen_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-container-listen-source");
+        let out = temp_output_dir("deploy-container-listen-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let container_path = out.join("deploy").join("container.json");
+        let mut container = read_json_value(&container_path).expect("container");
+        container["listen"] = serde_json::json!({
+            "origin_id": "ori_wrong",
+            "name": "port 9090",
+            "port": 9090,
+        });
+        write_json(&container_path, &container).expect("write corrupt container");
+
+        let err = cmd_verify_build(&out).expect_err("container listen mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy container listen does not match runtime artifact"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }

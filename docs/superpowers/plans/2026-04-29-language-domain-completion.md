@@ -20,7 +20,7 @@
 
 **Deploy route inventory delta (2026-05-03):** `orv build --prod` now writes `deploy/routes.json` for server builds and `orv verify-build` checks that it matches the server runtime artifact, giving deploy/reveal tooling a standalone route inventory before native bundling.
 
-**Deploy container contract delta (2026-05-03):** `orv build --prod` now writes `deploy/container.json` and `deploy/Dockerfile` for server builds, and `orv verify-build` checks that the container contract points at the same runtime artifact, route inventory, entrypoint, and reference server command. Remaining production deploy work is native server binaries and real runtime images.
+**Deploy container contract delta (2026-05-03):** `orv build --prod` now writes `deploy/container.json` and `deploy/Dockerfile` for server builds, records listen/port exposure in the container contract, emits Dockerfile `EXPOSE` for static nonzero listen ports, and `orv verify-build` checks that the container contract points at the same runtime artifact, route inventory, entrypoint, listen descriptor, ports, and reference server command. Remaining production deploy work is native server binaries and real runtime images.
 
 **Server listen artifact delta (2026-05-03):** origin maps now include `listen` nodes, server runtime artifacts preserve listen origin/static port descriptors, `server/launch.json` must match that listen descriptor during `orv verify-build`, and prod builds reject static test-only `@listen 0`. Remaining deployment work is wiring environment-driven ports and native runtime images.
 
