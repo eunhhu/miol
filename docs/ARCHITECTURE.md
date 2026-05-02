@@ -213,9 +213,10 @@ dist/
 - `orv graph <file>` — AST ProjectGraph v1 + HIR origin map/edge JSON 출력
 - `orv test <path> --filter <name> --list` — `.orv` 파일을 찾아 `test "name"` 블록이 있는 파일을 reference runtime 으로 실행하거나 발견 목록 JSON 출력
 - `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact, HTML-only static page, 또는 client page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/entrypoint 추가
-- `orv verify-build <dir>` — build manifest/plan target 존재, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap 검증
+- `orv verify-build <dir>` — build manifest/plan target 존재, source bundle hash, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증
 - `orv check-artifact <file>` — server runtime artifact source bundle 재분석
+- `orv check-build <dir>` — build-level source bundle 재분석
 - `orv run-artifact <file>` — server runtime artifact source bundle 재수화 + reference runtime 실행
 - `orv run-build <dir>` — bundle plan 기준 reference server artifact 실행, 또는 static page HTML 출력
 - `orv dev <file-or-orv.toml> --out <dir>` — build + verify-build + run-build reference dev bootstrap

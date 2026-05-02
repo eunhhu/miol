@@ -10,6 +10,7 @@
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
+//! `orv check-build <dir>`은 build source bundle 을 재분석하며,
 //! `orv run-artifact <file>`은 source bundle 을 재수화해 reference runtime 으로 실행한다.
 //! `orv run-build <dir>`은 `server/launch.json` 의 reference runner 계약을 실행한다.
 //! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
@@ -88,6 +89,11 @@ enum Command {
     CheckArtifact {
         /// 검사할 artifact JSON 경로.
         file: PathBuf,
+    },
+    /// build artifact source bundle을 재분석한다.
+    CheckBuild {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
     },
     /// server runtime artifact source bundle을 재수화하고 실행한다.
     RunArtifact {
@@ -327,6 +333,13 @@ fn main() -> ExitCode {
             }
         },
         Command::CheckArtifact { file } => match cmd_check_artifact(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::CheckBuild { dir } => match cmd_check_build(&dir) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -5872,6 +5885,19 @@ fn cmd_check_artifact(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_check_build(dir: &Path) -> anyhow::Result<()> {
+    verify_build_dir(dir)?;
+    let source_bundle = read_source_bundle_artifact(&dir.join("source-bundle.json"))?;
+    let lowered = lower_source_bundle_entry(&source_bundle)?;
+    println!(
+        "build: {} checked (sources={}, items={})",
+        dir.display(),
+        source_bundle.files.len(),
+        lowered.program.items.len()
+    );
+    Ok(())
+}
+
 fn cmd_run_artifact(path: &Path) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     run_artifact_with_writer(path, &mut stdout)
@@ -6112,6 +6138,26 @@ fn lower_artifact_entry(
     Ok(lowered)
 }
 
+fn lower_source_bundle_entry(
+    artifact: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<orv_analyzer::LowerResult> {
+    let entry = source_bundle_entry_path(artifact)?;
+    let loaded = orv_project::load_project_from_sources(
+        &entry,
+        artifact
+            .files
+            .iter()
+            .map(|file| (PathBuf::from(&file.path), file.source.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
+    Ok(lowered)
+}
+
 fn artifact_entry_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> anyhow::Result<PathBuf> {
     let entry = normalized_artifact_path(&artifact.entry);
     if let Some(file) = artifact.source_bundle.files.iter().find(|file| {
@@ -6124,6 +6170,25 @@ fn artifact_entry_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> anyhow
         return Ok(PathBuf::from(&artifact.source_bundle.files[0].path));
     }
     anyhow::bail!("entry source `{}` not found in artifact", artifact.entry)
+}
+
+fn source_bundle_entry_path(
+    artifact: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<PathBuf> {
+    let entry = normalized_artifact_path(&artifact.entry);
+    if let Some(file) = artifact.files.iter().find(|file| {
+        let path = normalized_artifact_path(&file.path);
+        path == entry || path.ends_with(&entry)
+    }) {
+        return Ok(PathBuf::from(&file.path));
+    }
+    if artifact.files.len() == 1 {
+        return Ok(PathBuf::from(&artifact.files[0].path));
+    }
+    anyhow::bail!(
+        "entry source `{}` not found in source bundle",
+        artifact.entry
+    )
 }
 
 fn normalized_artifact_path(path: &str) -> String {
@@ -11269,6 +11334,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn check_build_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "check-build", "target/orv-build-test"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn run_artifact_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -11921,6 +11994,26 @@ entry = "src/main.orv"
             .expect("client targets")
             .iter()
             .any(|target| target["kind"] == "client_wasm"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_build_reanalyzes_source_bundle_without_original_source() {
+        let dir = temp_output_dir("check-build-source-bundle");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("page.orv");
+        std::fs::write(
+            &path,
+            r#"let sig count: int = 0
+@out @html { @body { @p count } }"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        std::fs::remove_file(&path).expect("remove source");
+
+        cmd_check_build(&out).expect("check build");
         let _ = std::fs::remove_dir_all(dir);
     }
 
