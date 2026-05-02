@@ -169,6 +169,8 @@ pub struct DebugFrame {
     pub locals: Vec<DebugVariable>,
     /// Function/domain call stack active while this statement executed.
     pub stack: Vec<DebugStackFrame>,
+    /// Stdout text emitted while this statement executed.
+    pub output: String,
 }
 
 /// Runtime value for one debugger-visible binding.
@@ -585,6 +587,7 @@ struct DebugTraceState {
     names: Vec<(NameId, String)>,
     frames: Vec<DebugFrame>,
     stack: Vec<DebugStackFrame>,
+    output: String,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -649,6 +652,7 @@ impl<'w, W: Write> Interp<'w, W> {
         };
         let names = debug.names.clone();
         let stack = debug.stack.clone();
+        let output = debug.output.clone();
         let locals = names
             .into_iter()
             .filter_map(|(id, name)| {
@@ -659,10 +663,12 @@ impl<'w, W: Write> Interp<'w, W> {
             })
             .collect();
         if let Some(debug) = &mut self.debug {
+            debug.output.clear();
             debug.frames.push(DebugFrame {
                 span,
                 locals,
                 stack,
+                output,
             });
         }
     }
@@ -679,6 +685,12 @@ impl<'w, W: Write> Interp<'w, W> {
     fn debug_pop_call(&mut self) {
         if let Some(debug) = &mut self.debug {
             debug.stack.pop();
+        }
+    }
+
+    fn debug_record_output(&mut self, text: &str) {
+        if let Some(debug) = &mut self.debug {
+            debug.output.push_str(text);
         }
     }
 
@@ -3434,7 +3446,9 @@ impl<'w, W: Write> Interp<'w, W> {
     }
 
     fn println(&mut self, v: &Value) -> Result<(), RuntimeError> {
-        writeln!(self.writer, "{v}").map_err(|e| RuntimeError::native(format!("io error: {e}")))
+        writeln!(self.writer, "{v}").map_err(|e| RuntimeError::native(format!("io error: {e}")))?;
+        self.debug_record_output(&format!("{v}\n"));
+        Ok(())
     }
 }
 

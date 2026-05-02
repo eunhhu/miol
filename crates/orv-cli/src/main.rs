@@ -1515,6 +1515,7 @@ struct DapFrameState {
     line: u64,
     locals: Vec<DapVariable>,
     stack: Vec<DapStackFrameState>,
+    output: String,
 }
 
 #[derive(Clone)]
@@ -1739,14 +1740,14 @@ impl DapSession {
             frames: std::mem::take(&mut frames),
             current_frame_index,
         });
-        if !runtime.stdout.is_empty() {
-            self.queue_event(
-                "output",
-                serde_json::json!({
-                    "category": "stdout",
-                    "output": runtime.stdout,
-                }),
-            );
+        if self
+            .launched
+            .as_ref()
+            .is_some_and(|launched| !launched.frames.is_empty())
+        {
+            self.queue_frame_outputs(0, current_frame_index);
+        } else if !runtime.stdout.is_empty() {
+            self.queue_stdout_output(&runtime.stdout);
         }
         if !runtime.error.is_empty() {
             self.queue_event(
@@ -2066,12 +2067,16 @@ impl DapSession {
     }
 
     fn continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
-        let next_breakpoint = {
+        let (next_breakpoint, start_frame, has_frames) = {
             let launched = self
                 .launched
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
-            self.next_verified_breakpoint_frame(launched)
+            (
+                self.next_verified_breakpoint_frame(launched),
+                launched.current_frame_index.saturating_add(1),
+                !launched.frames.is_empty(),
+            )
         };
         self.queue_event(
             "continued",
@@ -2081,6 +2086,7 @@ impl DapSession {
             }),
         );
         if let Some(index) = next_breakpoint {
+            self.queue_frame_outputs(start_frame, index);
             let launched = self
                 .launched
                 .as_mut()
@@ -2094,6 +2100,14 @@ impl DapSession {
             return Ok(serde_json::json!({
                 "allThreadsContinued": false,
             }));
+        }
+        if has_frames {
+            let end_frame = self
+                .launched
+                .as_ref()
+                .and_then(|launched| launched.frames.len().checked_sub(1))
+                .unwrap_or(0);
+            self.queue_frame_outputs(start_frame, end_frame);
         }
         self.queue_event("terminated", serde_json::json!({}));
         self.launched = None;
@@ -2123,6 +2137,7 @@ impl DapSession {
             launched.current_frame_index = next_frame;
             launched.stopped_line = frame.line;
             launched.stopped_reason = "step".to_string();
+            self.queue_current_frame_output();
             self.queue_stopped_event();
             return Ok(serde_json::json!({}));
         }
@@ -2184,6 +2199,47 @@ impl DapSession {
             event: event.to_string(),
             body,
         });
+    }
+
+    fn queue_current_frame_output(&mut self) {
+        let output = self
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.frames.get(launched.current_frame_index))
+            .map(|frame| frame.output.clone())
+            .unwrap_or_default();
+        self.queue_stdout_output(&output);
+    }
+
+    fn queue_frame_outputs(&mut self, start: usize, end: usize) {
+        let outputs = self.launched.as_ref().map_or_else(Vec::new, |launched| {
+            if start > end {
+                return Vec::new();
+            }
+            launched
+                .frames
+                .iter()
+                .skip(start)
+                .take(end.saturating_sub(start).saturating_add(1))
+                .map(|frame| frame.output.clone())
+                .collect()
+        });
+        for output in outputs {
+            self.queue_stdout_output(&output);
+        }
+    }
+
+    fn queue_stdout_output(&mut self, output: &str) {
+        if output.is_empty() {
+            return;
+        }
+        self.queue_event(
+            "output",
+            serde_json::json!({
+                "category": "stdout",
+                "output": output,
+            }),
+        );
     }
 
     fn drain_pending_events(&mut self) -> Vec<serde_json::Value> {
@@ -2311,6 +2367,7 @@ fn dap_runtime_frames(
                 line,
                 locals,
                 stack,
+                output: frame.output.clone(),
             })
         })
         .collect()
@@ -6184,6 +6241,49 @@ function greet(user: User): string -> "hello"
                 && event["body"]["reason"] == "step"
                 && event["body"]["threadId"] == 1
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_next_queues_output_for_reached_runtime_frame() {
+        let dir = temp_output_dir("dap-next-output-frame");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n@out \"second\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 166,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        assert!(session.drain_pending_events().is_empty());
+        session
+            .message_response(&serde_json::json!({
+                "seq": 167,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let events = session.drain_pending_events();
+
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "output"
+                && event["body"]["category"] == "stdout"
+                && event["body"]["output"] == "second\n"
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "event" && event["event"] == "stopped"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
