@@ -678,15 +678,19 @@ fn cmd_init(dir: &Path, name: Option<&str>, template: InitTemplate) -> anyhow::R
         ),
     )?;
     let entry_source = match template {
-        InitTemplate::Basic => BASIC_INIT_TEMPLATE_SOURCE,
-        InitTemplate::Shop => SHOP_INIT_TEMPLATE_SOURCE,
+        InitTemplate::Basic => BASIC_INIT_TEMPLATE_SOURCE.to_string(),
+        InitTemplate::Shop => shop_init_template_source(),
     };
-    write_new_text_file(&src.join("main.orv"), entry_source)?;
+    write_new_text_file(&src.join("main.orv"), &entry_source)?;
     if template == InitTemplate::Shop {
         write_new_text_file(&dir.join("README.md"), &shop_init_readme(&project_name))?;
     }
     println!("init: {} created", dir.display());
     Ok(())
+}
+
+fn shop_init_template_source() -> String {
+    SHOP_INIT_TEMPLATE_SOURCE.replace("@listen 0", "@listen 8080")
 }
 
 fn shop_init_readme(project_name: &str) -> String {
@@ -7291,6 +7295,7 @@ fn verify_deploy_server_target(
     let artifact = read_server_artifact(&dir.join(artifact_path))?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    validate_prod_server_listen(Some(&artifact))?;
     verify_deploy_routes_artifact(
         dir,
         routes_artifact,
@@ -8261,6 +8266,9 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
                 .map(|file| (file.path.display().to_string(), file.source.clone())),
         )
     });
+    if profile.is_production() {
+        validate_prod_server_listen(server_artifact.as_ref())?;
+    }
 
     std::fs::create_dir_all(out)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", out.display()))?;
@@ -8320,6 +8328,23 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         )?;
     }
     println!("build: wrote {}", out.display());
+    Ok(())
+}
+
+fn validate_prod_server_listen(
+    server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
+) -> anyhow::Result<()> {
+    let Some(server_artifact) = server_artifact else {
+        return Ok(());
+    };
+    if server_artifact
+        .listen
+        .as_ref()
+        .and_then(|listen| listen.port)
+        == Some(0)
+    {
+        anyhow::bail!("prod server listen port must be 1..=65535; @listen 0 is test-only");
+    }
     Ok(())
 }
 
@@ -9099,6 +9124,18 @@ mod tests {
         path
     }
 
+    fn prod_server_source(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_output_dir(name);
+        std::fs::create_dir_all(&dir).expect("create prod source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "@server { @listen 8080 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write prod source");
+        (dir, path)
+    }
+
     fn json_routes_include(routes: &serde_json::Value, method: &str, path: &str) -> bool {
         routes.as_array().is_some_and(|routes| {
             routes
@@ -9327,6 +9364,7 @@ test "checkout failing runtime body" {
 
         let entry = dir.join("src").join("main.orv");
         let source = std::fs::read_to_string(&entry).expect("entry source");
+        assert!(source.contains("@listen 8080"));
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
@@ -14793,7 +14831,7 @@ entry = "src/main.orv"
 
     #[test]
     fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
-        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let (src_dir, path) = prod_server_source("build-prod-source");
         let out = temp_output_dir("build-prod-artifacts");
 
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
@@ -14865,12 +14903,27 @@ entry = "src/main.orv"
         assert!(script.contains("orv run-artifact"));
 
         cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_prod_rejects_test_only_ephemeral_listen_port() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("build-prod-ephemeral-listen");
+
+        let err = cmd_build_with_profile(&path, &out, BuildProfile::Production)
+            .expect_err("ephemeral prod listen");
+
+        assert!(err
+            .to_string()
+            .contains("prod server listen port must be 1..=65535"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
     fn verify_build_rejects_deploy_routes_mismatch() {
-        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let (src_dir, path) = prod_server_source("deploy-routes-source");
         let out = temp_output_dir("deploy-routes-mismatch");
 
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
@@ -14884,12 +14937,13 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy routes do not match runtime artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
     fn verify_build_rejects_deploy_container_mismatch() {
-        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let (src_dir, path) = prod_server_source("deploy-container-source");
         let out = temp_output_dir("deploy-container-mismatch");
 
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
@@ -14903,6 +14957,7 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
 

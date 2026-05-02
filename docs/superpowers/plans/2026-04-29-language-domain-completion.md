@@ -22,7 +22,7 @@
 
 **Deploy container contract delta (2026-05-03):** `orv build --prod` now writes `deploy/container.json` and `deploy/Dockerfile` for server builds, and `orv verify-build` checks that the container contract points at the same runtime artifact, route inventory, entrypoint, and reference server command. Remaining production deploy work is native server binaries and real runtime images.
 
-**Server listen artifact delta (2026-05-03):** origin maps now include `listen` nodes, server runtime artifacts preserve listen origin/static port descriptors, and `server/launch.json` must match that listen descriptor during `orv verify-build`. Remaining deployment work is rejecting/rewriting test-only `@listen 0` for production targets and wiring environment-driven ports.
+**Server listen artifact delta (2026-05-03):** origin maps now include `listen` nodes, server runtime artifacts preserve listen origin/static port descriptors, `server/launch.json` must match that listen descriptor during `orv verify-build`, and prod builds reject static test-only `@listen 0`. Remaining deployment work is wiring environment-driven ports and native runtime images.
 
 ---
 
