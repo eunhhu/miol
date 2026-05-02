@@ -2310,6 +2310,7 @@ struct DapLaunchState {
     live_requested: bool,
     live: Option<DapLiveState>,
     long_running: bool,
+    async_runtime: Option<DapAsyncRuntimeState>,
 }
 
 struct DapPendingEvent {
@@ -2367,6 +2368,25 @@ struct DapRuntimeState {
     status: String,
     stdout: String,
     error: String,
+}
+
+#[derive(Clone)]
+struct DapAsyncRuntimeState {
+    kind: String,
+    state: String,
+    resume_count: u64,
+    pause_count: u64,
+}
+
+impl DapAsyncRuntimeState {
+    fn server() -> Self {
+        Self {
+            kind: "server".to_string(),
+            state: "paused".to_string(),
+            resume_count: 0,
+            pause_count: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2604,6 +2624,7 @@ impl DapSession {
             &sources,
             live_requested,
         );
+        let async_runtime = long_running.then(DapAsyncRuntimeState::server);
         let mut executable_lines = if frames.is_empty() {
             dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1])
         } else {
@@ -2642,6 +2663,7 @@ impl DapSession {
             live_requested,
             live,
             long_running,
+            async_runtime: async_runtime.clone(),
         });
         if self
             .launched
@@ -2669,7 +2691,7 @@ impl DapSession {
             },
             "projectGraphNodes": loaded.graph.nodes.len(),
             "diagnostics": diagnostic_count,
-            "runtime": dap_runtime_json(&runtime),
+            "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
         }))
     }
 
@@ -3108,45 +3130,74 @@ impl DapSession {
         if variables_reference != 1 {
             anyhow::bail!("unknown variablesReference {variables_reference}");
         }
+        let mut variables = vec![
+            serde_json::json!({
+                "name": "entry",
+                "value": launched.path.display().to_string(),
+                "type": "source",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "projectGraphNodes",
+                "value": launched.node_count.to_string(),
+                "type": "usize",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "diagnostics",
+                "value": launched.diagnostic_count.to_string(),
+                "type": "usize",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "runtimeStatus",
+                "value": launched.runtime.status,
+                "type": "string",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "stdout",
+                "value": launched.runtime.stdout,
+                "type": "string",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "runtimeError",
+                "value": launched.runtime.error,
+                "type": "string",
+                "variablesReference": 0,
+            }),
+        ];
+        if let Some(async_runtime) = &launched.async_runtime {
+            variables.extend([
+                serde_json::json!({
+                    "name": "runtimeKind",
+                    "value": async_runtime.kind,
+                    "type": "string",
+                    "variablesReference": 0,
+                }),
+                serde_json::json!({
+                    "name": "runtimeAsyncState",
+                    "value": async_runtime.state,
+                    "type": "string",
+                    "variablesReference": 0,
+                }),
+                serde_json::json!({
+                    "name": "runtimeResumeCount",
+                    "value": async_runtime.resume_count.to_string(),
+                    "type": "usize",
+                    "variablesReference": 0,
+                }),
+                serde_json::json!({
+                    "name": "runtimePauseCount",
+                    "value": async_runtime.pause_count.to_string(),
+                    "type": "usize",
+                    "variablesReference": 0,
+                }),
+            ]);
+        }
         Ok(serde_json::json!({
-            "variables": [
-                {
-                    "name": "entry",
-                    "value": launched.path.display().to_string(),
-                    "type": "source",
-                    "variablesReference": 0,
-                },
-                {
-                    "name": "projectGraphNodes",
-                    "value": launched.node_count.to_string(),
-                    "type": "usize",
-                    "variablesReference": 0,
-                },
-                {
-                    "name": "diagnostics",
-                    "value": launched.diagnostic_count.to_string(),
-                    "type": "usize",
-                    "variablesReference": 0,
-                },
-                {
-                    "name": "runtimeStatus",
-                    "value": launched.runtime.status,
-                    "type": "string",
-                    "variablesReference": 0,
-                },
-                {
-                    "name": "stdout",
-                    "value": launched.runtime.stdout,
-                    "type": "string",
-                    "variablesReference": 0,
-                },
-                {
-                    "name": "runtimeError",
-                    "value": launched.runtime.error,
-                    "type": "string",
-                    "variablesReference": 0,
-                },
-            ],
+            "variables": variables,
         }))
     }
 
@@ -3702,6 +3753,12 @@ impl DapSession {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before continue"))?;
         launched.runtime.status = "running".to_string();
+        if let Some(async_runtime) = launched.async_runtime.as_mut() {
+            if async_runtime.state != "running" {
+                async_runtime.resume_count = async_runtime.resume_count.saturating_add(1);
+            }
+            async_runtime.state = "running".to_string();
+        }
         Ok(serde_json::json!({
             "allThreadsContinued": false,
         }))
@@ -3853,6 +3910,12 @@ impl DapSession {
             .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
         if launched.long_running {
             launched.runtime.status = "paused".to_string();
+            if let Some(async_runtime) = launched.async_runtime.as_mut() {
+                if async_runtime.state != "paused" {
+                    async_runtime.pause_count = async_runtime.pause_count.saturating_add(1);
+                }
+                async_runtime.state = "paused".to_string();
+            }
         }
         launched.stopped_reason = "pause".to_string();
         self.queue_stopped_event();
@@ -4250,12 +4313,24 @@ fn dap_long_running_frame(
     })
 }
 
-fn dap_runtime_json(runtime: &DapRuntimeState) -> serde_json::Value {
-    serde_json::json!({
+fn dap_runtime_json(
+    runtime: &DapRuntimeState,
+    async_runtime: Option<&DapAsyncRuntimeState>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "status": runtime.status,
         "stdout": runtime.stdout,
         "error": runtime.error,
-    })
+    });
+    if let Some(async_runtime) = async_runtime {
+        value["async"] = serde_json::json!({
+            "kind": async_runtime.kind,
+            "state": async_runtime.state,
+            "resume_count": async_runtime.resume_count,
+            "pause_count": async_runtime.pause_count,
+        });
+    }
+    value
 }
 
 fn dap_runtime_frames(
@@ -4956,6 +5031,22 @@ fn dap_evaluate_project_value(
         "runtimeStatus" => Some((launched.runtime.status.clone(), "string".to_string())),
         "stdout" => Some((launched.runtime.stdout.clone(), "string".to_string())),
         "runtimeError" => Some((launched.runtime.error.clone(), "string".to_string())),
+        "runtimeKind" => launched
+            .async_runtime
+            .as_ref()
+            .map(|runtime| (runtime.kind.clone(), "string".to_string())),
+        "runtimeAsyncState" => launched
+            .async_runtime
+            .as_ref()
+            .map(|runtime| (runtime.state.clone(), "string".to_string())),
+        "runtimeResumeCount" => launched
+            .async_runtime
+            .as_ref()
+            .map(|runtime| (runtime.resume_count.to_string(), "usize".to_string())),
+        "runtimePauseCount" => launched
+            .async_runtime
+            .as_ref()
+            .map(|runtime| (runtime.pause_count.to_string(), "usize".to_string())),
         _ => None,
     }
 }
@@ -4980,6 +5071,25 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
             })
         })
         .collect::<Vec<_>>();
+    if launched.async_runtime.is_some() {
+        targets.extend(
+            [
+                "runtimeKind",
+                "runtimeAsyncState",
+                "runtimeResumeCount",
+                "runtimePauseCount",
+            ]
+            .into_iter()
+            .filter(|expression| expression.starts_with(prefix))
+            .map(|expression| {
+                serde_json::json!({
+                    "label": expression,
+                    "type": "property",
+                    "sortText": expression,
+                })
+            }),
+        );
+    }
     targets.extend(
         dap_current_locals(launched)
             .iter()
@@ -10569,6 +10679,111 @@ let total: int = add(2, 3)
                 && event["body"]["reason"] == "pause"
                 && event["body"]["threadId"] == 1
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_exposes_async_pause_resume_state() {
+        let dir = temp_output_dir("dap-server-async-state");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 226,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 227,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 228,
+                "type": "request",
+                "command": "pause",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("pause response");
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 229,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+        let async_state = session
+            .message_response(&serde_json::json!({
+                "seq": 230,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "runtimeAsyncState",
+                },
+            }))
+            .expect("evaluate response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 231,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "runtimeA",
+                    "column": 9,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["runtime"]["async"]["kind"], "server");
+        assert_eq!(launch["body"]["runtime"]["async"]["state"], "paused");
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(
+                |variable| variable["name"] == "runtimeAsyncState" && variable["value"] == "paused"
+            ));
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(|variable| variable["name"] == "runtimeResumeCount" && variable["value"] == "1"));
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(|variable| variable["name"] == "runtimePauseCount" && variable["value"] == "1"));
+        assert_eq!(async_state["success"], true, "{async_state}");
+        assert_eq!(async_state["body"]["result"], "paused");
+        assert!(completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets")
+            .iter()
+            .any(|target| target["label"] == "runtimeAsyncState" && target["type"] == "property"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
