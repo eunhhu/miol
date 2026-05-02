@@ -128,7 +128,7 @@ HIR → tree-walking 실행
 HIR → origin map JSON
 ```
 
-현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, bundle plan을 읽어 source span, graph node, route descriptor 또는 client bundle target을 JSON으로 반환한다. `orv editor reveal <dir> <origin-id>`는 같은 origin id를 first-party editor focus/source/production navigation payload로 변환한다. `orv editor trace <dir> --trace <trace.json>`은 captured request trace frame의 origin id를 같은 editor navigation payload로 확장한다. live production trace capture transport는 로드맵이다.
+현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, bundle plan을 읽어 source span, graph node, route descriptor 또는 client bundle target을 JSON으로 반환한다. `orv editor reveal <dir> <origin-id>`는 같은 origin id를 first-party editor focus/source/production navigation payload로 변환한다. `orv editor trace <dir> --trace <trace.json>`은 captured request trace frame의 origin id를 같은 editor navigation payload로 확장한다. DAP in-process attach는 `runtimeRequestTracePath`로 captured request trace 파일을 flush할 수 있고, 외부 production trace capture transport는 로드맵이다.
 
 ### 4.6단계: 초기 build artifact (orv-compiler + orv-cli)
 

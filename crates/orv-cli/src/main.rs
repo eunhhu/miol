@@ -3023,6 +3023,7 @@ struct DapLaunchState {
     long_running: bool,
     attach_runtime_requested: bool,
     attach_runtime_mode: DapRuntimeAttachMode,
+    runtime_request_trace_path: Option<PathBuf>,
     runtime_process: Option<DapRuntimeProcess>,
     attached_server: Option<orv_runtime::server::AttachedServer>,
     async_runtime: Option<DapAsyncRuntimeState>,
@@ -3169,6 +3170,17 @@ impl DapLaunchState {
         transport.state = state.to_string();
         transport.process_id = process_id.map(u64::from);
         transport.address = address;
+    }
+
+    fn write_runtime_request_trace_file(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.runtime_request_trace_path else {
+            return Ok(());
+        };
+        let frames = self.attached_server.as_ref().map_or_else(
+            Vec::new,
+            orv_runtime::server::AttachedServer::request_frames,
+        );
+        write_json(path, &dap_server_request_trace_json(&frames))
     }
 }
 
@@ -3519,9 +3531,15 @@ impl DapSession {
             "pause" => self.pause_result(request),
             "terminateThreads" => self.terminate_threads_result(request),
             "disconnect" | "terminate" => {
-                self.queue_event("terminated", serde_json::json!({}));
-                self.launched = None;
-                Ok(serde_json::json!({}))
+                let flush = self
+                    .launched
+                    .as_ref()
+                    .map_or_else(|| Ok(()), DapLaunchState::write_runtime_request_trace_file);
+                flush.map(|()| {
+                    self.queue_event("terminated", serde_json::json!({}));
+                    self.launched = None;
+                    serde_json::json!({})
+                })
             }
             _ => Err(anyhow::anyhow!("unsupported DAP command `{command}`")),
         };
@@ -3574,6 +3592,7 @@ impl DapSession {
         let live_requested = dap_launch_live(request);
         let attach_runtime_requested = dap_launch_attach_runtime(request);
         let attach_runtime_mode = dap_launch_attach_runtime_mode(request)?;
+        let runtime_request_trace_path = dap_launch_runtime_request_trace_path(request)?;
         let (runtime, mut frames, live, long_running) = dap_launch_runtime_state(
             &lowered,
             diagnostic_count,
@@ -3613,6 +3632,7 @@ impl DapSession {
             long_running,
             attach_runtime_requested,
             attach_runtime_mode,
+            runtime_request_trace_path,
             runtime_process: None,
             attached_server: None,
             async_runtime: async_runtime.clone(),
@@ -3724,6 +3744,12 @@ impl DapSession {
                     launched.attach_runtime_mode
                 })
         };
+        let runtime_request_trace_path =
+            dap_launch_runtime_request_trace_path(request)?.or_else(|| {
+                self.launched
+                    .as_ref()
+                    .and_then(|launched| launched.runtime_request_trace_path.clone())
+            });
         let path = request
             .pointer("/arguments/program")
             .and_then(serde_json::Value::as_str)
@@ -3731,13 +3757,17 @@ impl DapSession {
             .transpose()?
             .or_else(|| self.launched.as_ref().map(|launched| launched.path.clone()))
             .ok_or_else(|| anyhow::anyhow!("launch is required before restart"))?;
-        let restart_request = serde_json::json!({
-            "arguments": {
+        let mut arguments = serde_json::json!({
                 "program": path.display().to_string(),
                 "live": live_requested,
                 "attachRuntime": attach_runtime_requested,
                 "attachRuntimeMode": attach_runtime_mode.protocol_name(),
-            },
+        });
+        if let Some(path) = runtime_request_trace_path {
+            arguments["runtimeRequestTracePath"] = serde_json::json!(path.display().to_string());
+        }
+        let restart_request = serde_json::json!({
+            "arguments": arguments,
         });
         self.launch_result(&restart_request)
     }
@@ -4934,6 +4964,7 @@ impl DapSession {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
         if launched.long_running {
+            launched.write_runtime_request_trace_file()?;
             launched.suspend_runtime_process()?;
             launched.runtime.status = "paused".to_string();
             if let Some(async_runtime) = launched.async_runtime.as_mut() {
@@ -4963,6 +4994,9 @@ impl DapSession {
             });
         if !terminates_reference_thread {
             anyhow::bail!("unknown ORV thread id");
+        }
+        if let Some(launched) = &self.launched {
+            launched.write_runtime_request_trace_file()?;
         }
         self.queue_event("terminated", serde_json::json!({}));
         self.launched = None;
@@ -5562,7 +5596,6 @@ fn dap_async_runtime_variables(
     launched: &DapLaunchState,
     async_runtime: &DapAsyncRuntimeState,
 ) -> Vec<serde_json::Value> {
-    let request_frames = dap_runtime_request_frames(launched);
     let mut variables = vec![
         serde_json::json!({
             "name": "runtimeKind",
@@ -5600,33 +5633,8 @@ fn dap_async_runtime_variables(
             "type": "string",
             "variablesReference": 0,
         }),
-        serde_json::json!({
-            "name": "runtimeRequestCount",
-            "value": request_frames.len().to_string(),
-            "type": "usize",
-            "variablesReference": 0,
-        }),
-        serde_json::json!({
-            "name": "runtimeLastRequest",
-            "value": request_frames
-                .last()
-                .map_or_else(String::new, dap_server_request_frame_display),
-            "type": "string",
-            "variablesReference": 0,
-        }),
-        serde_json::json!({
-            "name": "runtimeRequestFrames",
-            "value": dap_server_request_frames_display(&request_frames),
-            "type": "string",
-            "variablesReference": 0,
-        }),
-        serde_json::json!({
-            "name": "runtimeRequestTrace",
-            "value": dap_server_request_trace_display(&request_frames),
-            "type": "json",
-            "variablesReference": 0,
-        }),
     ];
+    variables.extend(dap_runtime_request_variables(launched));
     if let Some(listen) = &async_runtime.listen {
         variables.extend([
             serde_json::json!({
@@ -5658,6 +5666,47 @@ fn dap_async_runtime_variables(
                 "variablesReference": 0,
             }),
         ]);
+    }
+    variables
+}
+
+fn dap_runtime_request_variables(launched: &DapLaunchState) -> Vec<serde_json::Value> {
+    let request_frames = dap_runtime_request_frames(launched);
+    let mut variables = vec![
+        serde_json::json!({
+            "name": "runtimeRequestCount",
+            "value": request_frames.len().to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeLastRequest",
+            "value": request_frames
+                .last()
+                .map_or_else(String::new, dap_server_request_frame_display),
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeRequestFrames",
+            "value": dap_server_request_frames_display(&request_frames),
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeRequestTrace",
+            "value": dap_server_request_trace_display(&request_frames),
+            "type": "json",
+            "variablesReference": 0,
+        }),
+    ];
+    if let Some(path) = &launched.runtime_request_trace_path {
+        variables.push(serde_json::json!({
+            "name": "runtimeRequestTracePath",
+            "value": path.display().to_string(),
+            "type": "path",
+            "variablesReference": 0,
+        }));
     }
     variables
 }
@@ -6489,6 +6538,10 @@ fn dap_evaluate_async_runtime_value(
             dap_server_request_trace_display(&dap_runtime_request_frames(launched)),
             "json".to_string(),
         )),
+        "runtimeRequestTracePath" => launched
+            .runtime_request_trace_path
+            .as_ref()
+            .map(|path| (path.display().to_string(), "path".to_string())),
         "runtimeListen" => runtime
             .listen
             .as_ref()
@@ -6550,6 +6603,7 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimeLastRequest",
                 "runtimeRequestFrames",
                 "runtimeRequestTrace",
+                "runtimeRequestTracePath",
                 "runtimeListen",
                 "runtimeListenPort",
                 "runtimeTransport",
@@ -6919,6 +6973,19 @@ fn dap_launch_attach_runtime_mode(
         Some("inProcess" | "in-process") => Ok(DapRuntimeAttachMode::InProcess),
         Some(mode) => anyhow::bail!("unsupported attachRuntimeMode `{mode}`"),
     }
+}
+
+fn dap_launch_runtime_request_trace_path(
+    request: &serde_json::Value,
+) -> anyhow::Result<Option<PathBuf>> {
+    request
+        .pointer("/arguments/runtimeRequestTracePath")
+        .or_else(|| request.pointer("/arguments/requestTracePath"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(dap_path_from_protocol_string)
+        .transpose()
 }
 
 fn dap_launch_executable_lines(entry_path: &Path, frames: &[DapFrameState]) -> Vec<u64> {
@@ -10918,6 +10985,23 @@ mod tests {
         response
     }
 
+    fn dap_test_request(
+        session: &mut DapSession,
+        seq: u64,
+        command: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut request = serde_json::json!({
+            "seq": seq,
+            "type": "request",
+            "command": command,
+        });
+        request["arguments"] = arguments;
+        session
+            .message_response(&request)
+            .unwrap_or_else(|| panic!("{command} response"))
+    }
+
     fn prod_server_source(name: &str) -> (PathBuf, PathBuf) {
         let dir = temp_output_dir(name);
         std::fs::create_dir_all(&dir).expect("create prod source dir");
@@ -13229,6 +13313,131 @@ let total: int = add(2, 3)
             .iter()
             .any(|target| target["label"] == "runtimeRequestTrace"));
         drop(session);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_in_process_runtime_flushes_request_trace_path_on_pause() {
+        let dir = temp_output_dir("dap-runtime-request-trace-path");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let trace_path = dir.join("trace").join("requests.json");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = dap_test_request(
+            &mut session,
+            241,
+            "launch",
+            serde_json::json!({
+                "program": format!("file://{}", source.display()),
+                "attachRuntime": true,
+                "attachRuntimeMode": "inProcess",
+                "runtimeRequestTracePath": trace_path.display().to_string(),
+            }),
+        );
+        dap_test_request(
+            &mut session,
+            242,
+            "continue",
+            serde_json::json!({ "threadId": 1 }),
+        );
+        let address = session
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.async_runtime.as_ref())
+            .and_then(|runtime| runtime.transport.as_ref())
+            .and_then(|transport| transport.address.clone())
+            .expect("in-process runtime address");
+
+        let response = send_raw_http(&address, "/ping");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let pause = dap_test_request(
+            &mut session,
+            243,
+            "pause",
+            serde_json::json!({ "threadId": 1 }),
+        );
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(pause["success"], true, "{pause}");
+        let trace = read_json_value(&trace_path).expect("trace file");
+        assert_eq!(trace["schema_version"], 1);
+        assert_eq!(trace["kind"], "orv.production.trace");
+        assert_eq!(trace["frames"][0]["method"], "GET");
+        assert_eq!(trace["frames"][0]["path"], "/ping");
+        assert_eq!(trace["frames"][0]["status"], 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_in_process_runtime_exposes_request_trace_path_expression() {
+        let dir = temp_output_dir("dap-runtime-request-trace-path-expression");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let trace_path = dir.join("trace").join("requests.json");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = dap_test_request(
+            &mut session,
+            247,
+            "launch",
+            serde_json::json!({
+                "program": format!("file://{}", source.display()),
+                "attachRuntime": true,
+                "attachRuntimeMode": "inProcess",
+                "runtimeRequestTracePath": trace_path.display().to_string(),
+            }),
+        );
+        let variables = dap_test_request(
+            &mut session,
+            248,
+            "variables",
+            serde_json::json!({ "variablesReference": 1 }),
+        );
+        let trace_path_value = dap_test_request(
+            &mut session,
+            249,
+            "evaluate",
+            serde_json::json!({ "expression": "runtimeRequestTracePath" }),
+        );
+        let completions = dap_test_request(
+            &mut session,
+            250,
+            "completions",
+            serde_json::json!({
+                "text": "runtimeRequestTraceP",
+                "column": 21,
+                "line": 1,
+            }),
+        );
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(|variable| variable["name"] == "runtimeRequestTracePath"
+                && variable["value"] == trace_path.display().to_string()));
+        assert_eq!(trace_path_value["success"], true, "{trace_path_value}");
+        assert_eq!(
+            trace_path_value["body"]["result"],
+            trace_path.display().to_string()
+        );
+        assert!(completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets")
+            .iter()
+            .any(|target| target["label"] == "runtimeRequestTracePath"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
