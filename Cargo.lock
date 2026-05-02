@@ -866,6 +866,7 @@ dependencies = [
  "orv-runtime",
  "orv-syntax",
  "serde_json",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -875,17 +876,12 @@ name = "orv-compiler"
 version = "0.1.0"
 dependencies = [
  "orv-analyzer",
- "orv-core",
  "orv-diagnostics",
  "orv-hir",
- "orv-project",
  "orv-resolve",
- "orv-runtime",
  "orv-syntax",
  "pretty_assertions",
  "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -933,7 +929,6 @@ name = "orv-project"
 version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
- "orv-hir",
  "orv-syntax",
  "serde",
  "thiserror",

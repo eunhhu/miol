@@ -1,13 +1,29 @@
 //! orv CLI 프론트엔드 — `orv` 바이너리.
 //!
 //! MVP: `orv run <file>`로 `.orv` 파일을 tree-walking 인터프리터로 실행한다.
-//! `orv origins <file>`은 HIR 기반 origin map JSON을 출력한다.
+//! source-entry 명령은 `orv.toml` 의 `[project].entry`와 프로젝트 디렉터리
+//! 입력도 허용한다. `orv init <dir>`은 최소 프로젝트 scaffold 를 만든다.
+//! `orv origins <file>`은 HIR 기반 origin map JSON을 출력한다. `orv graph
+//! <file>`은 AST 기반 `ProjectGraph` v1과 HIR origin map JSON을 출력하고,
+//! `orv build <file-or-orv.toml> --out <dir>`은 초기 build artifact directory 를 생성한다.
+//! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
+//! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
+//! `orv check-artifact <file>`은 source bundle 을 재분석하며,
+//! `orv run-artifact <file>`은 source bundle 을 재수화해 reference runtime 으로 실행한다.
+//! `orv run-build <dir>`은 `server/launch.json` 의 reference runner 계약을 실행한다.
+//! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
+//! `.orv` span 과 production descriptor 로 되짚는다.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use orv_diagnostics::FileId;
+use codespan_reporting::files::SimpleFiles;
+use codespan_reporting::term::termcolor::WriteColor;
+use orv_diagnostics::{FileId, Span};
+use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
+use orv_syntax::ast::{ConstraintValue, Program, Stmt, TypeConstraint, TypeRef, TypeRefKind};
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -37,6 +53,167 @@ enum Command {
     Origins {
         /// 대상 파일 경로.
         file: PathBuf,
+    },
+    /// AST 기반 `ProjectGraph` v1과 HIR origin map을 JSON으로 출력한다.
+    Graph {
+        /// 대상 파일 경로.
+        file: PathBuf,
+    },
+    /// 빌드 artifact 디렉터리를 생성한다.
+    Build {
+        /// 대상 파일 경로.
+        file: PathBuf,
+        /// artifact 출력 디렉터리.
+        #[arg(long, short = 'o')]
+        out: PathBuf,
+    },
+    /// build artifact 디렉터리의 manifest/plan 산출물을 검증한다.
+    VerifyBuild {
+        /// 검증할 build artifact 디렉터리.
+        dir: PathBuf,
+    },
+    /// server runtime artifact를 검증한다.
+    VerifyArtifact {
+        /// 검증할 artifact JSON 경로.
+        file: PathBuf,
+    },
+    /// server runtime artifact source bundle을 재분석한다.
+    CheckArtifact {
+        /// 검사할 artifact JSON 경로.
+        file: PathBuf,
+    },
+    /// server runtime artifact source bundle을 재수화하고 실행한다.
+    RunArtifact {
+        /// 실행할 artifact JSON 경로.
+        file: PathBuf,
+    },
+    /// build artifact 디렉터리의 server launcher를 실행한다.
+    RunBuild {
+        /// 실행할 build artifact 디렉터리.
+        dir: PathBuf,
+    },
+    /// build artifact를 생성/검증한 뒤 reference dev runtime으로 실행한다.
+    Dev {
+        /// 실행할 소스 파일, orv.toml, 또는 프로젝트 디렉터리.
+        #[arg(default_value = ".")]
+        file: PathBuf,
+        /// dev artifact 출력 디렉터리.
+        #[arg(long, short = 'o', default_value = "target/orv-dev")]
+        out: PathBuf,
+    },
+    /// build artifact 디렉터리에서 origin id를 원본 코드/production descriptor로 reveal한다.
+    Reveal {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// reveal 할 origin id.
+        origin_id: String,
+    },
+    /// 새 orv 프로젝트를 생성한다.
+    Init {
+        /// 생성할 프로젝트 디렉터리.
+        dir: PathBuf,
+        /// 프로젝트 이름.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// orv 테스트를 실행한다.
+    Test {
+        /// 테스트를 찾을 파일 또는 디렉터리.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// 이름에 이 문자열을 포함하는 테스트만 선택한다.
+        #[arg(long)]
+        filter: Option<String>,
+        /// 테스트를 실행하지 않고 발견된 테스트 목록만 JSON으로 출력한다.
+        #[arg(long)]
+        list: bool,
+    },
+    /// DB schema migration helper commands.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+    /// Editor/LSP helper commands.
+    Lsp {
+        #[command(subcommand)]
+        command: LspCommand,
+    },
+    /// Debug Adapter Protocol helper commands.
+    Dap {
+        #[command(subcommand)]
+        command: DapCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// 현재 struct schema와 적용된 schema snapshot의 migration dry-run plan을 출력한다.
+    Plan {
+        /// 대상 소스 파일 경로.
+        file: PathBuf,
+        /// 마지막 적용 schema snapshot JSON 경로.
+        #[arg(long)]
+        applied: Option<PathBuf>,
+    },
+    /// 현재 struct schema snapshot을 적용된 schema 파일로 저장한다.
+    Apply {
+        /// 대상 소스 파일 경로.
+        file: PathBuf,
+        /// 갱신할 적용 schema snapshot JSON 경로.
+        #[arg(long)]
+        schema: PathBuf,
+        /// migration apply 이력을 기록할 JSON 경로.
+        #[arg(long)]
+        history: Option<PathBuf>,
+    },
+    /// 현재 struct schema snapshot을 migration workflow로 적용한다.
+    Migrate {
+        /// 대상 소스 파일 경로.
+        file: PathBuf,
+        /// 갱신할 적용 schema snapshot JSON 경로.
+        #[arg(long)]
+        schema: PathBuf,
+        /// migration apply 이력을 기록할 JSON 경로.
+        #[arg(long)]
+        history: Option<PathBuf>,
+    },
+    /// 마지막 적용 전 schema snapshot으로 되돌린다.
+    Rollback {
+        /// 되돌릴 적용 schema snapshot JSON 경로.
+        #[arg(long)]
+        schema: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum LspCommand {
+    /// 현재 파일의 LSP bootstrap snapshot JSON을 출력한다.
+    Snapshot {
+        /// 대상 소스 파일 경로.
+        file: PathBuf,
+    },
+    /// build artifact origin id를 LSP location JSON으로 reveal한다.
+    Reveal {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// reveal 할 origin id.
+        origin_id: String,
+    },
+    /// stdin/stdout JSON-RPC LSP server bootstrap을 실행한다.
+    Serve {
+        /// stdin/stdout transport를 사용한다.
+        #[arg(long)]
+        stdio: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DapCommand {
+    /// stdin/stdout Debug Adapter Protocol server bootstrap을 실행한다.
+    Serve {
+        /// stdin/stdout transport를 사용한다.
+        #[arg(long)]
+        stdio: bool,
     },
 }
 
@@ -71,62 +248,3964 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Graph { file } => match cmd_graph(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Build { file, out } => match cmd_build(&file, &out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::VerifyBuild { dir } => match cmd_verify_build(&dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::VerifyArtifact { file } => match cmd_verify_artifact(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::CheckArtifact { file } => match cmd_check_artifact(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::RunArtifact { file } => match cmd_run_artifact(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::RunBuild { dir } => match cmd_run_build(&dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Dev { file, out } => match cmd_dev(&file, &out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Reveal { dir, origin_id } => match cmd_reveal(&dir, &origin_id) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Init { dir, name } => match cmd_init(&dir, name.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Test { path, filter, list } => match cmd_test(&path, filter.as_deref(), list) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Db { command } => match command {
+            DbCommand::Plan { file, applied } => match cmd_db_plan(&file, applied.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Apply {
+                file,
+                schema,
+                history,
+            } => match cmd_db_apply_with_history(&file, &schema, history.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Migrate {
+                file,
+                schema,
+                history,
+            } => match cmd_db_migrate(&file, &schema, history.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Rollback { schema } => match cmd_db_rollback(&schema) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
+        Command::Lsp { command } => match command {
+            LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            LspCommand::Reveal { dir, origin_id } => match cmd_lsp_reveal(&dir, &origin_id) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            LspCommand::Serve { stdio } => match cmd_lsp_serve(stdio) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
+        Command::Dap { command } => match command {
+            DapCommand::Serve { stdio } => match cmd_dap_serve(stdio) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
     }
 }
 
 fn cmd_run(path: &Path) -> anyhow::Result<()> {
-    let lowered = load_checked_hir(path)?;
+    let entry = project_entry_path(path)?;
+    let lowered = load_checked_hir(&entry)?;
     orv_runtime::run(&lowered.program).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
 fn cmd_check(path: &Path) -> anyhow::Result<()> {
-    let _lowered = load_checked_hir(path)?;
-    println!("check: {} passed", path.display());
+    let entry = project_entry_path(path)?;
+    let _lowered = load_checked_hir(&entry)?;
+    println!("check: {} passed", entry.display());
     Ok(())
 }
 
 fn cmd_origins(path: &Path) -> anyhow::Result<()> {
-    let lowered = load_checked_hir(path)?;
+    let entry = project_entry_path(path)?;
+    let lowered = load_checked_hir(&entry)?;
     let origins = orv_compiler::origin_map(&lowered.program);
     println!("{}", serde_json::to_string_pretty(&origins)?);
     Ok(())
+}
+
+fn cmd_graph(path: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let value = project_graph_json_for_path(&entry)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_lsp_snapshot(path: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let value = lsp_snapshot_json(&entry)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_lsp_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
+    let value = lsp_reveal_json(dir, origin_id)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_lsp_serve(use_stdio: bool) -> anyhow::Result<()> {
+    if !use_stdio {
+        anyhow::bail!("lsp serve currently requires --stdio");
+    }
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+    lsp_serve_stdio_stream(&mut reader, &mut writer)
+}
+
+fn cmd_dap_serve(use_stdio: bool) -> anyhow::Result<()> {
+    if !use_stdio {
+        anyhow::bail!("dap serve currently requires --stdio");
+    }
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+    dap_serve_stdio_stream(&mut reader, &mut writer)
+}
+
+fn cmd_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
+    let value = reveal_origin_json(dir, origin_id)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_init(dir: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    let project_name = name
+        .map(str::to_string)
+        .or_else(|| {
+            dir.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_string)
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "orv-app".to_string());
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", src.display()))?;
+    write_new_text_file(
+        &dir.join("orv.toml"),
+        &format!(
+            "[project]\nname = \"{}\"\nversion = \"0.1.0\"\nentry = \"src/main.orv\"\n",
+            escape_toml_string(&project_name)
+        ),
+    )?;
+    write_new_text_file(
+        &src.join("main.orv"),
+        "@html { @body { @h1 \"Hello from orv\" @p \"Edit src/main.orv\" } }\n",
+    )?;
+    println!("init: {} created", dir.display());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct OrvTestSummary {
+    selected: usize,
+    passed: usize,
+    failed: usize,
+    files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct OrvTestCase {
+    file: PathBuf,
+    name: String,
+}
+
+fn cmd_test(path: &Path, filter: Option<&str>, list: bool) -> anyhow::Result<()> {
+    if list {
+        let value = orv_test_list_json(path, filter)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let summary = orv_test_summary(path, filter)?;
+    println!("test: {} passed", summary.passed);
+    Ok(())
+}
+
+fn orv_test_list_json(path: &Path, filter: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let tests = orv_test_cases(path, filter)?
+        .into_iter()
+        .map(|case| {
+            serde_json::json!({
+                "path": case.file.display().to_string(),
+                "name": case.name,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "tests": tests,
+    }))
+}
+
+fn orv_test_cases(path: &Path, filter: Option<&str>) -> anyhow::Result<Vec<OrvTestCase>> {
+    let files = orv_test_candidate_files(path)?;
+    let mut cases = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(&file)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
+        for name in orv_test_names(&source) {
+            if filter.is_none_or(|filter| name.contains(filter)) {
+                cases.push(OrvTestCase {
+                    file: file.clone(),
+                    name,
+                });
+            }
+        }
+    }
+    Ok(cases)
+}
+
+fn orv_test_summary(path: &Path, filter: Option<&str>) -> anyhow::Result<OrvTestSummary> {
+    let files = orv_test_candidate_files(path)?;
+    let mut summary = OrvTestSummary {
+        selected: 0,
+        passed: 0,
+        failed: 0,
+        files: Vec::new(),
+    };
+    for file in files {
+        let source = std::fs::read_to_string(&file)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
+        let names = orv_test_names(&source);
+        let selected = names
+            .iter()
+            .filter(|name| filter.is_none_or(|filter| name.contains(filter)))
+            .count();
+        if selected == 0 {
+            continue;
+        }
+        summary.selected += selected;
+        summary.files.push(file.clone());
+        let lowered = load_checked_hir(&file)?;
+        let mut output = Vec::new();
+        if let Err(err) = orv_runtime::run_with_writer(&lowered.program, &mut output) {
+            summary.failed += selected;
+            anyhow::bail!("test: {} failed: {err}", file.display());
+        }
+        summary.passed += selected;
+    }
+    Ok(summary)
+}
+
+fn orv_test_candidate_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if path.is_dir() {
+        let mut files = Vec::new();
+        collect_orv_files(path, &mut files)?;
+        files.sort();
+        return Ok(files);
+    }
+    let file = project_entry_path(path)?;
+    if is_orv_file(&file) {
+        return Ok(vec![file]);
+    }
+    anyhow::bail!("test path must be a .orv file, orv.toml, or directory")
+}
+
+fn collect_orv_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", dir.display()))?
+    {
+        let entry = entry.map_err(|e| anyhow::anyhow!("failed to read dir entry: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_orv_files(&path, out)?;
+        } else if is_orv_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_orv_file(path: &Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str) == Some("orv")
+}
+
+fn orv_test_names(source: &str) -> Vec<String> {
+    let lexed = orv_syntax::lex(source, FileId(0));
+    let mut names = Vec::new();
+    for window in lexed.tokens.windows(2) {
+        let [head, tail] = window else {
+            continue;
+        };
+        if matches!(&head.kind, orv_syntax::TokenKind::Ident(name) if name == "test") {
+            if let orv_syntax::TokenKind::String(name) = &tail.kind {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
+fn cmd_db_plan(path: &Path, applied: Option<&Path>) -> anyhow::Result<()> {
+    let value = db_plan_json(path, applied)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_db_apply(path: &Path, schema: &Path) -> anyhow::Result<()> {
+    cmd_db_apply_with_history(path, schema, None)
+}
+
+fn cmd_db_migrate(path: &Path, schema: &Path, history: Option<&Path>) -> anyhow::Result<()> {
+    cmd_db_apply_with_history(path, schema, history)
+}
+
+fn cmd_db_apply_with_history(
+    path: &Path,
+    schema: &Path,
+    history: Option<&Path>,
+) -> anyhow::Result<()> {
+    let snapshot = current_db_schema_snapshot(path)?;
+    let previous = if schema.is_file() {
+        read_json_value(schema)?
+    } else {
+        empty_db_schema_snapshot()
+    };
+    let actions = db_schema_diff_actions(&previous, &snapshot);
+    backup_schema_for_rollback(schema)?;
+    write_json_atomic(schema, &snapshot)?;
+    if let Some(history) = history {
+        append_db_history(history, path, &snapshot, actions)?;
+    }
+    println!("db schema: {} applied", schema.display());
+    Ok(())
+}
+
+fn cmd_db_rollback(schema: &Path) -> anyhow::Result<()> {
+    let rollback = rollback_schema_path(schema);
+    if !rollback.is_file() {
+        anyhow::bail!("no rollback schema snapshot at {}", rollback.display());
+    }
+    let snapshot = read_json_value(&rollback)?;
+    write_json_atomic(schema, &snapshot)?;
+    std::fs::remove_file(&rollback)
+        .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", rollback.display()))?;
+    println!("db schema: {} rolled back", schema.display());
+    Ok(())
+}
+
+fn backup_schema_for_rollback(schema: &Path) -> anyhow::Result<()> {
+    if schema.is_file() {
+        let current = read_json_value(schema)?;
+        write_json_atomic(&rollback_schema_path(schema), &current)?;
+    }
+    Ok(())
+}
+
+fn append_db_history(
+    history: &Path,
+    source: &Path,
+    schema: &serde_json::Value,
+    actions: Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let mut value = if history.is_file() {
+        read_json_value(history)?
+    } else {
+        serde_json::json!({
+            "schema_version": 1,
+            "entries": [],
+        })
+    };
+    let entries = value
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("db history entries must be an array"))?;
+    entries.push(serde_json::json!({
+        "source": source.display().to_string(),
+        "schema_hash": stable_json_hash(schema)?,
+        "actions": actions,
+    }));
+    write_json_atomic(history, &value)
+}
+
+fn db_plan_json(path: &Path, applied: Option<&Path>) -> anyhow::Result<serde_json::Value> {
+    let current_schema = current_db_schema_snapshot(path)?;
+    let applied_schema = if let Some(applied) = applied {
+        read_json_value(applied)?
+    } else {
+        empty_db_schema_snapshot()
+    };
+    let actions = db_schema_diff_actions(&applied_schema, &current_schema);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "current_schema": current_schema,
+        "actions": actions,
+    }))
+}
+
+fn project_entry_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_dir() {
+        return project_manifest_entry_path(&path.join("orv.toml"));
+    }
+    if path.file_name().is_some_and(|name| name == "orv.toml") {
+        return project_manifest_entry_path(path);
+    }
+    Ok(path.to_path_buf())
+}
+
+fn project_manifest_entry_path(manifest: &Path) -> anyhow::Result<PathBuf> {
+    let source = std::fs::read_to_string(manifest)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest.display()))?;
+    let value = toml::from_str::<toml::Value>(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", manifest.display()))?;
+    let entry = value
+        .get("project")
+        .and_then(|project| project.get("entry"))
+        .and_then(toml::Value::as_str)
+        .filter(|entry| !entry.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{} must define [project].entry", manifest.display()))?;
+    let base = manifest.parent().unwrap_or_else(|| Path::new("."));
+    Ok(base.join(entry))
+}
+
+fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if path.exists() {
+        anyhow::bail!("refusing to overwrite {}", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, contents)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn lsp_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    let origin_map = orv_compiler::origin_map(&lowered.program);
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(lsp_diagnostics_json(&loaded.diagnostics, &loaded.files));
+    diagnostics.extend(lsp_diagnostics_json(&resolved.diagnostics, &loaded.files));
+    diagnostics.extend(lsp_diagnostics_json(&lowered.diagnostics, &loaded.files));
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "uri": path.display().to_string(),
+        "diagnostics": diagnostics,
+        "project_graph": project_graph_json(&loaded.graph, &origin_map),
+        "document_symbols": lsp_document_symbols_json(&loaded.graph, &loaded.files),
+    }))
+}
+
+fn lsp_reveal_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json::Value> {
+    let reveal = reveal_origin_json(dir, origin_id)?;
+    let source = reveal
+        .get("source")
+        .ok_or_else(|| anyhow::anyhow!("reveal source missing"))?;
+    let path = json_str(source, "path", "reveal source")?;
+    let start = json_u32(source, "start", "reveal source")?;
+    let end = json_u32(source, "end", "reveal source")?;
+    let source_text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read reveal source {path}: {e}"))?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "origin": reveal.get("origin").cloned().unwrap_or(serde_json::Value::Null),
+        "location": {
+            "uri": path,
+            "range": lsp_range_for_source(&source_text, start, end),
+        },
+        "project_graph": reveal.get("project_graph").cloned().unwrap_or(serde_json::Value::Null),
+        "production": reveal.get("production").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+#[cfg(test)]
+fn lsp_jsonrpc_response(request: &serde_json::Value) -> serde_json::Value {
+    LspSession::default().jsonrpc_response(request)
+}
+
+#[derive(Default)]
+struct LspSession {
+    open_documents: HashMap<PathBuf, String>,
+    workspace_root: Option<PathBuf>,
+}
+
+impl LspSession {
+    fn message_response(&mut self, request: &serde_json::Value) -> Option<serde_json::Value> {
+        if request.get("id").is_none() {
+            self.handle_notification(request);
+            return None;
+        }
+        Some(self.jsonrpc_response(request))
+    }
+
+    fn jsonrpc_response(&mut self, request: &serde_json::Value) -> serde_json::Value {
+        let id = request
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match request.get("method").and_then(serde_json::Value::as_str) {
+            Some("initialize") => self.initialize_response(request, &id),
+            Some("shutdown") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": serde_json::Value::Null,
+            }),
+            Some("textDocument/documentSymbol") => match self.document_symbol_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/codeLens") => match self.code_lens_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/codeAction") => match self.code_action_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/documentLink") => match self.document_link_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/foldingRange") => match self.folding_range_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/selectionRange") => match self.selection_range_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/semanticTokens/full") => {
+                match self.semantic_tokens_result(request) {
+                    Ok(result) => lsp_jsonrpc_result(&id, &result),
+                    Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+                }
+            }
+            Some("textDocument/diagnostic") => {
+                match self.text_document_diagnostic_result(request) {
+                    Ok(result) => lsp_jsonrpc_result(&id, &result),
+                    Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+                }
+            }
+            Some("workspace/diagnostic") => match self.workspace_diagnostic_result() {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("workspace/executeCommand") => match self.execute_command_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/definition") => match self.definition_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/references") => match self.references_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/documentHighlight") => match self.document_highlight_result(request)
+            {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/prepareRename") => match self.prepare_rename_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/rename") => match self.rename_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/hover") => match self.hover_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("textDocument/completion") => match self.completion_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some("workspace/symbol") => match self.workspace_symbol_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
+            Some(method) => lsp_jsonrpc_method_not_found(&id, method),
+            None => lsp_jsonrpc_error(&id, -32600, "invalid request"),
+        }
+    }
+
+    fn initialize_response(
+        &mut self,
+        request: &serde_json::Value,
+        id: &serde_json::Value,
+    ) -> serde_json::Value {
+        self.handle_initialize(request);
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "serverInfo": {
+                    "name": "orv-lsp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "documentSymbolProvider": true,
+                    "codeLensProvider": {
+                        "resolveProvider": false,
+                    },
+                    "codeActionProvider": {
+                        "codeActionKinds": ["quickfix"],
+                    },
+                    "executeCommandProvider": {
+                        "commands": ["orv.revealSourceNode", "orv.revealDiagnostic"],
+                    },
+                    "documentLinkProvider": {
+                        "resolveProvider": false,
+                    },
+                    "foldingRangeProvider": true,
+                    "selectionRangeProvider": true,
+                    "semanticTokensProvider": {
+                        "legend": {
+                            "tokenTypes": ["namespace", "type", "function"],
+                            "tokenModifiers": ["declaration"],
+                        },
+                        "full": true,
+                        "range": false,
+                    },
+                    "workspaceSymbolProvider": true,
+                    "definitionProvider": true,
+                    "referencesProvider": true,
+                    "documentHighlightProvider": true,
+                    "renameProvider": {
+                        "prepareProvider": true,
+                    },
+                    "hoverProvider": true,
+                    "completionProvider": {
+                        "triggerCharacters": ["@", ".", ":"],
+                    },
+                    "diagnosticProvider": {
+                        "interFileDependencies": true,
+                        "workspaceDiagnostics": true,
+                    },
+                },
+            },
+        })
+    }
+
+    fn handle_initialize(&mut self, request: &serde_json::Value) {
+        let Some(root_uri) = request
+            .pointer("/params/rootUri")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        if let Ok(path) = lsp_file_uri_path(root_uri) {
+            self.workspace_root = Some(path);
+        }
+    }
+
+    fn text_document_diagnostic_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let diagnostics = lsp_diagnostics_for_loaded_project(&loaded);
+        Ok(serde_json::json!({
+            "kind": "full",
+            "items": diagnostics,
+        }))
+    }
+
+    fn workspace_diagnostic_result(&self) -> anyhow::Result<serde_json::Value> {
+        let root = self.workspace_root.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("initialize.params.rootUri is required before workspace/diagnostic")
+        })?;
+        let entry = project_entry_path(root)?;
+        let loaded = self.loaded_project_for_path(&entry)?;
+        Ok(serde_json::json!({
+            "items": lsp_workspace_diagnostic_items_json(&loaded),
+        }))
+    }
+
+    fn execute_command_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let command = request
+            .pointer("/params/command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("command must be a string"))?;
+        match command {
+            "orv.revealSourceNode" => self.execute_reveal_source_node(request),
+            "orv.revealDiagnostic" => Ok(lsp_execute_reveal_diagnostic_json(request)),
+            _ => Err(anyhow::anyhow!("unsupported LSP command `{command}`")),
+        }
+    }
+
+    fn execute_reveal_source_node(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let node_id = request
+            .pointer("/params/arguments/0")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("orv.revealSourceNode requires source node id"))?;
+        let node_id = ProjectNodeId::try_from(node_id)
+            .map_err(|_| anyhow::anyhow!("source node id is too large"))?;
+        let root = self.workspace_root.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("initialize.params.rootUri is required before workspace/executeCommand")
+        })?;
+        let entry = project_entry_path(root)?;
+        let loaded = self.loaded_project_for_path(&entry)?;
+        let node = loaded
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown source node `{node_id}`"))?;
+        Ok(serde_json::json!({
+            "command": "orv.revealSourceNode",
+            "source_node": node.id,
+            "name": node.name,
+            "kind": lsp_symbol_kind(node.kind).unwrap_or("Symbol"),
+            "location": lsp_location_json(node, &loaded.files),
+        }))
+    }
+
+    fn definition_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(node) = lsp_definition_node(&loaded.graph, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(lsp_location_json(node, &loaded.files))
+    }
+
+    fn references_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_reference_locations_json(
+            &loaded.files,
+            name,
+        )))
+    }
+
+    fn document_highlight_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(
+            identifier_occurrences(&file.source, name)
+                .into_iter()
+                .map(|(start, end)| {
+                    serde_json::json!({
+                        "range": lsp_range_for_source(
+                            &file.source,
+                            u32::try_from(start).unwrap_or(u32::MAX),
+                            u32::try_from(end).unwrap_or(u32::MAX),
+                        ),
+                        "kind": 1,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    fn prepare_rename_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some((start, end, name)) = identifier_span_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(serde_json::json!({
+            "range": lsp_range_for_source(
+                &file.source,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            ),
+            "placeholder": name,
+        }))
+    }
+
+    fn rename_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let new_name = request
+            .pointer("/params/newName")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("newName must be a string"))?;
+        if !lsp_valid_identifier_name(new_name) {
+            return Err(anyhow::anyhow!("newName must be a valid identifier"));
+        }
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::json!({ "changes": {} }));
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some((_, _, name)) = identifier_span_at_byte(&file.source, byte) else {
+            return Ok(serde_json::json!({ "changes": {} }));
+        };
+        let mut changes = serde_json::Map::new();
+        for file in &loaded.files {
+            let edits: Vec<_> = identifier_occurrences(&file.source, name)
+                .into_iter()
+                .map(|(start, end)| {
+                    serde_json::json!({
+                        "range": lsp_range_for_source(
+                            &file.source,
+                            u32::try_from(start).unwrap_or(u32::MAX),
+                            u32::try_from(end).unwrap_or(u32::MAX),
+                        ),
+                        "newText": new_name,
+                    })
+                })
+                .collect();
+            if !edits.is_empty() {
+                changes.insert(
+                    lsp_file_uri_for_path(&file.path),
+                    serde_json::Value::Array(edits),
+                );
+            }
+        }
+        Ok(serde_json::json!({ "changes": changes }))
+    }
+
+    fn hover_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(node) = lsp_definition_node(&loaded.graph, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(lsp_hover_json(node, &loaded.files))
+    }
+
+    fn document_symbol_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        Ok(serde_json::Value::Array(
+            lsp_document_symbols_protocol_json(&loaded.graph, &loaded.files),
+        ))
+    }
+
+    fn code_lens_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_code_lenses_json(
+            &loaded.graph,
+            &loaded.files,
+            file.id,
+        )))
+    }
+
+    fn code_action_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let requested_range = lsp_request_range(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let start = lsp_position_to_byte(&file.source, requested_range.0);
+        let end = lsp_position_to_byte(&file.source, requested_range.1);
+        Ok(serde_json::Value::Array(lsp_code_actions_json(
+            &loaded, file, start, end,
+        )))
+    }
+
+    fn document_link_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_document_links_json(
+            &loaded.graph,
+            &loaded.files,
+            file.id,
+        )))
+    }
+
+    fn folding_range_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_folding_ranges_json(
+            &loaded.graph,
+            &loaded.files,
+            file.id,
+        )))
+    }
+
+    fn selection_range_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let positions = request
+            .pointer("/params/positions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("positions must be an array"))?;
+        let mut ranges = Vec::with_capacity(positions.len());
+        for position in positions {
+            let position = lsp_position_value(position)?;
+            let byte = lsp_position_to_byte(&file.source, position);
+            ranges.push(
+                lsp_selection_range_json(&loaded.graph, &loaded.files, file.id, byte)
+                    .unwrap_or_else(|| {
+                        let byte = u32::try_from(byte).unwrap_or(u32::MAX);
+                        serde_json::json!({
+                            "range": lsp_range_for_source(&file.source, byte, byte),
+                        })
+                    }),
+            );
+        }
+        Ok(serde_json::Value::Array(ranges))
+    }
+
+    fn semantic_tokens_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::json!({ "data": [] }));
+        };
+        Ok(lsp_semantic_tokens_json(
+            &loaded.graph,
+            &loaded.files,
+            file.id,
+        ))
+    }
+
+    fn completion_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        Ok(serde_json::json!({
+            "isIncomplete": false,
+            "items": lsp_completion_items_json(&loaded.graph),
+        }))
+    }
+
+    fn workspace_symbol_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let query = request
+            .pointer("/params/query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let root = self.workspace_root.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("initialize.params.rootUri is required before workspace/symbol")
+        })?;
+        let entry = project_entry_path(root)?;
+        let loaded = self.loaded_project_for_path(&entry)?;
+        Ok(serde_json::Value::Array(lsp_workspace_symbols_json(
+            &loaded.graph,
+            &loaded.files,
+            query,
+        )))
+    }
+
+    fn loaded_project_for_path(&self, path: &Path) -> anyhow::Result<orv_project::LoadedProject> {
+        if let Some(source) = self.open_documents.get(path) {
+            return orv_project::load_project_from_sources(
+                path,
+                [(path.to_path_buf(), source.clone())],
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"));
+        }
+        orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn handle_notification(&mut self, request: &serde_json::Value) {
+        match request.get("method").and_then(serde_json::Value::as_str) {
+            Some("textDocument/didOpen") => self.handle_did_open(request),
+            Some("textDocument/didChange") => self.handle_did_change(request),
+            _ => {}
+        }
+    }
+
+    fn handle_did_open(&mut self, request: &serde_json::Value) {
+        let Some(uri) = request
+            .pointer("/params/textDocument/uri")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Some(text) = request
+            .pointer("/params/textDocument/text")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Ok(path) = lsp_file_uri_path(uri) else {
+            return;
+        };
+        self.open_documents.insert(path, text.to_string());
+    }
+
+    fn handle_did_change(&mut self, request: &serde_json::Value) {
+        let Some(uri) = request
+            .pointer("/params/textDocument/uri")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Some(text) = request
+            .pointer("/params/contentChanges")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|changes| changes.last())
+            .and_then(|change| change.get("text"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Ok(path) = lsp_file_uri_path(uri) else {
+            return;
+        };
+        self.open_documents.insert(path, text.to_string());
+    }
+}
+
+#[cfg(test)]
+fn dap_protocol_response(request: &serde_json::Value) -> serde_json::Value {
+    DapSession::default()
+        .message_response(request)
+        .expect("DAP response")
+}
+
+#[derive(Default)]
+struct DapSession {
+    next_seq: u64,
+    launched: Option<DapLaunchState>,
+    breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
+}
+
+#[derive(Clone)]
+struct DapLaunchState {
+    path: PathBuf,
+    uri: String,
+    name: String,
+    node_count: usize,
+    diagnostic_count: usize,
+    stopped_line: u64,
+    runtime: DapRuntimeState,
+    sources: Vec<DapSourceInfo>,
+}
+
+#[derive(Clone)]
+struct DapSourceInfo {
+    reference: u64,
+    name: String,
+    path: PathBuf,
+    uri: String,
+}
+
+#[derive(Clone)]
+struct DapBreakpoint {
+    id: u64,
+    line: u64,
+    verified: bool,
+}
+
+#[derive(Clone)]
+struct DapRuntimeState {
+    status: String,
+    stdout: String,
+    error: String,
+}
+
+impl DapSession {
+    fn message_response(&mut self, request: &serde_json::Value) -> Option<serde_json::Value> {
+        if request.get("type").and_then(serde_json::Value::as_str) != Some("request") {
+            return None;
+        }
+        let seq = self.next_response_seq();
+        let request_seq = request
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let command = request
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let result = match command {
+            "initialize" => Ok(serde_json::json!({
+                "supportsConfigurationDoneRequest": true,
+                "supportsTerminateRequest": true,
+                "supportsLoadedSourcesRequest": true,
+                "supportsEvaluateForHovers": true,
+                "supportsCompletionsRequest": true,
+                "supportsBreakpointLocationsRequest": true,
+                "supportsExceptionInfoRequest": true,
+            })),
+            "launch" => self.launch_result(request),
+            "configurationDone" => Ok(serde_json::json!({})),
+            "setBreakpoints" => self.set_breakpoints_result(request),
+            "breakpointLocations" => self.breakpoint_locations_result(request),
+            "threads" => Ok(serde_json::json!({
+                "threads": [
+                    {
+                        "id": 1,
+                        "name": "orv reference runtime",
+                    },
+                ],
+            })),
+            "stackTrace" => self.stack_trace_result(),
+            "scopes" => self.scopes_result(),
+            "variables" => self.variables_result(request),
+            "evaluate" => self.evaluate_result(request),
+            "completions" => self.completions_result(request),
+            "exceptionInfo" => self.exception_info_result(),
+            "loadedSources" => self.loaded_sources_result(),
+            "source" => self.source_result(request),
+            "continue" => self.continue_result(),
+            "next" | "stepIn" | "stepOut" | "pause" => self.empty_debug_control_result(),
+            "disconnect" | "terminate" => {
+                self.launched = None;
+                Ok(serde_json::json!({}))
+            }
+            _ => Err(anyhow::anyhow!("unsupported DAP command `{command}`")),
+        };
+        Some(match result {
+            Ok(body) => dap_success_response(seq, request_seq, command, &body),
+            Err(err) => dap_error_response(seq, request_seq, command, &err.to_string()),
+        })
+    }
+
+    const fn next_response_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    fn launch_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let path = dap_program_path(request)?;
+        let loaded = orv_project::load_project(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let file = lsp_source_file_for_path(&loaded.files, &path)
+            .ok_or_else(|| anyhow::anyhow!("launch program is not part of loaded project"))?;
+        let resolved = orv_resolve::resolve(&loaded.program);
+        let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+        let diagnostic_count =
+            loaded.diagnostics.len() + resolved.diagnostics.len() + lowered.diagnostics.len();
+        let runtime = dap_runtime_state(&lowered, diagnostic_count);
+        let entry_path = file.path.clone();
+        let entry_uri = lsp_file_uri_for_path(&entry_path);
+        let entry_name = entry_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("app.orv")
+            .to_string();
+        let stopped_line = self
+            .first_verified_breakpoint_line(&entry_path)
+            .unwrap_or(1);
+        let sources = loaded
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
+            })
+            .collect();
+        self.launched = Some(DapLaunchState {
+            path: entry_path.clone(),
+            uri: entry_uri.clone(),
+            name: entry_name.clone(),
+            node_count: loaded.graph.nodes.len(),
+            diagnostic_count,
+            stopped_line,
+            runtime: runtime.clone(),
+            sources,
+        });
+        Ok(serde_json::json!({
+            "entry": {
+                "name": entry_name,
+                "path": entry_path.display().to_string(),
+                "uri": entry_uri,
+            },
+            "projectGraphNodes": loaded.graph.nodes.len(),
+            "diagnostics": diagnostic_count,
+            "runtime": dap_runtime_json(&runtime),
+        }))
+    }
+
+    fn loaded_sources_result(&self) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before loadedSources"))?;
+        Ok(serde_json::json!({
+            "sources": launched
+                .sources
+                .iter()
+                .map(dap_source_json)
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn source_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before source"))?;
+        let source = if let Some(reference) = dap_source_reference(request) {
+            launched
+                .sources
+                .iter()
+                .find(|source| source.reference == reference)
+                .ok_or_else(|| anyhow::anyhow!("unknown sourceReference {reference}"))?
+        } else {
+            let requested_path = dap_normalize_path(&dap_source_path(request)?);
+            launched
+                .sources
+                .iter()
+                .find(|source| dap_normalize_path(&source.path) == requested_path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "source `{}` is not part of the launched project",
+                        requested_path.display()
+                    )
+                })?
+        };
+        let content = std::fs::read_to_string(&source.path).map_err(|e| {
+            anyhow::anyhow!("failed to read source `{}`: {e}", source.path.display())
+        })?;
+        Ok(serde_json::json!({
+            "content": content,
+            "mimeType": "text/x-orv",
+        }))
+    }
+
+    fn set_breakpoints_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let path = dap_normalize_path(&dap_source_path(request)?);
+        let breakpoints = request
+            .pointer("/arguments/breakpoints")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(Vec::new, |items| {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let line = breakpoint
+                            .get("line")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        DapBreakpoint {
+                            id: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                            line,
+                            verified: line > 0,
+                        }
+                    })
+                    .collect()
+            });
+        self.breakpoints.insert(path, breakpoints.clone());
+        let response_breakpoints = breakpoints
+            .iter()
+            .map(|breakpoint| {
+                serde_json::json!({
+                    "id": breakpoint.id,
+                    "verified": breakpoint.verified,
+                    "line": breakpoint.line,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "breakpoints": response_breakpoints,
+        }))
+    }
+
+    fn breakpoint_locations_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let path = dap_breakpoint_source_path(self.launched.as_ref(), request)?;
+        let loaded = orv_project::load_project(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let file = lsp_source_file_for_path(&loaded.files, &path)
+            .ok_or_else(|| anyhow::anyhow!("breakpoint source is not part of loaded project"))?;
+        let line = request
+            .pointer("/arguments/line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let end_line = request
+            .pointer("/arguments/endLine")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(line);
+        Ok(serde_json::json!({
+            "breakpoints": dap_breakpoint_locations_json(
+                &loaded.graph,
+                &loaded.files,
+                file.id,
+                line,
+                end_line,
+            ),
+        }))
+    }
+
+    fn stack_trace_result(&self) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before stackTrace"))?;
+        Ok(serde_json::json!({
+            "stackFrames": [
+                {
+                    "id": 1,
+                    "name": "orv entry",
+                    "source": {
+                        "name": launched.name,
+                        "path": launched.path.display().to_string(),
+                        "sourceReference": 0,
+                        "uri": launched.uri,
+                    },
+                    "line": launched.stopped_line,
+                    "column": 1,
+                },
+            ],
+            "totalFrames": 1,
+        }))
+    }
+
+    fn scopes_result(&self) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before scopes"))?;
+        Ok(serde_json::json!({
+            "scopes": [
+                {
+                    "name": "Project",
+                    "variablesReference": 1,
+                    "expensive": false,
+                    "source": {
+                        "name": launched.name,
+                        "path": launched.path.display().to_string(),
+                        "sourceReference": 0,
+                        "uri": launched.uri,
+                    },
+                },
+            ],
+        }))
+    }
+
+    fn variables_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before variables"))?;
+        let variables_reference = request
+            .pointer("/arguments/variablesReference")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("variables.arguments.variablesReference is required"))?;
+        if variables_reference != 1 {
+            anyhow::bail!("unknown variablesReference {variables_reference}");
+        }
+        Ok(serde_json::json!({
+            "variables": [
+                {
+                    "name": "entry",
+                    "value": launched.path.display().to_string(),
+                    "type": "source",
+                    "variablesReference": 0,
+                },
+                {
+                    "name": "projectGraphNodes",
+                    "value": launched.node_count.to_string(),
+                    "type": "usize",
+                    "variablesReference": 0,
+                },
+                {
+                    "name": "diagnostics",
+                    "value": launched.diagnostic_count.to_string(),
+                    "type": "usize",
+                    "variablesReference": 0,
+                },
+                {
+                    "name": "runtimeStatus",
+                    "value": launched.runtime.status,
+                    "type": "string",
+                    "variablesReference": 0,
+                },
+                {
+                    "name": "stdout",
+                    "value": launched.runtime.stdout,
+                    "type": "string",
+                    "variablesReference": 0,
+                },
+                {
+                    "name": "runtimeError",
+                    "value": launched.runtime.error,
+                    "type": "string",
+                    "variablesReference": 0,
+                },
+            ],
+        }))
+    }
+
+    fn evaluate_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before evaluate"))?;
+        let expression = request
+            .pointer("/arguments/expression")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|expression| !expression.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("evaluate.arguments.expression is required"))?;
+        let (result, value_type) = dap_evaluate_project_value(launched, expression)
+            .ok_or_else(|| anyhow::anyhow!("unknown evaluate expression `{expression}`"))?;
+        Ok(serde_json::json!({
+            "result": result,
+            "type": value_type,
+            "variablesReference": 0,
+        }))
+    }
+
+    fn completions_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.require_launch("completions")?;
+        let prefix = request
+            .pointer("/arguments/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        Ok(serde_json::json!({
+            "targets": dap_completion_targets_json(prefix),
+        }))
+    }
+
+    fn exception_info_result(&self) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before exceptionInfo"))?;
+        Ok(dap_exception_info_json(&launched.runtime))
+    }
+
+    fn continue_result(&self) -> anyhow::Result<serde_json::Value> {
+        self.require_launch("continue")?;
+        Ok(serde_json::json!({
+            "allThreadsContinued": false,
+        }))
+    }
+
+    fn empty_debug_control_result(&self) -> anyhow::Result<serde_json::Value> {
+        self.require_launch("debug control")?;
+        Ok(serde_json::json!({}))
+    }
+
+    fn require_launch(&self, command: &str) -> anyhow::Result<()> {
+        self.launched
+            .as_ref()
+            .map(|_| ())
+            .ok_or_else(|| anyhow::anyhow!("launch is required before {command}"))
+    }
+
+    fn first_verified_breakpoint_line(&self, path: &Path) -> Option<u64> {
+        let normalized = dap_normalize_path(path);
+        self.breakpoints.get(&normalized).and_then(|breakpoints| {
+            breakpoints
+                .iter()
+                .find(|breakpoint| breakpoint.verified)
+                .map(|breakpoint| breakpoint.line)
+        })
+    }
+}
+
+fn dap_runtime_state(
+    lowered: &orv_analyzer::LowerResult,
+    diagnostic_count: usize,
+) -> DapRuntimeState {
+    if diagnostic_count > 0 {
+        return DapRuntimeState {
+            status: "diagnostics".to_string(),
+            stdout: String::new(),
+            error: "diagnostics present".to_string(),
+        };
+    }
+    let mut stdout = Vec::new();
+    match orv_runtime::run_with_writer(&lowered.program, &mut stdout) {
+        Ok(()) => DapRuntimeState {
+            status: "ok".to_string(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            error: String::new(),
+        },
+        Err(err) => DapRuntimeState {
+            status: "error".to_string(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            error: err.to_string(),
+        },
+    }
+}
+
+fn dap_runtime_json(runtime: &DapRuntimeState) -> serde_json::Value {
+    serde_json::json!({
+        "status": runtime.status,
+        "stdout": runtime.stdout,
+        "error": runtime.error,
+    })
+}
+
+fn dap_exception_info_json(runtime: &DapRuntimeState) -> serde_json::Value {
+    let (exception_id, description, break_mode) = match runtime.status.as_str() {
+        "diagnostics" => ("orv.diagnostics", "diagnostics present", "always"),
+        "error" => ("orv.runtime", runtime.error.as_str(), "always"),
+        _ => ("orv.none", "no exception", "never"),
+    };
+    serde_json::json!({
+        "exceptionId": exception_id,
+        "description": description,
+        "breakMode": break_mode,
+        "details": {
+            "message": description,
+            "typeName": runtime.status,
+            "stackTrace": "",
+        },
+    })
+}
+
+fn dap_evaluate_project_value(
+    launched: &DapLaunchState,
+    expression: &str,
+) -> Option<(String, String)> {
+    match expression {
+        "entry" => Some((launched.path.display().to_string(), "source".to_string())),
+        "projectGraphNodes" => Some((launched.node_count.to_string(), "usize".to_string())),
+        "diagnostics" => Some((launched.diagnostic_count.to_string(), "usize".to_string())),
+        "runtimeStatus" => Some((launched.runtime.status.clone(), "string".to_string())),
+        "stdout" => Some((launched.runtime.stdout.clone(), "string".to_string())),
+        "runtimeError" => Some((launched.runtime.error.clone(), "string".to_string())),
+        _ => None,
+    }
+}
+
+fn dap_completion_targets_json(prefix: &str) -> Vec<serde_json::Value> {
+    const EXPRESSIONS: &[&str] = &[
+        "entry",
+        "projectGraphNodes",
+        "diagnostics",
+        "runtimeStatus",
+        "stdout",
+        "runtimeError",
+    ];
+    EXPRESSIONS
+        .iter()
+        .filter(|expression| expression.starts_with(prefix))
+        .map(|expression| {
+            serde_json::json!({
+                "label": expression,
+                "type": "property",
+                "sortText": expression,
+            })
+        })
+        .collect()
+}
+
+fn dap_breakpoint_locations_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+    line: u64,
+    end_line: u64,
+) -> Vec<serde_json::Value> {
+    let start_line = line.min(end_line);
+    let end_line = line.max(end_line);
+    let mut locations = graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file_id)
+        .filter(|node| lsp_selectable_node_kind(node.kind))
+        .filter_map(|node| {
+            let file = files.iter().find(|file| file.id == node.file)?;
+            let start = byte_position(&file.source, node.span.range.start);
+            let line = u64::try_from(start.0 + 1).unwrap_or(u64::MAX);
+            let column = u64::try_from(start.1 + 1).unwrap_or(u64::MAX);
+            if line < start_line || line > end_line {
+                return None;
+            }
+            Some(serde_json::json!({
+                "line": line,
+                "column": column,
+            }))
+        })
+        .collect::<Vec<_>>();
+    locations.sort_by_key(|location| {
+        (
+            location
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+            location
+                .get("column")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        )
+    });
+    locations
+        .dedup_by(|left, right| left["line"] == right["line"] && left["column"] == right["column"]);
+    locations
+}
+
+fn dap_source_info(path: &Path, reference: u64) -> DapSourceInfo {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("source.orv")
+        .to_string();
+    DapSourceInfo {
+        reference,
+        name,
+        path: path.to_path_buf(),
+        uri: lsp_file_uri_for_path(path),
+    }
+}
+
+fn dap_source_json(source: &DapSourceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "name": source.name,
+        "path": source.path.display().to_string(),
+        "sourceReference": source.reference,
+        "uri": source.uri,
+    })
+}
+
+fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let program = request
+        .pointer("/arguments/program")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("launch.arguments.program must be a path or file URI"))?;
+    dap_path_from_protocol_string(program)
+}
+
+fn dap_source_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let path = request
+        .pointer("/arguments/source/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("source.path must be a path or file URI"))?;
+    dap_path_from_protocol_string(path)
+}
+
+fn dap_source_reference(request: &serde_json::Value) -> Option<u64> {
+    request
+        .pointer("/arguments/sourceReference")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|reference| *reference > 0)
+}
+
+fn dap_breakpoint_source_path(
+    launched: Option<&DapLaunchState>,
+    request: &serde_json::Value,
+) -> anyhow::Result<PathBuf> {
+    if let Some(reference) = request
+        .pointer("/arguments/source/sourceReference")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|reference| *reference > 0)
+    {
+        let launched = launched.ok_or_else(|| {
+            anyhow::anyhow!("launch is required before sourceReference breakpointLocations")
+        })?;
+        return launched
+            .sources
+            .iter()
+            .find(|source| source.reference == reference)
+            .map(|source| source.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("unknown sourceReference {reference}"));
+    }
+    let path = request
+        .pointer("/arguments/source/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("source.path must be a path or file URI"))?;
+    dap_path_from_protocol_string(path)
+}
+
+fn dap_path_from_protocol_string(path: &str) -> anyhow::Result<PathBuf> {
+    if path.starts_with("file://") {
+        lsp_file_uri_path(path)
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
+fn dap_normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn dap_success_response(
+    seq: u64,
+    request_seq: u64,
+    command: &str,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "response",
+        "request_seq": request_seq,
+        "success": true,
+        "command": command,
+        "body": body,
+    })
+}
+
+fn dap_error_response(
+    seq: u64,
+    request_seq: u64,
+    command: &str,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "response",
+        "request_seq": request_seq,
+        "success": false,
+        "command": command,
+        "message": message,
+    })
+}
+
+fn lsp_text_document_uri(request: &serde_json::Value) -> anyhow::Result<&str> {
+    request
+        .pointer("/params/textDocument/uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("textDocument.uri must be a file URI"))
+}
+
+fn lsp_text_document_position(request: &serde_json::Value) -> anyhow::Result<(usize, usize)> {
+    let position = request
+        .pointer("/params/position")
+        .ok_or_else(|| anyhow::anyhow!("position must be an object"))?;
+    lsp_position_value(position)
+}
+
+fn lsp_request_range(
+    request: &serde_json::Value,
+) -> anyhow::Result<((usize, usize), (usize, usize))> {
+    let start = request
+        .pointer("/params/range/start")
+        .ok_or_else(|| anyhow::anyhow!("range.start must be an object"))?;
+    let end = request
+        .pointer("/params/range/end")
+        .ok_or_else(|| anyhow::anyhow!("range.end must be an object"))?;
+    Ok((lsp_position_value(start)?, lsp_position_value(end)?))
+}
+
+fn lsp_position_value(value: &serde_json::Value) -> anyhow::Result<(usize, usize)> {
+    let line = value
+        .get("line")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("position.line must be an integer"))?;
+    let character = value
+        .get("character")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("position.character must be an integer"))?;
+    Ok((
+        usize::try_from(line).map_err(|_| anyhow::anyhow!("position.line is too large"))?,
+        usize::try_from(character)
+            .map_err(|_| anyhow::anyhow!("position.character is too large"))?,
+    ))
+}
+
+fn lsp_diagnostics_for_loaded_project(
+    loaded: &orv_project::LoadedProject,
+) -> Vec<serde_json::Value> {
+    let diagnostics = lsp_project_diagnostics(loaded);
+    lsp_diagnostics_json(&diagnostics, &loaded.files)
+}
+
+fn lsp_project_diagnostics(
+    loaded: &orv_project::LoadedProject,
+) -> Vec<orv_diagnostics::Diagnostic> {
+    let resolved = orv_resolve::resolve(&loaded.program);
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(loaded.diagnostics.clone());
+    diagnostics.extend(resolved.diagnostics);
+    diagnostics.extend(lowered.diagnostics);
+    diagnostics
+}
+
+fn lsp_workspace_diagnostic_items_json(
+    loaded: &orv_project::LoadedProject,
+) -> Vec<serde_json::Value> {
+    let resolved = orv_resolve::resolve(&loaded.program);
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    loaded
+        .files
+        .iter()
+        .filter_map(|file| {
+            let mut diagnostics = Vec::new();
+            diagnostics.extend(lsp_diagnostics_json_for_file(
+                &loaded.diagnostics,
+                &loaded.files,
+                file.id,
+            ));
+            diagnostics.extend(lsp_diagnostics_json_for_file(
+                &resolved.diagnostics,
+                &loaded.files,
+                file.id,
+            ));
+            diagnostics.extend(lsp_diagnostics_json_for_file(
+                &lowered.diagnostics,
+                &loaded.files,
+                file.id,
+            ));
+            if diagnostics.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "uri": lsp_file_uri_for_path(&file.path),
+                "version": serde_json::Value::Null,
+                "kind": "full",
+                "items": diagnostics,
+            }))
+        })
+        .collect()
+}
+
+fn lsp_source_file_for_path<'a>(files: &'a [SourceFile], path: &Path) -> Option<&'a SourceFile> {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    files
+        .iter()
+        .find(|file| file.path == path || file.path == normalized)
+}
+
+fn lsp_definition_node<'a>(
+    graph: &'a ProjectGraph,
+    name: &str,
+) -> Option<&'a orv_project::ProjectNode> {
+    graph.nodes.iter().find(|node| {
+        node.name == name
+            && matches!(
+                node.kind,
+                ProjectNodeKind::Struct
+                    | ProjectNodeKind::Enum
+                    | ProjectNodeKind::TypeAlias
+                    | ProjectNodeKind::Function
+                    | ProjectNodeKind::Define
+            )
+    })
+}
+
+fn lsp_location_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serde_json::Value {
+    let uri = files.iter().find(|file| file.id == node.file).map_or_else(
+        || "file://<unknown>".to_string(),
+        |file| lsp_file_uri_for_path(&file.path),
+    );
+    serde_json::json!({
+        "uri": uri,
+        "range": lsp_range_json(node.span, files),
+    })
+}
+
+fn lsp_hover_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serde_json::Value {
+    let kind = lsp_symbol_kind(node.kind).unwrap_or("Symbol");
+    serde_json::json!({
+        "contents": {
+            "kind": "markdown",
+            "value": format!("**{kind}** `{}`", node.name),
+        },
+        "range": lsp_range_json(node.span, files),
+    })
+}
+
+fn lsp_file_uri_for_path(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+fn lsp_position_to_byte(source: &str, position: (usize, usize)) -> usize {
+    let (target_line, target_character) = position;
+    let mut line = 0;
+    let mut character = 0;
+    for (byte, ch) in source.char_indices() {
+        if line == target_line && character == target_character {
+            return byte;
+        }
+        if ch == '\n' {
+            if line == target_line {
+                return byte;
+            }
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+    source.len()
+}
+
+fn identifier_at_byte(source: &str, byte: usize) -> Option<&str> {
+    identifier_span_at_byte(source, byte).map(|(_, _, name)| name)
+}
+
+fn identifier_span_at_byte(source: &str, byte: usize) -> Option<(usize, usize, &str)> {
+    let bytes = source.as_bytes();
+    let byte = byte.min(bytes.len());
+    let mut start = byte;
+    while start > 0 && is_identifier_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = byte;
+    while end < bytes.len() && is_identifier_byte(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    source.get(start..end).map(|name| (start, end, name))
+}
+
+fn lsp_reference_locations_json(files: &[SourceFile], name: &str) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .flat_map(|file| {
+            identifier_occurrences(&file.source, name)
+                .into_iter()
+                .map(move |(start, end)| {
+                    serde_json::json!({
+                        "uri": lsp_file_uri_for_path(&file.path),
+                        "range": lsp_range_for_source(
+                            &file.source,
+                            u32::try_from(start).unwrap_or(u32::MAX),
+                            u32::try_from(end).unwrap_or(u32::MAX),
+                        ),
+                    })
+                })
+        })
+        .collect()
+}
+
+fn identifier_occurrences(source: &str, name: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if is_identifier_byte(bytes[index]) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_identifier_byte(bytes[index]) {
+                index += 1;
+            }
+            if source.get(start..index) == Some(name) {
+                out.push((start, index));
+            }
+        } else {
+            index += 1;
+        }
+    }
+    out
+}
+
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn lsp_valid_identifier_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_') && bytes.all(is_identifier_byte)
+}
+
+fn lsp_file_uri_path(uri: &str) -> anyhow::Result<PathBuf> {
+    let raw_path = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| anyhow::anyhow!("textDocument.uri must use file://"))?;
+    Ok(PathBuf::from(percent_decode_uri_path(raw_path)?))
+}
+
+fn percent_decode_uri_path(raw: &str) -> anyhow::Result<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = bytes
+                .get(index + 1)
+                .and_then(|byte| uri_hex_value(*byte))
+                .ok_or_else(|| anyhow::anyhow!("invalid percent escape in file URI"))?;
+            let lo = bytes
+                .get(index + 2)
+                .and_then(|byte| uri_hex_value(*byte))
+                .ok_or_else(|| anyhow::anyhow!("invalid percent escape in file URI"))?;
+            out.push((hi << 4) | lo);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| anyhow::anyhow!("file URI path is not UTF-8: {e}"))
+}
+
+const fn uri_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn lsp_jsonrpc_result(id: &serde_json::Value, result: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn lsp_jsonrpc_method_not_found(id: &serde_json::Value, method: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": "method not found",
+            "data": {
+                "method": method,
+            },
+        },
+    })
+}
+
+fn lsp_jsonrpc_error(id: &serde_json::Value, code: i32, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+}
+
+fn lsp_diagnostics_json(
+    diagnostics: &[orv_diagnostics::Diagnostic],
+    files: &[SourceFile],
+) -> Vec<serde_json::Value> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| lsp_diagnostic_json(diagnostic, files))
+        .collect()
+}
+
+fn lsp_diagnostics_json_for_file(
+    diagnostics: &[orv_diagnostics::Diagnostic],
+    files: &[SourceFile],
+    file_id: FileId,
+) -> Vec<serde_json::Value> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| lsp_diagnostic_file_id(diagnostic) == Some(file_id))
+        .map(|diagnostic| lsp_diagnostic_json(diagnostic, files))
+        .collect()
+}
+
+fn lsp_diagnostic_json(
+    diagnostic: &orv_diagnostics::Diagnostic,
+    files: &[SourceFile],
+) -> serde_json::Value {
+    let span = lsp_diagnostic_span(diagnostic);
+    serde_json::json!({
+        "source": "orv",
+        "severity": lsp_severity(diagnostic.severity),
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "range": lsp_range_json(span, files),
+    })
+}
+
+fn lsp_diagnostic_span(diagnostic: &orv_diagnostics::Diagnostic) -> Span {
+    diagnostic
+        .primary
+        .as_ref()
+        .map(|label| label.span)
+        .or_else(|| diagnostic.secondary.first().map(|label| label.span))
+        .unwrap_or(Span::DUMMY)
+}
+
+fn lsp_diagnostic_file_id(diagnostic: &orv_diagnostics::Diagnostic) -> Option<FileId> {
+    diagnostic
+        .primary
+        .as_ref()
+        .map(|label| label.span.file)
+        .or_else(|| diagnostic.secondary.first().map(|label| label.span.file))
+}
+
+fn lsp_document_symbols_json(graph: &ProjectGraph, files: &[SourceFile]) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            lsp_symbol_kind(node.kind).map(|kind| {
+                serde_json::json!({
+                    "name": node.name,
+                    "kind": kind,
+                    "range": lsp_range_json(node.span, files),
+                    "selectionRange": lsp_range_json(node.span, files),
+                    "source_node": node.id,
+                })
+            })
+        })
+        .collect()
+}
+
+fn lsp_document_symbols_protocol_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            lsp_symbol_kind_code(node.kind).map(|kind| {
+                serde_json::json!({
+                    "name": node.name,
+                    "kind": kind,
+                    "range": lsp_range_json(node.span, files),
+                    "selectionRange": lsp_range_json(node.span, files),
+                    "data": {
+                        "source_node": node.id,
+                    },
+                })
+            })
+        })
+        .collect()
+}
+
+fn lsp_code_lenses_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file_id)
+        .filter_map(|node| {
+            let kind = lsp_symbol_kind(node.kind)?;
+            Some(serde_json::json!({
+                "range": lsp_range_json(node.span, files),
+                "command": {
+                    "title": format!("Reveal {kind} {}", node.name),
+                    "command": "orv.revealSourceNode",
+                    "arguments": [node.id, node.name],
+                },
+                "data": {
+                    "source_node": node.id,
+                },
+            }))
+        })
+        .collect()
+}
+
+fn lsp_code_actions_json(
+    loaded: &orv_project::LoadedProject,
+    file: &SourceFile,
+    requested_start: usize,
+    requested_end: usize,
+) -> Vec<serde_json::Value> {
+    let uri = lsp_file_uri_for_path(&file.path);
+    let start = u32::try_from(requested_start.min(requested_end)).unwrap_or(u32::MAX);
+    let end = u32::try_from(requested_start.max(requested_end)).unwrap_or(u32::MAX);
+    lsp_project_diagnostics(loaded)
+        .iter()
+        .filter(|diagnostic| lsp_diagnostic_file_id(diagnostic) == Some(file.id))
+        .filter(|diagnostic| lsp_span_overlaps_range(lsp_diagnostic_span(diagnostic), start, end))
+        .map(|diagnostic| {
+            let diagnostic_json = lsp_diagnostic_json(diagnostic, &loaded.files);
+            let range = diagnostic_json
+                .get("range")
+                .cloned()
+                .unwrap_or_else(|| lsp_range_for_source(&file.source, start, end));
+            serde_json::json!({
+                "title": format!("Reveal diagnostic: {}", diagnostic.message),
+                "kind": "quickfix",
+                "diagnostics": [diagnostic_json],
+                "command": {
+                    "title": "Reveal diagnostic",
+                    "command": "orv.revealDiagnostic",
+                    "arguments": [
+                        uri,
+                        range,
+                        diagnostic.code.clone().unwrap_or_default(),
+                        diagnostic.message,
+                    ],
+                },
+            })
+        })
+        .collect()
+}
+
+fn lsp_execute_reveal_diagnostic_json(request: &serde_json::Value) -> serde_json::Value {
+    let uri = request
+        .pointer("/params/arguments/0")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let range = request
+        .pointer("/params/arguments/1")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let code = request
+        .pointer("/params/arguments/2")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let message = request
+        .pointer("/params/arguments/3")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "command": "orv.revealDiagnostic",
+        "uri": uri,
+        "range": range,
+        "code": code,
+        "message": message,
+    })
+}
+
+const fn lsp_span_overlaps_range(span: Span, start: u32, end: u32) -> bool {
+    span.range.start <= end && start <= span.range.end
+}
+
+fn lsp_document_links_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ProjectNodeKind::Import && node.file == file_id)
+        .filter_map(|node| {
+            let target = graph
+                .edges
+                .iter()
+                .find(|edge| edge.kind == ProjectEdgeKind::Imports && edge.from == node.id)?;
+            let target_node = graph
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == target.to)?;
+            let target_file = files.iter().find(|file| file.id == target_node.file)?;
+            Some(serde_json::json!({
+                "range": lsp_range_json(node.span, files),
+                "target": lsp_file_uri_for_path(&target_file.path),
+                "tooltip": format!("Open {}", target_node.name),
+            }))
+        })
+        .collect()
+}
+
+fn lsp_folding_ranges_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file_id)
+        .filter(|node| {
+            matches!(
+                node.kind,
+                ProjectNodeKind::Struct
+                    | ProjectNodeKind::Enum
+                    | ProjectNodeKind::TypeAlias
+                    | ProjectNodeKind::Function
+                    | ProjectNodeKind::Define
+                    | ProjectNodeKind::Domain
+            )
+        })
+        .filter_map(|node| lsp_folding_range_json(node.span, files))
+        .collect()
+}
+
+fn lsp_folding_range_json(span: Span, files: &[SourceFile]) -> Option<serde_json::Value> {
+    let file = files.iter().find(|file| file.id == span.file)?;
+    let start = byte_position(&file.source, span.range.start);
+    let end = byte_position(&file.source, span.range.end);
+    if end.0 <= start.0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "startLine": start.0,
+        "startCharacter": start.1,
+        "endLine": end.0,
+        "endCharacter": end.1,
+        "kind": "region",
+    }))
+}
+
+fn lsp_selection_range_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+    byte: usize,
+) -> Option<serde_json::Value> {
+    let byte = u32::try_from(byte).unwrap_or(u32::MAX);
+    let mut nodes: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file_id)
+        .filter(|node| lsp_selectable_node_kind(node.kind))
+        .filter(|node| node.span.range.start <= byte && byte <= node.span.range.end)
+        .collect();
+    nodes.sort_by_key(|node| node.span.range.end.saturating_sub(node.span.range.start));
+
+    let mut current = None;
+    for node in nodes.into_iter().rev() {
+        current = Some(serde_json::json!({
+            "range": lsp_range_json(node.span, files),
+            "parent": current.unwrap_or(serde_json::Value::Null),
+        }));
+    }
+    current
+}
+
+const fn lsp_selectable_node_kind(kind: ProjectNodeKind) -> bool {
+    matches!(
+        kind,
+        ProjectNodeKind::Struct
+            | ProjectNodeKind::Enum
+            | ProjectNodeKind::TypeAlias
+            | ProjectNodeKind::Function
+            | ProjectNodeKind::Define
+            | ProjectNodeKind::Domain
+            | ProjectNodeKind::Import
+    )
+}
+
+#[derive(Clone, Copy)]
+struct LspSemanticToken {
+    line: usize,
+    character: usize,
+    length: usize,
+    token_type: u32,
+    modifiers: u32,
+}
+
+fn lsp_semantic_tokens_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    file_id: FileId,
+) -> serde_json::Value {
+    let Some(file) = files.iter().find(|file| file.id == file_id) else {
+        return serde_json::json!({ "data": [] });
+    };
+    let mut tokens = graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file_id)
+        .filter_map(|node| {
+            let token_type = lsp_semantic_token_type(node.kind)?;
+            let (start, end) = lsp_node_name_span(&file.source, node)?;
+            let start = byte_position(&file.source, start);
+            let end = byte_position(&file.source, end);
+            if start.0 != end.0 || end.1 <= start.1 {
+                return None;
+            }
+            Some(LspSemanticToken {
+                line: start.0,
+                character: start.1,
+                length: end.1 - start.1,
+                token_type,
+                modifiers: 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    tokens.sort_by_key(|token| (token.line, token.character));
+
+    let mut data = Vec::with_capacity(tokens.len() * 5);
+    let mut previous_line = 0;
+    let mut previous_character = 0;
+    for token in tokens {
+        let delta_line = token.line.saturating_sub(previous_line);
+        let delta_character = if delta_line == 0 {
+            token.character.saturating_sub(previous_character)
+        } else {
+            token.character
+        };
+        data.push(u32::try_from(delta_line).unwrap_or(u32::MAX));
+        data.push(u32::try_from(delta_character).unwrap_or(u32::MAX));
+        data.push(u32::try_from(token.length).unwrap_or(u32::MAX));
+        data.push(token.token_type);
+        data.push(token.modifiers);
+        previous_line = token.line;
+        previous_character = token.character;
+    }
+    serde_json::json!({ "data": data })
+}
+
+fn lsp_node_name_span(source: &str, node: &orv_project::ProjectNode) -> Option<(u32, u32)> {
+    let start = usize::try_from(node.span.range.start)
+        .ok()?
+        .min(source.len());
+    let end = usize::try_from(node.span.range.end).ok()?.min(source.len());
+    let span_source = source.get(start..end)?;
+    let offset = span_source.find(&node.name)?;
+    let start = start + offset;
+    let end = start + node.name.len();
+    Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?))
+}
+
+const fn lsp_semantic_token_type(kind: ProjectNodeKind) -> Option<u32> {
+    match kind {
+        ProjectNodeKind::Domain => Some(0),
+        ProjectNodeKind::Struct | ProjectNodeKind::Enum | ProjectNodeKind::TypeAlias => Some(1),
+        ProjectNodeKind::Function | ProjectNodeKind::Define => Some(2),
+        ProjectNodeKind::File | ProjectNodeKind::Import => None,
+    }
+}
+
+fn lsp_completion_items_json(graph: &ProjectGraph) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    for node in &graph.nodes {
+        let Some(kind) = lsp_completion_item_kind_code(node.kind) else {
+            continue;
+        };
+        if items.iter().any(|item: &serde_json::Value| {
+            item.get("label").and_then(serde_json::Value::as_str) == Some(node.name.as_str())
+                && item.get("kind").and_then(serde_json::Value::as_u64) == Some(u64::from(kind))
+        }) {
+            continue;
+        }
+        items.push(serde_json::json!({
+            "label": node.name.clone(),
+            "kind": kind,
+            "detail": lsp_symbol_kind(node.kind).unwrap_or("Symbol"),
+            "data": {
+                "source_node": node.id,
+            },
+        }));
+    }
+    items
+}
+
+fn lsp_workspace_symbols_json(
+    graph: &ProjectGraph,
+    files: &[SourceFile],
+    query: &str,
+) -> Vec<serde_json::Value> {
+    let normalized_query = query.to_ascii_lowercase();
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let kind = lsp_symbol_kind_code(node.kind)?;
+            if !normalized_query.is_empty()
+                && !node
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(normalized_query.as_str())
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "name": node.name,
+                "kind": kind,
+                "location": lsp_location_json(node, files),
+                "data": {
+                    "source_node": node.id,
+                },
+            }))
+        })
+        .collect()
+}
+
+const fn lsp_severity(severity: orv_diagnostics::Severity) -> u8 {
+    match severity {
+        orv_diagnostics::Severity::Error => 1,
+        orv_diagnostics::Severity::Warning => 2,
+        orv_diagnostics::Severity::Note => 3,
+        orv_diagnostics::Severity::Help => 4,
+    }
+}
+
+const fn lsp_symbol_kind(kind: ProjectNodeKind) -> Option<&'static str> {
+    match kind {
+        ProjectNodeKind::Struct => Some("Struct"),
+        ProjectNodeKind::Enum => Some("Enum"),
+        ProjectNodeKind::TypeAlias => Some("TypeAlias"),
+        ProjectNodeKind::Function => Some("Function"),
+        ProjectNodeKind::Define => Some("Function"),
+        ProjectNodeKind::Domain => Some("Event"),
+        ProjectNodeKind::File | ProjectNodeKind::Import => None,
+    }
+}
+
+const fn lsp_symbol_kind_code(kind: ProjectNodeKind) -> Option<u8> {
+    match kind {
+        ProjectNodeKind::Struct | ProjectNodeKind::TypeAlias => Some(23),
+        ProjectNodeKind::Enum => Some(10),
+        ProjectNodeKind::Function | ProjectNodeKind::Define => Some(12),
+        ProjectNodeKind::Domain => Some(24),
+        ProjectNodeKind::File | ProjectNodeKind::Import => None,
+    }
+}
+
+const fn lsp_completion_item_kind_code(kind: ProjectNodeKind) -> Option<u8> {
+    match kind {
+        ProjectNodeKind::Struct | ProjectNodeKind::TypeAlias => Some(22),
+        ProjectNodeKind::Enum => Some(13),
+        ProjectNodeKind::Function | ProjectNodeKind::Define => Some(3),
+        ProjectNodeKind::Domain => Some(23),
+        ProjectNodeKind::File | ProjectNodeKind::Import => None,
+    }
+}
+
+fn lsp_range_json(span: Span, files: &[SourceFile]) -> serde_json::Value {
+    let Some(file) = files.iter().find(|file| file.id == span.file) else {
+        return serde_json::json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 },
+        });
+    };
+    let start = byte_position(&file.source, span.range.start);
+    let end = byte_position(&file.source, span.range.end);
+    lsp_range_from_positions(start, end)
+}
+
+fn lsp_range_for_source(source: &str, start: u32, end: u32) -> serde_json::Value {
+    lsp_range_from_positions(byte_position(source, start), byte_position(source, end))
+}
+
+fn lsp_range_from_positions(start: (usize, usize), end: (usize, usize)) -> serde_json::Value {
+    serde_json::json!({
+        "start": {
+            "line": start.0,
+            "character": start.1,
+        },
+        "end": {
+            "line": end.0,
+            "character": end.1,
+        },
+    })
+}
+
+fn byte_position(source: &str, byte: u32) -> (usize, usize) {
+    let byte = usize::try_from(byte)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let prefix = source.get(..byte).unwrap_or(source);
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let character = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count();
+    (line, character)
+}
+
+fn current_db_schema_snapshot(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let entry = project_entry_path(path)?;
+    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    Ok(db_schema_snapshot_json(&loaded.program))
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    let temp = atomic_temp_path(path);
+    let bytes = serde_json::to_vec_pretty(value)?;
+    std::fs::write(&temp, bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", temp.display()))?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to replace {} with {}: {e}",
+            path.display(),
+            temp.display()
+        )
+    })
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("schema.json");
+    path.with_file_name(format!(".{file_name}.tmp"))
+}
+
+fn rollback_schema_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("schema.json");
+    path.with_file_name(format!("{file_name}.rollback"))
+}
+
+fn stable_json_hash(value: &serde_json::Value) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(format!("{:016x}", fnv1a64(&bytes)))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x00000100000001b3);
+    }
+    hash
+}
+
+fn empty_db_schema_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "structs": {},
+    })
+}
+
+fn db_schema_snapshot_json(program: &Program) -> serde_json::Value {
+    let mut structs = serde_json::Map::new();
+    for item in &program.items {
+        let Stmt::Struct(stmt) = item else {
+            continue;
+        };
+        let mut fields = serde_json::Map::new();
+        for field in &stmt.fields {
+            fields.insert(
+                field.name.name.clone(),
+                serde_json::json!({
+                    "type": type_ref_string(&field.ty),
+                    "optional": type_ref_optional(&field.ty),
+                    "span": span_json(field.span),
+                }),
+            );
+        }
+        structs.insert(
+            stmt.name.name.clone(),
+            serde_json::json!({
+                "fields": fields,
+                "span": span_json(stmt.span),
+            }),
+        );
+    }
+    serde_json::json!({
+        "schema_version": 1,
+        "structs": structs,
+    })
+}
+
+fn db_schema_diff_actions(
+    applied_schema: &serde_json::Value,
+    current_schema: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(current_structs) = current_schema
+        .get("structs")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let empty = serde_json::Map::new();
+    let applied_structs = applied_schema
+        .get("structs")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(&empty);
+    let mut actions = Vec::new();
+    for (struct_name, current_struct) in current_structs {
+        let Some(applied_struct) = applied_structs.get(struct_name) else {
+            actions.push(serde_json::json!({
+                "kind": "create_struct",
+                "struct": struct_name,
+                "fields": schema_fields(current_struct).cloned().unwrap_or_default(),
+            }));
+            continue;
+        };
+        diff_schema_fields(struct_name, applied_struct, current_struct, &mut actions);
+    }
+    for struct_name in applied_structs.keys() {
+        if !current_structs.contains_key(struct_name) {
+            actions.push(serde_json::json!({
+                "kind": "drop_struct",
+                "struct": struct_name,
+            }));
+        }
+    }
+    actions
+}
+
+fn diff_schema_fields(
+    struct_name: &str,
+    applied_struct: &serde_json::Value,
+    current_struct: &serde_json::Value,
+    actions: &mut Vec<serde_json::Value>,
+) {
+    let empty = serde_json::Map::new();
+    let applied_fields = schema_fields(applied_struct).unwrap_or(&empty);
+    let current_fields = schema_fields(current_struct).unwrap_or(&empty);
+    for (field_name, current_field) in current_fields {
+        let Some(applied_field) = applied_fields.get(field_name) else {
+            actions.push(schema_field_action(
+                "add_field",
+                struct_name,
+                field_name,
+                current_field,
+            ));
+            continue;
+        };
+        if applied_field.get("type") != current_field.get("type")
+            || applied_field.get("optional") != current_field.get("optional")
+        {
+            let mut action =
+                schema_field_action("change_field", struct_name, field_name, current_field);
+            action["from"] = applied_field.clone();
+            actions.push(action);
+        }
+    }
+    for field_name in applied_fields.keys() {
+        if !current_fields.contains_key(field_name) {
+            actions.push(serde_json::json!({
+                "kind": "drop_field",
+                "struct": struct_name,
+                "field": field_name,
+            }));
+        }
+    }
+}
+
+fn schema_fields(value: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value.get("fields").and_then(serde_json::Value::as_object)
+}
+
+fn schema_field_action(
+    kind: &str,
+    struct_name: &str,
+    field_name: &str,
+    field: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "struct": struct_name,
+        "field": field_name,
+        "type": field.get("type").cloned().unwrap_or(serde_json::Value::Null),
+        "optional": field.get("optional").cloned().unwrap_or(serde_json::Value::Bool(false)),
+    })
+}
+
+fn type_ref_string(ty: &TypeRef) -> String {
+    let mut base = match &ty.kind {
+        TypeRefKind::Named(id) => id.name.clone(),
+        TypeRefKind::Nullable(inner) => format!("{}?", type_ref_string(inner)),
+        TypeRefKind::Array(inner) => format!("{}[]", type_ref_string(inner)),
+        TypeRefKind::Pattern(pattern) => format!("\"{pattern}\""),
+        TypeRefKind::Union(items) => items
+            .iter()
+            .map(type_ref_string)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        TypeRefKind::InlineObject(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, ty)| format!("{}: {}", name.name, type_ref_string(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
+        TypeRefKind::Tuple(items) => {
+            let items = items
+                .iter()
+                .map(type_ref_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({items})")
+        }
+    };
+    if !ty.constraints.is_empty() {
+        base.push('(');
+        base.push_str(
+            &ty.constraints
+                .iter()
+                .map(type_constraint_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        base.push(')');
+    }
+    base
+}
+
+fn type_ref_optional(ty: &TypeRef) -> bool {
+    matches!(ty.kind, TypeRefKind::Nullable(_))
+}
+
+fn type_constraint_string(constraint: &TypeConstraint) -> String {
+    match constraint {
+        TypeConstraint::Flag(name) => name.clone(),
+        TypeConstraint::ExactInt(value) => value.to_string(),
+        TypeConstraint::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            let sep = if *inclusive { "..=" } else { ".." };
+            format!(
+                "{}{sep}{}",
+                start.map_or_else(String::new, |value| value.to_string()),
+                end.map_or_else(String::new, |value| value.to_string())
+            )
+        }
+        TypeConstraint::KeyValue { key, value } => {
+            format!("{key}={}", constraint_value_string(value))
+        }
+    }
+}
+
+fn constraint_value_string(value: &ConstraintValue) -> String {
+    match value {
+        ConstraintValue::Int(value) => value.to_string(),
+        ConstraintValue::String(value) => format!("\"{value}\""),
+        ConstraintValue::Bool(value) => value.to_string(),
+        ConstraintValue::Ident(value) => value.clone(),
+    }
+}
+
+fn cmd_verify_build(dir: &Path) -> anyhow::Result<()> {
+    verify_build_dir(dir)?;
+    println!("build: {} verified", dir.display());
+    Ok(())
+}
+
+fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
+    let manifest = read_json_value(&dir.join("build-manifest.json"))?;
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    verify_bundle_targets(dir, &plan)?;
+    verify_manifest_artifacts(dir, &manifest)
+}
+
+fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("build manifest artifacts must be an array"))?;
+    for artifact in artifacts {
+        let kind = json_str(artifact, "kind", "build manifest artifact")?;
+        let path = json_str(artifact, "path", "build manifest artifact")?;
+        let artifact_path = dir.join(path);
+        if !artifact_path.is_file() {
+            anyhow::bail!(
+                "missing manifest artifact {kind}: {}",
+                artifact_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result<()> {
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    for bundle in bundles {
+        let kind = json_str(bundle, "kind", "bundle target")?;
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target = dir.join(path);
+        if !target.is_file() {
+            anyhow::bail!("missing bundle target {kind}: {}", target.display());
+        }
+        match kind {
+            "server_runtime" => {
+                let artifact = read_server_artifact(&target)?;
+                orv_compiler::verify_server_runtime_artifact(&artifact)
+                    .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+            }
+            "server_launcher" => verify_server_launcher_target(dir, &target)?,
+            "static_page" => verify_static_page_target(bundle, &target)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn verify_server_launcher_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
+    let launch = read_server_launch_artifact(target)?;
+    if launch.protocol != "http1" {
+        anyhow::bail!("server launcher protocol must be http1");
+    }
+    let expected = vec![
+        "orv".to_string(),
+        "run-artifact".to_string(),
+        launch.artifact.clone(),
+    ];
+    if launch.command != expected {
+        anyhow::bail!("server launcher command must be `orv run-artifact <artifact>`");
+    }
+    let artifact = read_server_artifact(&dir.join(&launch.artifact))?;
+    orv_compiler::verify_server_runtime_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    if launch.runtime != artifact.runtime {
+        anyhow::bail!("server launcher runtime does not match runtime artifact");
+    }
+    if launch.routes != artifact.routes {
+        anyhow::bail!("server launcher routes do not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_static_page_target(bundle: &serde_json::Value, target: &Path) -> anyhow::Result<()> {
+    let runtime_features = bundle
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("static_page runtime_features must be an array"))?;
+    if !runtime_features.is_empty() {
+        anyhow::bail!("static_page bundle must be zero-runtime");
+    }
+    let html = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    let trimmed = html.trim_start();
+    if trimmed.is_empty() {
+        anyhow::bail!("static_page bundle is empty: {}", target.display());
+    }
+    if !(trimmed.starts_with("<html") || trimmed.starts_with("<!doctype")) {
+        anyhow::bail!("static_page bundle is not html: {}", target.display());
+    }
+    Ok(())
+}
+
+fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))
+}
+
+fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json::Value> {
+    let origin_map = read_origin_map(dir)?;
+    let entry = origin_map
+        .entries
+        .iter()
+        .find(|entry| entry.id == origin_id)
+        .ok_or_else(|| anyhow::anyhow!("origin id `{origin_id}` not found"))?;
+    let graph = read_json_value(&dir.join("project-graph.json"))?;
+    let file_paths = graph_file_paths(&graph);
+    let server_artifacts = read_server_artifacts(dir)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "origin": entry,
+        "source": reveal_source(entry, &file_paths, &server_artifacts),
+        "project_graph": reveal_project_graph_node(&graph, origin_id),
+        "production": {
+            "routes": reveal_routes(origin_id, &server_artifacts),
+        },
+    }))
+}
+
+fn read_origin_map(dir: &Path) -> anyhow::Result<orv_compiler::OriginMap> {
+    serde_json::from_value(read_json_value(&dir.join("origin-map.json"))?)
+        .map_err(|e| anyhow::anyhow!("failed to parse origin-map.json: {e}"))
+}
+
+fn read_server_artifacts(
+    dir: &Path,
+) -> anyhow::Result<Vec<(String, orv_compiler::ServerRuntimeArtifact)>> {
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let mut artifacts = Vec::new();
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(artifacts);
+    };
+    for bundle in bundles {
+        if bundle.get("kind").and_then(serde_json::Value::as_str) != Some("server_runtime") {
+            continue;
+        }
+        let path = json_str(bundle, "path", "bundle target")?;
+        let artifact = read_server_artifact(&dir.join(path))?;
+        artifacts.push((path.to_string(), artifact));
+    }
+    Ok(artifacts)
+}
+
+fn graph_file_paths(graph: &serde_json::Value) -> HashMap<u32, String> {
+    let mut paths = HashMap::new();
+    let Some(nodes) = graph.get("nodes").and_then(serde_json::Value::as_array) else {
+        return paths;
+    };
+    for node in nodes {
+        if node.get("kind").and_then(serde_json::Value::as_str) != Some("file") {
+            continue;
+        }
+        let Some(file) = node.get("file").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(path) = node.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Ok(file) = u32::try_from(file) {
+            paths.insert(file, path.to_string());
+        }
+    }
+    paths
+}
+
+fn reveal_source(
+    entry: &orv_compiler::OriginEntry,
+    file_paths: &HashMap<u32, String>,
+    server_artifacts: &[(String, orv_compiler::ServerRuntimeArtifact)],
+) -> serde_json::Value {
+    let mut path = file_paths.get(&entry.span.file).cloned();
+    let mut source = None;
+    if let Ok(file_index) = usize::try_from(entry.span.file) {
+        for (_, artifact) in server_artifacts {
+            if let Some(file) = artifact.source_bundle.files.get(file_index) {
+                path = Some(file.path.clone());
+                source = Some(file.source.clone());
+                break;
+            }
+        }
+    }
+    if source.is_none() {
+        if let Some(path) = &path {
+            source = std::fs::read_to_string(path).ok();
+        }
+    }
+    let snippet = source.as_deref().and_then(|source| {
+        byte_snippet(source, entry.span.start, entry.span.end).map(ToString::to_string)
+    });
+    serde_json::json!({
+        "file": entry.span.file,
+        "path": path,
+        "start": entry.span.start,
+        "end": entry.span.end,
+        "snippet": snippet,
+    })
+}
+
+fn byte_snippet(source: &str, start: u32, end: u32) -> Option<&str> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    source.get(start..end)
+}
+
+fn reveal_project_graph_node(graph: &serde_json::Value, origin_id: &str) -> serde_json::Value {
+    let Some(nodes) = graph.get("nodes").and_then(serde_json::Value::as_array) else {
+        return serde_json::Value::Null;
+    };
+    let Some(links) = graph
+        .get("semantic")
+        .and_then(|semantic| semantic.get("origin_links"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return serde_json::Value::Null;
+    };
+    let Some(link) = links
+        .iter()
+        .find(|link| link.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id))
+    else {
+        return serde_json::Value::Null;
+    };
+    let Some(node_id) = link.get("node_id") else {
+        return serde_json::Value::Null;
+    };
+    nodes
+        .iter()
+        .find(|node| node.get("id") == Some(node_id))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn reveal_routes(
+    origin_id: &str,
+    server_artifacts: &[(String, orv_compiler::ServerRuntimeArtifact)],
+) -> Vec<serde_json::Value> {
+    let mut routes = Vec::new();
+    for (artifact_path, artifact) in server_artifacts {
+        for route in artifact
+            .routes
+            .iter()
+            .filter(|route| route.origin_id == origin_id)
+        {
+            routes.push(serde_json::json!({
+                "artifact": artifact_path,
+                "method": route.method,
+                "path": route.path,
+                "origin_id": route.origin_id,
+            }));
+        }
+    }
+    routes
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> anyhow::Result<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{context} field `{key}` must be a string"))
+}
+
+fn json_u32(value: &serde_json::Value, key: &str, context: &str) -> anyhow::Result<u32> {
+    let raw = value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("{context} field `{key}` must be an integer"))?;
+    u32::try_from(raw).map_err(|_| anyhow::anyhow!("{context} field `{key}` is too large"))
+}
+
+fn cmd_verify_artifact(path: &Path) -> anyhow::Result<()> {
+    let artifact = read_server_artifact(path)?;
+    orv_compiler::verify_server_runtime_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    println!(
+        "artifact: {} verified (routes={}, sources={})",
+        path.display(),
+        artifact.routes.len(),
+        artifact.source_bundle.files.len()
+    );
+    Ok(())
+}
+
+fn cmd_check_artifact(path: &Path) -> anyhow::Result<()> {
+    let artifact = read_server_artifact(path)?;
+    orv_compiler::verify_server_runtime_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    let lowered = lower_artifact_entry(&artifact)?;
+    println!(
+        "artifact: {} checked (routes={}, sources={}, items={})",
+        path.display(),
+        artifact.routes.len(),
+        artifact.source_bundle.files.len(),
+        lowered.program.items.len()
+    );
+    Ok(())
+}
+
+fn cmd_run_artifact(path: &Path) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    run_artifact_with_writer(path, &mut stdout)
+}
+
+fn cmd_run_build(dir: &Path) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    run_build_with_writer(dir, &mut stdout)
+}
+
+fn cmd_dev(path: &Path, out: &Path) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    dev_with_writer(path, out, &mut stdout)
+}
+
+fn dev_with_writer<W: std::io::Write>(
+    path: &Path,
+    out: &Path,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    cmd_build(path, out)?;
+    verify_build_dir(out)?;
+    run_build_with_writer(out, writer)
+}
+
+fn run_build_with_writer<W: std::io::Write>(dir: &Path, writer: &mut W) -> anyhow::Result<()> {
+    let plan_path = dir.join("bundle-plan.json");
+    if plan_path.is_file() {
+        let plan = read_json_value(&plan_path)?;
+        if let Some(launcher) = bundle_target_path(&plan, "server_launcher")? {
+            let launch_path = dir.join(launcher);
+            verify_server_launcher_target(dir, &launch_path)?;
+            let launch = read_server_launch_artifact(&launch_path)?;
+            return run_artifact_with_writer(&dir.join(launch.artifact), writer);
+        }
+        return run_static_build_with_writer(dir, writer);
+    }
+    let launch_path = dir.join("server").join("launch.json");
+    if launch_path.is_file() {
+        verify_server_launcher_target(dir, &launch_path)?;
+        let launch = read_server_launch_artifact(&launch_path)?;
+        return run_artifact_with_writer(&dir.join(launch.artifact), writer);
+    }
+    run_static_build_with_writer(dir, writer)
+}
+
+fn bundle_target_path(plan: &serde_json::Value, kind: &str) -> anyhow::Result<Option<String>> {
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    for bundle in bundles {
+        if bundle.get("kind").and_then(serde_json::Value::as_str) == Some(kind) {
+            return Ok(Some(json_str(bundle, "path", "bundle target")?.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn run_static_build_with_writer<W: std::io::Write>(
+    dir: &Path,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    let bundle = bundles
+        .iter()
+        .find(|bundle| {
+            bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+        })
+        .ok_or_else(|| anyhow::anyhow!("build has no server launcher or static page target"))?;
+    let path = json_str(bundle, "path", "bundle target")?;
+    let target = dir.join(path);
+    verify_static_page_target(bundle, &target)?;
+    let html = std::fs::read_to_string(&target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    writer.write_all(html.as_bytes())?;
+    Ok(())
+}
+
+fn run_artifact_with_writer<W: std::io::Write>(path: &Path, writer: &mut W) -> anyhow::Result<()> {
+    let artifact = read_server_artifact(path)?;
+    orv_compiler::verify_server_runtime_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    let lowered = lower_artifact_entry(&artifact)?;
+    orv_runtime::run_with_writer(&lowered.program, writer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn lsp_serve_stdio_stream<R, W>(reader: &mut R, writer: &mut W) -> anyhow::Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    let mut session = LspSession::default();
+    loop {
+        let Some(content_length) = read_lsp_content_length(reader)? else {
+            return Ok(());
+        };
+        let mut body = vec![0_u8; content_length];
+        std::io::Read::read_exact(reader, &mut body)?;
+        let request: serde_json::Value = serde_json::from_slice(&body)?;
+        if let Some(response) = session.message_response(&request) {
+            write_lsp_response_frame(writer, &response)?;
+            writer.flush()?;
+        }
+    }
+}
+
+fn dap_serve_stdio_stream<R, W>(reader: &mut R, writer: &mut W) -> anyhow::Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    let mut session = DapSession::default();
+    loop {
+        let Some(content_length) = read_lsp_content_length(reader)? else {
+            return Ok(());
+        };
+        let mut body = vec![0_u8; content_length];
+        std::io::Read::read_exact(reader, &mut body)?;
+        let request: serde_json::Value = serde_json::from_slice(&body)?;
+        if let Some(response) = session.message_response(&request) {
+            write_lsp_response_frame(writer, &response)?;
+            writer.flush()?;
+        }
+    }
+}
+
+#[cfg(test)]
+fn lsp_stdio_response(input: &str) -> anyhow::Result<String> {
+    let mut reader = std::io::Cursor::new(input.as_bytes());
+    let mut writer = Vec::new();
+    lsp_serve_stdio_stream(&mut reader, &mut writer)?;
+    String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid utf-8 LSP response: {e}"))
+}
+
+#[cfg(test)]
+fn dap_stdio_response(input: &str) -> anyhow::Result<String> {
+    let mut reader = std::io::Cursor::new(input.as_bytes());
+    let mut writer = Vec::new();
+    dap_serve_stdio_stream(&mut reader, &mut writer)?;
+    String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid utf-8 DAP response: {e}"))
+}
+
+fn read_lsp_content_length<R: std::io::BufRead>(reader: &mut R) -> anyhow::Result<Option<usize>> {
+    let mut content_length = None;
+    let mut saw_header = false;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            if saw_header {
+                anyhow::bail!("incomplete LSP header");
+            }
+            return Ok(None);
+        }
+        let header = line.trim_end_matches('\n').trim_end_matches('\r');
+        if header.is_empty() {
+            break;
+        }
+        saw_header = true;
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("Content-Length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| anyhow::anyhow!("invalid Content-Length: {e}"))?,
+            );
+        }
+    }
+    content_length
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("missing Content-Length header"))
+}
+
+fn write_lsp_response_frame<W: std::io::Write>(
+    writer: &mut W,
+    response: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let body = serde_json::to_string(response)?;
+    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    Ok(())
+}
+
+fn read_server_artifact(path: &Path) -> anyhow::Result<orv_compiler::ServerRuntimeArtifact> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))
+}
+
+fn read_server_launch_artifact(path: &Path) -> anyhow::Result<orv_compiler::ServerLaunchArtifact> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))
+}
+
+fn lower_artifact_entry(
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<orv_analyzer::LowerResult> {
+    let entry = artifact_entry_path(artifact)?;
+    let loaded = orv_project::load_project_from_sources(
+        &entry,
+        artifact
+            .source_bundle
+            .files
+            .iter()
+            .map(|file| (PathBuf::from(&file.path), file.source.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
+    Ok(lowered)
+}
+
+fn artifact_entry_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> anyhow::Result<PathBuf> {
+    let entry = normalized_artifact_path(&artifact.entry);
+    if let Some(file) = artifact.source_bundle.files.iter().find(|file| {
+        let path = normalized_artifact_path(&file.path);
+        path == entry || path.ends_with(&entry)
+    }) {
+        return Ok(PathBuf::from(&file.path));
+    }
+    if artifact.source_bundle.files.len() == 1 {
+        return Ok(PathBuf::from(&artifact.source_bundle.files[0].path));
+    }
+    anyhow::bail!("entry source `{}` not found in artifact", artifact.entry)
+}
+
+fn normalized_artifact_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
+    let origin_map = orv_compiler::origin_map(&lowered.program);
+    let graph = project_graph_json(&loaded.graph, &origin_map);
+    let manifest = orv_compiler::build_manifest(entry.display().to_string(), &origin_map);
+    let bundle_plan = orv_compiler::bundle_plan(&manifest);
+    let static_page = bundle_plan
+        .bundles
+        .iter()
+        .find(|bundle| bundle.kind == "static_page")
+        .map(|bundle| {
+            render_static_page(&lowered).map(|html| (PathBuf::from(bundle.path.clone()), html))
+        })
+        .transpose()?;
+    let server_artifact_path = "server/app.orv-runtime.json";
+    let server_launch_path = "server/launch.json";
+    let server_artifact = manifest.capabilities.has_server.then(|| {
+        orv_compiler::server_runtime_artifact(
+            &manifest,
+            &origin_map,
+            loaded
+                .files
+                .iter()
+                .map(|file| (file.path.display().to_string(), file.source.clone())),
+        )
+    });
+
+    std::fs::create_dir_all(out)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", out.display()))?;
+    write_json(
+        &out.join("build-manifest.json"),
+        &serde_json::to_value(manifest)?,
+    )?;
+    write_json(
+        &out.join("bundle-plan.json"),
+        &serde_json::to_value(bundle_plan)?,
+    )?;
+    write_json(
+        &out.join("origin-map.json"),
+        &serde_json::to_value(origin_map)?,
+    )?;
+    write_json(&out.join("project-graph.json"), &graph)?;
+    if let Some(server_artifact) = server_artifact {
+        write_json(
+            &out.join(server_artifact_path),
+            &serde_json::to_value(&server_artifact)?,
+        )?;
+        let launch = orv_compiler::server_launch_artifact(server_artifact_path, &server_artifact);
+        write_json(
+            &out.join(server_launch_path),
+            &serde_json::to_value(launch)?,
+        )?;
+    }
+    if let Some((path, html)) = static_page {
+        write_text(&out.join(path), &html)?;
+    }
+    println!("build: wrote {}", out.display());
+    Ok(())
+}
+
+fn render_static_page(lowered: &orv_analyzer::LowerResult) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    orv_runtime::run_with_writer(&lowered.program, &mut out).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut html = String::from_utf8(out).map_err(|e| anyhow::anyhow!("html is not utf-8: {e}"))?;
+    if html.ends_with('\n') {
+        html.pop();
+        if html.ends_with('\r') {
+            html.pop();
+        }
+    }
+    Ok(html)
+}
+
+fn write_text(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, text)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    std::fs::write(path, bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn project_graph_json_for_path(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
+    let origin_map = orv_compiler::origin_map(&lowered.program);
+    Ok(project_graph_json(&loaded.graph, &origin_map))
+}
+
+fn project_graph_json(
+    graph: &ProjectGraph,
+    origin_map: &orv_compiler::OriginMap,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "stats": project_graph_stats(graph, origin_map),
+        "nodes": graph.nodes.iter().map(|node| {
+            serde_json::json!({
+                "id": node.id,
+                "kind": node_kind(node.kind),
+                "name": node.name,
+                "file": node.file.0,
+                "span": span_json(node.span),
+            })
+        }).collect::<Vec<_>>(),
+        "edges": graph.edges.iter().map(|edge| {
+            serde_json::json!({
+                "from": edge.from,
+                "to": edge.to,
+                "kind": edge_kind(edge.kind),
+            })
+        }).collect::<Vec<_>>(),
+        "semantic": {
+            "origin_map": origin_map,
+            "origin_edges": origin_edges(origin_map),
+            "origin_links": origin_links(graph, origin_map),
+        },
+    })
+}
+
+fn project_graph_stats(
+    graph: &ProjectGraph,
+    origin_map: &orv_compiler::OriginMap,
+) -> serde_json::Value {
+    let file_count = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ProjectNodeKind::File)
+        .count();
+    let import_count = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ProjectNodeKind::Import)
+        .count();
+    let domain_count = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ProjectNodeKind::Domain)
+        .count();
+    let declaration_count = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                ProjectNodeKind::Struct
+                    | ProjectNodeKind::Enum
+                    | ProjectNodeKind::TypeAlias
+                    | ProjectNodeKind::Function
+                    | ProjectNodeKind::Define
+            )
+        })
+        .count();
+    let semantic_call_edge_count = origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == "calls")
+        .count();
+
+    serde_json::json!({
+        "node_count": graph.nodes.len(),
+        "edge_count": graph.edges.len(),
+        "file_count": file_count,
+        "import_count": import_count,
+        "declaration_count": declaration_count,
+        "domain_count": domain_count,
+        "max_source_contains_depth": max_project_contains_depth(graph),
+        "semantic_origin_count": origin_map.entries.len(),
+        "semantic_edge_count": origin_map.edges.len(),
+        "semantic_call_edge_count": semantic_call_edge_count,
+        "max_semantic_contains_depth": max_origin_contains_depth(origin_map),
+    })
+}
+
+fn max_project_contains_depth(graph: &ProjectGraph) -> usize {
+    let mut children: HashMap<ProjectNodeId, Vec<ProjectNodeId>> = HashMap::new();
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == ProjectEdgeKind::Contains)
+    {
+        children.entry(edge.from).or_default().push(edge.to);
+    }
+    let mut memo = HashMap::new();
+    graph
+        .nodes
+        .iter()
+        .map(|node| project_contains_depth(node.id, &children, &mut memo, &mut Vec::new()))
+        .max()
+        .unwrap_or(0)
+}
+
+fn project_contains_depth(
+    node: ProjectNodeId,
+    children: &HashMap<ProjectNodeId, Vec<ProjectNodeId>>,
+    memo: &mut HashMap<ProjectNodeId, usize>,
+    visiting: &mut Vec<ProjectNodeId>,
+) -> usize {
+    if let Some(depth) = memo.get(&node) {
+        return *depth;
+    }
+    if visiting.contains(&node) {
+        return 0;
+    }
+    visiting.push(node);
+    let depth = children.get(&node).map_or(0, |child_nodes| {
+        child_nodes
+            .iter()
+            .map(|child| 1 + project_contains_depth(*child, children, memo, visiting))
+            .max()
+            .unwrap_or(0)
+    });
+    visiting.pop();
+    memo.insert(node, depth);
+    depth
+}
+
+fn max_origin_contains_depth(origin_map: &orv_compiler::OriginMap) -> usize {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == "contains")
+    {
+        children
+            .entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
+    }
+    let mut memo = HashMap::new();
+    origin_map
+        .entries
+        .iter()
+        .map(|entry| origin_contains_depth(&entry.id, &children, &mut memo, &mut Vec::new()))
+        .max()
+        .unwrap_or(0)
+}
+
+fn origin_contains_depth<'a>(
+    node: &'a str,
+    children: &HashMap<&'a str, Vec<&'a str>>,
+    memo: &mut HashMap<&'a str, usize>,
+    visiting: &mut Vec<&'a str>,
+) -> usize {
+    if let Some(depth) = memo.get(node) {
+        return *depth;
+    }
+    if visiting.contains(&node) {
+        return 0;
+    }
+    visiting.push(node);
+    let depth = children.get(node).map_or(0, |child_nodes| {
+        child_nodes
+            .iter()
+            .map(|child| 1 + origin_contains_depth(child, children, memo, visiting))
+            .max()
+            .unwrap_or(0)
+    });
+    visiting.pop();
+    memo.insert(node, depth);
+    depth
+}
+
+fn origin_edges(origin_map: &orv_compiler::OriginMap) -> Vec<serde_json::Value> {
+    origin_map
+        .edges
+        .iter()
+        .map(|edge| {
+            serde_json::json!({
+                "kind": edge.kind,
+                "from": edge.from,
+                "to": edge.to,
+            })
+        })
+        .collect()
+}
+
+fn origin_links(
+    graph: &ProjectGraph,
+    origin_map: &orv_compiler::OriginMap,
+) -> Vec<serde_json::Value> {
+    origin_map
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.file.0 == entry.span.file
+                        && node.span.range.start == entry.span.start
+                        && node.span.range.end == entry.span.end
+                })
+                .map(|node| {
+                    serde_json::json!({
+                        "kind": "source_node",
+                        "origin_id": entry.id,
+                        "node_id": node.id,
+                    })
+                })
+        })
+        .collect()
+}
+
+fn span_json(span: Span) -> serde_json::Value {
+    serde_json::json!({
+        "file": span.file.0,
+        "start": span.range.start,
+        "end": span.range.end,
+    })
+}
+
+const fn node_kind(kind: ProjectNodeKind) -> &'static str {
+    match kind {
+        ProjectNodeKind::File => "file",
+        ProjectNodeKind::Import => "import",
+        ProjectNodeKind::Struct => "struct",
+        ProjectNodeKind::Enum => "enum",
+        ProjectNodeKind::TypeAlias => "type_alias",
+        ProjectNodeKind::Function => "function",
+        ProjectNodeKind::Define => "define",
+        ProjectNodeKind::Domain => "domain",
+    }
+}
+
+const fn edge_kind(kind: ProjectEdgeKind) -> &'static str {
+    match kind {
+        ProjectEdgeKind::Contains => "contains",
+        ProjectEdgeKind::Imports => "imports",
+    }
 }
 
 fn load_checked_hir(path: &Path) -> anyhow::Result<orv_analyzer::LowerResult> {
     // B3: entry 파일에서 시작해 import 를 따라 multi-file 을 하나의 Program 으로
     // 병합한다. import 가 없으면 entry 한 파일만 로드되므로 기존 동작과 동일.
     let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    report_diagnostics(&loaded.diagnostics, path)?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
 
     let resolved = orv_resolve::resolve(&loaded.program);
-    report_diagnostics(&resolved.diagnostics, path)?;
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
 
     // B5: 타입 진단도 보고. 에러면 실행 전에 중단.
     let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
-    report_diagnostics(&lowered.diagnostics, path)?;
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
     Ok(lowered)
 }
 
-fn cmd_dump(path: &PathBuf) -> anyhow::Result<()> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+fn cmd_dump(path: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let source = std::fs::read_to_string(&entry)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", entry.display()))?;
     let file_id = FileId(0);
     let lx = orv_syntax::lex(&source, file_id);
-    report_diagnostics(&lx.diagnostics, path)?;
+    let files = vec![SourceFile {
+        id: file_id,
+        path: entry,
+        source,
+    }];
+    report_diagnostics(&lx.diagnostics, &files)?;
     let pr = orv_syntax::parse_with_newlines(lx.tokens, file_id, lx.newlines);
-    report_diagnostics(&pr.diagnostics, path)?;
+    report_diagnostics(&pr.diagnostics, &files)?;
     println!("{:#?}", pr.program);
     Ok(())
 }
 
-fn report_diagnostics(diags: &[orv_diagnostics::Diagnostic], path: &Path) -> anyhow::Result<()> {
+fn report_diagnostics(
+    diags: &[orv_diagnostics::Diagnostic],
+    files: &[SourceFile],
+) -> anyhow::Result<()> {
     if diags.is_empty() {
         return Ok(());
     }
-    let file_name = path.display().to_string();
-    let source = std::fs::read_to_string(path).unwrap_or_default();
-    let files = codespan_reporting::files::SimpleFile::new(&file_name, &source);
+    let mut writer = codespan_reporting::term::termcolor::StandardStream::stderr(
+        codespan_reporting::term::termcolor::ColorChoice::Auto,
+    );
+    emit_diagnostics(diags, files, &mut writer)?;
+    if diags
+        .iter()
+        .any(|d| matches!(d.severity, orv_diagnostics::Severity::Error))
+    {
+        anyhow::bail!("aborting due to previous errors");
+    }
+    Ok(())
+}
+
+fn emit_diagnostics<W: WriteColor>(
+    diags: &[orv_diagnostics::Diagnostic],
+    source_files: &[SourceFile],
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    let mut files = SimpleFiles::new();
+    let mut ids = std::collections::HashMap::new();
+    for source_file in source_files {
+        let id = files.add(
+            source_file.path.display().to_string(),
+            source_file.source.clone(),
+        );
+        ids.insert(source_file.id, id);
+    }
+    let fallback = files.add("<unknown>".to_string(), String::new());
 
     for d in diags {
         let mut labels = Vec::new();
@@ -134,16 +4213,22 @@ fn report_diagnostics(diags: &[orv_diagnostics::Diagnostic], path: &Path) -> any
             let start = lbl.span.range.start as usize;
             let end = lbl.span.range.end as usize;
             labels.push(
-                codespan_reporting::diagnostic::Label::primary((), start..end)
-                    .with_message(&lbl.message),
+                codespan_reporting::diagnostic::Label::primary(
+                    file_id(&ids, lbl.span, fallback),
+                    start..end,
+                )
+                .with_message(&lbl.message),
             );
         }
         for sec in &d.secondary {
             let start = sec.span.range.start as usize;
             let end = sec.span.range.end as usize;
             labels.push(
-                codespan_reporting::diagnostic::Label::secondary((), start..end)
-                    .with_message(&sec.message),
+                codespan_reporting::diagnostic::Label::secondary(
+                    file_id(&ids, sec.span, fallback),
+                    start..end,
+                )
+                .with_message(&sec.message),
             );
         }
         let severity = match d.severity {
@@ -155,22 +4240,30 @@ fn report_diagnostics(diags: &[orv_diagnostics::Diagnostic], path: &Path) -> any
         let mut diag = codespan_reporting::diagnostic::Diagnostic::new(severity)
             .with_message(&d.message)
             .with_labels(labels);
-        for note in &d.notes {
-            diag = diag.with_notes(vec![note.clone()]);
+        if !d.notes.is_empty() {
+            diag = diag.with_notes(d.notes.clone());
         }
         let config = codespan_reporting::term::Config::default();
-        let mut writer = codespan_reporting::term::termcolor::StandardStream::stderr(
-            codespan_reporting::term::termcolor::ColorChoice::Auto,
-        );
-        codespan_reporting::term::emit(&mut writer, &config, &files, &diag).ok();
-    }
-    if diags
-        .iter()
-        .any(|d| matches!(d.severity, orv_diagnostics::Severity::Error))
-    {
-        anyhow::bail!("aborting due to previous errors");
+        codespan_reporting::term::emit(writer, &config, &files, &diag)?;
     }
     Ok(())
+}
+
+fn file_id(ids: &std::collections::HashMap<FileId, usize>, span: Span, fallback: usize) -> usize {
+    ids.get(&span.file).copied().unwrap_or(fallback)
+}
+
+#[cfg(test)]
+fn render_diagnostics_for_test(
+    diags: &[orv_diagnostics::Diagnostic],
+    files: &[SourceFile],
+) -> String {
+    let mut out = Vec::new();
+    {
+        let mut writer = codespan_reporting::term::termcolor::NoColor::new(&mut out);
+        emit_diagnostics(diags, files, &mut writer).expect("render diagnostics");
+    }
+    String::from_utf8(out).expect("diagnostics are utf-8")
 }
 
 #[cfg(test)]
@@ -207,6 +4300,17 @@ mod tests {
         }
     }
 
+    fn temp_output_dir(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after unix epoch")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("orv-cli-{name}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
     #[test]
     fn check_accepts_all_e2e_fixtures() {
         let files = orv_files_under(&["fixtures", "e2e"]);
@@ -224,5 +4328,3000 @@ mod tests {
         for file in files {
             cmd_check(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
         }
+    }
+
+    #[test]
+    fn check_accepts_orv_toml_project_entry() {
+        let dir = temp_output_dir("project-manifest-check");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+        let entry = src.join("main.orv");
+        std::fs::write(&entry, "@out \"manifest check\"\n").expect("write entry");
+        let manifest = dir.join("orv.toml");
+        std::fs::write(
+            &manifest,
+            r#"[project]
+name = "manifest-demo"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_check(&manifest).expect("manifest check");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graph_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "graph", "fixtures/e2e/hello.orv"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn init_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "init", "target/new-shop", "--name", "new-shop"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn test_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "test", "src/models", "--filter", "user"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn test_list_flag_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "test", "--list", "src/models"]);
+        let cli = match parsed {
+            Ok(cli) => cli,
+            Err(err) => panic!("{}", err.render()),
+        };
+        match cli.command {
+            Command::Test { path, filter, list } => {
+                assert_eq!(path, PathBuf::from("src/models"));
+                assert_eq!(filter, None);
+                assert!(list);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn test_list_json_discovers_filtered_tests_without_running_them() {
+        let dir = temp_output_dir("test-runner-list");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("checkout_test.orv");
+        std::fs::write(
+            &source,
+            r#"test "checkout shows cart" {
+  assert true
+}
+
+test "checkout failing runtime body" {
+  assert false
+}
+"#,
+        )
+        .expect("write test source");
+
+        let value = orv_test_list_json(&dir, Some("shows")).expect("test list");
+        let tests = value["tests"].as_array().expect("tests array");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0]["name"], "checkout shows cart");
+        assert_eq!(tests[0]["path"], source.display().to_string());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_summary_discovers_and_runs_matching_tests() {
+        let dir = temp_output_dir("test-runner-pass");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("math_test.orv");
+        std::fs::write(
+            &source,
+            r#"test "math adds" {
+  assert 1 + 2 == 3
+}
+"#,
+        )
+        .expect("write test source");
+
+        let summary = orv_test_summary(&dir, Some("math")).expect("test summary");
+
+        assert_eq!(summary.selected, 1);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.files.iter().any(|file| file == &source));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_summary_reports_runtime_failures() {
+        let dir = temp_output_dir("test-runner-fail");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("math_test.orv");
+        std::fs::write(
+            &source,
+            r#"test "math fails" {
+  assert 1 + 2 == 4
+}
+"#,
+        )
+        .expect("write test source");
+
+        let err = orv_test_summary(&dir, None).expect_err("failing test should fail");
+
+        assert!(err.to_string().contains("math_test.orv"));
+        assert!(err.to_string().contains("assertion failed"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_writes_project_manifest_and_entry() {
+        let dir = temp_output_dir("init-project");
+
+        cmd_init(&dir, Some("starter-shop")).expect("init project");
+
+        let manifest = dir.join("orv.toml");
+        let entry = dir.join("src").join("main.orv");
+        assert!(manifest.is_file(), "missing {}", manifest.display());
+        assert!(entry.is_file(), "missing {}", entry.display());
+        let manifest_text = std::fs::read_to_string(&manifest).expect("manifest text");
+        assert!(manifest_text.contains("name = \"starter-shop\""));
+        assert!(manifest_text.contains("entry = \"src/main.orv\""));
+        cmd_check(&manifest).expect("check manifest project");
+        cmd_check(&dir).expect("check project directory");
+        let out = dir.join("dist");
+        cmd_build(&dir, &out).expect("build project directory");
+        assert!(out.join("pages").join("index.html").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_snapshot_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "lsp", "snapshot", "fixtures/e2e/hello.orv"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn lsp_reveal_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "lsp",
+            "reveal",
+            "target/orv-build-test",
+            "route:GET_/ping:abc123",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn lsp_serve_stdio_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "lsp", "serve", "--stdio"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn dap_serve_stdio_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "dap", "serve", "--stdio"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn build_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "build",
+            "fixtures/e2e/hello.orv",
+            "--out",
+            "target/orv-build-test",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_plan_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "db", "plan", "fixtures/e2e/hello.orv"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_apply_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "apply",
+            "fixtures/e2e/hello.orv",
+            "--schema",
+            "target/orv-db-schema.json",
+            "--history",
+            "target/orv-db-history.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_migrate_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "migrate",
+            "fixtures/e2e/hello.orv",
+            "--schema",
+            "target/orv-db-schema.json",
+            "--history",
+            "target/orv-db-history.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_rollback_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "rollback",
+            "--schema",
+            "target/orv-db-schema.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_plan_reports_added_nullable_field_from_applied_snapshot() {
+        let dir = temp_output_dir("db-plan");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+  email: string
+  avatar: string?
+}"#,
+        )
+        .expect("write source");
+        let applied = dir.join("applied-schema.json");
+        std::fs::write(
+            &applied,
+            r#"{
+  "schema_version": 1,
+  "structs": {
+    "User": {
+      "fields": {
+        "id": { "type": "int", "optional": false },
+        "email": { "type": "string", "optional": false }
+      }
+    }
+  }
+}"#,
+        )
+        .expect("write applied schema");
+
+        let plan = db_plan_json(&source, Some(&applied)).expect("db plan");
+
+        let actions = plan["actions"].as_array().expect("actions array");
+        assert!(actions.iter().any(|action| {
+            action["kind"] == "add_field"
+                && action["struct"] == "User"
+                && action["field"] == "avatar"
+                && action["type"] == "string?"
+                && action["optional"] == true
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_snapshot_includes_diagnostics_graph_and_document_symbols() {
+        let dir = temp_output_dir("lsp-snapshot");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+}
+
+function greet(user: User): string -> "hello"
+"#,
+        )
+        .expect("write source");
+
+        let snapshot = lsp_snapshot_json(&source).expect("lsp snapshot");
+
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(
+            snapshot["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .len(),
+            0
+        );
+        assert!(snapshot["project_graph"]["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .any(|node| node["kind"] == "struct" && node["name"] == "User"));
+        let symbols = snapshot["document_symbols"]
+            .as_array()
+            .expect("document symbols");
+        let user = symbols
+            .iter()
+            .find(|symbol| symbol["name"] == "User")
+            .expect("User symbol");
+        assert_eq!(user["kind"], "Struct");
+        assert_eq!(user["range"]["start"]["line"], 0);
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "greet" && symbol["kind"] == "Function"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_initialize_returns_server_capabilities() {
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "initialize",
+            "params": {},
+        }));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["serverInfo"]["name"], "orv-lsp");
+        assert_eq!(response["result"]["capabilities"]["textDocumentSync"], 1);
+        assert_eq!(
+            response["result"]["capabilities"]["documentSymbolProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["documentLinkProvider"]["resolveProvider"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["foldingRangeProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["selectionRangeProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["definitionProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["referencesProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["documentHighlightProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["semanticTokensProvider"]["full"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"][1],
+            "type"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["codeLensProvider"]["resolveProvider"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["codeActionProvider"]["codeActionKinds"][0],
+            "quickfix"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["executeCommandProvider"]["commands"][0],
+            "orv.revealSourceNode"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["renameProvider"]["prepareProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["workspaceSymbolProvider"],
+            true
+        );
+        assert_eq!(response["result"]["capabilities"]["hoverProvider"], true);
+        assert_eq!(
+            response["result"]["capabilities"]["completionProvider"]["triggerCharacters"][0],
+            "@"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
+            true
+        );
+    }
+
+    #[test]
+    fn lsp_shutdown_returns_null_result() {
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "shutdown",
+        }));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 8);
+        assert!(response.get("error").is_none());
+        assert!(response
+            .get("result")
+            .is_some_and(serde_json::Value::is_null));
+    }
+
+    #[test]
+    fn lsp_unknown_method_returns_method_not_found_with_method_name() {
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "request-9",
+            "method": "workspace/configuration",
+        }));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "request-9");
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(
+            response["error"]["data"]["method"],
+            "workspace/configuration"
+        );
+    }
+
+    #[test]
+    fn lsp_stdio_serves_content_length_initialize_frame() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "initialize",
+            "params": {},
+        })
+        .to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+
+        let output = lsp_stdio_response(&input).expect("stdio response");
+        let (_, response_body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length response frame");
+        let response: serde_json::Value =
+            serde_json::from_str(response_body).expect("response json");
+
+        assert!(output.starts_with("Content-Length: "));
+        assert_eq!(response["id"], 10);
+        assert_eq!(response["result"]["serverInfo"]["name"], "orv-lsp");
+    }
+
+    #[test]
+    fn lsp_stdio_ignores_notifications_without_id() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {},
+        })
+        .to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+
+        let output = lsp_stdio_response(&input).expect("stdio response");
+
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn dap_initialize_returns_debug_capabilities() {
+        let response = dap_protocol_response(&serde_json::json!({
+            "seq": 1,
+            "type": "request",
+            "command": "initialize",
+            "arguments": {},
+        }));
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 1);
+        assert_eq!(response["command"], "initialize");
+        assert_eq!(response["success"], true);
+        assert_eq!(response["body"]["supportsConfigurationDoneRequest"], true);
+        assert_eq!(response["body"]["supportsTerminateRequest"], true);
+        assert_eq!(response["body"]["supportsLoadedSourcesRequest"], true);
+        assert_eq!(response["body"]["supportsEvaluateForHovers"], true);
+        assert_eq!(response["body"]["supportsCompletionsRequest"], true);
+        assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
+        assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
+    }
+
+    #[test]
+    fn dap_stdio_serves_content_length_initialize_frame() {
+        let body = serde_json::json!({
+            "seq": 1,
+            "type": "request",
+            "command": "initialize",
+            "arguments": {},
+        })
+        .to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let (_, response_body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length response frame");
+        let response: serde_json::Value =
+            serde_json::from_str(response_body).expect("response json");
+
+        assert!(output.starts_with("Content-Length: "));
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["command"], "initialize");
+        assert_eq!(response["success"], true);
+    }
+
+    #[test]
+    fn dap_launch_threads_and_stacktrace_use_entry_source() {
+        let dir = temp_output_dir("dap-launch");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 2,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let threads = session
+            .message_response(&serde_json::json!({
+                "seq": 3,
+                "type": "request",
+                "command": "threads",
+            }))
+            .expect("threads response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 4,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["projectGraphNodes"], 1);
+        assert_eq!(threads["body"]["threads"][0]["id"], 1);
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["totalFrames"], 1);
+        let frame = &stack["body"]["stackFrames"][0];
+        assert_eq!(frame["id"], 1);
+        assert_eq!(frame["line"], 1);
+        assert_eq!(frame["column"], 1);
+        assert_eq!(
+            frame["source"]["path"],
+            canonical_source.display().to_string()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_loaded_sources_returns_project_files_after_launch() {
+        let dir = temp_output_dir("dap-loaded-sources");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(
+            &source,
+            "import models.user.User\nlet u: User = { id: 1 }\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 30,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let loaded = session
+            .message_response(&serde_json::json!({
+                "seq": 31,
+                "type": "request",
+                "command": "loadedSources",
+                "arguments": {},
+            }))
+            .expect("loadedSources response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(loaded["success"], true, "{loaded}");
+        let sources = loaded["body"]["sources"].as_array().expect("sources");
+        assert!(sources
+            .iter()
+            .any(|item| item["name"] == "app.orv" && item["path"].as_str().is_some()));
+        assert!(sources
+            .iter()
+            .any(|item| item["name"] == "user.orv" && item["path"].as_str().is_some()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_breakpoint_locations_return_project_graph_lines() {
+        let dir = temp_output_dir("dap-breakpoint-locations");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User { id: int }
+
+function greet(user: User): string -> "hello"
+"#,
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 51,
+                "type": "request",
+                "command": "breakpointLocations",
+                "arguments": {
+                    "source": {
+                        "path": format!("file://{}", source.display()),
+                    },
+                    "line": 1,
+                    "endLine": 3,
+                },
+            }))
+            .expect("breakpointLocations response");
+
+        assert_eq!(response["success"], true, "{response}");
+        let breakpoints = response["body"]["breakpoints"]
+            .as_array()
+            .expect("breakpoint locations");
+        assert!(breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint["line"] == 1 && breakpoint["column"] == 1));
+        assert!(breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint["line"] == 3 && breakpoint["column"] == 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_exception_info_returns_launch_runtime_status() {
+        let dir = temp_output_dir("dap-exception-info");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let bad: int = \"wrong\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 52,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let exception = session
+            .message_response(&serde_json::json!({
+                "seq": 53,
+                "type": "request",
+                "command": "exceptionInfo",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("exceptionInfo response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["runtime"]["status"], "diagnostics");
+        assert_eq!(exception["success"], true, "{exception}");
+        assert_eq!(exception["body"]["exceptionId"], "orv.diagnostics");
+        assert_eq!(exception["body"]["description"], "diagnostics present");
+        assert_eq!(exception["body"]["breakMode"], "always");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_source_returns_loaded_file_content_after_launch() {
+        let dir = temp_output_dir("dap-source");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        let imported_source = "pub struct User { id: int }\n";
+        std::fs::write(
+            &source,
+            "import models.user.User\nlet u: User = { id: 1 }\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, imported_source).expect("write imported");
+        let canonical_imported = std::fs::canonicalize(&imported).expect("canonical imported");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 32,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let source_response = session
+            .message_response(&serde_json::json!({
+                "seq": 33,
+                "type": "request",
+                "command": "source",
+                "arguments": {
+                    "source": {
+                        "path": canonical_imported.display().to_string(),
+                    },
+                },
+            }))
+            .expect("source response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(source_response["success"], true, "{source_response}");
+        assert_eq!(source_response["body"]["content"], imported_source);
+        assert_eq!(source_response["body"]["mimeType"], "text/x-orv");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_source_returns_content_by_loaded_source_reference() {
+        let dir = temp_output_dir("dap-source-reference");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        let imported_source = "pub struct User { id: int }\n";
+        std::fs::write(
+            &source,
+            "import models.user.User\nlet u: User = { id: 1 }\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, imported_source).expect("write imported");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 34,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let loaded = session
+            .message_response(&serde_json::json!({
+                "seq": 35,
+                "type": "request",
+                "command": "loadedSources",
+                "arguments": {},
+            }))
+            .expect("loadedSources response");
+        let user_reference = loaded["body"]["sources"]
+            .as_array()
+            .expect("sources")
+            .iter()
+            .find(|item| item["name"] == "user.orv")
+            .and_then(|item| item["sourceReference"].as_u64())
+            .expect("user source reference");
+        let source_response = session
+            .message_response(&serde_json::json!({
+                "seq": 36,
+                "type": "request",
+                "command": "source",
+                "arguments": {
+                    "sourceReference": user_reference,
+                },
+            }))
+            .expect("source response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert!(user_reference > 0);
+        assert_eq!(source_response["success"], true, "{source_response}");
+        assert_eq!(source_response["body"]["content"], imported_source);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_set_breakpoints_and_stacktrace_use_verified_breakpoint_line() {
+        let dir = temp_output_dir("dap-breakpoints");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let breakpoints = session
+            .message_response(&serde_json::json!({
+                "seq": 5,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        { "line": 2 }
+                    ],
+                },
+            }))
+            .expect("breakpoints response");
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 6,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 7,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(breakpoints["success"], true, "{breakpoints}");
+        assert_eq!(breakpoints["body"]["breakpoints"][0]["verified"], true);
+        assert_eq!(breakpoints["body"]["breakpoints"][0]["line"], 2);
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_scopes_and_variables_expose_project_launch_state() {
+        let dir = temp_output_dir("dap-variables");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 8,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 9,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("scopes response");
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 10,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+
+        assert_eq!(scopes["success"], true, "{scopes}");
+        assert_eq!(scopes["body"]["scopes"][0]["name"], "Project");
+        assert_eq!(scopes["body"]["scopes"][0]["variablesReference"], 1);
+        let vars = variables["body"]["variables"]
+            .as_array()
+            .expect("variables");
+        assert!(vars.iter().any(|var| {
+            var["name"] == "entry" && var["value"] == canonical_source.display().to_string()
+        }));
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "projectGraphNodes" && var["value"] == "1"));
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "diagnostics" && var["value"] == "0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_variables_include_reference_runtime_output() {
+        let dir = temp_output_dir("dap-runtime-output");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@out \"debug-ready\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 11,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 12,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(launch["body"]["runtime"]["status"], "ok");
+        assert_eq!(launch["body"]["runtime"]["stdout"], "debug-ready\n");
+        let vars = variables["body"]["variables"]
+            .as_array()
+            .expect("variables");
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "runtimeStatus" && var["value"] == "ok"));
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "stdout" && var["value"] == "debug-ready\n"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_evaluate_returns_project_runtime_values() {
+        let dir = temp_output_dir("dap-evaluate");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@out \"eval-ready\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 37,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let evaluate = session
+            .message_response(&serde_json::json!({
+                "seq": 38,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "stdout",
+                    "context": "repl",
+                },
+            }))
+            .expect("evaluate response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(evaluate["success"], true, "{evaluate}");
+        assert_eq!(evaluate["body"]["result"], "eval-ready\n");
+        assert_eq!(evaluate["body"]["type"], "string");
+        assert_eq!(evaluate["body"]["variablesReference"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_completions_returns_evaluable_project_values() {
+        let dir = temp_output_dir("dap-completions");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@out \"complete-ready\"\n").expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 39,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 40,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "std",
+                    "column": 4,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert_eq!(completions["success"], true, "{completions}");
+        let targets = completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets");
+        assert!(targets
+            .iter()
+            .any(|target| target["label"] == "stdout" && target["type"] == "property"));
+        assert!(targets.iter().all(|target| target["label"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("std"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_stdio_document_symbol_returns_symbols_for_file_uri() {
+        let dir = temp_output_dir("lsp-document-symbol");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+}
+
+function greet(user: User): string -> "hello"
+"#,
+        )
+        .expect("write source");
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        })
+        .to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+
+        let output = lsp_stdio_response(&input).expect("stdio response");
+        let (_, response_body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length response frame");
+        let response: serde_json::Value =
+            serde_json::from_str(response_body).expect("response json");
+        let symbols = response["result"].as_array().expect("document symbols");
+
+        assert_eq!(response["id"], 11);
+        assert!(response.get("error").is_none());
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "User" && symbol["kind"] == 23));
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "greet" && symbol["kind"] == 12));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_document_symbol_accepts_percent_encoded_file_uri() {
+        let dir = temp_output_dir("lsp-document-symbol-space");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app space.orv");
+        std::fs::write(&source, "struct User { id: int }\n").expect("write source");
+        let uri = format!("file://{}", source.display()).replace(' ', "%20");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                },
+            },
+        }));
+
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]
+            .as_array()
+            .expect("document symbols")
+            .iter()
+            .any(|symbol| symbol["name"] == "User"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_text_document_diagnostic_returns_full_report_for_file_uri() {
+        let dir = temp_output_dir("lsp-diagnostic");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let bad: int = \"wrong\"\n").expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "textDocument/diagnostic",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 13);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["kind"], "full");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("diagnostic items");
+        assert!(items.iter().any(|item| {
+            item["severity"] == 1
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("type mismatch"))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_code_action_returns_reveal_action_for_diagnostic_range() {
+        let dir = temp_output_dir("lsp-code-action");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let bad: int = \"wrong\"\n").expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 25 },
+                },
+                "context": {
+                    "diagnostics": [],
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 32);
+        assert!(response.get("error").is_none(), "{response}");
+        let actions = response["result"].as_array().expect("code actions");
+        let action = actions
+            .iter()
+            .find(|action| {
+                action["title"]
+                    .as_str()
+                    .is_some_and(|title| title.contains("type mismatch"))
+            })
+            .expect("diagnostic reveal action");
+        assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["command"]["command"], "orv.revealDiagnostic");
+        assert_eq!(action["diagnostics"][0]["source"], "orv");
+        assert_eq!(
+            action["command"]["arguments"][0],
+            format!("file://{}", canonical_source.display())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_document_link_returns_import_targets() {
+        let dir = temp_output_dir("lsp-document-link");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(&source, "import models.user.User\nlet ok: int = 1\n")
+            .expect("write source");
+        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let canonical_imported = std::fs::canonicalize(&imported).expect("canonical imported");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "textDocument/documentLink",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 24);
+        assert!(response.get("error").is_none(), "{response}");
+        let links = response["result"].as_array().expect("document links");
+        let link = links
+            .iter()
+            .find(|link| link["target"] == format!("file://{}", canonical_imported.display()))
+            .expect("import document link");
+        assert_eq!(link["range"]["start"]["line"], 0);
+        assert_eq!(link["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_folding_range_returns_multiline_declarations() {
+        let dir = temp_output_dir("lsp-folding-range");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+  email: string
+}
+
+function greet(user: User): string -> {
+  "hello"
+}
+"#,
+        )
+        .expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "textDocument/foldingRange",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 25);
+        assert!(response.get("error").is_none(), "{response}");
+        let ranges = response["result"].as_array().expect("folding ranges");
+        assert!(ranges.iter().any(|range| {
+            range["startLine"] == 0 && range["endLine"].as_u64().is_some_and(|line| line >= 3)
+        }));
+        assert!(ranges.iter().any(|range| {
+            range["startLine"] == 5 && range["endLine"].as_u64().is_some_and(|line| line >= 7)
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_selection_range_returns_structural_parent_range() {
+        let dir = temp_output_dir("lsp-selection-range");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+  email: string
+}
+
+function greet(user: User): string -> {
+  "hello"
+}
+"#,
+        )
+        .expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "textDocument/selectionRange",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "positions": [
+                    {
+                        "line": 1,
+                        "character": 4,
+                    },
+                ],
+            },
+        }));
+
+        assert_eq!(response["id"], 26);
+        assert!(response.get("error").is_none(), "{response}");
+        let selections = response["result"].as_array().expect("selection ranges");
+        assert_eq!(selections.len(), 1);
+        let selection = &selections[0];
+        assert_eq!(selection["range"]["start"]["line"], 0);
+        assert_eq!(selection["range"]["start"]["character"], 0);
+        assert!(selection["range"]["end"]["line"]
+            .as_u64()
+            .is_some_and(|line| line >= 3));
+        assert!(selection
+            .get("parent")
+            .is_none_or(serde_json::Value::is_null));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_prepare_rename_returns_identifier_range_and_placeholder() {
+        let dir = temp_output_dir("lsp-prepare-rename");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "struct User { id: int }\n").expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 27,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 0,
+                    "character": 8,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 27);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["placeholder"], "User");
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 7);
+        assert_eq!(response["result"]["range"]["end"]["character"], 11);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_rename_returns_workspace_edit_for_project_references() {
+        let dir = temp_output_dir("lsp-rename");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let source = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(
+            &source,
+            "import models.user.User\nlet u: User = { id: 1 }\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let canonical_imported = std::fs::canonicalize(&imported).expect("canonical imported");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 28,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": 8,
+                },
+                "newName": "Account",
+            },
+        }));
+
+        assert_eq!(response["id"], 28);
+        assert!(response.get("error").is_none(), "{response}");
+        let changes = response["result"]["changes"].as_object().expect("changes");
+        let source_uri = format!("file://{}", canonical_source.display());
+        let imported_uri = format!("file://{}", canonical_imported.display());
+        let source_edits = changes
+            .get(&source_uri)
+            .and_then(serde_json::Value::as_array)
+            .expect("source edits");
+        let imported_edits = changes
+            .get(&imported_uri)
+            .and_then(serde_json::Value::as_array)
+            .expect("imported edits");
+        assert!(
+            source_edits
+                .iter()
+                .filter(|edit| edit["newText"] == "Account")
+                .count()
+                >= 2
+        );
+        assert!(imported_edits
+            .iter()
+            .any(|edit| edit["newText"] == "Account"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_document_highlight_returns_current_file_identifier_occurrences() {
+        let dir = temp_output_dir("lsp-document-highlight");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"struct User { id: int }
+
+let u: User = { id: 1 }
+let v: User = u
+",
+        )
+        .expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 29,
+            "method": "textDocument/documentHighlight",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": 8,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 29);
+        assert!(response.get("error").is_none(), "{response}");
+        let highlights = response["result"].as_array().expect("highlights");
+        assert_eq!(highlights.len(), 3);
+        assert!(highlights
+            .iter()
+            .any(|highlight| highlight["range"]["start"]["line"] == 0));
+        assert!(highlights
+            .iter()
+            .any(|highlight| highlight["range"]["start"]["line"] == 2));
+        assert!(highlights
+            .iter()
+            .any(|highlight| highlight["range"]["start"]["line"] == 3));
+        assert!(highlights.iter().all(|highlight| highlight["kind"] == 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_semantic_tokens_returns_project_graph_declaration_tokens() {
+        let dir = temp_output_dir("lsp-semantic-tokens");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User { id: int }
+
+function greet(user: User): string -> "hello"
+"#,
+        )
+        .expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "textDocument/semanticTokens/full",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 30);
+        assert!(response.get("error").is_none(), "{response}");
+        let data = response["result"]["data"]
+            .as_array()
+            .expect("semantic token data");
+        assert_eq!(data.len() % 5, 0);
+        let tokens: Vec<Vec<u64>> = data
+            .chunks(5)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|value| value.as_u64().expect("semantic token integer"))
+                    .collect()
+            })
+            .collect();
+        assert!(tokens
+            .iter()
+            .any(|token| token.as_slice() == [0, 7, 4, 1, 1]));
+        assert!(tokens
+            .iter()
+            .any(|token| token.as_slice() == [2, 9, 5, 2, 1]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_code_lens_returns_project_graph_reveal_commands() {
+        let dir = temp_output_dir("lsp-code-lens");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User { id: int }
+
+function greet(user: User): string -> "hello"
+"#,
+        )
+        .expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "textDocument/codeLens",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 31);
+        assert!(response.get("error").is_none(), "{response}");
+        let lenses = response["result"].as_array().expect("code lenses");
+        let user_lens = lenses
+            .iter()
+            .find(|lens| lens["command"]["arguments"][1] == "User")
+            .expect("User code lens");
+        assert_eq!(user_lens["range"]["start"]["line"], 0);
+        assert_eq!(user_lens["command"]["command"], "orv.revealSourceNode");
+        assert_eq!(user_lens["command"]["title"], "Reveal Struct User");
+        assert!(lenses
+            .iter()
+            .any(|lens| lens["command"]["arguments"][1] == "greet"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_execute_command_reveals_project_graph_source_node() {
+        let dir = temp_output_dir("lsp-execute-command");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+        let source = src.join("main.orv");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "execute-command"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(&source, "struct User { id: int }\n").expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let mut session = LspSession::default();
+
+        let initialize = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "initialize",
+            "params": {
+                "rootUri": format!("file://{}", dir.display()),
+            },
+        }));
+        let lenses = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "textDocument/codeLens",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+        let user_lens = lenses["result"]
+            .as_array()
+            .expect("code lenses")
+            .iter()
+            .find(|lens| lens["command"]["arguments"][1] == "User")
+            .expect("User code lens")
+            .clone();
+        let execute = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 35,
+            "method": "workspace/executeCommand",
+            "params": {
+                "command": user_lens["command"]["command"],
+                "arguments": user_lens["command"]["arguments"],
+            },
+        }));
+
+        assert!(initialize.get("error").is_none(), "{initialize}");
+        assert!(lenses.get("error").is_none(), "{lenses}");
+        assert_eq!(execute["id"], 35);
+        assert!(execute.get("error").is_none(), "{execute}");
+        assert_eq!(execute["result"]["name"], "User");
+        assert_eq!(execute["result"]["kind"], "Struct");
+        assert_eq!(
+            execute["result"]["source_node"],
+            user_lens["command"]["arguments"][0]
+        );
+        assert_eq!(
+            execute["result"]["location"]["uri"],
+            format!("file://{}", canonical_source.display())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_workspace_diagnostic_returns_imported_file_diagnostics() {
+        let dir = temp_output_dir("lsp-workspace-diagnostic");
+        let src = dir.join("src");
+        let models = src.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let entry = src.join("main.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "workspace-diagnostic"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(&entry, "import models.user.User\nlet ok: int = 1\n").expect("write entry");
+        std::fs::write(
+            &imported,
+            "pub struct User { id: int }\nlet bad: int = \"wrong\"\n",
+        )
+        .expect("write imported");
+        let canonical_imported = std::fs::canonicalize(&imported).expect("canonical imported");
+        let mut session = LspSession::default();
+
+        let initialize = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "initialize",
+            "params": {
+                "rootUri": format!("file://{}", dir.display()),
+            },
+        }));
+        let response = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "workspace/diagnostic",
+            "params": {
+                "previousResultIds": [],
+            },
+        }));
+
+        assert!(initialize.get("error").is_none(), "{initialize}");
+        assert_eq!(response["id"], 23);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("workspace diagnostic items");
+        let imported_report = items
+            .iter()
+            .find(|item| item["uri"] == format!("file://{}", canonical_imported.display()))
+            .expect("imported diagnostic report");
+        let diagnostics = imported_report["items"]
+            .as_array()
+            .expect("imported diagnostics");
+        assert!(diagnostics.iter().any(|item| {
+            item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("type mismatch"))
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_definition_returns_symbol_declaration_location() {
+        let dir = temp_output_dir("lsp-definition");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"struct User {
+  id: int
+}
+
+let u: User = { id: 1 }
+",
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 4,
+                    "character": 8,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 16);
+        assert!(response.get("error").is_none(), "{response}");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        assert_eq!(
+            response["result"]["uri"],
+            format!("file://{}", canonical_source.display())
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_hover_returns_symbol_summary() {
+        let dir = temp_output_dir("lsp-hover");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"struct User {
+  id: int
+}
+
+let u: User = { id: 1 }
+",
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 4,
+                    "character": 8,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 17);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["contents"]["kind"], "markdown");
+        assert_eq!(response["result"]["contents"]["value"], "**Struct** `User`");
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_references_returns_identifier_locations() {
+        let dir = temp_output_dir("lsp-references");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+}
+
+function greet(user: User): string -> "hello"
+
+let u: User = { id: 1 }
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 6,
+                    "character": 8,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 19);
+        assert!(response.get("error").is_none(), "{response}");
+        let locations = response["result"].as_array().expect("reference locations");
+        assert!(locations.iter().any(|location| {
+            location["range"]["start"]["line"] == 0 && location["range"]["start"]["character"] == 7
+        }));
+        assert!(locations.iter().any(|location| {
+            location["range"]["start"]["line"] == 4 && location["range"]["start"]["character"] == 21
+        }));
+        assert!(locations.iter().any(|location| {
+            location["range"]["start"]["line"] == 6 && location["range"]["start"]["character"] == 7
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_project_symbols() {
+        let dir = temp_output_dir("lsp-completion");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+}
+
+function greet(user: User): string -> "hello"
+
+@server {
+  @route GET /ping {
+    @respond 200 "ok"
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 18,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 5,
+                    "character": 0,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 18);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isIncomplete"], false);
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "User" && item["kind"] == 22));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "greet" && item["kind"] == 3));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "route" && item["kind"] == 23));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_workspace_symbol_returns_matching_project_symbols() {
+        let dir = temp_output_dir("lsp-workspace-symbol");
+        let src = dir.join("src");
+        let models = src.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let entry = src.join("main.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "workspace-symbol"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(
+            &entry,
+            "import models.user.User\nfunction checkout(user: User): string -> \"ok\"\n",
+        )
+        .expect("write entry");
+        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let canonical_imported = std::fs::canonicalize(&imported).expect("canonical imported");
+        let mut session = LspSession::default();
+
+        let initialize = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "initialize",
+            "params": {
+                "rootUri": format!("file://{}", dir.display()),
+            },
+        }));
+        let response = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "workspace/symbol",
+            "params": {
+                "query": "User",
+            },
+        }));
+
+        assert!(initialize.get("error").is_none(), "{initialize}");
+        assert_eq!(response["id"], 21);
+        assert!(response.get("error").is_none(), "{response}");
+        let symbols = response["result"].as_array().expect("workspace symbols");
+        let user = symbols
+            .iter()
+            .find(|symbol| symbol["name"] == "User")
+            .expect("User workspace symbol");
+        assert_eq!(user["kind"], 23);
+        assert_eq!(
+            user["location"]["uri"],
+            format!("file://{}", canonical_imported.display())
+        );
+        assert!(symbols.iter().all(|symbol| symbol["name"]
+            .as_str()
+            .is_some_and(|name| name.contains("User"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_stdio_document_symbol_uses_did_open_unsaved_content() {
+        let dir = temp_output_dir("lsp-did-open-symbol");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("unsaved.orv");
+        let uri = format!("file://{}", source.display());
+        let did_open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "orv",
+                    "version": 1,
+                    "text": "struct Draft { id: int }\n",
+                },
+            },
+        })
+        .to_string();
+        let document_symbol = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        })
+        .to_string();
+        let input = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            did_open.len(),
+            did_open,
+            document_symbol.len(),
+            document_symbol
+        );
+
+        let output = lsp_stdio_response(&input).expect("stdio response");
+        let (_, response_body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length response frame");
+        let response: serde_json::Value =
+            serde_json::from_str(response_body).expect("response json");
+
+        assert_eq!(response["id"], 14);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]
+            .as_array()
+            .expect("document symbols")
+            .iter()
+            .any(|symbol| symbol["name"] == "Draft"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_stdio_document_symbol_uses_did_change_unsaved_content() {
+        let dir = temp_output_dir("lsp-did-change-symbol");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("unsaved.orv");
+        let uri = format!("file://{}", source.display());
+        let did_open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "orv",
+                    "version": 1,
+                    "text": "struct Draft { id: int }\n",
+                },
+            },
+        })
+        .to_string();
+        let did_change = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                    "version": 2,
+                },
+                "contentChanges": [
+                    { "text": "struct Changed { id: int }\n" }
+                ],
+            },
+        })
+        .to_string();
+        let document_symbol = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        })
+        .to_string();
+        let input = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            did_open.len(),
+            did_open,
+            did_change.len(),
+            did_change,
+            document_symbol.len(),
+            document_symbol
+        );
+
+        let output = lsp_stdio_response(&input).expect("stdio response");
+        let (_, response_body) = output
+            .split_once("\r\n\r\n")
+            .expect("content-length response frame");
+        let response: serde_json::Value =
+            serde_json::from_str(response_body).expect("response json");
+        let symbols = response["result"].as_array().expect("document symbols");
+
+        assert_eq!(response["id"], 15);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(symbols.iter().any(|symbol| symbol["name"] == "Changed"));
+        assert!(!symbols.iter().any(|symbol| symbol["name"] == "Draft"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_apply_writes_current_schema_snapshot() {
+        let dir = temp_output_dir("db-apply");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write source");
+        let schema = dir.join("schema.json");
+
+        cmd_db_apply(&source, &schema).expect("apply schema");
+
+        let written = read_json_value(&schema).expect("read schema");
+        assert_eq!(written["schema_version"], 1);
+        assert_eq!(
+            written["structs"]["User"]["fields"]["email"]["type"],
+            "string"
+        );
+        let plan = db_plan_json(&source, Some(&schema)).expect("db plan after apply");
+        assert_eq!(plan["actions"].as_array().expect("actions").len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_apply_appends_migration_history_when_requested() {
+        let dir = temp_output_dir("db-history");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let first_source = dir.join("first.orv");
+        std::fs::write(
+            &first_source,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write first source");
+        let second_source = dir.join("second.orv");
+        std::fs::write(
+            &second_source,
+            r#"struct User {
+  id: int
+  email: string
+  avatar: string?
+}"#,
+        )
+        .expect("write second source");
+        let schema = dir.join("schema.json");
+        let history = dir.join("history.json");
+
+        cmd_db_apply_with_history(&first_source, &schema, Some(&history))
+            .expect("apply first schema");
+        cmd_db_apply_with_history(&second_source, &schema, Some(&history))
+            .expect("apply second schema");
+
+        let history = read_json_value(&history).expect("read history");
+        assert_eq!(history["schema_version"], 1);
+        let entries = history["entries"].as_array().expect("history entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["actions"].as_array().expect("actions").len(), 1);
+        assert!(entries[1]["actions"]
+            .as_array()
+            .expect("actions")
+            .iter()
+            .any(|action| action["kind"] == "add_field" && action["field"] == "avatar"));
+        assert_ne!(entries[0]["schema_hash"], entries[1]["schema_hash"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_migrate_applies_schema_and_history() {
+        let dir = temp_output_dir("db-migrate");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"struct Order {
+  id: int
+  total: int
+}"#,
+        )
+        .expect("write source");
+        let schema = dir.join("schema.json");
+        let history = dir.join("history.json");
+
+        cmd_db_migrate(&source, &schema, Some(&history)).expect("migrate schema");
+
+        let written = read_json_value(&schema).expect("read schema");
+        assert_eq!(
+            written["structs"]["Order"]["fields"]["total"]["type"],
+            "int"
+        );
+        let history = read_json_value(&history).expect("read history");
+        assert_eq!(
+            history["entries"]
+                .as_array()
+                .expect("history entries")
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn db_rollback_restores_previous_schema_snapshot() {
+        let dir = temp_output_dir("db-rollback");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let original_source = dir.join("original.orv");
+        std::fs::write(
+            &original_source,
+            r#"struct User {
+  id: int
+  email: string
+}"#,
+        )
+        .expect("write original source");
+        let changed_source = dir.join("changed.orv");
+        std::fs::write(
+            &changed_source,
+            r#"struct User {
+  id: int
+  email: string
+  avatar: string?
+}"#,
+        )
+        .expect("write changed source");
+        let schema = dir.join("schema.json");
+
+        cmd_db_apply(&original_source, &schema).expect("apply original schema");
+        cmd_db_apply(&changed_source, &schema).expect("apply changed schema");
+        assert!(
+            read_json_value(&schema).expect("read changed schema")["structs"]["User"]["fields"]
+                .as_object()
+                .expect("fields")
+                .contains_key("avatar")
+        );
+
+        cmd_db_rollback(&schema).expect("rollback schema");
+
+        let restored = read_json_value(&schema).expect("read restored schema");
+        assert!(!restored["structs"]["User"]["fields"]
+            .as_object()
+            .expect("fields")
+            .contains_key("avatar"));
+        let plan = db_plan_json(&original_source, Some(&schema)).expect("plan after rollback");
+        assert_eq!(plan["actions"].as_array().expect("actions").len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verify_artifact_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "verify-artifact",
+            "target/orv-build-test/server/app.orv-runtime.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn check_artifact_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "check-artifact",
+            "target/orv-build-test/server/app.orv-runtime.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn run_artifact_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "run-artifact",
+            "target/orv-build-test/server/app.orv-runtime.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn run_build_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "run-build", "target/orv-build-test"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn dev_subcommand_is_accepted() {
+        let parsed =
+            Cli::try_parse_from(["orv", "dev", "src/main.orv", "--out", "target/orv-dev-test"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn reveal_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "reveal",
+            "target/orv-build-test",
+            "route:GET_/ping:abc123",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn verify_build_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn build_writes_manifest_origin_map_and_project_graph() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("build-artifacts");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let manifest_path = out.join("build-manifest.json");
+        let origin_map_path = out.join("origin-map.json");
+        let bundle_plan_path = out.join("bundle-plan.json");
+        let server_artifact_path = out.join("server").join("app.orv-runtime.json");
+        let server_launch_path = out.join("server").join("launch.json");
+        let graph_path = out.join("project-graph.json");
+        assert!(
+            manifest_path.is_file(),
+            "missing {}",
+            manifest_path.display()
+        );
+        assert!(
+            origin_map_path.is_file(),
+            "missing {}",
+            origin_map_path.display()
+        );
+        assert!(
+            bundle_plan_path.is_file(),
+            "missing {}",
+            bundle_plan_path.display()
+        );
+        assert!(
+            server_artifact_path.is_file(),
+            "missing {}",
+            server_artifact_path.display()
+        );
+        assert!(
+            server_launch_path.is_file(),
+            "missing {}",
+            server_launch_path.display()
+        );
+        assert!(graph_path.is_file(), "missing {}", graph_path.display());
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["entry"], path.display().to_string());
+        assert_eq!(manifest["runtime"], "reference-interpreter");
+        let runtime_features = manifest["capabilities"]["runtime_features"]
+            .as_array()
+            .expect("runtime features array");
+        assert!(runtime_features
+            .iter()
+            .any(|feature| feature == "http_server"));
+        assert!(runtime_features.iter().any(|feature| feature == "router"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "origin_map"
+                && artifact["path"] == "origin-map.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "bundle_plan"
+                && artifact["path"] == "bundle-plan.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "project_graph"
+                && artifact["path"] == "project-graph.json"));
+        let plan: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&bundle_plan_path).expect("plan"))
+                .expect("bundle plan json");
+        assert_eq!(plan["schema_version"], 1);
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "server_runtime"
+                && bundle["path"] == "server/app.orv-runtime.json"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "server_launcher"
+                && bundle["path"] == "server/launch.json"));
+        let server_artifact: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&server_artifact_path).expect("server artifact"),
+        )
+        .expect("server artifact json");
+        assert_eq!(server_artifact["schema_version"], 1);
+        assert_eq!(server_artifact["runtime"], "reference-interpreter");
+        assert!(server_artifact["routes"]
+            .as_array()
+            .expect("routes array")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        assert!(server_artifact["source_bundle"]["files"]
+            .as_array()
+            .expect("source bundle files")
+            .iter()
+            .any(|file| file["source"]
+                .as_str()
+                .is_some_and(|source| source.contains("@route GET /ping"))
+                && file["content_hash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.starts_with("fnv1a64:"))));
+        let launch: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&server_launch_path).expect("server launch artifact"),
+        )
+        .expect("server launch json");
+        assert_eq!(launch["schema_version"], 1);
+        assert_eq!(launch["runtime"], "reference-interpreter");
+        assert_eq!(launch["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(launch["protocol"], "http1");
+        assert_eq!(launch["command"][0], "orv");
+        assert_eq!(launch["command"][1], "run-artifact");
+        assert_eq!(launch["command"][2], "server/app.orv-runtime.json");
+        assert!(launch["routes"]
+            .as_array()
+            .expect("launch routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_accepts_orv_toml_project_entry() {
+        let dir = temp_output_dir("project-manifest-build");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+        let entry = src.join("main.orv");
+        std::fs::write(&entry, "@html { \"Manifest page\" }\n").expect("write entry");
+        let manifest = dir.join("orv.toml");
+        std::fs::write(
+            &manifest,
+            r#"[project]
+name = "manifest-build"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write manifest");
+        let out = dir.join("dist");
+
+        cmd_build(&manifest, &out).expect("manifest build");
+
+        let build_manifest = read_json_value(&out.join("build-manifest.json")).expect("manifest");
+        assert_eq!(build_manifest["entry"], entry.display().to_string());
+        assert!(
+            out.join("pages").join("index.html").is_file(),
+            "missing static page"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_writes_static_html_page_for_html_only_entry() {
+        let out = temp_output_dir("build-static-page");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"@out @html { @body { @h1 "Home" @p "zero runtime" } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let page = build_out.join("pages").join("index.html");
+        let html = std::fs::read_to_string(&page).expect("static page");
+        assert_eq!(
+            html,
+            "<html><body><h1>Home</h1><p>zero runtime</p></body></html>"
+        );
+        let plan: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(build_out.join("bundle-plan.json")).expect("plan"),
+        )
+        .expect("bundle plan json");
+        let static_bundle = plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .find(|bundle| bundle["kind"] == "static_page")
+            .expect("static page bundle");
+        assert_eq!(static_bundle["path"], "pages/index.html");
+        assert_eq!(
+            static_bundle["runtime_features"]
+                .as_array()
+                .expect("runtime features")
+                .len(),
+            0
+        );
+        assert!(!plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "server_runtime"));
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_accepts_static_page_output() {
+        let out = temp_output_dir("verify-build-static");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        cmd_verify_build(&build_out).expect("verify build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_missing_static_page_output() {
+        let out = temp_output_dir("verify-build-missing-static");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        std::fs::remove_file(build_out.join("pages").join("index.html")).expect("remove page");
+
+        let err = cmd_verify_build(&build_out).expect_err("missing static page");
+
+        assert!(err
+            .to_string()
+            .contains("missing bundle target static_page"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reveal_origin_links_build_artifact_back_to_source_and_route() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("reveal-origin");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+
+        let reveal = reveal_origin_json(&out, &route.id).expect("reveal origin");
+
+        assert_eq!(reveal["schema_version"], 1);
+        assert_eq!(reveal["origin"]["id"], route.id);
+        assert_eq!(reveal["origin"]["kind"], "route");
+        assert_eq!(reveal["origin"]["name"], "GET /ping");
+        let canonical_path = std::fs::canonicalize(&path).expect("canonical entry path");
+        assert_eq!(
+            reveal["source"]["path"],
+            canonical_path.display().to_string()
+        );
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@route GET /ping")));
+        assert_eq!(reveal["project_graph"]["kind"], "domain");
+        assert_eq!(reveal["project_graph"]["name"], "route");
+        assert!(reveal["production"]["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn lsp_reveal_returns_location_for_build_origin() {
+        let dir = temp_output_dir("lsp-reveal");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+
+        let reveal = lsp_reveal_json(&out, &route.id).expect("lsp reveal");
+
+        assert_eq!(reveal["schema_version"], 1);
+        assert_eq!(reveal["origin"]["id"], route.id);
+        let canonical_path = std::fs::canonicalize(&path).expect("canonical source path");
+        assert_eq!(
+            reveal["location"]["uri"],
+            canonical_path.display().to_string()
+        );
+        assert_eq!(reveal["location"]["range"]["start"]["line"], 2);
+        assert_eq!(reveal["location"]["range"]["start"]["character"], 2);
+        assert!(reveal["production"]["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_build_executes_server_launch_artifact_relative_to_build_dir() {
+        let out = temp_output_dir("run-build");
+        let artifact = out.join("server").join("app.orv-runtime.json");
+        write_reference_artifact(&artifact, "artifact.orv", r#"@out "build ok""#);
+        let launch = orv_compiler::ServerLaunchArtifact {
+            schema_version: orv_compiler::SERVER_LAUNCH_ARTIFACT_VERSION,
+            runtime: "reference-interpreter".to_string(),
+            artifact: "server/app.orv-runtime.json".to_string(),
+            command: vec![
+                "orv".to_string(),
+                "run-artifact".to_string(),
+                "server/app.orv-runtime.json".to_string(),
+            ],
+            protocol: "http1".to_string(),
+            routes: Vec::new(),
+        };
+        write_json(
+            &out.join("server").join("launch.json"),
+            &serde_json::to_value(launch).expect("launch value"),
+        )
+        .expect("write launch");
+        let mut stdout = Vec::new();
+
+        run_build_with_writer(&out, &mut stdout).expect("run build");
+
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "build ok\n"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_build_prints_zero_runtime_static_page() {
+        let out = temp_output_dir("run-build-static");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Static" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let mut stdout = Vec::new();
+
+        run_build_with_writer(&build_out, &mut stdout).expect("run build");
+
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "<html><body><h1>Static</h1></body></html>"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_build_uses_bundle_plan_instead_of_stale_server_launcher() {
+        let out = temp_output_dir("run-build-static-stale-server");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Fresh" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let stale_launch = build_out.join("server").join("launch.json");
+        if let Some(parent) = stale_launch.parent() {
+            std::fs::create_dir_all(parent).expect("create stale server dir");
+        }
+        std::fs::write(&stale_launch, "{ stale").expect("write stale launch");
+        let mut stdout = Vec::new();
+
+        run_build_with_writer(&build_out, &mut stdout).expect("run build");
+
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "<html><body><h1>Fresh</h1></body></html>"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn dev_builds_verifies_and_runs_static_page() {
+        let out = temp_output_dir("dev-static");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Dev" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer(&entry, &build_out, &mut stdout).expect("dev");
+
+        assert!(build_out.join("build-manifest.json").is_file());
+        assert!(build_out.join("bundle-plan.json").is_file());
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "<html><body><h1>Dev</h1></body></html>"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_artifact_accepts_generated_server_runtime_artifact() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("verify-artifact");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let artifact = out.join("server").join("app.orv-runtime.json");
+
+        cmd_verify_artifact(&artifact).expect("verify artifact");
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn check_artifact_rehydrates_generated_server_runtime_artifact() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("check-artifact");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let artifact = out.join("server").join("app.orv-runtime.json");
+
+        cmd_check_artifact(&artifact).expect("check artifact");
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_artifact_rehydrates_and_runs_source_bundle() {
+        let out = temp_output_dir("run-artifact");
+        let artifact = out.join("app.orv-runtime.json");
+        write_reference_artifact(&artifact, "artifact.orv", r#"@out "artifact ok""#);
+        let mut stdout = Vec::new();
+
+        run_artifact_with_writer(&artifact, &mut stdout).expect("run artifact");
+
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "artifact ok\n"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_artifact_rehydrates_imported_source_bundle() {
+        let out = temp_output_dir("run-artifact-import");
+        let artifact = out.join("app.orv-runtime.json");
+        write_reference_artifact_with_sources(
+            &artifact,
+            "main.orv",
+            [
+                (
+                    "main.orv",
+                    "import models.user.User\nlet u: User = { name: \"Ada\" }\n@out u.name",
+                ),
+                ("models/user.orv", "pub struct User { name: string }"),
+            ],
+        );
+        let mut stdout = Vec::new();
+
+        run_artifact_with_writer(&artifact, &mut stdout).expect("run artifact");
+
+        assert_eq!(String::from_utf8(stdout).expect("stdout utf-8"), "Ada\n");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_artifact_rejects_corrupt_source_bundle() {
+        let out = temp_output_dir("run-artifact-corrupt");
+        let artifact_path = out.join("app.orv-runtime.json");
+        write_reference_artifact(&artifact_path, "artifact.orv", r#"@out "artifact ok""#);
+        let mut artifact: orv_compiler::ServerRuntimeArtifact =
+            serde_json::from_str(&std::fs::read_to_string(&artifact_path).expect("artifact json"))
+                .expect("artifact");
+        artifact.source_bundle.files[0].source = r#"@out "tampered""#.to_string();
+        write_json(
+            &artifact_path,
+            &serde_json::to_value(artifact).expect("artifact value"),
+        )
+        .expect("write artifact");
+        let mut stdout = Vec::new();
+
+        let err = run_artifact_with_writer(&artifact_path, &mut stdout).expect_err("hash mismatch");
+
+        assert!(err.to_string().contains("content hash mismatch"));
+        assert!(stdout.is_empty());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    fn write_reference_artifact(path: &Path, entry: &str, source: &str) {
+        write_reference_artifact_with_sources(path, entry, [(entry, source)]);
+    }
+
+    fn write_reference_artifact_with_sources<'a>(
+        path: &Path,
+        entry: &str,
+        sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) {
+        let manifest = orv_compiler::BuildManifest {
+            schema_version: orv_compiler::BUILD_MANIFEST_VERSION,
+            entry: entry.to_string(),
+            runtime: "reference-interpreter".to_string(),
+            artifacts: Vec::new(),
+            capabilities: orv_compiler::BuildCapabilities {
+                has_server: false,
+                server_routes: 0,
+                client_wasm: false,
+                runtime_features: vec!["console_io".to_string()],
+            },
+        };
+        let origin_map = orv_compiler::OriginMap {
+            version: orv_compiler::ORIGIN_MAP_VERSION,
+            entries: Vec::new(),
+            edges: Vec::new(),
+        };
+        let artifact = orv_compiler::server_runtime_artifact(&manifest, &origin_map, sources);
+        write_json(
+            path,
+            &serde_json::to_value(artifact).expect("artifact value"),
+        )
+        .expect("write artifact");
+    }
+
+    #[test]
+    fn graph_json_for_path_outputs_schema_nodes_and_edges() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let value = project_graph_json_for_path(&path).expect("graph json");
+
+        assert_eq!(value["schema_version"], 1);
+        let nodes = value["nodes"].as_array().expect("nodes array");
+        let edges = value["edges"].as_array().expect("edges array");
+        assert!(nodes.iter().any(|node| node["kind"] == "file"));
+        assert!(nodes.iter().any(|node| node["kind"] == "domain"));
+        assert!(edges.iter().any(|edge| edge["kind"] == "contains"));
+        assert_eq!(value["stats"]["node_count"], nodes.len());
+        assert_eq!(value["stats"]["edge_count"], edges.len());
+        assert_eq!(value["stats"]["file_count"], 1);
+        assert!(
+            value["stats"]["max_semantic_contains_depth"]
+                .as_u64()
+                .expect("semantic depth")
+                >= 2
+        );
+    }
+
+    #[test]
+    fn graph_json_for_path_includes_semantic_origin_map() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let value = project_graph_json_for_path(&path).expect("graph json");
+        let entries = value["semantic"]["origin_map"]["entries"]
+            .as_array()
+            .expect("origin entries array");
+
+        assert!(entries
+            .iter()
+            .any(|entry| entry["kind"] == "route" && entry["name"] == "GET /ping"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["kind"] == "domain" && entry["name"] == "respond"));
+    }
+
+    #[test]
+    fn graph_json_links_semantic_origins_to_ast_nodes() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let value = project_graph_json_for_path(&path).expect("graph json");
+        let nodes = value["nodes"].as_array().expect("nodes array");
+        let route_node = nodes
+            .iter()
+            .find(|node| node["kind"] == "domain" && node["name"] == "route")
+            .expect("route AST node");
+        let route_origin = value["semantic"]["origin_map"]["entries"]
+            .as_array()
+            .expect("origin entries array")
+            .iter()
+            .find(|entry| entry["kind"] == "route" && entry["name"] == "GET /ping")
+            .expect("route origin");
+        let links = value["semantic"]["origin_links"]
+            .as_array()
+            .expect("origin links array");
+
+        assert!(links.iter().any(|link| {
+            link["kind"] == "source_node"
+                && link["origin_id"] == route_origin["id"]
+                && link["node_id"] == route_node["id"]
+        }));
+    }
+
+    #[test]
+    fn graph_json_includes_semantic_origin_edges() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let value = project_graph_json_for_path(&path).expect("graph json");
+        let entries = value["semantic"]["origin_map"]["entries"]
+            .as_array()
+            .expect("origin entries array");
+        let server = entries
+            .iter()
+            .find(|entry| entry["kind"] == "domain" && entry["name"] == "server")
+            .expect("server origin");
+        let route = entries
+            .iter()
+            .find(|entry| entry["kind"] == "route" && entry["name"] == "GET /ping")
+            .expect("route origin");
+        let respond = entries
+            .iter()
+            .find(|entry| entry["kind"] == "domain" && entry["name"] == "respond")
+            .expect("respond origin");
+        let edges = value["semantic"]["origin_edges"]
+            .as_array()
+            .expect("origin edges array");
+
+        assert!(edges.iter().any(|edge| {
+            edge["kind"] == "contains" && edge["from"] == server["id"] && edge["to"] == route["id"]
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge["kind"] == "contains" && edge["from"] == route["id"] && edge["to"] == respond["id"]
+        }));
+    }
+
+    #[test]
+    fn graph_json_exposes_call_edges_from_origin_map() {
+        let path = workspace_path(&["fixtures", "plan", "01-basics.orv"]);
+        let value = project_graph_json_for_path(&path).expect("graph json");
+        let edges = value["semantic"]["origin_edges"]
+            .as_array()
+            .expect("origin edges array");
+
+        assert!(edges.iter().any(|edge| edge["kind"] == "calls"));
+    }
+
+    #[test]
+    fn rendered_diagnostics_use_span_file_source() {
+        let files = vec![
+            orv_project::SourceFile {
+                id: FileId(0),
+                path: PathBuf::from("main.orv"),
+                source: "import models.user.User\nlet u: User = { name: \"ok\" }\n".to_string(),
+            },
+            orv_project::SourceFile {
+                id: FileId(1),
+                path: PathBuf::from("models/user.orv"),
+                source: "pub struct User { name: string }\nlet bad: int = \"wrong\"\n".to_string(),
+            },
+        ];
+        let start =
+            u32::try_from(files[1].source.find("\"wrong\"").unwrap()).expect("offset fits u32");
+        let len = u32::try_from("\"wrong\"".len()).expect("length fits u32");
+        let diag = orv_diagnostics::Diagnostic::error(
+            "type mismatch: `bad` annotated as `int` but value has type `string`",
+        )
+        .with_primary(
+            orv_diagnostics::Span::new(
+                FileId(1),
+                orv_diagnostics::ByteRange::new(start, start + len),
+            ),
+            "value has type `string`",
+        );
+
+        let rendered = render_diagnostics_for_test(&[diag], &files);
+        assert!(rendered.contains("models/user.orv"), "{rendered}");
+        assert!(rendered.contains("let bad: int = \"wrong\""), "{rendered}");
+        assert!(
+            !rendered.contains("let u: User = { name: \"ok\" }"),
+            "{rendered}"
+        );
     }
 }
