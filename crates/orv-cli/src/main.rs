@@ -2567,7 +2567,10 @@ impl DapSession {
         &mut self,
         request: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let path = dap_normalize_path(&dap_source_path(request)?);
+        let path = dap_normalize_path(&dap_breakpoint_source_path(
+            self.launched.as_ref(),
+            request,
+        )?);
         let verified_lines = dap_verified_breakpoint_lines(&path).unwrap_or_default();
         let breakpoints = request
             .pointer("/arguments/breakpoints")
@@ -4767,9 +4770,8 @@ fn dap_breakpoint_source_path(
         .and_then(serde_json::Value::as_u64)
         .filter(|reference| *reference > 0)
     {
-        let launched = launched.ok_or_else(|| {
-            anyhow::anyhow!("launch is required before sourceReference breakpointLocations")
-        })?;
+        let launched = launched
+            .ok_or_else(|| anyhow::anyhow!("launch is required before sourceReference lookup"))?;
         return launched
             .sources
             .iter()
@@ -8264,6 +8266,48 @@ function greet(user: User): string -> "hello"
         );
         assert_eq!(response["body"]["breakpoints"][1]["verified"], true);
         assert_eq!(response["body"]["breakpoints"][1]["filter"], "orv.runtime");
+    }
+
+    #[test]
+    fn dap_set_breakpoints_accepts_loaded_source_reference() {
+        let dir = temp_output_dir("dap-set-breakpoints-source-ref");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 7,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 8,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "sourceReference": 1,
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 1,
+                        },
+                    ],
+                },
+            }))
+            .expect("setBreakpoints response");
+
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["body"]["breakpoints"][0]["verified"], true);
+        assert_eq!(response["body"]["breakpoints"][0]["line"], 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
