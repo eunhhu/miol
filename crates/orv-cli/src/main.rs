@@ -5516,9 +5516,25 @@ fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
     if deploy.get("profile").and_then(serde_json::Value::as_str) != Some("prod") {
         anyhow::bail!("deploy manifest profile must be prod");
     }
+    verify_deploy_source_bundle(dir, deploy.get("source_bundle"))?;
     verify_deploy_server_target(dir, deploy.get("server"))?;
     verify_deploy_static_target(dir, deploy.get("static"))?;
     verify_deploy_client_target(dir, deploy.get("client"))
+}
+
+fn verify_deploy_source_bundle(
+    dir: &Path,
+    source_bundle: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(path) = source_bundle.and_then(serde_json::Value::as_str) else {
+        anyhow::bail!("deploy manifest source_bundle must be a string");
+    };
+    let target = dir.join(path);
+    if !target.is_file() {
+        anyhow::bail!("missing deploy source bundle: {}", target.display());
+    }
+    read_source_bundle_artifact(&target)?;
+    Ok(())
 }
 
 fn verify_deploy_server_target(
@@ -6460,6 +6476,7 @@ fn write_prod_deploy_artifacts(
         "entry": entry.display().to_string(),
         "runtime": manifest.runtime.clone(),
         "runtime_features": manifest.capabilities.runtime_features.clone(),
+        "source_bundle": "source-bundle.json",
         "server": server,
         "static": static_target,
         "client": client,
@@ -11581,6 +11598,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["schema_version"], 1);
         assert_eq!(deploy["profile"], "prod");
         assert_eq!(deploy["entry"], path.display().to_string());
+        assert_eq!(deploy["source_bundle"], "source-bundle.json");
         assert_eq!(deploy["server"]["artifact"], "server/app.orv-runtime.json");
         assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
         assert!(deploy["server"]["routes"]
