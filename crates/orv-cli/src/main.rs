@@ -6331,7 +6331,8 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
     verify_bundle_targets(dir, &plan)?;
     verify_manifest_artifacts(dir, &manifest)?;
-    verify_deploy_manifest_if_present(dir)
+    verify_deploy_manifest_if_present(dir)?;
+    verify_dev_hmr_session_if_present(dir, &plan)
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -6530,6 +6531,100 @@ fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
     }
     if !client_wasm_exports_function(&bytes, CLIENT_WASM_START_EXPORT)? {
         anyhow::bail!("client_wasm bundle must export `{CLIENT_WASM_START_EXPORT}`");
+    }
+    Ok(())
+}
+
+fn verify_dev_hmr_session_if_present(dir: &Path, plan: &serde_json::Value) -> anyhow::Result<()> {
+    let session_path = dir.join("dev").join("session.json");
+    if !session_path.is_file() {
+        return Ok(());
+    }
+    let session = read_json_value(&session_path)?;
+    if session
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("dev session schema_version must be 1");
+    }
+    if json_str(&session, "mode", "dev session")? != "hmr" {
+        anyhow::bail!("dev session mode must be hmr");
+    }
+    if json_str(&session, "source_bundle", "dev session")? != "source-bundle.json" {
+        anyhow::bail!("dev session source_bundle must be source-bundle.json");
+    }
+    let watch = session
+        .get("watch")
+        .ok_or_else(|| anyhow::anyhow!("dev session watch must be an object"))?;
+    let session_sources = watch
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("dev session watch.sources must be an array"))?;
+    let session_targets = watch
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("dev session watch.targets must be an array"))?;
+    let source_bundle = read_json_value(&dir.join("source-bundle.json"))?;
+    let expected_sources = source_bundle
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("source-bundle.json files must be an array"))?;
+    for source in expected_sources {
+        let path = json_str(source, "path", "source bundle file")?;
+        let content_hash = json_str(source, "content_hash", "source bundle file")?;
+        if !session_sources.iter().any(|session_source| {
+            session_source
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                == Some(path)
+                && session_source
+                    .get("content_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(content_hash)
+        }) {
+            anyhow::bail!("dev session missing source {path}");
+        }
+    }
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    for bundle in bundles {
+        let kind = json_str(bundle, "kind", "bundle target")?;
+        let path = json_str(bundle, "path", "bundle target")?;
+        if !session_targets.iter().any(|session_target| {
+            session_target
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some(kind)
+                && session_target
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(path)
+        }) {
+            anyhow::bail!("dev session missing bundle target {kind}:{path}");
+        }
+    }
+    let reload = session
+        .get("reload")
+        .ok_or_else(|| anyhow::anyhow!("dev session reload must be an object"))?;
+    let has_client_target = bundles.iter().any(|target| {
+        matches!(
+            target.get("kind").and_then(serde_json::Value::as_str),
+            Some("client_page" | "client_js" | "client_wasm")
+        )
+    });
+    let expected_strategy = if has_client_target {
+        "hot-reload"
+    } else {
+        "full-reload"
+    };
+    if json_str(reload, "strategy", "dev session reload")? != expected_strategy {
+        anyhow::bail!("dev session reload strategy must be {expected_strategy}");
+    }
+    if json_str(reload, "fallback", "dev session reload")? != "full-reload" {
+        anyhow::bail!("dev session reload fallback must be full-reload");
     }
     Ok(())
 }
@@ -13774,6 +13869,41 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn verify_build_rejects_invalid_dev_hmr_session_manifest() {
+        let out = temp_output_dir("verify-build-dev-hmr-session");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, true, &mut stdout).expect("dev hmr");
+        let session_path = build_out.join("dev").join("session.json");
+        let mut session = read_json_value(&session_path).expect("dev session");
+        session["watch"]["targets"] = serde_json::Value::Array(
+            session["watch"]["targets"]
+                .as_array()
+                .expect("targets")
+                .iter()
+                .filter(|target| target["kind"] != "client_wasm")
+                .cloned()
+                .collect(),
+        );
+        write_json(&session_path, &session).expect("write corrupt dev session");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid dev hmr session");
+
+        assert!(err
+            .to_string()
+            .contains("dev session missing bundle target client_wasm:client/app.wasm"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_client_wasm_without_orv_custom_section() {
         let out = temp_output_dir("verify-build-client-wasm-section");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -14280,6 +14410,7 @@ entry = "src/main.orv"
                         .iter()
                         .any(|feature| feature == "client_wasm")
             }));
+        cmd_verify_build(&build_out).expect("verify dev hmr build");
         let _ = std::fs::remove_dir_all(&out);
     }
 
