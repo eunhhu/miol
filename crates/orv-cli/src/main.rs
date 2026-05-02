@@ -2061,7 +2061,8 @@ impl DapSession {
             "reverseContinue" => self.reverse_continue_result(),
             "goto" => self.goto_result(request),
             "stepBack" => self.step_back_result(),
-            "next" | "stepIn" | "stepOut" => self.step_result(),
+            "next" | "stepIn" => self.step_result(),
+            "stepOut" => self.step_out_result(),
             "pause" => self.pause_result(),
             "terminateThreads" => self.terminate_threads_result(request),
             "disconnect" | "terminate" => {
@@ -2878,6 +2879,48 @@ impl DapSession {
             .launched
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before stepBack"))?;
+        launched.current_frame_index = target_frame;
+        if let Some(frame) = launched.frames.get(target_frame) {
+            launched.stopped_line = frame.line;
+        }
+        launched.stopped_reason = "step".to_string();
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
+    fn step_out_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let (start_frame, target_frame) = {
+            let launched = self
+                .launched
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before stepOut"))?;
+            let current = launched
+                .frames
+                .get(launched.current_frame_index)
+                .ok_or_else(|| anyhow::anyhow!("no current runtime frame"))?;
+            let current_depth = current.stack.len();
+            if current_depth == 0 {
+                anyhow::bail!("no caller frame");
+            }
+            let start = launched.current_frame_index.saturating_add(1);
+            let target = launched
+                .frames
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find_map(|(index, frame)| (frame.stack.len() < current_depth).then_some(index));
+            (start, target)
+        };
+        let Some(target_frame) = target_frame else {
+            self.launched = None;
+            self.queue_event("terminated", serde_json::json!({}));
+            return Ok(serde_json::json!({}));
+        };
+        self.queue_frame_outputs(start_frame, target_frame);
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before stepOut"))?;
         launched.current_frame_index = target_frame;
         if let Some(frame) = launched.frames.get(target_frame) {
             launched.stopped_line = frame.line;
@@ -8545,6 +8588,89 @@ let total: int = add(2, 3)
 
         assert_eq!(step_back["success"], true, "{step_back}");
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "step"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_step_out_leaves_current_function_frame() {
+        let dir = temp_output_dir("dap-step-out");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+let done: int = total
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 190,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 191,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let inside_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 192,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("inside stack response");
+        let step_out = session
+            .message_response(&serde_json::json!({
+                "seq": 193,
+                "type": "request",
+                "command": "stepOut",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stepOut response");
+        let events = session.drain_pending_events();
+        let outside_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 194,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("outside stack response");
+
+        assert_eq!(inside_stack["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(inside_stack["body"]["stackFrames"][0]["line"], 2);
+        assert_eq!(step_out["success"], true, "{step_out}");
+        assert_eq!(outside_stack["body"]["stackFrames"][0]["name"], "orv entry");
+        assert_eq!(outside_stack["body"]["stackFrames"][0]["line"], 5);
         assert!(events.iter().any(|event| {
             event["type"] == "event"
                 && event["event"] == "stopped"
