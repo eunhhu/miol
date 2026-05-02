@@ -407,3 +407,50 @@ fn db_recover_rejects_multiple_cutoffs() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_archive_writes_wal_manifest() {
+    let dir = temp_dir("db-archive-wal");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+{"schema_version":1,"op":"create","ts_unix_ms":2000,"table":"User","data":{"email":"b@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .output()
+        .expect("run db archive");
+
+    assert!(
+        output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = read_json(&archive);
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["kind"], "orv.db.wal_archive");
+    assert_eq!(manifest["wal"]["path"], wal.display().to_string());
+    assert_eq!(manifest["wal"]["record_count"], 2);
+    assert_eq!(manifest["wal"]["first_ts_unix_ms"], 1000);
+    assert_eq!(manifest["wal"]["last_ts_unix_ms"], 2000);
+    assert!(manifest["wal"]["hash"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("fnv1a64:")));
+    assert_eq!(manifest["records"][0]["record"], 1);
+    assert_eq!(manifest["records"][0]["ts_unix_ms"], 1000);
+    assert_eq!(manifest["records"][1]["record"], 2);
+    assert_eq!(manifest["records"][1]["ts_unix_ms"], 2000);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -246,6 +246,15 @@ enum DbCommand {
         #[arg(long)]
         until_time: Option<String>,
     },
+    /// JSONL WAL archive manifest artifact를 작성한다.
+    Archive {
+        /// 읽을 @db.wal JSONL 경로.
+        #[arg(long)]
+        wal: PathBuf,
+        /// 쓸 WAL archive manifest JSON 경로.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
         /// 읽을 migration history JSON 경로.
@@ -483,6 +492,13 @@ fn main() -> ExitCode {
                 until_unix_ms,
                 until_time.as_deref(),
             ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            DbCommand::Archive { wal, out } => match cmd_db_archive(&wal, &out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -980,6 +996,75 @@ fn cmd_db_recover(
         _ => unreachable!("validated mutually exclusive recover limits"),
     }
     Ok(())
+}
+
+fn cmd_db_archive(wal: &Path, out: &Path) -> anyhow::Result<()> {
+    let manifest = db_wal_archive_manifest(wal)?;
+    write_json_atomic(out, &manifest)?;
+    println!(
+        "db archive: {} written from {}",
+        out.display(),
+        wal.display()
+    );
+    Ok(())
+}
+
+fn db_wal_archive_manifest(wal: &Path) -> anyhow::Result<serde_json::Value> {
+    let source = std::fs::read_to_string(wal)
+        .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let has_complete_tail = source.ends_with('\n');
+    let mut records = Vec::new();
+    let mut first_ts_unix_ms = None;
+    let mut last_ts_unix_ms = None;
+    for (line_index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(source)
+                if line_index + 1 == lines.len() && !has_complete_tail && source.is_eof() =>
+            {
+                break;
+            }
+            Err(source) => {
+                return Err(anyhow::anyhow!(
+                    "failed to parse WAL {} line {}: {source}",
+                    wal.display(),
+                    line_index + 1
+                ));
+            }
+        };
+        let record_number = records.len() + 1;
+        let timestamp = record.get("ts_unix_ms").and_then(serde_json::Value::as_u64);
+        if let Some(timestamp) = timestamp {
+            first_ts_unix_ms.get_or_insert(timestamp);
+            last_ts_unix_ms = Some(timestamp);
+        }
+        let mut item = serde_json::Map::new();
+        item.insert(
+            "record".to_string(),
+            serde_json::Value::from(u64::try_from(record_number).unwrap_or(u64::MAX)),
+        );
+        if let Some(timestamp) = timestamp {
+            item.insert("ts_unix_ms".to_string(), serde_json::Value::from(timestamp));
+        }
+        records.push(serde_json::Value::Object(item));
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.db.wal_archive",
+        "wal": {
+            "path": wal.display().to_string(),
+            "hash": format!("fnv1a64:{:016x}", fnv1a64(source.as_bytes())),
+            "byte_count": source.len(),
+            "record_count": records.len(),
+            "first_ts_unix_ms": first_ts_unix_ms,
+            "last_ts_unix_ms": last_ts_unix_ms,
+        },
+        "records": records,
+    }))
 }
 
 fn parse_db_recover_time_unix_ms(input: &str) -> anyhow::Result<u64> {
