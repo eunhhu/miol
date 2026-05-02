@@ -1998,6 +1998,7 @@ impl DapSession {
                 Ok(serde_json::json!({
                     "supportsConfigurationDoneRequest": true,
                     "supportsTerminateRequest": true,
+                    "supportsTerminateThreadsRequest": true,
                     "supportsLoadedSourcesRequest": true,
                     "supportsEvaluateForHovers": true,
                     "supportsCompletionsRequest": true,
@@ -2062,6 +2063,7 @@ impl DapSession {
             "stepBack" => self.step_back_result(),
             "next" | "stepIn" | "stepOut" => self.step_result(),
             "pause" => self.pause_result(),
+            "terminateThreads" => self.terminate_threads_result(request),
             "disconnect" | "terminate" => {
                 self.queue_event("terminated", serde_json::json!({}));
                 self.launched = None;
@@ -2939,6 +2941,27 @@ impl DapSession {
             .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
         launched.stopped_reason = "pause".to_string();
         self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
+    fn terminate_threads_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.require_launch("terminateThreads")?;
+        let terminates_reference_thread = request
+            .pointer("/arguments/threadIds")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|thread_ids| {
+                thread_ids
+                    .iter()
+                    .any(|thread_id| thread_id.as_u64() == Some(1))
+            });
+        if !terminates_reference_thread {
+            anyhow::bail!("unknown ORV thread id");
+        }
+        self.queue_event("terminated", serde_json::json!({}));
+        self.launched = None;
         Ok(serde_json::json!({}))
     }
 
@@ -7590,6 +7613,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["success"], true);
         assert_eq!(response["body"]["supportsConfigurationDoneRequest"], true);
         assert_eq!(response["body"]["supportsTerminateRequest"], true);
+        assert_eq!(response["body"]["supportsTerminateThreadsRequest"], true);
         assert_eq!(response["body"]["supportsLoadedSourcesRequest"], true);
         assert_eq!(response["body"]["supportsEvaluateForHovers"], true);
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
@@ -8727,6 +8751,57 @@ let total: int = add(2, 3)
                 && event["body"]["reason"] == "pause"
                 && event["body"]["threadId"] == 1
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_terminate_threads_clears_launch_and_queues_terminated_event() {
+        let dir = temp_output_dir("dap-terminate-threads");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 183,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let terminate_threads = session
+            .message_response(&serde_json::json!({
+                "seq": 184,
+                "type": "request",
+                "command": "terminateThreads",
+                "arguments": {
+                    "threadIds": [1],
+                },
+            }))
+            .expect("terminateThreads response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 185,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(terminate_threads["success"], true, "{terminate_threads}");
+        assert!(events
+            .iter()
+            .any(|event| { event["type"] == "event" && event["event"] == "terminated" }));
+        assert_eq!(stack["success"], false, "{stack}");
+        assert!(stack["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("launch is required")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
