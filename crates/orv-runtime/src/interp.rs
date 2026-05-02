@@ -153,6 +153,31 @@ pub struct HandlerOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Result of a reference-runtime debug run.
+#[derive(Clone, Debug, Default)]
+pub struct DebugRun {
+    /// Ordered snapshots captured after runtime-executed statements.
+    pub frames: Vec<DebugFrame>,
+}
+
+/// One debugger-visible frame snapshot.
+#[derive(Clone, Debug)]
+pub struct DebugFrame {
+    /// Source span of the statement that produced this snapshot.
+    pub span: orv_diagnostics::Span,
+    /// Lexical bindings visible in the runtime environment at this point.
+    pub locals: Vec<DebugVariable>,
+}
+
+/// Runtime value for one debugger-visible binding.
+#[derive(Clone, Debug)]
+pub struct DebugVariable {
+    /// Source-level binding name.
+    pub name: String,
+    /// Runtime value captured for the binding.
+    pub value: Value,
+}
+
 /// 런타임 에러.
 ///
 /// `thrown` 필드에 사용자 `throw` 값이 담긴 경우 try/catch 가 잡아낼 수
@@ -359,6 +384,27 @@ pub fn run_with_writer<W: Write>(program: &HirProgram, writer: &mut W) -> Result
     run_with_writer_in_env(program, HashMap::new(), writer).map(|_| ())
 }
 
+/// Run a program with debugger snapshots enabled.
+///
+/// The returned [`DebugRun`] contains snapshots captured after executable HIR
+/// statements. Runtime success or failure is returned separately so callers can
+/// still inspect partial output and frames when execution fails.
+pub fn run_with_debug<W: Write>(
+    program: &HirProgram,
+    writer: &mut W,
+) -> (DebugRun, Result<(), RuntimeError>) {
+    let mut interp = Interp::new_with_env(writer, HashMap::new());
+    interp.debug = Some(DebugTraceState::default());
+    let result = interp.run(program);
+    let debug = interp
+        .debug
+        .take()
+        .map_or_else(DebugRun::default, |state| DebugRun {
+            frames: state.frames,
+        });
+    (debug, result)
+}
+
 /// 주어진 초기 환경 위에서 프로그램을 실행하고, 실행 후 환경 스냅샷을 돌려준다.
 ///
 /// `@server` 부팅 단계처럼 기존 top-level 바인딩을 본문에 주입해야 하는 경로가
@@ -519,6 +565,14 @@ struct Interp<'w, W: Write> {
     /// Runtime-only bindings for domain handlers whose parameter names are not
     /// resolver-managed lexical declarations yet.
     dynamic_scopes: Vec<HashMap<String, Value>>,
+    /// Optional debugger trace collector.
+    debug: Option<DebugTraceState>,
+}
+
+#[derive(Default)]
+struct DebugTraceState {
+    names: Vec<(NameId, String)>,
+    frames: Vec<DebugFrame>,
 }
 
 impl<'w, W: Write> Interp<'w, W> {
@@ -549,6 +603,7 @@ impl<'w, W: Write> Interp<'w, W> {
             job_handlers: HashMap::new(),
             cron_handlers: Vec::new(),
             dynamic_scopes: Vec::new(),
+            debug: None,
         }
     }
 
@@ -561,19 +616,58 @@ impl<'w, W: Write> Interp<'w, W> {
         Ok(())
     }
 
+    fn debug_register_ident(&mut self, ident: &orv_hir::HirIdent) {
+        let Some(debug) = &mut self.debug else {
+            return;
+        };
+        if !debug.names.iter().any(|(id, _)| *id == ident.id) {
+            debug.names.push((ident.id, ident.name.clone()));
+        }
+    }
+
+    fn debug_register_params(&mut self, params: &[HirParam]) {
+        for param in params {
+            self.debug_register_ident(&param.name);
+        }
+    }
+
+    fn debug_capture(&mut self, span: orv_diagnostics::Span) {
+        let Some(debug) = &self.debug else {
+            return;
+        };
+        let names = debug.names.clone();
+        let locals = names
+            .into_iter()
+            .filter_map(|(id, name)| {
+                self.env
+                    .get(&id)
+                    .cloned()
+                    .map(|value| DebugVariable { name, value })
+            })
+            .collect();
+        if let Some(debug) = &mut self.debug {
+            debug.frames.push(DebugFrame { span, locals });
+        }
+    }
+
     fn exec_stmt(&mut self, stmt: &HirStmt, is_last: bool) -> Result<(), RuntimeError> {
         match stmt {
             HirStmt::Let(l) => {
                 let v = self.eval(&l.init)?;
                 self.env.insert(l.name.id, v);
+                self.debug_register_ident(&l.name);
+                self.debug_capture(l.span);
             }
             HirStmt::Const(c) => {
                 let v = self.eval(&c.init)?;
                 self.env.insert(c.name.id, v);
+                self.debug_register_ident(&c.name);
+                self.debug_capture(c.span);
             }
             HirStmt::Function(f) => {
                 let rc = Rc::new((**f).clone());
                 self.env.insert(f.name.id, Value::Function(rc.clone()));
+                self.debug_register_ident(&f.name);
                 // SPEC §9.6: nested define 은 외부에서 `@Parent.Child` dotted
                 // 경로로 접근 가능해야 한다. parent body 를 재귀 탐색해 nested
                 // function 들을 dotted name 을 가진 별도 Rc<HirFunctionStmt>
@@ -583,6 +677,7 @@ impl<'w, W: Write> Interp<'w, W> {
                 if f.is_define {
                     register_nested_defines(&mut self.env, &f.name.name, f);
                 }
+                self.debug_capture(f.span);
             }
             HirStmt::Struct(s) => {
                 self.type_structs.insert(
@@ -594,6 +689,8 @@ impl<'w, W: Write> Interp<'w, W> {
                 );
                 self.env
                     .insert(s.name.id, Value::TypeName(s.name.name.clone()));
+                self.debug_register_ident(&s.name);
+                self.debug_capture(s.span);
             }
             HirStmt::TypeAlias(alias) => {
                 if alias.params.is_empty() {
@@ -602,6 +699,8 @@ impl<'w, W: Write> Interp<'w, W> {
                 }
                 self.env
                     .insert(alias.name.id, Value::TypeName(alias.name.name.clone()));
+                self.debug_register_ident(&alias.name);
+                self.debug_capture(alias.span);
             }
             HirStmt::Enum(e) => {
                 // SPEC §4.4: enum 을 Value::Object 로 env 에 바인딩.
@@ -612,6 +711,8 @@ impl<'w, W: Write> Interp<'w, W> {
                     fields.push((v.name.clone(), val));
                 }
                 self.env.insert(e.name.id, Value::Object(fields));
+                self.debug_register_ident(&e.name);
+                self.debug_capture(e.span);
             }
             HirStmt::Return(_) => {
                 return Err(RuntimeError::native("`return` outside of a function"));
@@ -628,6 +729,7 @@ impl<'w, W: Write> Interp<'w, W> {
                 {
                     self.println(&v)?;
                 }
+                self.debug_capture(e.span);
             }
             // SPEC §8: import 는 멀티파일 로더가 병합을 끝낸 시점부터 참조
             // 바인딩이 실제로 env 에 존재한다. 런타임은 noop.
@@ -1142,6 +1244,10 @@ impl<'w, W: Write> Interp<'w, W> {
                     let (lo, hi, incl) = self.interpret_range(iter)?;
                     let mut i = lo;
                     let mut idx: i64 = 0;
+                    self.debug_register_ident(var);
+                    if let Some(iv) = index_var {
+                        self.debug_register_ident(iv);
+                    }
                     while if incl { i <= hi } else { i < hi } {
                         self.env.insert(var.id, Value::Int(i));
                         if let Some(iv) = index_var {
@@ -1176,6 +1282,10 @@ impl<'w, W: Write> Interp<'w, W> {
                         )));
                     }
                 };
+                self.debug_register_ident(var);
+                if let Some(iv) = index_var {
+                    self.debug_register_ident(iv);
+                }
                 for (i, item) in items.into_iter().enumerate() {
                     self.env.insert(var.id, item);
                     if let Some(iv) = index_var {
@@ -1578,6 +1688,7 @@ impl<'w, W: Write> Interp<'w, W> {
         for (p, v) in lam.params.iter().zip(args) {
             self.env.insert(p.name.id, v);
         }
+        self.debug_register_params(&lam.params);
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
@@ -2513,6 +2624,7 @@ impl<'w, W: Write> Interp<'w, W> {
         for (p, v) in func.params.iter().zip(args) {
             self.env.insert(p.name.id, v);
         }
+        self.debug_register_params(&func.params);
         for (id, v) in extras {
             self.env.insert(id, v);
         }
@@ -2556,6 +2668,7 @@ impl<'w, W: Write> Interp<'w, W> {
         for (p, v) in func.params.iter().zip(args) {
             self.env.insert(p.name.id, v);
         }
+        self.debug_register_params(&func.params);
         let saved_return = self.pending_return.take();
         let saved_html = self.html_buffer.take();
         let saved_loop = self.loop_signal;
@@ -2587,17 +2700,23 @@ impl<'w, W: Write> Interp<'w, W> {
                 HirStmt::Let(l) => {
                     let v = self.eval(&l.init)?;
                     self.env.insert(l.name.id, v);
+                    self.debug_register_ident(&l.name);
+                    self.debug_capture(l.span);
                 }
                 HirStmt::Const(c) => {
                     let v = self.eval(&c.init)?;
                     self.env.insert(c.name.id, v);
+                    self.debug_register_ident(&c.name);
+                    self.debug_capture(c.span);
                 }
                 HirStmt::Function(f) => {
                     let rc = Rc::new((**f).clone());
                     self.env.insert(f.name.id, Value::Function(rc.clone()));
+                    self.debug_register_ident(&f.name);
                     if f.is_define {
                         register_nested_defines(&mut self.env, &f.name.name, f);
                     }
+                    self.debug_capture(f.span);
                 }
                 HirStmt::Struct(_) => {}
                 HirStmt::TypeAlias(_) => {}
@@ -2608,6 +2727,8 @@ impl<'w, W: Write> Interp<'w, W> {
                         fields.push((v.name.clone(), val));
                     }
                     self.env.insert(e.name.id, Value::Object(fields));
+                    self.debug_register_ident(&e.name);
+                    self.debug_capture(e.span);
                 }
                 HirStmt::Import(_) => {}
                 HirStmt::Return(r) => {
@@ -2616,10 +2737,12 @@ impl<'w, W: Write> Interp<'w, W> {
                         None => Value::Void,
                     };
                     self.pending_return = Some(v.clone());
+                    self.debug_capture(r.span);
                     return Ok(ControlFlow::Return(v));
                 }
                 HirStmt::Expr(e) => {
                     let v = self.eval(e)?;
+                    self.debug_capture(e.span);
                     if let Some(ret) = self.pending_return.clone() {
                         return Ok(ControlFlow::Return(ret));
                     }
