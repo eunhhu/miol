@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term::termcolor::WriteColor;
 use orv_diagnostics::{FileId, Span};
@@ -128,6 +128,9 @@ enum Command {
         /// 프로젝트 이름.
         #[arg(long)]
         name: Option<String>,
+        /// 생성할 starter template.
+        #[arg(long, value_enum, default_value_t = InitTemplate::Basic)]
+        template: InitTemplate,
     },
     /// orv 테스트를 실행한다.
     Test {
@@ -156,6 +159,12 @@ enum Command {
         #[command(subcommand)]
         command: DapCommand,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InitTemplate {
+    Basic,
+    Shop,
 }
 
 #[derive(Subcommand)]
@@ -404,7 +413,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Init { dir, name } => match cmd_init(&dir, name.as_deref()) {
+        Command::Init {
+            dir,
+            name,
+            template,
+        } => match cmd_init(&dir, name.as_deref(), template) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -623,7 +636,11 @@ fn cmd_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_init(dir: &Path, name: Option<&str>) -> anyhow::Result<()> {
+const BASIC_INIT_TEMPLATE_SOURCE: &str =
+    "@html { @body { @h1 \"Hello from orv\" @p \"Edit src/main.orv\" } }\n";
+const SHOP_INIT_TEMPLATE_SOURCE: &str = include_str!("../../../fixtures/e2e/shopping_mall.orv");
+
+fn cmd_init(dir: &Path, name: Option<&str>, template: InitTemplate) -> anyhow::Result<()> {
     let project_name = name
         .map(str::to_string)
         .or_else(|| {
@@ -643,10 +660,11 @@ fn cmd_init(dir: &Path, name: Option<&str>) -> anyhow::Result<()> {
             escape_toml_string(&project_name)
         ),
     )?;
-    write_new_text_file(
-        &src.join("main.orv"),
-        "@html { @body { @h1 \"Hello from orv\" @p \"Edit src/main.orv\" } }\n",
-    )?;
+    let entry_source = match template {
+        InitTemplate::Basic => BASIC_INIT_TEMPLATE_SOURCE,
+        InitTemplate::Shop => SHOP_INIT_TEMPLATE_SOURCE,
+    };
+    write_new_text_file(&src.join("main.orv"), entry_source)?;
     println!("init: {} created", dir.display());
     Ok(())
 }
@@ -7984,7 +8002,7 @@ test "checkout failing runtime body" {
     fn init_writes_project_manifest_and_entry() {
         let dir = temp_output_dir("init-project");
 
-        cmd_init(&dir, Some("starter-shop")).expect("init project");
+        cmd_init(&dir, Some("starter-shop"), InitTemplate::Basic).expect("init project");
 
         let manifest = dir.join("orv.toml");
         let entry = dir.join("src").join("main.orv");
@@ -7998,6 +8016,33 @@ test "checkout failing runtime body" {
         let out = dir.join("dist");
         cmd_build(&dir, &out).expect("build project directory");
         assert!(out.join("pages").join("index.html").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_accepts_shop_template_flag() {
+        let parsed = Cli::try_parse_from(["orv", "init", "target/new-shop", "--template", "shop"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn init_shop_template_scaffolds_shopping_routes() {
+        let dir = temp_output_dir("init-shop-template");
+
+        cmd_init(&dir, Some("starter-shop"), InitTemplate::Shop).expect("init shop project");
+
+        let entry = dir.join("src").join("main.orv");
+        let source = std::fs::read_to_string(&entry).expect("entry source");
+        assert!(source.contains("@route POST /members"));
+        assert!(source.contains("@route POST /payments"));
+        assert!(source.contains("@route POST /shipments"));
+        cmd_check(&dir).expect("check shop project");
+        let out = dir.join("dist");
+        cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
+        assert!(out.join("server").join("app.orv-runtime.json").is_file());
+        assert!(out.join("deploy").join("manifest.json").is_file());
         let _ = std::fs::remove_dir_all(dir);
     }
 
