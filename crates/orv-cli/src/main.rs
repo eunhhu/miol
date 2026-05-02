@@ -2887,9 +2887,17 @@ impl DapSession {
                     )
                 })?
         };
-        let content = std::fs::read_to_string(&source.path).map_err(|e| {
-            anyhow::anyhow!("failed to read source `{}`: {e}", source.path.display())
-        })?;
+        let content = launched
+            .files
+            .iter()
+            .find(|file| dap_normalize_path(&file.path) == dap_normalize_path(&source.path))
+            .map(|file| file.source.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source `{}` is not part of the loaded project snapshot",
+                    source.path.display()
+                )
+            })?;
         Ok(serde_json::json!({
             "content": content,
             "mimeType": "text/x-orv",
@@ -12707,6 +12715,7 @@ function greet(user: User): string -> "hello"
             .find(|item| item["name"] == "user.orv")
             .and_then(|item| item["sourceReference"].as_u64())
             .expect("user source reference");
+        std::fs::remove_file(&imported).expect("remove imported after launch");
         let source_response = session
             .message_response(&serde_json::json!({
                 "seq": 36,
