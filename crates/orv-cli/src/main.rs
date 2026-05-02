@@ -23,7 +23,10 @@ use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term::termcolor::WriteColor;
 use orv_diagnostics::{FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
-use orv_syntax::ast::{ConstraintValue, Program, Stmt, TypeConstraint, TypeRef, TypeRefKind};
+use orv_syntax::ast::{
+    BinaryOp as AstBinaryOp, ConstraintValue, Expr, ExprKind, Program, Stmt, StringSegment,
+    TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
+};
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -1450,6 +1453,7 @@ struct DapSession {
     next_seq: u64,
     launched: Option<DapLaunchState>,
     breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
+    pending_events: Vec<DapPendingEvent>,
 }
 
 #[derive(Clone)]
@@ -1460,8 +1464,16 @@ struct DapLaunchState {
     node_count: usize,
     diagnostic_count: usize,
     stopped_line: u64,
+    stopped_reason: String,
+    executable_lines: Vec<u64>,
     runtime: DapRuntimeState,
     sources: Vec<DapSourceInfo>,
+    locals: Vec<DapVariable>,
+}
+
+struct DapPendingEvent {
+    event: String,
+    body: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -1477,6 +1489,7 @@ struct DapBreakpoint {
     id: u64,
     line: u64,
     verified: bool,
+    message: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1484,6 +1497,82 @@ struct DapRuntimeState {
     status: String,
     stdout: String,
     error: String,
+}
+
+#[derive(Clone)]
+struct DapVariable {
+    name: String,
+    value: String,
+    value_type: String,
+    line: u64,
+    variables_reference: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DapDebugValue {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Regex { pattern: String, flags: String },
+    Bool(bool),
+    Void,
+    Array(Vec<Self>),
+    Tuple(Vec<Self>),
+    Object(Vec<(String, Self)>),
+}
+
+impl DapDebugValue {
+    fn display_value(&self) -> String {
+        match self {
+            Self::Int(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
+            Self::String(value) => {
+                serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+            }
+            Self::Regex { pattern, flags } => format!("r\"{pattern}\"{flags}"),
+            Self::Bool(value) => value.to_string(),
+            Self::Void => "void".to_string(),
+            Self::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(Self::display_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{items}]")
+            }
+            Self::Tuple(items) => {
+                let items = items
+                    .iter()
+                    .map(Self::display_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({items})")
+            }
+            Self::Object(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", value.display_value()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ {fields} }}")
+            }
+        }
+    }
+
+    fn value_type(&self) -> String {
+        match self {
+            Self::Int(_) => "int",
+            Self::Float(_) => "float",
+            Self::String(_) => "string",
+            Self::Regex { .. } => "regex",
+            Self::Bool(_) => "bool",
+            Self::Void => "void",
+            Self::Array(_) => "array",
+            Self::Tuple(_) => "tuple",
+            Self::Object(_) => "object",
+        }
+        .to_string()
+    }
 }
 
 impl DapSession {
@@ -1501,17 +1590,35 @@ impl DapSession {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let result = match command {
-            "initialize" => Ok(serde_json::json!({
-                "supportsConfigurationDoneRequest": true,
-                "supportsTerminateRequest": true,
-                "supportsLoadedSourcesRequest": true,
-                "supportsEvaluateForHovers": true,
-                "supportsCompletionsRequest": true,
-                "supportsBreakpointLocationsRequest": true,
-                "supportsExceptionInfoRequest": true,
-            })),
+            "initialize" => {
+                self.queue_event("initialized", serde_json::json!({}));
+                Ok(serde_json::json!({
+                    "supportsConfigurationDoneRequest": true,
+                    "supportsTerminateRequest": true,
+                    "supportsLoadedSourcesRequest": true,
+                    "supportsEvaluateForHovers": true,
+                    "supportsCompletionsRequest": true,
+                    "supportsBreakpointLocationsRequest": true,
+                    "supportsExceptionInfoRequest": true,
+                    "supportsRestartRequest": true,
+                    "exceptionBreakpointFilters": [
+                        {
+                            "filter": "orv.diagnostics",
+                            "label": "ORV diagnostics",
+                            "default": true,
+                        },
+                        {
+                            "filter": "orv.runtime",
+                            "label": "ORV runtime errors",
+                            "default": true,
+                        },
+                    ],
+                }))
+            }
             "launch" => self.launch_result(request),
-            "configurationDone" => Ok(serde_json::json!({})),
+            "restart" => self.restart_result(request),
+            "configurationDone" => self.configuration_done_result(),
+            "setExceptionBreakpoints" => Ok(dap_set_exception_breakpoints_result(request)),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
             "threads" => Ok(serde_json::json!({
@@ -1531,8 +1638,10 @@ impl DapSession {
             "loadedSources" => self.loaded_sources_result(),
             "source" => self.source_result(request),
             "continue" => self.continue_result(),
-            "next" | "stepIn" | "stepOut" | "pause" => self.empty_debug_control_result(),
+            "next" | "stepIn" | "stepOut" => self.step_result(),
+            "pause" => self.pause_result(),
             "disconnect" | "terminate" => {
+                self.queue_event("terminated", serde_json::json!({}));
                 self.launched = None;
                 Ok(serde_json::json!({}))
             }
@@ -1566,9 +1675,22 @@ impl DapSession {
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("app.orv")
             .to_string();
-        let stopped_line = self
-            .first_verified_breakpoint_line(&entry_path)
-            .unwrap_or(1);
+        let first_breakpoint = self.first_verified_breakpoint_line(&entry_path);
+        let mut executable_lines =
+            dap_verified_breakpoint_lines(&entry_path).unwrap_or_else(|_| vec![1]);
+        if executable_lines.is_empty() {
+            executable_lines.push(1);
+        }
+        let stopped_line = first_breakpoint.unwrap_or_else(|| executable_lines[0]);
+        let stopped_reason = if runtime.status != "ok" {
+            "exception"
+        } else if first_breakpoint.is_some() {
+            "breakpoint"
+        } else {
+            "entry"
+        }
+        .to_string();
+        let locals = dap_local_variables(&loaded.program, &loaded.files);
         let sources = loaded
             .files
             .iter()
@@ -1584,9 +1706,30 @@ impl DapSession {
             node_count: loaded.graph.nodes.len(),
             diagnostic_count,
             stopped_line,
+            stopped_reason,
+            executable_lines,
             runtime: runtime.clone(),
             sources,
+            locals,
         });
+        if !runtime.stdout.is_empty() {
+            self.queue_event(
+                "output",
+                serde_json::json!({
+                    "category": "stdout",
+                    "output": runtime.stdout,
+                }),
+            );
+        }
+        if !runtime.error.is_empty() {
+            self.queue_event(
+                "output",
+                serde_json::json!({
+                    "category": "stderr",
+                    "output": runtime.error,
+                }),
+            );
+        }
         Ok(serde_json::json!({
             "entry": {
                 "name": entry_name,
@@ -1597,6 +1740,28 @@ impl DapSession {
             "diagnostics": diagnostic_count,
             "runtime": dap_runtime_json(&runtime),
         }))
+    }
+
+    fn configuration_done_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.require_launch("configurationDone")?;
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
+    fn restart_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let path = request
+            .pointer("/arguments/program")
+            .and_then(serde_json::Value::as_str)
+            .map(dap_path_from_protocol_string)
+            .transpose()?
+            .or_else(|| self.launched.as_ref().map(|launched| launched.path.clone()))
+            .ok_or_else(|| anyhow::anyhow!("launch is required before restart"))?;
+        let restart_request = serde_json::json!({
+            "arguments": {
+                "program": path.display().to_string(),
+            },
+        });
+        self.launch_result(&restart_request)
     }
 
     fn loaded_sources_result(&self) -> anyhow::Result<serde_json::Value> {
@@ -1651,6 +1816,7 @@ impl DapSession {
         request: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let path = dap_normalize_path(&dap_source_path(request)?);
+        let verified_lines = dap_verified_breakpoint_lines(&path).unwrap_or_default();
         let breakpoints = request
             .pointer("/arguments/breakpoints")
             .and_then(serde_json::Value::as_array)
@@ -1663,10 +1829,13 @@ impl DapSession {
                             .get("line")
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0);
+                        let verified = line > 0 && verified_lines.binary_search(&line).is_ok();
                         DapBreakpoint {
                             id: u64::try_from(index + 1).unwrap_or(u64::MAX),
                             line,
-                            verified: line > 0,
+                            verified,
+                            message: (!verified)
+                                .then(|| "no executable ORV node on this line".to_string()),
                         }
                     })
                     .collect()
@@ -1675,11 +1844,15 @@ impl DapSession {
         let response_breakpoints = breakpoints
             .iter()
             .map(|breakpoint| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "id": breakpoint.id,
                     "verified": breakpoint.verified,
                     "line": breakpoint.line,
-                })
+                });
+                if let Some(message) = &breakpoint.message {
+                    value["message"] = serde_json::Value::String(message.clone());
+                }
+                value
             })
             .collect::<Vec<_>>();
         Ok(serde_json::json!({
@@ -1756,6 +1929,17 @@ impl DapSession {
                         "uri": launched.uri,
                     },
                 },
+                {
+                    "name": "Locals",
+                    "variablesReference": 2,
+                    "expensive": false,
+                    "source": {
+                        "name": launched.name,
+                        "path": launched.path.display().to_string(),
+                        "sourceReference": 0,
+                        "uri": launched.uri,
+                    },
+                },
             ],
         }))
     }
@@ -1769,6 +1953,16 @@ impl DapSession {
             .pointer("/arguments/variablesReference")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("variables.arguments.variablesReference is required"))?;
+        if variables_reference == 2 {
+            return Ok(serde_json::json!({
+                "variables": launched
+                    .locals
+                    .iter()
+                    .filter(|local| local.line <= launched.stopped_line)
+                    .map(dap_variable_json)
+                    .collect::<Vec<_>>(),
+            }));
+        }
         if variables_reference != 1 {
             anyhow::bail!("unknown variablesReference {variables_reference}");
         }
@@ -1835,13 +2029,16 @@ impl DapSession {
     }
 
     fn completions_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        self.require_launch("completions")?;
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before completions"))?;
         let prefix = request
             .pointer("/arguments/text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         Ok(serde_json::json!({
-            "targets": dap_completion_targets_json(prefix),
+            "targets": dap_completion_targets_json(launched, prefix),
         }))
     }
 
@@ -1853,15 +2050,52 @@ impl DapSession {
         Ok(dap_exception_info_json(&launched.runtime))
     }
 
-    fn continue_result(&self) -> anyhow::Result<serde_json::Value> {
+    fn continue_result(&mut self) -> anyhow::Result<serde_json::Value> {
         self.require_launch("continue")?;
+        self.queue_event(
+            "continued",
+            serde_json::json!({
+                "threadId": 1,
+                "allThreadsContinued": false,
+            }),
+        );
+        self.queue_event("terminated", serde_json::json!({}));
+        self.launched = None;
         Ok(serde_json::json!({
             "allThreadsContinued": false,
         }))
     }
 
-    fn empty_debug_control_result(&self) -> anyhow::Result<serde_json::Value> {
-        self.require_launch("debug control")?;
+    fn step_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let next_line = {
+            let launched = self
+                .launched
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+            dap_following_executable_line(&launched.executable_lines, launched.stopped_line)
+        };
+        let Some(next_line) = next_line else {
+            self.launched = None;
+            self.queue_event("terminated", serde_json::json!({}));
+            return Ok(serde_json::json!({}));
+        };
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+        launched.stopped_line = next_line;
+        launched.stopped_reason = "step".to_string();
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
+    fn pause_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before debug control"))?;
+        launched.stopped_reason = "pause".to_string();
+        self.queue_stopped_event();
         Ok(serde_json::json!({}))
     }
 
@@ -1870,6 +2104,36 @@ impl DapSession {
             .as_ref()
             .map(|_| ())
             .ok_or_else(|| anyhow::anyhow!("launch is required before {command}"))
+    }
+
+    fn queue_stopped_event(&mut self) {
+        let Some(launched) = &self.launched else {
+            return;
+        };
+        self.queue_event(
+            "stopped",
+            serde_json::json!({
+                "reason": launched.stopped_reason,
+                "threadId": 1,
+                "allThreadsStopped": false,
+            }),
+        );
+    }
+
+    fn queue_event(&mut self, event: &str, body: serde_json::Value) {
+        self.pending_events.push(DapPendingEvent {
+            event: event.to_string(),
+            body,
+        });
+    }
+
+    fn drain_pending_events(&mut self) -> Vec<serde_json::Value> {
+        std::mem::take(&mut self.pending_events)
+            .into_iter()
+            .map(|event| {
+                dap_event_response(self.next_response_seq(), event.event.as_str(), &event.body)
+            })
+            .collect()
     }
 
     fn first_verified_breakpoint_line(&self, path: &Path) -> Option<u64> {
@@ -1917,6 +2181,34 @@ fn dap_runtime_json(runtime: &DapRuntimeState) -> serde_json::Value {
     })
 }
 
+fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_json::Value {
+    let breakpoints = request
+        .pointer("/arguments/filters")
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(Vec::new, |filters| {
+            filters
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|filter| {
+                    let verified = matches!(filter, "orv.diagnostics" | "orv.runtime");
+                    let mut breakpoint = serde_json::json!({
+                        "verified": verified,
+                        "filter": filter,
+                    });
+                    if !verified {
+                        breakpoint["message"] = serde_json::Value::String(
+                            "unsupported ORV exception filter".to_string(),
+                        );
+                    }
+                    breakpoint
+                })
+                .collect()
+        });
+    serde_json::json!({
+        "breakpoints": breakpoints,
+    })
+}
+
 fn dap_exception_info_json(runtime: &DapRuntimeState) -> serde_json::Value {
     let (exception_id, description, break_mode) = match runtime.status.as_str() {
         "diagnostics" => ("orv.diagnostics", "diagnostics present", "always"),
@@ -1935,10 +2227,250 @@ fn dap_exception_info_json(runtime: &DapRuntimeState) -> serde_json::Value {
     })
 }
 
+fn dap_variable_json(variable: &DapVariable) -> serde_json::Value {
+    serde_json::json!({
+        "name": variable.name,
+        "value": variable.value,
+        "type": variable.value_type,
+        "variablesReference": variable.variables_reference,
+    })
+}
+
+fn dap_local_variables(program: &Program, files: &[SourceFile]) -> Vec<DapVariable> {
+    let mut locals = Vec::new();
+    let mut env = HashMap::new();
+    for stmt in &program.items {
+        let local = match stmt {
+            Stmt::Let(stmt) => dap_local_variable(
+                &stmt.name.name,
+                stmt.ty.as_ref(),
+                &stmt.init,
+                stmt.span,
+                files,
+                &env,
+            ),
+            Stmt::Const(stmt) => dap_local_variable(
+                &stmt.name.name,
+                stmt.ty.as_ref(),
+                &stmt.init,
+                stmt.span,
+                files,
+                &env,
+            ),
+            _ => None,
+        };
+        if let Some((variable, value)) = local {
+            env.insert(variable.name.clone(), value);
+            locals.push(variable);
+        }
+    }
+    locals
+}
+
+fn dap_local_variable(
+    name: &str,
+    ty: Option<&TypeRef>,
+    init: &Expr,
+    span: Span,
+    files: &[SourceFile],
+    env: &HashMap<String, DapDebugValue>,
+) -> Option<(DapVariable, DapDebugValue)> {
+    let value = dap_expr_debug_value(init, env)?;
+    let line = dap_span_line(span, files)?;
+    let variable = DapVariable {
+        name: name.to_string(),
+        value: value.display_value(),
+        value_type: ty.map_or_else(|| value.value_type(), type_ref_string),
+        line,
+        variables_reference: 0,
+    };
+    Some((variable, value))
+}
+
+fn dap_span_line(span: Span, files: &[SourceFile]) -> Option<u64> {
+    let file = files.iter().find(|file| file.id == span.file)?;
+    let start = byte_position(&file.source, span.range.start);
+    Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
+}
+
+fn dap_expr_debug_value(
+    expr: &Expr,
+    env: &HashMap<String, DapDebugValue>,
+) -> Option<DapDebugValue> {
+    match &expr.kind {
+        ExprKind::Integer(value) => value.parse::<i64>().ok().map(DapDebugValue::Int),
+        ExprKind::Float(value) => value.parse::<f64>().ok().map(DapDebugValue::Float),
+        ExprKind::String(segments) => {
+            dap_string_debug_value(segments, env).map(DapDebugValue::String)
+        }
+        ExprKind::Regex { pattern, flags } => Some(DapDebugValue::Regex {
+            pattern: pattern.clone(),
+            flags: flags.clone(),
+        }),
+        ExprKind::True => Some(DapDebugValue::Bool(true)),
+        ExprKind::False => Some(DapDebugValue::Bool(false)),
+        ExprKind::Void => Some(DapDebugValue::Void),
+        ExprKind::Ident(ident) => env.get(&ident.name).cloned(),
+        ExprKind::Paren(inner) => dap_expr_debug_value(inner, env),
+        ExprKind::Unary { op, expr } => {
+            let value = dap_expr_debug_value(expr, env)?;
+            dap_apply_debug_unary(*op, value)
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let lhs = dap_expr_debug_value(lhs, env)?;
+            let rhs = dap_expr_debug_value(rhs, env)?;
+            dap_apply_debug_binary(*op, lhs, rhs)
+        }
+        ExprKind::Array(items) => items
+            .iter()
+            .map(|item| dap_expr_debug_value(item, env))
+            .collect::<Option<Vec<_>>>()
+            .map(DapDebugValue::Array),
+        ExprKind::Tuple(items) => items
+            .iter()
+            .map(|item| dap_expr_debug_value(item, env))
+            .collect::<Option<Vec<_>>>()
+            .map(DapDebugValue::Tuple),
+        ExprKind::Object(fields) => fields
+            .iter()
+            .filter(|field| !field.is_spread)
+            .map(|field| {
+                Some((
+                    field.name.name.clone(),
+                    dap_expr_debug_value(&field.value, env)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(DapDebugValue::Object),
+        _ => None,
+    }
+}
+
+fn dap_string_debug_value(
+    segments: &[StringSegment],
+    env: &HashMap<String, DapDebugValue>,
+) -> Option<String> {
+    let mut value = String::new();
+    for segment in segments {
+        match segment {
+            StringSegment::Str(text) => value.push_str(text),
+            StringSegment::Interp(expr) => {
+                value.push_str(&dap_expr_debug_value(expr, env)?.display_value());
+            }
+        }
+    }
+    Some(value)
+}
+
+fn dap_apply_debug_unary(op: AstUnaryOp, value: DapDebugValue) -> Option<DapDebugValue> {
+    match (op, value) {
+        (AstUnaryOp::Not, DapDebugValue::Bool(value)) => Some(DapDebugValue::Bool(!value)),
+        (AstUnaryOp::Neg, DapDebugValue::Int(value)) => Some(DapDebugValue::Int(-value)),
+        (AstUnaryOp::Neg, DapDebugValue::Float(value)) => Some(DapDebugValue::Float(-value)),
+        _ => None,
+    }
+}
+
+fn dap_apply_debug_binary(
+    op: AstBinaryOp,
+    lhs: DapDebugValue,
+    rhs: DapDebugValue,
+) -> Option<DapDebugValue> {
+    match op {
+        AstBinaryOp::Add => dap_debug_add(lhs, rhs),
+        AstBinaryOp::Sub => dap_debug_numeric(
+            lhs,
+            rhs,
+            |left, right| left - right,
+            |left, right| left - right,
+        ),
+        AstBinaryOp::Mul => dap_debug_numeric(
+            lhs,
+            rhs,
+            |left, right| left * right,
+            |left, right| left * right,
+        ),
+        AstBinaryOp::Div => dap_debug_numeric(
+            lhs,
+            rhs,
+            |left, right| left / right,
+            |left, right| left / right,
+        ),
+        AstBinaryOp::Rem => dap_debug_numeric(
+            lhs,
+            rhs,
+            |left, right| left % right,
+            |left, right| left % right,
+        ),
+        AstBinaryOp::Eq => Some(DapDebugValue::Bool(lhs == rhs)),
+        AstBinaryOp::Ne => Some(DapDebugValue::Bool(lhs != rhs)),
+        AstBinaryOp::And => match (lhs, rhs) {
+            (DapDebugValue::Bool(left), DapDebugValue::Bool(right)) => {
+                Some(DapDebugValue::Bool(left && right))
+            }
+            _ => None,
+        },
+        AstBinaryOp::Or => match (lhs, rhs) {
+            (DapDebugValue::Bool(left), DapDebugValue::Bool(right)) => {
+                Some(DapDebugValue::Bool(left || right))
+            }
+            _ => None,
+        },
+        AstBinaryOp::Coalesce => {
+            if lhs == DapDebugValue::Void {
+                Some(rhs)
+            } else {
+                Some(lhs)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn dap_debug_add(lhs: DapDebugValue, rhs: DapDebugValue) -> Option<DapDebugValue> {
+    match (lhs, rhs) {
+        (DapDebugValue::Int(left), DapDebugValue::Int(right)) => {
+            Some(DapDebugValue::Int(left + right))
+        }
+        (DapDebugValue::Float(left), DapDebugValue::Float(right)) => {
+            Some(DapDebugValue::Float(left + right))
+        }
+        (DapDebugValue::String(left), DapDebugValue::String(right)) => {
+            Some(DapDebugValue::String(format!("{left}{right}")))
+        }
+        _ => None,
+    }
+}
+
+fn dap_debug_numeric(
+    lhs: DapDebugValue,
+    rhs: DapDebugValue,
+    int_op: impl FnOnce(i64, i64) -> i64,
+    float_op: impl FnOnce(f64, f64) -> f64,
+) -> Option<DapDebugValue> {
+    match (lhs, rhs) {
+        (DapDebugValue::Int(left), DapDebugValue::Int(right)) => {
+            Some(DapDebugValue::Int(int_op(left, right)))
+        }
+        (DapDebugValue::Float(left), DapDebugValue::Float(right)) => {
+            Some(DapDebugValue::Float(float_op(left, right)))
+        }
+        _ => None,
+    }
+}
+
 fn dap_evaluate_project_value(
     launched: &DapLaunchState,
     expression: &str,
 ) -> Option<(String, String)> {
+    if let Some(local) = launched
+        .locals
+        .iter()
+        .filter(|local| local.line <= launched.stopped_line)
+        .find(|local| local.name == expression)
+    {
+        return Some((local.value.clone(), local.value_type.clone()));
+    }
     match expression {
         "entry" => Some((launched.path.display().to_string(), "source".to_string())),
         "projectGraphNodes" => Some((launched.node_count.to_string(), "usize".to_string())),
@@ -1950,7 +2482,7 @@ fn dap_evaluate_project_value(
     }
 }
 
-fn dap_completion_targets_json(prefix: &str) -> Vec<serde_json::Value> {
+fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<serde_json::Value> {
     const EXPRESSIONS: &[&str] = &[
         "entry",
         "projectGraphNodes",
@@ -1959,7 +2491,7 @@ fn dap_completion_targets_json(prefix: &str) -> Vec<serde_json::Value> {
         "stdout",
         "runtimeError",
     ];
-    EXPRESSIONS
+    let mut targets = EXPRESSIONS
         .iter()
         .filter(|expression| expression.starts_with(prefix))
         .map(|expression| {
@@ -1969,7 +2501,30 @@ fn dap_completion_targets_json(prefix: &str) -> Vec<serde_json::Value> {
                 "sortText": expression,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    targets.extend(
+        launched
+            .locals
+            .iter()
+            .filter(|local| local.line <= launched.stopped_line)
+            .filter(|local| local.name.starts_with(prefix))
+            .map(|local| {
+                serde_json::json!({
+                    "label": local.name,
+                    "type": "variable",
+                    "sortText": local.name,
+                })
+            }),
+    );
+    targets.sort_by_key(|target| {
+        target
+            .get("sortText")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
+    targets.dedup_by(|left, right| left["label"] == right["label"]);
+    targets
 }
 
 fn dap_breakpoint_locations_json(
@@ -2015,6 +2570,39 @@ fn dap_breakpoint_locations_json(
     locations
         .dedup_by(|left, right| left["line"] == right["line"] && left["column"] == right["column"]);
     locations
+}
+
+fn dap_verified_breakpoint_lines(path: &Path) -> anyhow::Result<Vec<u64>> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let file = lsp_source_file_for_path(&loaded.files, path)
+        .ok_or_else(|| anyhow::anyhow!("breakpoint source is not part of loaded project"))?;
+    let mut lines = loaded
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.file == file.id)
+        .filter(|node| lsp_selectable_node_kind(node.kind))
+        .filter_map(|node| {
+            let file = loaded.files.iter().find(|file| file.id == node.file)?;
+            let start = byte_position(&file.source, node.span.range.start);
+            Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
+        })
+        .collect::<Vec<_>>();
+    lines.extend(loaded.program.items.iter().filter_map(|stmt| {
+        let span = stmt.span();
+        if span.file != file.id {
+            return None;
+        }
+        let start = byte_position(&file.source, span.range.start);
+        Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
+    }));
+    lines.sort_unstable();
+    lines.dedup();
+    Ok(lines)
+}
+
+fn dap_following_executable_line(lines: &[u64], current: u64) -> Option<u64> {
+    lines.iter().copied().find(|line| *line > current)
 }
 
 fn dap_source_info(path: &Path, reference: u64) -> DapSourceInfo {
@@ -2130,6 +2718,15 @@ fn dap_error_response(
         "success": false,
         "command": command,
         "message": message,
+    })
+}
+
+fn dap_event_response(seq: u64, event: &str, body: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "event",
+        "event": event,
+        "body": body,
     })
 }
 
@@ -3667,6 +4264,9 @@ where
         let request: serde_json::Value = serde_json::from_slice(&body)?;
         if let Some(response) = session.message_response(&request) {
             write_lsp_response_frame(writer, &response)?;
+            for event in session.drain_pending_events() {
+                write_lsp_response_frame(writer, &event)?;
+            }
             writer.flush()?;
         }
     }
@@ -4311,6 +4911,35 @@ mod tests {
         path
     }
 
+    fn protocol_frames(output: &str) -> Vec<serde_json::Value> {
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        while offset < output.len() {
+            let tail = &output[offset..];
+            let (headers, _) = tail
+                .split_once("\r\n\r\n")
+                .expect("content-length response frame");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .expect("content length header");
+            let body_start = offset + headers.len() + "\r\n\r\n".len();
+            let body_end = body_start + content_length;
+            let body = output.get(body_start..body_end).expect("complete body");
+            frames.push(serde_json::from_str(body).expect("response json"));
+            offset = body_end;
+        }
+        frames
+    }
+
+    fn protocol_request_frame(body: &serde_json::Value) -> String {
+        let body = body.to_string();
+        format!("Content-Length: {}\r\n\r\n{}", body.len(), body)
+    }
+
     #[test]
     fn check_accepts_all_e2e_fixtures() {
         let files = orv_files_under(&["fixtures", "e2e"]);
@@ -4855,6 +5484,40 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsCompletionsRequest"], true);
         assert_eq!(response["body"]["supportsBreakpointLocationsRequest"], true);
         assert_eq!(response["body"]["supportsExceptionInfoRequest"], true);
+        assert_eq!(response["body"]["supportsRestartRequest"], true);
+    }
+
+    #[test]
+    fn dap_set_exception_breakpoints_accepts_orv_filters() {
+        let mut session = DapSession::default();
+
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 67,
+                "type": "request",
+                "command": "setExceptionBreakpoints",
+                "arguments": {
+                    "filters": ["orv.diagnostics", "orv.runtime"],
+                },
+            }))
+            .expect("setExceptionBreakpoints response");
+
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["command"], "setExceptionBreakpoints");
+        assert_eq!(
+            response["body"]["breakpoints"]
+                .as_array()
+                .expect("breakpoints")
+                .len(),
+            2
+        );
+        assert_eq!(response["body"]["breakpoints"][0]["verified"], true);
+        assert_eq!(
+            response["body"]["breakpoints"][0]["filter"],
+            "orv.diagnostics"
+        );
+        assert_eq!(response["body"]["breakpoints"][1]["verified"], true);
+        assert_eq!(response["body"]["breakpoints"][1]["filter"], "orv.runtime");
     }
 
     #[test]
@@ -4869,16 +5532,447 @@ function greet(user: User): string -> "hello"
         let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
 
         let output = dap_stdio_response(&input).expect("stdio response");
-        let (_, response_body) = output
-            .split_once("\r\n\r\n")
-            .expect("content-length response frame");
-        let response: serde_json::Value =
-            serde_json::from_str(response_body).expect("response json");
+        let frames = protocol_frames(&output);
+        let response = &frames[0];
 
         assert!(output.starts_with("Content-Length: "));
         assert_eq!(response["type"], "response");
         assert_eq!(response["command"], "initialize");
         assert_eq!(response["success"], true);
+    }
+
+    #[test]
+    fn dap_stdio_emits_initialized_event_after_initialize() {
+        let body = serde_json::json!({
+            "seq": 1,
+            "type": "request",
+            "command": "initialize",
+            "arguments": {},
+        })
+        .to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let frames = protocol_frames(&output);
+
+        assert_eq!(frames.len(), 2, "{output}");
+        assert_eq!(frames[0]["type"], "response");
+        assert_eq!(frames[0]["command"], "initialize");
+        assert_eq!(frames[1]["type"], "event");
+        assert_eq!(frames[1]["event"], "initialized");
+    }
+
+    #[test]
+    fn dap_stdio_emits_stopped_event_after_configuration_done() {
+        let dir = temp_output_dir("dap-stopped-event");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let input = [
+            protocol_request_frame(&serde_json::json!({
+                "seq": 1,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            })),
+            protocol_request_frame(&serde_json::json!({
+                "seq": 2,
+                "type": "request",
+                "command": "configurationDone",
+                "arguments": {},
+            })),
+        ]
+        .join("");
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let frames = protocol_frames(&output);
+        let stopped = frames
+            .iter()
+            .find(|frame| frame["type"] == "event" && frame["event"] == "stopped")
+            .expect("stopped event");
+
+        assert_eq!(stopped["body"]["reason"], "entry");
+        assert_eq!(stopped["body"]["threadId"], 1);
+        assert_eq!(stopped["body"]["allThreadsStopped"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_stdio_emits_continued_and_terminated_events_after_continue() {
+        let dir = temp_output_dir("dap-continue-events");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let input = [
+            protocol_request_frame(&serde_json::json!({
+                "seq": 1,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            })),
+            protocol_request_frame(&serde_json::json!({
+                "seq": 2,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            })),
+        ]
+        .join("");
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let frames = protocol_frames(&output);
+        let continued = frames
+            .iter()
+            .find(|frame| frame["type"] == "event" && frame["event"] == "continued")
+            .expect("continued event");
+        let terminated = frames
+            .iter()
+            .find(|frame| frame["type"] == "event" && frame["event"] == "terminated")
+            .expect("terminated event");
+
+        assert_eq!(continued["body"]["threadId"], 1);
+        assert_eq!(continued["body"]["allThreadsContinued"], false);
+        assert_eq!(terminated["body"], serde_json::json!({}));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_continue_terminates_session_state() {
+        let dir = temp_output_dir("dap-continue-terminates-state");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 71,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let continue_response = session
+            .message_response(&serde_json::json!({
+                "seq": 72,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 73,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(continue_response["success"], true, "{continue_response}");
+        assert_eq!(stack["success"], false, "{stack}");
+        assert!(stack["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("launch is required")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_stdio_emits_output_event_for_reference_stdout_after_launch() {
+        let dir = temp_output_dir("dap-output-event");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@out \"debug-ready\"\n").expect("write source");
+        let input = protocol_request_frame(&serde_json::json!({
+            "seq": 55,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": format!("file://{}", source.display()),
+            },
+        }));
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let frames = protocol_frames(&output);
+        let output_event = frames
+            .iter()
+            .find(|frame| frame["type"] == "event" && frame["event"] == "output")
+            .expect("output event");
+
+        assert_eq!(output_event["body"]["category"], "stdout");
+        assert_eq!(output_event["body"]["output"], "debug-ready\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_stdio_emits_stderr_output_event_for_runtime_error_after_launch() {
+        let dir = temp_output_dir("dap-error-output-event");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "throw \"panic!\"\n").expect("write source");
+        let input = protocol_request_frame(&serde_json::json!({
+            "seq": 56,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": format!("file://{}", source.display()),
+            },
+        }));
+
+        let output = dap_stdio_response(&input).expect("stdio response");
+        let frames = protocol_frames(&output);
+        let output_event = frames
+            .iter()
+            .find(|frame| frame["type"] == "event" && frame["event"] == "output")
+            .expect("output event");
+
+        assert_eq!(frames[0]["body"]["runtime"]["status"], "error");
+        assert_eq!(output_event["body"]["category"], "stderr");
+        assert!(output_event["body"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("panic!")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_next_advances_to_next_executable_line_and_queues_stopped_event() {
+        let dir = temp_output_dir("dap-next-line");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n\nlet second: int = 2\n")
+            .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 48,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let first_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 49,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first stack response");
+        let next = session
+            .message_response(&serde_json::json!({
+                "seq": 50,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let events = session.drain_pending_events();
+        let second_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 51,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("second stack response");
+
+        assert_eq!(first_stack["body"]["stackFrames"][0]["line"], 1);
+        assert_eq!(next["success"], true, "{next}");
+        assert_eq!(next["body"], serde_json::json!({}));
+        assert_eq!(second_stack["body"]["stackFrames"][0]["line"], 3);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "step"
+                && event["body"]["threadId"] == 1
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_next_after_last_executable_line_terminates_session() {
+        let dir = temp_output_dir("dap-next-terminate");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let only: int = 1\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 68,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let next = session
+            .message_response(&serde_json::json!({
+                "seq": 69,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 70,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(next["success"], true, "{next}");
+        assert!(events
+            .iter()
+            .any(|event| { event["type"] == "event" && event["event"] == "terminated" }));
+        assert_eq!(stack["success"], false, "{stack}");
+        assert!(stack["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("launch is required")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_pause_keeps_current_line_and_queues_pause_stopped_event() {
+        let dir = temp_output_dir("dap-pause-event");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 52,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let pause = session
+            .message_response(&serde_json::json!({
+                "seq": 53,
+                "type": "request",
+                "command": "pause",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("pause response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 54,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(pause["success"], true, "{pause}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "pause"
+                && event["body"]["threadId"] == 1
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_restart_reloads_current_program_and_resets_stopped_line() {
+        let dir = temp_output_dir("dap-restart");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 78,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 79,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let moved_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 80,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("moved stack response");
+        let restart = session
+            .message_response(&serde_json::json!({
+                "seq": 81,
+                "type": "request",
+                "command": "restart",
+                "arguments": {},
+            }))
+            .expect("restart response");
+        let restarted_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 82,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("restarted stack response");
+
+        assert_eq!(moved_stack["body"]["stackFrames"][0]["line"], 2);
+        assert_eq!(restart["success"], true, "{restart}");
+        assert_eq!(restarted_stack["body"]["stackFrames"][0]["line"], 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5220,6 +6314,42 @@ function greet(user: User): string -> "hello"
     }
 
     #[test]
+    fn dap_set_breakpoints_rejects_non_executable_lines() {
+        let dir = temp_output_dir("dap-breakpoint-verify");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\n\nlet second: int = 2\n")
+            .expect("write source");
+        let mut session = DapSession::default();
+
+        let breakpoints = session
+            .message_response(&serde_json::json!({
+                "seq": 47,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        { "line": 2 },
+                        { "line": 3 }
+                    ],
+                },
+            }))
+            .expect("breakpoints response");
+
+        assert_eq!(breakpoints["success"], true, "{breakpoints}");
+        assert_eq!(breakpoints["body"]["breakpoints"][0]["verified"], false);
+        assert_eq!(
+            breakpoints["body"]["breakpoints"][0]["message"],
+            "no executable ORV node on this line"
+        );
+        assert_eq!(breakpoints["body"]["breakpoints"][1]["verified"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn dap_scopes_and_variables_expose_project_launch_state() {
         let dir = temp_output_dir("dap-variables");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -5274,6 +6404,145 @@ function greet(user: User): string -> "hello"
         assert!(vars
             .iter()
             .any(|var| var["name"] == "diagnostics" && var["value"] == "0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_variables_expose_top_level_locals() {
+        let dir = temp_output_dir("dap-locals");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let answer: int = 42\nconst greeting = \"hello\"\nlet ready = true\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 41,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 42,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("scopes response");
+        let locals_ref = scopes["body"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .find(|scope| scope["name"] == "Locals")
+            .and_then(|scope| scope["variablesReference"].as_u64())
+            .expect("locals scope");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 43,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first next response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 44,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("second next response");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 45,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": locals_ref,
+                },
+            }))
+            .expect("locals response");
+
+        assert_eq!(locals_ref, 2);
+        assert_eq!(locals["success"], true, "{locals}");
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "answer" && var["value"] == "42" && var["type"] == "int"));
+        assert!(vars.iter().any(|var| {
+            var["name"] == "greeting" && var["value"] == "\"hello\"" && var["type"] == "string"
+        }));
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "ready" && var["value"] == "true" && var["type"] == "bool"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_evaluate_and_completions_include_top_level_locals() {
+        let dir = temp_output_dir("dap-local-evaluate");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 44,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let evaluate = session
+            .message_response(&serde_json::json!({
+                "seq": 45,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "answer",
+                    "context": "repl",
+                },
+            }))
+            .expect("evaluate response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 46,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "ans",
+                    "column": 4,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert_eq!(evaluate["success"], true, "{evaluate}");
+        assert_eq!(evaluate["body"]["result"], "42");
+        assert_eq!(evaluate["body"]["type"], "int");
+        let targets = completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets");
+        assert!(targets
+            .iter()
+            .any(|target| target["label"] == "answer" && target["type"] == "variable"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5401,6 +6670,238 @@ function greet(user: User): string -> "hello"
         assert!(targets.iter().all(|target| target["label"]
             .as_str()
             .is_some_and(|label| label.starts_with("std"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_locals_follow_current_stopped_line() {
+        let dir = temp_output_dir("dap-line-locals");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 57,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 58,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("scopes response");
+        let locals_ref = scopes["body"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .find(|scope| scope["name"] == "Locals")
+            .and_then(|scope| scope["variablesReference"].as_u64())
+            .expect("locals scope");
+        let first_locals = session
+            .message_response(&serde_json::json!({
+                "seq": 59,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": locals_ref,
+                },
+            }))
+            .expect("first locals response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 60,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let second_locals = session
+            .message_response(&serde_json::json!({
+                "seq": 61,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": locals_ref,
+                },
+            }))
+            .expect("second locals response");
+
+        let first_vars = first_locals["body"]["variables"]
+            .as_array()
+            .expect("first locals");
+        assert!(first_vars.iter().any(|var| var["name"] == "first"));
+        assert!(!first_vars.iter().any(|var| var["name"] == "second"));
+        let second_vars = second_locals["body"]["variables"]
+            .as_array()
+            .expect("second locals");
+        assert!(second_vars.iter().any(|var| var["name"] == "first"));
+        assert!(second_vars.iter().any(|var| var["name"] == "second"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_locals_evaluate_pure_top_level_expressions() {
+        let dir = temp_output_dir("dap-expression-locals");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let base: int = 2\nlet doubled: int = base * 2 + 1\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 62,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 63,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 64,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("scopes response");
+        let locals_ref = scopes["body"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .find(|scope| scope["name"] == "Locals")
+            .and_then(|scope| scope["variablesReference"].as_u64())
+            .expect("locals scope");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 65,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": locals_ref,
+                },
+            }))
+            .expect("locals response");
+        let evaluate = session
+            .message_response(&serde_json::json!({
+                "seq": 66,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "doubled",
+                    "context": "repl",
+                },
+            }))
+            .expect("evaluate response");
+
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert!(vars
+            .iter()
+            .any(|var| var["name"] == "doubled" && var["value"] == "5" && var["type"] == "int"));
+        assert_eq!(evaluate["success"], true, "{evaluate}");
+        assert_eq!(evaluate["body"]["result"], "5");
+        assert_eq!(evaluate["body"]["type"], "int");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_locals_evaluate_array_and_object_initializers() {
+        let dir = temp_output_dir("dap-compound-locals");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let xs = [1, 2, 3]\nlet user = { id: 1, name: \"Ada\" }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 74,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 75,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 76,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("scopes response");
+        let locals_ref = scopes["body"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .find(|scope| scope["name"] == "Locals")
+            .and_then(|scope| scope["variablesReference"].as_u64())
+            .expect("locals scope");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 77,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": locals_ref,
+                },
+            }))
+            .expect("locals response");
+
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert!(vars.iter().any(|var| var["name"] == "xs"
+            && var["value"] == "[1, 2, 3]"
+            && var["type"] == "array"));
+        assert!(vars.iter().any(|var| {
+            var["name"] == "user"
+                && var["value"] == "{ id: 1, name: \"Ada\" }"
+                && var["type"] == "object"
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
