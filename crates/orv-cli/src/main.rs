@@ -8898,6 +8898,14 @@ mod tests {
         path
     }
 
+    fn json_routes_include(routes: &serde_json::Value, method: &str, path: &str) -> bool {
+        routes.as_array().is_some_and(|routes| {
+            routes
+                .iter()
+                .any(|route| route["method"] == method && route["path"] == path)
+        })
+    }
+
     fn protocol_frames(output: &str) -> Vec<serde_json::Value> {
         let mut offset = 0;
         let mut frames = Vec::new();
@@ -9143,6 +9151,33 @@ test "checkout failing runtime body" {
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_shop_template_prod_artifacts_keep_full_service_routes() {
+        let dir = temp_output_dir("init-shop-prod-routes");
+
+        cmd_init(&dir, Some("starter-shop"), InitTemplate::Shop).expect("init shop project");
+        let out = dir.join("dist");
+        cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
+
+        let runtime =
+            read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        for (method, path) in [
+            ("POST", "/members"),
+            ("POST", "/payments"),
+            ("POST", "/shipments"),
+        ] {
+            assert!(json_routes_include(&runtime["routes"], method, path));
+            assert!(json_routes_include(
+                &deploy["server"]["routes"],
+                method,
+                path
+            ));
+        }
+        cmd_verify_build(&out).expect("verify shop prod build");
         let _ = std::fs::remove_dir_all(dir);
     }
 
