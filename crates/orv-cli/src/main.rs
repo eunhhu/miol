@@ -207,6 +207,14 @@ enum EditorCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    /// production request trace를 first-party editor navigation JSON으로 변환한다.
+    Trace {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// request frame trace JSON 경로.
+        #[arg(long)]
+        trace: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -612,6 +620,13 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::Trace { dir, trace } => match cmd_editor_trace(&dir, &trace) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -712,6 +727,12 @@ fn cmd_editor_export(path: &Path, out: &Path) -> anyhow::Result<()> {
             "files": ["index.html", "state.json"],
         }))?
     );
+    Ok(())
+}
+
+fn cmd_editor_trace(dir: &Path, trace: &Path) -> anyhow::Result<()> {
+    let value = editor_trace_json(dir, trace)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
@@ -1988,6 +2009,67 @@ fn editor_reveal_focus_json(
         "panel": panel,
         "node_id": project_graph.get("id").cloned().unwrap_or(serde_json::Value::Null),
     })
+}
+
+fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Value> {
+    let trace_value = read_json_value(trace)?;
+    let frames = trace_value
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("trace JSON must contain frames array"))?;
+    let mut editor_frames = Vec::with_capacity(frames.len());
+    for (index, frame) in frames.iter().enumerate() {
+        let origin_id = editor_trace_frame_origin_id(frame);
+        let navigation = match origin_id {
+            Some(origin_id) => editor_reveal_json(dir, origin_id)?,
+            None => serde_json::Value::Null,
+        };
+        editor_frames.push(serde_json::json!({
+            "index": index,
+            "origin_id": origin_id,
+            "request": editor_trace_request_json(frame),
+            "navigation": navigation,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.trace",
+        "build_dir": dir.display().to_string(),
+        "trace": {
+            "path": trace.display().to_string(),
+            "kind": trace_value.get("kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+            "frame_count": editor_frames.len(),
+        },
+        "frames": editor_frames,
+    }))
+}
+
+fn editor_trace_frame_origin_id(frame: &serde_json::Value) -> Option<&str> {
+    frame
+        .get("route_origin_id")
+        .or_else(|| frame.get("origin_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|origin_id| !origin_id.is_empty())
+}
+
+fn editor_trace_request_json(frame: &serde_json::Value) -> serde_json::Value {
+    let mut request = serde_json::Map::new();
+    for key in [
+        "method",
+        "path",
+        "status",
+        "route_method",
+        "route_path",
+        "route_origin_id",
+        "params",
+        "query",
+        "body",
+    ] {
+        if let Some(value) = frame.get(key) {
+            request.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(request)
 }
 
 fn editor_runtime_json(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -16602,6 +16684,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_trace_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "trace",
+            "target/orv-build",
+            "--trace",
+            "target/orv-trace.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -17701,12 +17798,12 @@ entry = "src/main.orv"
         let path = dir.join("app.orv");
         std::fs::write(
             &path,
-            r#"@server {
+            r"@server {
   @listen 0
   @route GET /ping {
     @respond 200 { ok: true }
   }
-}"#,
+}",
         )
         .expect("write source");
         let out = dir.join("dist");
@@ -17737,6 +17834,64 @@ entry = "src/main.orv"
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_trace_links_request_origin_to_source_navigation() {
+        let dir = temp_output_dir("editor-trace");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let trace_path = dir.join("production-trace.json");
+        write_json(
+            &trace_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "orv.production.trace",
+                "frames": [{
+                    "method": "GET",
+                    "path": "/ping",
+                    "status": 200,
+                    "route_origin_id": route.id,
+                }],
+            }),
+        )
+        .expect("write trace");
+
+        let trace = editor_trace_json(&out, &trace_path).expect("editor trace");
+
+        assert_eq!(trace["schema_version"], 1);
+        assert_eq!(trace["kind"], "orv.editor.trace");
+        assert_eq!(trace["trace"]["frame_count"], 1);
+        assert_eq!(trace["frames"][0]["request"]["method"], "GET");
+        assert_eq!(trace["frames"][0]["request"]["path"], "/ping");
+        assert_eq!(trace["frames"][0]["origin_id"], route.id);
+        assert_eq!(trace["frames"][0]["navigation"]["focus"]["panel"], "routes");
+        assert!(trace["frames"][0]["navigation"]["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@route GET /ping")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
