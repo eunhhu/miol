@@ -2440,6 +2440,7 @@ struct DapAsyncRuntimeState {
     state: String,
     resume_count: u64,
     pause_count: u64,
+    listen: Option<DapAsyncListenState>,
     routes: Vec<DapAsyncRouteState>,
 }
 
@@ -2449,13 +2450,21 @@ struct DapAsyncRouteState {
     path: String,
 }
 
+#[derive(Clone)]
+struct DapAsyncListenState {
+    kind: String,
+    display: String,
+    port: Option<u64>,
+}
+
 impl DapAsyncRuntimeState {
-    fn server(routes: Vec<DapAsyncRouteState>) -> Self {
+    fn server(listen: Option<DapAsyncListenState>, routes: Vec<DapAsyncRouteState>) -> Self {
         Self {
             kind: "server".to_string(),
             state: "paused".to_string(),
             resume_count: 0,
             pause_count: 0,
+            listen,
             routes,
         }
     }
@@ -4397,7 +4406,38 @@ fn dap_async_runtime_state(
     program: &orv_hir::HirProgram,
     long_running: bool,
 ) -> Option<DapAsyncRuntimeState> {
-    long_running.then(|| DapAsyncRuntimeState::server(dap_async_server_routes(program)))
+    long_running.then(|| {
+        DapAsyncRuntimeState::server(
+            dap_async_server_listen(program),
+            dap_async_server_routes(program),
+        )
+    })
+}
+
+fn dap_async_server_listen(program: &orv_hir::HirProgram) -> Option<DapAsyncListenState> {
+    program.items.iter().find_map(|stmt| match stmt {
+        orv_hir::HirStmt::Expr(expr) => dap_expr_async_server_listen(expr),
+        _ => None,
+    })
+}
+
+fn dap_expr_async_server_listen(expr: &orv_hir::HirExpr) -> Option<DapAsyncListenState> {
+    let orv_hir::HirExprKind::Server { listen, .. } = &expr.kind else {
+        return None;
+    };
+    let listen = listen.as_ref()?;
+    match &listen.kind {
+        orv_hir::HirExprKind::Integer(value) => Some(DapAsyncListenState {
+            kind: "static".to_string(),
+            display: value.clone(),
+            port: value.parse::<u64>().ok(),
+        }),
+        _ => Some(DapAsyncListenState {
+            kind: "expression".to_string(),
+            display: "<expression>".to_string(),
+            port: None,
+        }),
+    }
 }
 
 fn dap_async_server_routes(program: &orv_hir::HirProgram) -> Vec<DapAsyncRouteState> {
@@ -4485,9 +4525,21 @@ fn dap_runtime_json(
             "state": async_runtime.state,
             "resume_count": async_runtime.resume_count,
             "pause_count": async_runtime.pause_count,
+            "listen": async_runtime.listen.as_ref().map(dap_async_listen_json),
             "route_count": async_runtime.routes.len(),
             "routes": async_runtime.routes.iter().map(dap_async_route_json).collect::<Vec<_>>(),
         });
+    }
+    value
+}
+
+fn dap_async_listen_json(listen: &DapAsyncListenState) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "kind": listen.kind,
+        "display": listen.display,
+    });
+    if let Some(port) = listen.port {
+        value["port"] = serde_json::json!(port);
     }
     value
 }
@@ -4508,7 +4560,7 @@ fn dap_async_routes_display(routes: &[DapAsyncRouteState]) -> String {
 }
 
 fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serde_json::Value> {
-    vec![
+    let mut variables = vec![
         serde_json::json!({
             "name": "runtimeKind",
             "value": async_runtime.kind,
@@ -4545,7 +4597,24 @@ fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serd
             "type": "string",
             "variablesReference": 0,
         }),
-    ]
+    ];
+    if let Some(listen) = &async_runtime.listen {
+        variables.extend([
+            serde_json::json!({
+                "name": "runtimeListen",
+                "value": listen.display,
+                "type": "string",
+                "variablesReference": 0,
+            }),
+            serde_json::json!({
+                "name": "runtimeListenPort",
+                "value": listen.port.map_or_else(String::new, |port| port.to_string()),
+                "type": "usize",
+                "variablesReference": 0,
+            }),
+        ]);
+    }
+    variables
 }
 
 fn dap_runtime_frames(
@@ -5265,6 +5334,18 @@ fn dap_evaluate_async_runtime_value(
             dap_async_routes_display(&runtime.routes),
             "string".to_string(),
         )),
+        "runtimeListen" => runtime
+            .listen
+            .as_ref()
+            .map(|listen| (listen.display.clone(), "string".to_string())),
+        "runtimeListenPort" => runtime.listen.as_ref().map(|listen| {
+            (
+                listen
+                    .port
+                    .map_or_else(String::new, |port| port.to_string()),
+                "usize".to_string(),
+            )
+        }),
         _ => None,
     }
 }
@@ -5298,6 +5379,8 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimePauseCount",
                 "runtimeRouteCount",
                 "runtimeRoutes",
+                "runtimeListen",
+                "runtimeListenPort",
             ]
             .into_iter()
             .filter(|expression| expression.starts_with(prefix))
@@ -11819,6 +11902,81 @@ let total: int = add(2, 3)
             .expect("completion targets")
             .iter()
             .any(|target| target["label"] == "runtimeRoutes" && target["type"] == "property"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_exposes_async_listen_endpoint() {
+        let dir = temp_output_dir("dap-server-async-listen");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "@server { @listen 8080 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 236,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 237,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+        let listen = session
+            .message_response(&serde_json::json!({
+                "seq": 238,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "runtimeListen",
+                },
+            }))
+            .expect("listen evaluate response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 239,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "runtimeL",
+                    "column": 9,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["listen"]["kind"],
+            "static"
+        );
+        assert_eq!(launch["body"]["runtime"]["async"]["listen"]["port"], 8080);
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(|variable| variable["name"] == "runtimeListen" && variable["value"] == "8080"));
+        assert_eq!(listen["success"], true, "{listen}");
+        assert_eq!(listen["body"]["result"], "8080");
+        assert!(completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets")
+            .iter()
+            .any(|target| target["label"] == "runtimeListen" && target["type"] == "property"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
