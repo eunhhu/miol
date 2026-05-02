@@ -2037,6 +2037,7 @@ impl DapSession {
                     "supportsModulesRequest": true,
                     "supportsGotoTargetsRequest": true,
                     "supportsStepBack": true,
+                    "supportsStepInTargetsRequest": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -2085,7 +2086,8 @@ impl DapSession {
             "goto" => self.goto_result(request),
             "stepBack" => self.step_back_result(),
             "next" => self.next_result(),
-            "stepIn" => self.step_result(),
+            "stepInTargets" => self.step_in_targets_result(request),
+            "stepIn" => self.step_in_result(request),
             "stepOut" => self.step_out_result(),
             "pause" => self.pause_result(),
             "terminateThreads" => self.terminate_threads_result(request),
@@ -2993,7 +2995,55 @@ impl DapSession {
         Ok(serde_json::json!({}))
     }
 
-    fn step_result(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn step_in_targets_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let frame_id = request
+            .pointer("/arguments/frameId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("stepInTargets.arguments.frameId is required"))?;
+        if frame_id != 1 {
+            anyhow::bail!("stepInTargets currently supports current ORV frameId 1");
+        }
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before stepInTargets"))?;
+        Ok(serde_json::json!({
+            "targets": dap_step_in_targets_json(launched),
+        }))
+    }
+
+    fn step_in_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        if let Some(target_id) = request
+            .pointer("/arguments/targetId")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let (start_frame, target_frame) = {
+                let launched = self
+                    .launched
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("launch is required before stepIn"))?;
+                let target_frame = dap_step_in_target_indices(launched)
+                    .into_iter()
+                    .find(|index| dap_step_in_target_id(*index) == target_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown stepIn targetId {target_id}"))?;
+                (launched.current_frame_index.saturating_add(1), target_frame)
+            };
+            self.queue_frame_outputs(start_frame, target_frame);
+            let launched = self
+                .launched
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before stepIn"))?;
+            launched.current_frame_index = target_frame;
+            if let Some(frame) = launched.frames.get(target_frame) {
+                launched.stopped_line = frame.line;
+            }
+            launched.stopped_reason = "step".to_string();
+            self.queue_stopped_event();
+            return Ok(serde_json::json!({}));
+        }
         let next_frame = {
             let launched = self
                 .launched
@@ -3523,6 +3573,69 @@ fn dap_stack_frame_json(
         "line": line,
         "column": 1,
     })
+}
+
+fn dap_step_in_target_id(frame_index: usize) -> u64 {
+    u64::try_from(frame_index.saturating_add(1)).unwrap_or(u64::MAX)
+}
+
+fn dap_step_in_target_indices(launched: &DapLaunchState) -> Vec<usize> {
+    let Some(current_frame) = launched.frames.get(launched.current_frame_index) else {
+        return Vec::new();
+    };
+    let current_depth = current_frame.stack.len();
+    let mut seen = Vec::<(String, u64, u64)>::new();
+    let mut targets = Vec::new();
+    for (index, frame) in launched
+        .frames
+        .iter()
+        .enumerate()
+        .skip(launched.current_frame_index.saturating_add(1))
+    {
+        let depth = frame.stack.len();
+        if depth <= current_depth {
+            break;
+        }
+        if depth != current_depth.saturating_add(1) {
+            continue;
+        }
+        let Some(call_frame) = frame.stack.last() else {
+            continue;
+        };
+        let key = (
+            call_frame.name.clone(),
+            call_frame.source.reference,
+            call_frame.line,
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        targets.push(index);
+    }
+    targets
+}
+
+fn dap_step_in_targets_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
+    dap_step_in_target_indices(launched)
+        .into_iter()
+        .filter_map(|index| {
+            let frame = launched.frames.get(index)?;
+            let call_frame = frame.stack.last()?;
+            Some(serde_json::json!({
+                "id": dap_step_in_target_id(index),
+                "label": call_frame.name,
+                "line": call_frame.line,
+                "column": 1,
+                "source": {
+                    "name": call_frame.source.name,
+                    "path": call_frame.source.path.display().to_string(),
+                    "sourceReference": 0,
+                    "uri": call_frame.source.uri,
+                },
+            }))
+        })
+        .collect()
 }
 
 fn dap_current_locals(launched: &DapLaunchState) -> &[DapVariable] {
@@ -7735,6 +7848,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsModulesRequest"], true);
         assert_eq!(response["body"]["supportsGotoTargetsRequest"], true);
         assert_eq!(response["body"]["supportsStepBack"], true);
+        assert_eq!(response["body"]["supportsStepInTargetsRequest"], true);
     }
 
     #[test]
@@ -8795,6 +8909,85 @@ let done: int = total
         assert_eq!(stack["body"]["stackFrames"][0]["name"], "orv entry");
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 5);
         assert_eq!(stack["body"]["totalFrames"], 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_step_in_targets_enter_selected_function_frame() {
+        let dir = temp_output_dir("dap-step-in-targets");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 198,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let targets = session
+            .message_response(&serde_json::json!({
+                "seq": 199,
+                "type": "request",
+                "command": "stepInTargets",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("stepInTargets response");
+        let target_id = targets["body"]["targets"]
+            .as_array()
+            .expect("targets")
+            .iter()
+            .find(|target| target["label"] == "add")
+            .and_then(|target| target["id"].as_u64())
+            .expect("add target id");
+        let step_in = session
+            .message_response(&serde_json::json!({
+                "seq": 200,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                    "targetId": target_id,
+                },
+            }))
+            .expect("stepIn response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 201,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(targets["success"], true, "{targets}");
+        assert_eq!(step_in["success"], true, "{step_in}");
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "step"
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
