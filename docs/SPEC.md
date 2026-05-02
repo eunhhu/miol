@@ -2123,7 +2123,7 @@ await @db.transaction @hint isolation=serializable {
 | `serializable` | 최고 일관성, 금융 트랜잭션 |
 | `snapshot` | MVCC 스냅샷 |
 
-**현재 구현:** MVP 레퍼런스 런타임의 `@db`는 프로세스 메모리 안의 테이블 맵으로 동작한다. `create/find/update/delete`, 필터, 정렬, 제한, 간단한 집계와 벡터 거리 정렬을 검증하기 위한 실행 모델이며, 프로세스 종료 시 데이터는 사라진다. WAL, fsync, 트랜잭션, savepoint, 외부 DB 어댑터, 마이그레이션은 아직 구현되어 있지 않다.
+**현재 구현:** MVP 레퍼런스 런타임의 `@db`는 프로세스 메모리 안의 테이블 맵으로 동작한다. `create/find/update/delete`, 필터, 정렬, 제한, 간단한 집계와 벡터 거리 정렬을 검증하기 위한 실행 모델이다. 명시적 `@db.save(path)` / `@db.load(path)`는 JSON snapshot 파일로 현재 DB 상태를 저장/복구할 수 있다. `@db.wal(path)`는 JSONL WAL 파일을 replay하고 이후 `create/update/delete/upsert` mutation을 append+fsync 한 뒤 메모리에 적용한다. `@db.checkpoint()`는 현재 DB 상태를 snapshot WAL record 한 줄로 압축하고 replay 시 row id/next id를 보존한다. WAL-backed `@db.transaction` rollback은 메모리 상태를 복원한 뒤 checkpoint를 써서 replay에서도 실패한 mutation이 살아나지 않게 한다. WAL replay는 crash로 찢긴 마지막 EOF record를 무시하고 앞의 fsync된 record를 복구한다. CLI `orv db plan <file> --applied <schema.json>`은 현재 `struct` schema snapshot과 적용된 schema snapshot을 비교해 `create_struct`/`add_field`/`change_field`/`drop_field` dry-run JSON을 출력한다. `orv db apply <file> --schema <schema.json> --history <history.json>`와 `orv db migrate <file> --schema <schema.json> --history <history.json>`은 현재 schema snapshot을 적용된 schema 파일로 저장하고, 요청 시 schema hash와 actions를 migration history에 append하며, 이후 plan 결과가 비도록 만든다. `orv db rollback --schema <schema.json>`은 apply 직전 schema snapshot 백업을 복원한다. savepoint, 외부 DB 어댑터, 데이터 마이그레이션 실행, 데이터 rollback/squash, WAL archive, 전체 crash matrix 검증은 아직 구현되어 있지 않다.
 
 **로드맵 보장:**
 - Write-Ahead Log (WAL) + fsync로 내구성 보장
@@ -2749,7 +2749,7 @@ function showAndReturn(a: int, b: int): string -> {
 
 ## 13. 최적화 모델
 
-> 구현 상태: 로드맵. 현재 `orv-compiler`의 코드 생성/최적화 단계는 비어 있고, CLI는 HIR을 레퍼런스 런타임으로 직접 실행한다. 이 장은 프로덕션 컴파일러가 갖춰진 뒤의 목표 모델이다.
+> 구현 상태: 로드맵. 현재 `orv-compiler`는 origin map, 초기 build manifest, bundle plan, source-bundled server runtime descriptor artifact, reference server launch artifact를 만들고, manifest에 필요한 `runtime_features`만 기록하지만, production codegen/최적화 단계는 아직 없다. CLI는 HIR을 레퍼런스 런타임으로 직접 실행하고, `orv build <file-or-orv.toml> --out <dir>`은 manifest/bundle-plan/origin-map/project-graph/server-runtime/launch JSON을 출력한다. Server 없는 HTML-only entry는 zero-runtime `pages/index.html` 정적 페이지도 출력하며, 해당 bundle target의 `runtime_features`는 빈 배열이다. 생성된 server runtime artifact는 검증, 재분석, reference runtime 실행이 가능하고, `server/launch.json`은 `orv run-artifact server/app.orv-runtime.json` 실행 계약을 기록한다. 이 장은 프로덕션 컴파일러가 갖춰진 뒤의 목표 모델이다.
 
 orv 컴파일러는 "프로젝트 특화" 최적화를 수행한다. 핵심 원칙은 다음과 같다.
 
@@ -2991,21 +2991,24 @@ test "API 응답 확인" async {
 
 ### 14.4 테스트 실행
 
+> 구현 상태: 부분 구현. 현재 `orv test <path> --filter <name>`은 파일/디렉터리에서 `.orv` 파일을 찾고, `test "name"` 선언이 있는 파일을 기존 reference runtime 으로 실행한다. `orv test --list <path> --filter <name>`은 실행 없이 발견된 test 이름/path 목록을 JSON으로 출력한다. `assert` 실패는 runtime throw 로 실패 처리된다. filter 는 test 이름 기준으로 파일을 선택하지만, 현재 parser 가 test 이름을 AST/HIR에 보존하지 않기 때문에 선택된 파일 안의 test block 은 함께 실행된다. test case 단위 isolation, async test scheduler, fixture lifecycle, rich reporter 는 로드맵이다.
+
 ```
 orv test              # 전체 테스트 실행
 orv test src/models   # 특정 디렉토리
 orv test --filter "사용자"  # 이름 필터
+orv test --list src/models  # 발견 목록 JSON
 ```
 
 ---
 
 ## 15. 패키지 매니저
 
-> 구현 상태: 부분 구현. 현재 CLI는 단일 entry 파일 기준 `run`, `check`, `dump`, `origins`를 제공한다. `orv.toml`, `orv.lock`, 패키지 레지스트리, workspace/package/db 명령은 로드맵이다.
+> 구현 상태: 부분 구현. 현재 CLI는 `orv init <dir>` 프로젝트 scaffold와, 단일 entry 파일 또는 `orv.toml` `[project].entry` 기준 `run`, `dev`, `check`, `dump`, `origins`, `graph`, `test`, `lsp snapshot`, `lsp reveal`, `lsp serve --stdio`, `dap serve --stdio`, `build`, `verify-build`, `verify-artifact`, `check-artifact`, `run-artifact`, `run-build`, `reveal`, `db plan/apply/migrate/rollback`을 제공한다. `orv-project`는 멀티파일 source map과 AST ProjectGraph v1을 생성하고, `orv graph <file>`은 이를 source/semantic graph depth stats, HIR origin map, HIR `contains`/`calls` origin edge, origin-to-AST-node link와 함께 JSON으로 출력한다. `orv test <path> --filter <name>`은 `.orv` 파일을 찾아 `test "name"` 블록이 있는 파일을 reference runtime 으로 실행하고 `--list`로 발견 목록 JSON을 출력한다. `orv dap serve --stdio`는 Debug Adapter Protocol initialize/launch/configurationDone/setBreakpoints/breakpointLocations/exceptionInfo/threads/stackTrace/scopes/variables/loadedSources/source/continue/step/disconnect/terminate bootstrap을 제공하고 launch 시 프로젝트 그래프와 진단을 읽어 entry source stack frame, breakpoint location list, exception status, loaded source list/content, project-scope variables, reference runtime stdout/status/error variables를 반환한다. `orv build <file-or-orv.toml> --out <dir>`은 `build-manifest.json`, `bundle-plan.json`, `origin-map.json`, `project-graph.json`, source-bundled `server/app.orv-runtime.json`, `server/launch.json` artifact directory를 만들며, HTML-only entry는 zero-runtime `pages/index.html`도 출력한다. manifest는 `runtime_features`로 필요한 runtime layer만 선언하고 bundle plan은 future bundler target을 선언한다. `orv verify-build <dir>`은 manifest/plan target path, server runtime/launch artifact, static page zero-runtime/HTML shape를 검증한다. `orv verify-artifact <file>`은 source hash와 route descriptor shape를 검증하고, `orv check-artifact <file>`은 import 포함 source bundle을 재분석하며, `orv run-artifact <file>`은 검증된 source bundle을 재수화해 reference runtime으로 실행한다. `orv run-build <dir>`은 bundle plan target을 기준으로 연결된 reference artifact를 실행하거나, server 없는 static page build에서는 verified zero-runtime HTML을 출력한다. `orv dev <file-or-orv.toml> --out <dir>`은 build, verify-build, run-build를 순서대로 수행하는 reference dev bootstrap이다. `orv reveal <dir> <origin-id>`는 build artifact origin id를 source span, ProjectGraph node, server route descriptor로 역추적한다. 그래프 시각화 UI, 전체 `orv.toml` 설정/의존성 처리, `orv.lock`, 패키지 레지스트리, workspace/package 명령, HMR dev server, production server/WASM 번들은 로드맵이다.
 
 ### 15.1 orv.toml — 프로젝트 매니페스트
 
-`orv.toml`은 프로젝트 설정 파일이다. Cargo.toml 스타일을 따른다.
+`orv.toml`은 프로젝트 설정 파일이다. Cargo.toml 스타일을 따른다. 현재 구현은 최소 `[project].entry`를 읽어 `run`/`check`/`origins`/`graph`/`lsp snapshot`/`build`/`db plan`/`db apply` 같은 source-entry 명령의 entry 파일로 해석한다. 의존성, workspace, build profile, FFI allowlist는 로드맵이다.
 
 ```toml
 [project]
@@ -3034,23 +3037,34 @@ mock-server = "0.2.0"
 | `orv check <file>` | 파싱, 이름 해석, 타입/도메인 진단만 수행 |
 | `orv dump <file>` | 파싱된 AST를 디버그 출력 |
 | `orv origins <file>` | HIR 기반 origin map JSON 출력 |
+| `orv graph <file>` | AST ProjectGraph v1 + HIR origin map/edge JSON 출력 |
+| `orv build <file-or-orv.toml> --out <dir>` | 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact 또는 HTML-only static page 출력 |
+| `orv verify-build <dir>` | build manifest/plan target, server runtime/launch artifact, static page zero-runtime shape 검증 |
+| `orv verify-artifact <file>` | server runtime artifact source hash/route descriptor 검증 |
+| `orv check-artifact <file>` | server runtime artifact source bundle 재분석 |
+| `orv run-artifact <file>` | server runtime artifact source bundle 재수화 + reference runtime 실행 |
+| `orv run-build <dir>` | bundle plan 기준 reference artifact 실행, 또는 static page HTML 출력 |
+| `orv dev <file-or-orv.toml> --out <dir>` | build + verify-build + run-build reference dev bootstrap |
+| `orv reveal <dir> <origin-id>` | build artifact origin id를 source span, ProjectGraph node, route descriptor로 역추적 |
+| `orv test <path> --filter <name> --list` | `.orv` test block 파일 탐색 + reference runtime 실행 또는 발견 목록 JSON 출력 |
+| `orv lsp snapshot/reveal/serve --stdio` | 에디터 bootstrap JSON, production reveal, LSP initialize/diagnostic/symbol/code-lens/code-action/folding/selection/semantic-tokens/definition/references/highlight/rename/hover/completion 처리 |
+| `orv dap serve --stdio` | DAP initialize/launch/configurationDone/setBreakpoints/breakpointLocations/exceptionInfo/threads/stackTrace/scopes/variables/loadedSources/source/continue/step/disconnect/terminate bootstrap |
+| `orv init <dir> --name <name>` | 최소 `orv.toml` + `src/main.orv` 프로젝트 scaffold 생성 |
+| `orv db plan/apply/migrate/rollback` | schema diff dry-run, snapshot apply/migrate/history, rollback |
 
 로드맵 CLI:
 
 | 명령어 | 설명 |
 |--------|------|
-| `orv build` | 프로젝트 빌드 (서버 바이너리 + 클라이언트 번들) |
-| `orv dev` | 개발 서버 실행 (핫 리로드, HMR) |
-| `orv test` | 테스트 실행 |
-| `orv init` | 새 프로젝트 초기화 |
+| `orv build --prod` | 프로젝트 빌드 (서버 바이너리 + 클라이언트 번들) |
+| `orv dev --watch/--hmr` | 개발 서버 변경 감지, hot reload, HMR |
 | `orv add <pkg>` | 의존성 추가 |
 | `orv remove <pkg>` | 의존성 제거 |
-| `orv db migrate` | DB 스키마 마이그레이션 적용 |
 | `orv db backup` | DB 포인트-인-타임 백업 |
 | `orv db restore` | DB 복구 |
 | `orv db tune` | 런타임 프로파일 기반 쿼리 재최적화 |
 | `orv workspace new <name>` | 워크스페이스에 크레이트 추가 |
-| `orv graph` | 프로젝트 도메인 그래프 시각화 |
+| `orv graph --view` | 프로젝트 도메인 그래프 시각화 |
 
 ### 15.4 워크스페이스 (멀티 프로젝트)
 
@@ -3083,7 +3097,7 @@ let api = @route /api {
 }
 ```
 
-**배포 단위:** 각 크레이트는 독립된 서버 바이너리 또는 클라이언트 번들로 출력된다. 워크스페이스 루트의 `orv build` 는 변경된 크레이트만 재빌드한다 (증분, §13.9).
+**로드맵 배포 단위:** 각 크레이트는 독립된 서버 바이너리 또는 클라이언트 번들로 출력된다. 워크스페이스 루트의 `orv build --prod` 는 변경된 크레이트만 재빌드한다 (증분, §13.9).
 
 **크로스 크레이트 증분 빌드:** `shared/models` 변경은 해당 타입을 직접 참조한 크레이트만 재컴파일한다. 의존 그래프의 추가 하위 노드는 시그니처 미변경 시 캐시를 유지한다.
 
@@ -3101,7 +3115,7 @@ orv-stripe = "0.3.0"   # 공개 레지스트리
 
 ## 16. 통합 에디터
 
-> 구현 상태: 로드맵. 현재 repo에는 자체 에디터, LSP/DAP 서버, Tree-sitter 패키지, `orv dev`, origin map/reveal, 런타임 인스펙션 UI가 없다.
+> 구현 상태: 부분 구현. 현재 repo에는 자체 에디터, 완전한 LSP/DAP 서버, Tree-sitter 패키지, HMR dev server, 에디터 통합 reveal UI, 런타임 인스펙션 UI가 없다. HIR origin map 생성, AST ProjectGraph v1, build artifact origin reveal CLI는 구현되어 있으며, `orv dev`는 build+verify+run-build reference bootstrap으로 제공된다. `orv lsp snapshot <file>`은 diagnostics, ProjectGraph, LSP-style document symbols/ranges를 editor bootstrap JSON으로 출력한다. `orv lsp reveal <dir> <origin-id>`는 build artifact origin을 LSP location/range와 production descriptor로 변환한다. `orv lsp serve --stdio`는 Content-Length stdio JSON-RPC에서 initialize/shutdown/notification/unknown-method와 `textDocument/documentSymbol`, `textDocument/codeLens`, `textDocument/codeAction`, `textDocument/documentLink`, `textDocument/foldingRange`, `textDocument/selectionRange`, `textDocument/semanticTokens/full`, `textDocument/diagnostic`, `workspace/diagnostic`, `workspace/executeCommand`, `textDocument/definition`, `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/completion`, `workspace/symbol` file URI/root URI 요청을 처리하고, `textDocument/didOpen`/`textDocument/didChange` full-sync unsaved buffer를 세션 안에 보관한다. `orv dap serve --stdio`는 Content-Length Debug Adapter Protocol에서 initialize/launch/configurationDone/setBreakpoints/breakpointLocations/exceptionInfo/threads/stackTrace/scopes/variables/evaluate/completions/loadedSources/source/continue/step/disconnect/terminate를 처리하고, launch 시 같은 프로젝트 로더/그래프/진단으로 entry source stack frame, breakpoint location list, exception status, loaded source list/content, project-scope variables/evaluate/completion 값, reference runtime stdout/status/error variables를 만든다. 완전한 장기 실행 LSP method set, 실제 런타임 중단/스텝/locals DAP, 에디터 UI 연결은 아직 로드맵이다.
 
 orv 플랫폼은 자체 에디터를 포함하는 것을 목표로 한다. 외부 VSCode/Neovim도 LSP/DAP를 통해 지원하되, **컴파일러 프로젝트 그래프**는 LSP로 직렬화하는 순간 표현력을 잃는다는 전제를 둔다. 자체 에디터는 컴파일러와 같은 메모리 구조를 공유하며, 다음 기능들은 **외부 에디터에서 재현할 수 없는** 것으로 정의된다.
 
@@ -3237,11 +3251,11 @@ let user = await userApi.fetch("/me")   ▸ { id: 42, name: "Alice" }
 
 ### 16.11 프로덕션-코드 양방향 추적
 
-> 구현 상태: 부분 구현. 현재 MVP는 `orv-compiler`의 HIR origin map 생성 API, `orv origins <file>` JSON 출력, HTTP route 응답의 `x-orv-origin-id` 헤더를 제공한다. 전체 프로덕션 이벤트 연결, 에디터 reveal, 빌드 프로필 제어는 아직 없다. 이 절은 컴파일러/런타임/에디터가 갖춰진 뒤의 목표 동작을 정의한다.
+> 구현 상태: 부분 구현. 현재 MVP는 `orv-compiler`의 HIR origin map 생성 API, `orv origins <file>` JSON 출력, HTTP route 응답의 `x-orv-origin-id` 헤더, `orv reveal <dir> <origin-id>` build artifact 역추적을 제공한다. 전체 프로덕션 이벤트 연결, 에디터 reveal, 빌드 프로필 제어는 아직 없다. 이 절은 컴파일러/런타임/에디터가 갖춰진 뒤의 목표 동작을 정의한다.
 
 일반적인 개발 흐름은 `코드 작성 -> 실행/프리뷰 확인`이다. orv 에디터는 이 방향을 지원하되, 반대 방향인 **`프로덕션 관찰 -> 코드 reveal -> 프로젝트 그래프 탐색`**을 같은 수준의 기본 기능으로 제공하는 것을 목표로 한다.
 
-핵심 단위는 **origin map**이다. 현재 origin map 생성기는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에 안정적인 origin id와 span fingerprint를 부여한다. 현재 HTTP 런타임은 매칭된 `@route`의 origin id를 `x-orv-origin-id` 응답 헤더로 내보낸다. 로드맵 빌드 산출물은 이 id를 통해 더 넓은 프로덕션 이벤트와 원본 `.orv` span을 연결한다.
+핵심 단위는 **origin map**이다. 현재 origin map 생성기는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에 안정적인 origin id와 span fingerprint를 부여하고, HIR traversal 기반 parent-child `contains` edge와 call expression에서 resolved function으로 이어지는 `calls` edge를 함께 기록한다. 현재 HTTP 런타임은 매칭된 `@route`의 origin id를 `x-orv-origin-id` 응답 헤더로 내보낸다. `orv reveal <dir> <origin-id>`는 build artifact directory의 `origin-map.json`, `project-graph.json`, server runtime artifact를 결합해 source span, graph node, route descriptor를 JSON으로 반환한다. 로드맵 빌드 산출물은 이 id를 통해 더 넓은 프로덕션 이벤트와 원본 `.orv` span을 연결한다.
 
 | 프로덕션에서 선택한 대상 | reveal 대상 |
 |------------------------|------------|
@@ -3303,7 +3317,7 @@ reveal은 단순 파일 점프가 아니다. 에디터는 선택한 프로덕션
 
 ### 16.15 외부 에디터 지원
 
-> 구현 상태: 로드맵. 현재 CLI는 `orv lsp`, DAP 서버, Tree-sitter 패키지를 제공하지 않는다.
+> 구현 상태: 부분 구현. 현재 CLI는 `orv lsp snapshot`, `orv lsp reveal`, `orv lsp serve --stdio`의 initialize/shutdown stdio bootstrap과 `textDocument/documentSymbol`, `textDocument/codeLens`, `textDocument/codeAction`, `textDocument/documentLink`, `textDocument/foldingRange`, `textDocument/selectionRange`, `textDocument/semanticTokens/full`, `textDocument/diagnostic`, `workspace/diagnostic`, `workspace/executeCommand`, `textDocument/definition`, `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/completion`, `workspace/symbol` file URI/root URI 응답, `textDocument/didOpen`/`textDocument/didChange` full-sync open-buffer cache를 제공한다. `orv dap serve --stdio`는 DAP initialize/launch/configurationDone/setBreakpoints/breakpointLocations/exceptionInfo/threads/stackTrace/scopes/variables/evaluate/completions/loadedSources/source/continue/step/disconnect/terminate bootstrap과 entry source stack frame/loaded source content/project variables/evaluate/reference runtime stdout/status/error variables를 제공한다. Tree-sitter 패키지, 리팩터링 같은 완전한 LSP method set, 실제 런타임 중단/스텝/locals DAP는 아직 로드맵이다.
 
 자체 에디터를 권장하지만, VSCode/Neovim/JetBrains도 1급으로 지원하는 것을 목표로 한다.
 
