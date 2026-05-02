@@ -206,6 +206,12 @@ enum EditorCommand {
         /// 출력 디렉터리.
         #[arg(long)]
         out: PathBuf,
+        /// trace origin reveal에 사용할 build artifact 디렉터리.
+        #[arg(long)]
+        build: Option<PathBuf>,
+        /// 함께 embed 할 production request trace JSON 경로.
+        #[arg(long)]
+        trace: Option<PathBuf>,
     },
     /// production request trace를 first-party editor navigation JSON으로 변환한다.
     Trace {
@@ -613,7 +619,16 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            EditorCommand::Export { file, out } => match cmd_editor_export(&file, &out) {
+            EditorCommand::Export {
+                file,
+                out,
+                build,
+                trace,
+            } => match if build.is_none() && trace.is_none() {
+                cmd_editor_export(&file, &out)
+            } else {
+                cmd_editor_export_with_options(&file, &out, build.as_deref(), trace.as_deref())
+            } {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -713,8 +728,17 @@ fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
 }
 
 fn cmd_editor_export(path: &Path, out: &Path) -> anyhow::Result<()> {
+    cmd_editor_export_with_options(path, out, None, None)
+}
+
+fn cmd_editor_export_with_options(
+    path: &Path,
+    out: &Path,
+    build: Option<&Path>,
+    trace: Option<&Path>,
+) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
-    let state = editor_export_state_json(&entry)?;
+    let state = editor_export_state_json_with_trace(&entry, build, trace)?;
     write_json(&out.join("state.json"), &state)?;
     write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
     println!(
@@ -2173,6 +2197,22 @@ fn editor_export_state_json(path: &Path) -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+fn editor_export_state_json_with_trace(
+    path: &Path,
+    build: Option<&Path>,
+    trace: Option<&Path>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut state = editor_export_state_json(path)?;
+    if let Some(trace) = trace {
+        let build = build.ok_or_else(|| anyhow::anyhow!("--build is required with --trace"))?;
+        state
+            .as_object_mut()
+            .expect("editor export state is object")
+            .insert("trace".to_string(), editor_trace_json(build, trace)?);
+    }
+    Ok(state)
+}
+
 fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let entry = state
         .pointer("/snapshot/entry/path")
@@ -2183,6 +2223,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let schema_count = json_array_count(state.pointer("/snapshot/panels/schema"));
     let domain_count = json_array_count(state.pointer("/snapshot/panels/domains"));
     let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
+    let trace_count = json_array_count(state.pointer("/trace/frames"));
     let runtime_status = state
         .pointer("/runtime/runtime/status")
         .and_then(serde_json::Value::as_str)
@@ -2209,6 +2250,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(&mut html, "<span>Routes<b>{route_count}</b></span>")?;
     write!(&mut html, "<span>Schema<b>{schema_count}</b></span>")?;
     write!(&mut html, "<span>Domains<b>{domain_count}</b></span>")?;
+    write!(&mut html, "<span>Trace<b>{trace_count}</b></span>")?;
     html.push_str("</nav></aside>\n");
     html.push_str("<header class=\"topbar\">");
     write!(
@@ -2228,6 +2270,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(
         &mut html,
         "<section class=\"panel\"><h2>Diagnostics</h2><div class=\"metric\">{diagnostic_count}</div><p class=\"muted\">Project loader, resolver, and analyzer diagnostics.</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Trace</h2><div class=\"metric\">{trace_count}</div><p class=\"muted\">Captured request frames linked to source and production origins.</p></section>"
     )?;
     html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
     write!(
@@ -16850,6 +16896,25 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_export_trace_options_are_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "export",
+            "src/main.orv",
+            "--out",
+            "target/orv-editor",
+            "--build",
+            "target/orv-build",
+            "--trace",
+            "target/orv-trace.json",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn editor_trace_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -18163,6 +18228,65 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             state["runtime"]["runtime"]["stdout"],
             "editor-export-ready\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_embeds_trace_navigation_state() {
+        let dir = temp_output_dir("editor-export-trace");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        )
+        .expect("write source");
+        let build_out = dir.join("dist");
+
+        cmd_build(&path, &build_out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(build_out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let trace_path = dir.join("production-trace.json");
+        write_json(
+            &trace_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "orv.production.trace",
+                "frames": [{
+                    "method": "GET",
+                    "path": "/ping",
+                    "status": 200,
+                    "route_origin_id": route.id,
+                }],
+            }),
+        )
+        .expect("write trace");
+        let out = dir.join("editor");
+
+        cmd_editor_export_with_options(&path, &out, Some(&build_out), Some(&trace_path))
+            .expect("editor export with trace");
+
+        let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let state = read_json_value(&out.join("state.json")).expect("editor state");
+        assert!(html.contains("Trace"));
+        assert_eq!(state["trace"]["kind"], "orv.editor.trace");
+        assert_eq!(state["trace"]["frames"][0]["origin_id"], route.id);
+        assert_eq!(
+            state["trace"]["frames"][0]["navigation"]["focus"]["panel"],
+            "routes"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
