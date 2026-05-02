@@ -3455,6 +3455,13 @@ impl DapSession {
 
     fn step_in_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         if self.launch_is_live() {
+            if request
+                .pointer("/arguments/targetId")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            {
+                anyhow::bail!("stepIn targetId is unavailable in live debug mode");
+            }
             return self.step_in_live_result();
         }
         if let Some(target_id) = request
@@ -9832,6 +9839,55 @@ let total: int = add(2, 3)
                 && event["body"]["reason"] == "breakpoint"
         }));
         assert!(events.iter().all(|event| event["event"] != "terminated"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_live_step_in_rejects_target_id() {
+        let dir = temp_output_dir("dap-live-step-in-target");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 218,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "live": true,
+                },
+            }))
+            .expect("launch response");
+        let step_in = session
+            .message_response(&serde_json::json!({
+                "seq": 219,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                    "targetId": 1_000_000,
+                },
+            }))
+            .expect("stepIn response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 220,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(step_in["success"], false, "{step_in}");
+        assert!(step_in["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("targetId is unavailable in live debug mode")));
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
