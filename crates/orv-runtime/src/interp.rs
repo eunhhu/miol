@@ -2236,16 +2236,15 @@ impl<'w, W: Write> Interp<'w, W> {
             "push" => call_push_method(method, args),
             "offline" => call_offline_method(method, args),
             "cache" => call_cache_method(method, args),
-            "net" | "net.tcp" | "net.udp" | "net.tun" => call_net_method(ns, method, args),
+            "net" | "net.tcp" | "net.udp" | "net.tun" => {
+                self.require_unsafe_boundary(ns, method)?;
+                call_net_method(ns, method, args)
+            }
             "plugin" | "plugin.host" => call_plugin_method(ns, method, args),
             "gpu" => call_gpu_method(method, args),
             "observability" => call_observability_method(method, args),
             "ffi" => {
-                if self.unsafe_depth == 0 {
-                    return Err(RuntimeError::native(format!(
-                        "ffi method `{method}` requires @unsafe boundary"
-                    )));
-                }
+                self.require_unsafe_boundary(ns, method)?;
                 call_ffi_method(method, args)
             }
             "audit" => call_audit_method(method, args),
@@ -2383,6 +2382,15 @@ impl<'w, W: Write> Interp<'w, W> {
             "kind".to_string(),
             Value::Str("unsafe".to_string()),
         )]))
+    }
+
+    fn require_unsafe_boundary(&self, ns: &str, method: &str) -> Result<(), RuntimeError> {
+        if self.unsafe_depth == 0 {
+            return Err(RuntimeError::native(format!(
+                "{ns} method `{method}` requires @unsafe boundary"
+            )));
+        }
+        Ok(())
     }
 
     fn eval_observability_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
@@ -8507,17 +8515,26 @@ let local = store.put("logo", "blob")
     }
 
     #[test]
+    fn net_methods_require_unsafe_boundary() {
+        let err = run_str(r#"let tun = @net.tun.create(name="orv0")"#).unwrap_err();
+        assert!(err.message.contains("requires @unsafe"), "{}", err.message);
+    }
+
+    #[test]
     fn net_plugin_gpu_and_observability_reference_stubs_return_handles() {
         let out = run_str(
-            r#"let tun = @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
-let written = @net.tun.write(tun, "packet")
+            r#"let net = @unsafe {
+  let tun = @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
+  let written = @net.tun.write(tun, "packet")
+  { name: tun.name, bytes: written.bytes }
+}
 let plugin = @plugin.load("ext/markdown-preview.wasm")
 let activation = plugin.activate()
 let compute = @gpu.compute(file="shaders/blur.wgsl", workgroup=[16, 16, 1])
 let ctx = @gpu.context("canvas")
 let obs = @observability.configure({ service: "superapp" })
-@out tun.name
-@out written.bytes
+@out net.name
+@out net.bytes
 @out plugin.path
 @out activation.status
 @out compute.kind

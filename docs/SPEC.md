@@ -2481,7 +2481,7 @@ let url: string = await @storage.signedUrl("videos/{id}.mp4", ttl=3600)
 
 ### 11.16 @net (raw TCP/UDP / TUN)
 
-HTTP 레벨로는 VPN, 커스텀 프로토콜 프록시, 게임 서버의 저수준 제어가 불가능하다. `@net` 도메인은 raw 소켓과 OS 가상 인터페이스를 노출한다. **FFI 영역**이므로 `unsafe` 컨텍스트가 필요하다.
+HTTP 레벨로는 VPN, 커스텀 프로토콜 프록시, 게임 서버의 저수준 제어가 불가능하다. `@net` 도메인은 raw 소켓과 OS 가상 인터페이스를 노출한다. **FFI 영역**이므로 `unsafe` 컨텍스트가 필요하다. 현재 레퍼런스 런타임은 `@net.*` method call을 `@unsafe` 블록 밖에서 거부한다.
 
 ```orv
 // TCP 서버
@@ -2505,10 +2505,12 @@ HTTP 레벨로는 VPN, 커스텀 프로토콜 프록시, 게임 서버의 저수
 }
 
 // TUN 가상 인터페이스 (VPN)
-let tun = await @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
-for await packet in tun.read() {
-  let encrypted = crypto.encrypt(packet, sessionKey)
-  await tunnelChannel.send(encrypted)
+@unsafe {
+  let tun = await @net.tun.create(name="orv0", ipv4="10.8.0.1/24")
+  for await packet in tun.read() {
+    let encrypted = crypto.encrypt(packet, sessionKey)
+    await tunnelChannel.send(encrypted)
+  }
 }
 ```
 
