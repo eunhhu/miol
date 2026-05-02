@@ -2333,6 +2333,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let domain_count = json_array_count(state.pointer("/snapshot/panels/domains"));
     let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
     let trace_count = json_array_count(state.pointer("/trace/frames"));
+    let trace_status_counts = editor_trace_status_counts_from_state(state);
     let runtime_status = state
         .pointer("/runtime/runtime/status")
         .and_then(serde_json::Value::as_str)
@@ -2349,7 +2350,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("<title>orv editor</title>\n");
     html.push_str("<style>\n");
     html.push_str(":root{color-scheme:light;--bg:#f7f8fb;--ink:#18202f;--muted:#687386;--line:#d7dce5;--panel:#ffffff;--accent:#0f766e;--warn:#b45309;}\n");
-    html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}.list{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}.list li{border-top:1px solid var(--line);padding-top:6px;color:var(--muted);word-break:break-word;cursor:pointer}.list li:focus{outline:2px solid var(--accent);outline-offset:2px}.detail{min-height:120px}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
+    html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}.list{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}.list li{border-top:1px solid var(--line);padding-top:6px;color:var(--muted);word-break:break-word;cursor:pointer}.list li:focus{outline:2px solid var(--accent);outline-offset:2px}.filterbar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}.filterbar button{border:1px solid var(--line);background:#f8fafc;color:var(--ink);padding:5px 8px;font:inherit;cursor:pointer}.filterbar button[aria-pressed=\"true\"]{border-color:var(--accent);color:var(--accent);font-weight:700}.detail{min-height:120px}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<main id=\"orv-editor\">\n");
     html.push_str(
@@ -2384,10 +2385,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<section class=\"panel\"><h2>Diagnostics</h2><div class=\"metric\">{diagnostic_count}</div><p class=\"muted\">Project loader, resolver, and analyzer diagnostics.</p></section>"
     )?;
-    write!(
-        &mut html,
-        "<section class=\"panel\"><h2>Trace</h2><div class=\"metric\">{trace_count}</div><p class=\"muted\">Captured request frames linked to source and production origins.</p><ul id=\"trace-list\" class=\"list\"></ul></section>"
-    )?;
+    write_trace_panel_html(&mut html, trace_count, &trace_status_counts)?;
     html.push_str("<section class=\"panel\"><h2>Selected Trace</h2><pre id=\"trace-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
     write!(
@@ -2402,9 +2400,67 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str(&state_json);
     html.push_str("</script>\n");
     html.push_str(
-        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const traceFrames = state.trace?.frames || [];\n  put('trace-list', traceFrames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n  renderTraceDetail(traceFrames[0]);\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
+        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
     );
     Ok(html)
+}
+
+fn write_trace_panel_html(
+    html: &mut String,
+    trace_count: usize,
+    trace_status_counts: &EditorTraceStatusCounts,
+) -> anyhow::Result<()> {
+    write!(
+        html,
+        "<section class=\"panel\"><h2>Trace</h2><div class=\"metric\">{trace_count}</div><div id=\"trace-status-summary\" class=\"nav\">"
+    )?;
+    write!(
+        html,
+        "<span>OK<b>{}</b></span><span>Client Err<b>{}</b></span><span>Server Err<b>{}</b></span>",
+        trace_status_counts.ok, trace_status_counts.client_error, trace_status_counts.server_error
+    )?;
+    html.push_str("</div><div class=\"filterbar\">");
+    for (filter, label, count) in [
+        ("all", "All", trace_status_counts.total),
+        ("ok", "OK", trace_status_counts.ok),
+        ("redirect", "3xx", trace_status_counts.redirect),
+        ("client_error", "4xx", trace_status_counts.client_error),
+        ("server_error", "5xx", trace_status_counts.server_error),
+        ("other", "Other", trace_status_counts.other),
+    ] {
+        write!(
+            html,
+            "<button type=\"button\" data-trace-filter=\"{}\" aria-pressed=\"{}\">{}<b>{}</b></button>",
+            filter,
+            if filter == "all" { "true" } else { "false" },
+            label,
+            count
+        )?;
+    }
+    html.push_str("</div><ul id=\"trace-list\" class=\"list\"></ul></section>");
+    Ok(())
+}
+
+fn editor_trace_status_counts_from_state(state: &serde_json::Value) -> EditorTraceStatusCounts {
+    let mut counts = EditorTraceStatusCounts::default();
+    let Some(value) = state.pointer("/trace/trace/status_counts") else {
+        return counts;
+    };
+    counts.total = json_usize_field(value, "total");
+    counts.ok = json_usize_field(value, "ok");
+    counts.redirect = json_usize_field(value, "redirect");
+    counts.client_error = json_usize_field(value, "client_error");
+    counts.server_error = json_usize_field(value, "server_error");
+    counts.other = json_usize_field(value, "other");
+    counts
+}
+
+fn json_usize_field(value: &serde_json::Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
 }
 
 fn json_array_count(value: Option<&serde_json::Value>) -> usize {
@@ -18719,6 +18775,55 @@ define Auth() -> { @out "auth" }
             "routes"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_renders_trace_status_filters() {
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "snapshot": {
+                "entry": { "path": "app.orv" },
+                "panels": {
+                    "files": [],
+                    "routes": [],
+                    "schema": [],
+                    "domains": []
+                },
+                "diagnostics": []
+            },
+            "runtime": {
+                "runtime": {
+                    "status": "ok",
+                    "stdout": ""
+                }
+            },
+            "trace": {
+                "trace": {
+                    "status_counts": {
+                        "total": 3,
+                        "ok": 1,
+                        "redirect": 0,
+                        "client_error": 1,
+                        "server_error": 1,
+                        "other": 0
+                    }
+                },
+                "frames": [
+                    { "summary": { "label": "GET /ok -> 200", "status_class": "ok" } },
+                    { "summary": { "label": "GET /missing -> 404", "status_class": "client_error" } },
+                    { "summary": { "label": "POST /checkout -> 503", "status_class": "server_error" } }
+                ]
+            }
+        });
+
+        let html = editor_export_html(&state).expect("editor html");
+
+        assert!(html.contains("id=\"trace-status-summary\""));
+        assert!(html.contains("data-trace-filter=\"client_error\""));
+        assert!(html.contains("data-trace-filter=\"server_error\""));
+        assert!(html.contains("filterTraceFrames"));
+        assert!(html.contains("Client Err<b>1</b>"));
+        assert!(html.contains("Server Err<b>1</b>"));
     }
 
     #[test]
