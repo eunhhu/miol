@@ -546,7 +546,7 @@ impl InMemoryDb {
     /// # Errors
     /// Returns an error when the WAL cannot be read, parsed, or replayed.
     pub fn load_wal(path: &Path) -> Result<Self, DbSnapshotError> {
-        Self::load_wal_records(path, None)
+        Self::load_wal_records(path, None, None)
     }
 
     /// Load a DB by replaying at most `until_record` complete WAL records.
@@ -558,10 +558,26 @@ impl InMemoryDb {
         path: &Path,
         until_record: Option<usize>,
     ) -> Result<Self, DbSnapshotError> {
-        Self::load_wal_records(path, until_record)
+        Self::load_wal_records(path, until_record, None)
     }
 
-    fn load_wal_records(path: &Path, until_record: Option<usize>) -> Result<Self, DbSnapshotError> {
+    /// Load a DB by replaying complete WAL records whose `ts_unix_ms` is not
+    /// newer than `until_unix_ms`. Missing WAL means empty DB.
+    ///
+    /// # Errors
+    /// Returns an error when the WAL cannot be read, parsed, or replayed.
+    pub fn load_wal_until_unix_ms(
+        path: &Path,
+        until_unix_ms: Option<u64>,
+    ) -> Result<Self, DbSnapshotError> {
+        Self::load_wal_records(path, None, until_unix_ms)
+    }
+
+    fn load_wal_records(
+        path: &Path,
+        until_record: Option<usize>,
+        until_unix_ms: Option<u64>,
+    ) -> Result<Self, DbSnapshotError> {
         let mut db = Self {
             tables: HashMap::new(),
             wal_path: Some(path.to_path_buf()),
@@ -600,6 +616,20 @@ impl InMemoryDb {
                     });
                 }
             };
+            if let Some(limit) = until_unix_ms {
+                let timestamp = record
+                    .get("ts_unix_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        DbSnapshotError::Invalid(format!(
+                            "wal line {}: missing ts_unix_ms for timestamp recovery",
+                            line_index + 1
+                        ))
+                    })?;
+                if timestamp > limit {
+                    break;
+                }
+            }
             replay_wal_record(&mut db, &record).map_err(|err| {
                 DbSnapshotError::Invalid(format!("wal line {}: {err}", line_index + 1))
             })?;
@@ -656,7 +686,8 @@ fn append_wal_record(path: &Path, record: &serde_json::Value) -> Result<(), DbSn
             path: path.to_path_buf(),
             source,
         })?;
-    let bytes = serde_json::to_vec(record).map_err(|source| DbSnapshotError::Json {
+    let record = wal_record_with_timestamp(record);
+    let bytes = serde_json::to_vec(&record).map_err(|source| DbSnapshotError::Json {
         path: path.to_path_buf(),
         source,
     })?;
@@ -686,7 +717,8 @@ fn replace_wal_with_record(path: &Path, record: &serde_json::Value) -> Result<()
             path: temp_path.clone(),
             source,
         })?;
-    let bytes = serde_json::to_vec(record).map_err(|source| DbSnapshotError::Json {
+    let record = wal_record_with_timestamp(record);
+    let bytes = serde_json::to_vec(&record).map_err(|source| DbSnapshotError::Json {
         path: temp_path.clone(),
         source,
     })?;
@@ -709,6 +741,23 @@ fn wal_checkpoint_temp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("orv-db.wal");
     path.with_file_name(format!(".{file_name}.checkpoint.tmp"))
+}
+
+fn wal_record_with_timestamp(record: &serde_json::Value) -> serde_json::Value {
+    let mut record = record.clone();
+    if let Some(object) = record.as_object_mut() {
+        object
+            .entry("ts_unix_ms".to_string())
+            .or_insert_with(|| serde_json::json!(current_unix_ms()));
+    }
+    record
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn replay_wal_record(db: &mut InMemoryDb, record: &serde_json::Value) -> Result<(), String> {
@@ -1320,6 +1369,31 @@ mod tests {
             restored.find_one("User", &obj(&[("name", Value::Str("Bea".into()))])),
             Value::Void
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_records_include_unix_ms_timestamp() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-db-wal-timestamp-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let mut db = InMemoryDb::load_wal(&path).expect("open wal");
+
+        db.create_logged("User", obj(&[("name", Value::Str("Ada".into()))]))
+            .expect("logged create");
+
+        let wal = std::fs::read_to_string(&path).expect("read wal");
+        let record: serde_json::Value =
+            serde_json::from_str(wal.lines().next().expect("wal record")).expect("parse record");
+        assert!(
+            record["ts_unix_ms"].as_u64().is_some_and(|value| value > 0),
+            "{record}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -239,6 +239,9 @@ enum DbCommand {
         /// 처음 N개 complete WAL record까지만 재생한다.
         #[arg(long)]
         until_record: Option<usize>,
+        /// 이 unix millisecond timestamp 이하 WAL record까지만 재생한다.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
     },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
@@ -468,7 +471,8 @@ fn main() -> ExitCode {
                 wal,
                 out,
                 until_record,
-            } => match cmd_db_recover(&wal, &out, until_record) {
+                until_unix_ms,
+            } => match cmd_db_recover(&wal, &out, until_record, until_unix_ms) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -912,25 +916,44 @@ fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_db_recover(wal: &Path, out: &Path, until_record: Option<usize>) -> anyhow::Result<()> {
-    let db = orv_runtime::db::InMemoryDb::load_wal_until_record(wal, until_record)
-        .map_err(|e| anyhow::anyhow!("db wal recover failed: {e}"))?;
+fn cmd_db_recover(
+    wal: &Path,
+    out: &Path,
+    until_record: Option<usize>,
+    until_unix_ms: Option<u64>,
+) -> anyhow::Result<()> {
+    if until_record.is_some() && until_unix_ms.is_some() {
+        anyhow::bail!("db recover accepts only one of --until-record or --until-unix-ms");
+    }
+    let db = if until_unix_ms.is_some() {
+        orv_runtime::db::InMemoryDb::load_wal_until_unix_ms(wal, until_unix_ms)
+    } else {
+        orv_runtime::db::InMemoryDb::load_wal_until_record(wal, until_record)
+    }
+    .map_err(|e| anyhow::anyhow!("db wal recover failed: {e}"))?;
     let snapshot = db.snapshot_json();
     validate_db_data_snapshot(&snapshot)?;
     backup_json_for_rollback(out)?;
     write_json_atomic(out, &snapshot)?;
-    match until_record {
-        Some(limit) => println!(
+    match (until_record, until_unix_ms) {
+        (Some(limit), None) => println!(
             "db recover: {} written from {} through record {}",
             out.display(),
             wal.display(),
             limit
         ),
-        None => println!(
+        (None, Some(limit)) => println!(
+            "db recover: {} written from {} through unix ms {}",
+            out.display(),
+            wal.display(),
+            limit
+        ),
+        (None, None) => println!(
             "db recover: {} written from {}",
             out.display(),
             wal.display()
         ),
+        (Some(_), Some(_)) => unreachable!("validated mutually exclusive recover limits"),
     }
     Ok(())
 }

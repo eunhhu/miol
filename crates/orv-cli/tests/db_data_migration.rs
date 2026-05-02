@@ -279,3 +279,46 @@ fn db_recover_replays_wal_until_record_into_snapshot() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_recover_replays_wal_until_unix_ms_into_snapshot() {
+    let dir = temp_dir("db-recover-wal-unix-ms");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let data = dir.join("data.json");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+{"schema_version":1,"op":"create","ts_unix_ms":2000,"table":"User","data":{"email":"b@example.com"}}
+{"schema_version":1,"op":"create","ts_unix_ms":3000,"table":"User","data":{"email":"c@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let recover = orv()
+        .args(["db", "recover"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&data)
+        .arg("--until-unix-ms")
+        .arg("2000")
+        .output()
+        .expect("run db recover");
+    assert!(
+        recover.status.success(),
+        "recover failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&recover.stdout),
+        String::from_utf8_lossy(&recover.stderr)
+    );
+
+    let recovered = read_json(&data);
+    let rows = recovered["tables"]["User"]["rows"]
+        .as_array()
+        .expect("recovered rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["email"], "a@example.com");
+    assert_eq!(rows[1]["email"], "b@example.com");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
