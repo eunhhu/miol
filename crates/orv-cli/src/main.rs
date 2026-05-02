@@ -8975,6 +8975,12 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains(routes_artifact) {
         anyhow::bail!("deploy runbook must reference {routes_artifact}");
     }
+    if !runbook.contains("ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json") {
+        anyhow::bail!("deploy runbook must document request trace capture env");
+    }
+    if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
+        anyhow::bail!("deploy runbook must document editor trace navigation command");
+    }
     if let Some(port) = deploy_runbook_port_assignment(listen) {
         if !runbook.contains(&port) {
             anyhow::bail!("deploy runbook must document {port}");
@@ -10445,6 +10451,13 @@ fn write_prod_deploy_runbook(
 
 - Compose: {compose_path}
 - Routes: {routes_artifact}
+
+## Request Trace
+
+```sh
+ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json ./deploy/server.sh
+orv editor trace . --trace deploy/request-trace.json
+```
 
 ## Routes
 
@@ -17401,6 +17414,8 @@ entry = "src/main.orv"
         let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
         assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
         assert!(runbook.contains("PORT=8080"));
+        assert!(runbook.contains("ORV_RUNTIME_REQUEST_TRACE_PATH=deploy/request-trace.json"));
+        assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("- GET /ping"));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
