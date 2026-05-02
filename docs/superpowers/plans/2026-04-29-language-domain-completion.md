@@ -16,6 +16,8 @@
 
 **DB archive delta (2026-05-03):** `orv db recover` now accepts `--archive <archive.json>` as an alternative to raw `--wal`, resolves file archive targets, and verifies archived WAL hash/byte count before replay. Remaining DB persistence work is remote archive targets, external adapters, and full crash matrix coverage.
 
+**Shop scaffold delta (2026-05-03):** `orv init --template shop` now writes the shopping route scaffold plus a README with check/build/verify/run-build commands and the member/payment/shipment route inventory. Remaining shop north-star work is native server deployment, real payment/shipping adapters, persistent external DB adapters, and browser UI.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure

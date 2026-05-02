@@ -681,8 +681,47 @@ fn cmd_init(dir: &Path, name: Option<&str>, template: InitTemplate) -> anyhow::R
         InitTemplate::Shop => SHOP_INIT_TEMPLATE_SOURCE,
     };
     write_new_text_file(&src.join("main.orv"), entry_source)?;
+    if template == InitTemplate::Shop {
+        write_new_text_file(&dir.join("README.md"), &shop_init_readme(&project_name))?;
+    }
     println!("init: {} created", dir.display());
     Ok(())
+}
+
+fn shop_init_readme(project_name: &str) -> String {
+    format!(
+        "# {project_name}\n\
+\n\
+Generated ORV shop starter.\n\
+\n\
+## Verify\n\
+\n\
+```sh\n\
+orv check .\n\
+orv build . --prod --out dist\n\
+orv verify-build dist\n\
+```\n\
+\n\
+## Run\n\
+\n\
+```sh\n\
+orv run-build dist\n\
+```\n\
+\n\
+## Routes\n\
+\n\
+- `GET /health`\n\
+- `POST /products`\n\
+- `GET /products`\n\
+- `GET /products/:sku`\n\
+- `POST /members`\n\
+- `GET /members/:handle`\n\
+- `POST /orders`\n\
+- `GET /orders/:customer`\n\
+- `POST /payments`\n\
+- `POST /shipments`\n\
+- `GET /shipments/:orderId`\n"
+    )
 }
 
 #[derive(Debug)]
@@ -9087,6 +9126,23 @@ test "checkout failing runtime body" {
         cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
         assert!(out.join("server").join("app.orv-runtime.json").is_file());
         assert!(out.join("deploy").join("manifest.json").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn init_shop_template_writes_deploy_guide() {
+        let dir = temp_output_dir("init-shop-guide");
+
+        cmd_init(&dir, Some("starter-shop"), InitTemplate::Shop).expect("init shop project");
+
+        let guide = std::fs::read_to_string(dir.join("README.md")).expect("shop README");
+        assert!(guide.contains("starter-shop"));
+        assert!(guide.contains("orv check ."));
+        assert!(guide.contains("orv build . --prod --out dist"));
+        assert!(guide.contains("orv verify-build dist"));
+        assert!(guide.contains("POST /members"));
+        assert!(guide.contains("POST /payments"));
+        assert!(guide.contains("POST /shipments"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
