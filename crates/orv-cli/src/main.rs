@@ -2038,6 +2038,7 @@ impl DapSession {
                     "supportsGotoTargetsRequest": true,
                     "supportsStepBack": true,
                     "supportsStepInTargetsRequest": true,
+                    "supportsRestartFrame": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -2085,6 +2086,7 @@ impl DapSession {
             "reverseContinue" => self.reverse_continue_result(),
             "goto" => self.goto_result(request),
             "stepBack" => self.step_back_result(),
+            "restartFrame" => self.restart_frame_result(request),
             "next" => self.next_result(),
             "stepInTargets" => self.step_in_targets_result(request),
             "stepIn" => self.step_in_result(request),
@@ -2914,6 +2916,38 @@ impl DapSession {
         Ok(serde_json::json!({}))
     }
 
+    fn restart_frame_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let frame_id = request
+            .pointer("/arguments/frameId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("restartFrame.arguments.frameId is required"))?;
+        if frame_id != 1 {
+            anyhow::bail!("restartFrame currently supports current ORV frameId 1");
+        }
+        let target_frame = {
+            let launched = self
+                .launched
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before restartFrame"))?;
+            dap_restart_frame_target_index(launched)
+                .ok_or_else(|| anyhow::anyhow!("no restartable runtime frame"))?
+        };
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before restartFrame"))?;
+        launched.current_frame_index = target_frame;
+        if let Some(frame) = launched.frames.get(target_frame) {
+            launched.stopped_line = frame.line;
+        }
+        launched.stopped_reason = "restart".to_string();
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
     fn next_result(&mut self) -> anyhow::Result<serde_json::Value> {
         let (start_frame, target_frame) = {
             let launched = self
@@ -3636,6 +3670,32 @@ fn dap_step_in_targets_json(launched: &DapLaunchState) -> Vec<serde_json::Value>
             }))
         })
         .collect()
+}
+
+fn dap_restart_frame_target_index(launched: &DapLaunchState) -> Option<usize> {
+    let current_index = launched.current_frame_index;
+    let current_frame = launched.frames.get(current_index)?;
+    let Some(current_call) = current_frame.stack.last() else {
+        return Some(0);
+    };
+    let current_depth = current_frame.stack.len();
+    let mut target = current_index;
+    for index in (0..=current_index).rev() {
+        let frame = launched.frames.get(index)?;
+        if frame.stack.len() < current_depth {
+            break;
+        }
+        let Some(call) = frame.stack.last() else {
+            continue;
+        };
+        if call.name == current_call.name
+            && call.source.reference == current_call.source.reference
+            && call.line == current_call.line
+        {
+            target = index;
+        }
+    }
+    Some(target)
 }
 
 fn dap_current_locals(launched: &DapLaunchState) -> &[DapVariable] {
@@ -7849,6 +7909,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsGotoTargetsRequest"], true);
         assert_eq!(response["body"]["supportsStepBack"], true);
         assert_eq!(response["body"]["supportsStepInTargetsRequest"], true);
+        assert_eq!(response["body"]["supportsRestartFrame"], true);
     }
 
     #[test]
@@ -8987,6 +9048,98 @@ let total: int = add(2, 3)
             event["type"] == "event"
                 && event["event"] == "stopped"
                 && event["body"]["reason"] == "step"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_restart_frame_rewinds_current_function_frame() {
+        let dir = temp_output_dir("dap-restart-frame");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 202,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 203,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first stepIn response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 204,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("second stepIn response");
+        let before = session
+            .message_response(&serde_json::json!({
+                "seq": 205,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("before stack response");
+        let restart_frame = session
+            .message_response(&serde_json::json!({
+                "seq": 206,
+                "type": "request",
+                "command": "restartFrame",
+                "arguments": {
+                    "frameId": 1,
+                },
+            }))
+            .expect("restartFrame response");
+        let events = session.drain_pending_events();
+        let after = session
+            .message_response(&serde_json::json!({
+                "seq": 207,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("after stack response");
+
+        assert_eq!(before["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(before["body"]["stackFrames"][0]["line"], 3);
+        assert_eq!(restart_frame["success"], true, "{restart_frame}");
+        assert_eq!(after["body"]["stackFrames"][0]["name"], "add");
+        assert_eq!(after["body"]["stackFrames"][0]["line"], 2);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "restart"
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
