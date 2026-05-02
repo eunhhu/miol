@@ -2061,7 +2061,8 @@ impl DapSession {
             "reverseContinue" => self.reverse_continue_result(),
             "goto" => self.goto_result(request),
             "stepBack" => self.step_back_result(),
-            "next" | "stepIn" => self.step_result(),
+            "next" => self.next_result(),
+            "stepIn" => self.step_result(),
             "stepOut" => self.step_out_result(),
             "pause" => self.pause_result(),
             "terminateThreads" => self.terminate_threads_result(request),
@@ -2879,6 +2880,45 @@ impl DapSession {
             .launched
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("launch is required before stepBack"))?;
+        launched.current_frame_index = target_frame;
+        if let Some(frame) = launched.frames.get(target_frame) {
+            launched.stopped_line = frame.line;
+        }
+        launched.stopped_reason = "step".to_string();
+        self.queue_stopped_event();
+        Ok(serde_json::json!({}))
+    }
+
+    fn next_result(&mut self) -> anyhow::Result<serde_json::Value> {
+        let (start_frame, target_frame) = {
+            let launched = self
+                .launched
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("launch is required before next"))?;
+            let current = launched
+                .frames
+                .get(launched.current_frame_index)
+                .ok_or_else(|| anyhow::anyhow!("no current runtime frame"))?;
+            let current_depth = current.stack.len();
+            let start = launched.current_frame_index.saturating_add(1);
+            let target = launched
+                .frames
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find_map(|(index, frame)| (frame.stack.len() <= current_depth).then_some(index));
+            (start, target)
+        };
+        let Some(target_frame) = target_frame else {
+            self.launched = None;
+            self.queue_event("terminated", serde_json::json!({}));
+            return Ok(serde_json::json!({}));
+        };
+        self.queue_frame_outputs(start_frame, target_frame);
+        let launched = self
+            .launched
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before next"))?;
         launched.current_frame_index = target_frame;
         if let Some(frame) = launched.frames.get(target_frame) {
             launched.stopped_line = frame.line;
@@ -8628,12 +8668,12 @@ let done: int = total
             .message_response(&serde_json::json!({
                 "seq": 191,
                 "type": "request",
-                "command": "next",
+                "command": "stepIn",
                 "arguments": {
                     "threadId": 1,
                 },
             }))
-            .expect("next response");
+            .expect("stepIn response");
         let inside_stack = session
             .message_response(&serde_json::json!({
                 "seq": 192,
@@ -8676,6 +8716,62 @@ let done: int = total
                 && event["event"] == "stopped"
                 && event["body"]["reason"] == "step"
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_next_steps_over_function_call_frames() {
+        let dir = temp_output_dir("dap-next-step-over");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+let done: int = total
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 195,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let next = session
+            .message_response(&serde_json::json!({
+                "seq": 196,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("next response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 197,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(next["success"], true, "{next}");
+        assert_eq!(stack["body"]["stackFrames"][0]["name"], "orv entry");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 5);
+        assert_eq!(stack["body"]["totalFrames"], 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8753,12 +8849,12 @@ let total: int = add(2, 3)
             .message_response(&serde_json::json!({
                 "seq": 164,
                 "type": "request",
-                "command": "next",
+                "command": "stepIn",
                 "arguments": {
                     "threadId": 1,
                 },
             }))
-            .expect("next response");
+            .expect("stepIn response");
         let stack = session
             .message_response(&serde_json::json!({
                 "seq": 165,
