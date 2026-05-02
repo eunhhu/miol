@@ -6,6 +6,7 @@
 //! `orv origins <file>`은 HIR 기반 origin map JSON을 출력한다. `orv graph
 //! <file>`은 AST 기반 `ProjectGraph` v1과 HIR origin map JSON을 출력하고,
 //! `orv build <file-or-orv.toml> --out <dir>`은 초기 build artifact directory 를 생성한다.
+//! `--prod`는 같은 artifact에 deploy manifest와 reference server entrypoint를 추가한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
@@ -69,6 +70,9 @@ enum Command {
         /// artifact 출력 디렉터리.
         #[arg(long, short = 'o')]
         out: PathBuf,
+        /// 배포용 production profile 산출물을 함께 생성한다.
+        #[arg(long)]
+        prod: bool,
     },
     /// build artifact 디렉터리의 manifest/plan 산출물을 검증한다.
     VerifyBuild {
@@ -282,13 +286,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Build { file, out } => match cmd_build(&file, &out) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
+        Command::Build { file, out, prod } => {
+            match cmd_build_with_profile(&file, &out, BuildProfile::from_prod_flag(prod)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Command::VerifyBuild { dir } => match cmd_verify_build(&dir) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -4688,7 +4694,8 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let manifest = read_json_value(&dir.join("build-manifest.json"))?;
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
     verify_bundle_targets(dir, &plan)?;
-    verify_manifest_artifacts(dir, &manifest)
+    verify_manifest_artifacts(dir, &manifest)?;
+    verify_deploy_manifest_if_present(dir)
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -4777,6 +4784,85 @@ fn verify_static_page_target(bundle: &serde_json::Value, target: &Path) -> anyho
     }
     if !(trimmed.starts_with("<html") || trimmed.starts_with("<!doctype")) {
         anyhow::bail!("static_page bundle is not html: {}", target.display());
+    }
+    Ok(())
+}
+
+fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
+    let deploy_manifest = dir.join("deploy").join("manifest.json");
+    if !deploy_manifest.is_file() {
+        return Ok(());
+    }
+    let deploy = read_json_value(&deploy_manifest)?;
+    let version = deploy
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("deploy manifest schema_version must be an integer"))?;
+    if version != 1 {
+        anyhow::bail!("unsupported deploy manifest schema_version {version}");
+    }
+    if deploy.get("profile").and_then(serde_json::Value::as_str) != Some("prod") {
+        anyhow::bail!("deploy manifest profile must be prod");
+    }
+    verify_deploy_server_target(dir, deploy.get("server"))?;
+    verify_deploy_static_target(dir, deploy.get("static"))
+}
+
+fn verify_deploy_server_target(
+    dir: &Path,
+    server: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(server) = server.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let artifact = json_str(server, "artifact", "deploy server")?;
+    let entrypoint = json_str(server, "entrypoint", "deploy server")?;
+    let entrypoint_path = dir.join(entrypoint);
+    if !entrypoint_path.is_file() {
+        anyhow::bail!(
+            "missing deploy server entrypoint: {}",
+            entrypoint_path.display()
+        );
+    }
+    let script = std::fs::read_to_string(&entrypoint_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", entrypoint_path.display()))?;
+    if !script.contains("orv run-artifact") {
+        anyhow::bail!("deploy server entrypoint must run `orv run-artifact`");
+    }
+    let artifact = read_server_artifact(&dir.join(artifact))?;
+    orv_compiler::verify_server_runtime_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
+    {
+        anyhow::bail!("deploy server runtime does not match runtime artifact");
+    }
+    if let Some(routes) = server.get("routes") {
+        let artifact_routes = serde_json::to_value(&artifact.routes)?;
+        if routes != &artifact_routes {
+            anyhow::bail!("deploy server routes do not match runtime artifact");
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_static_target(
+    dir: &Path,
+    static_target: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(static_target) = static_target.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let path = json_str(static_target, "path", "deploy static")?;
+    let target = dir.join(path);
+    if !target.is_file() {
+        anyhow::bail!("missing deploy static target: {}", target.display());
+    }
+    let runtime_features = static_target
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy static runtime_features must be an array"))?;
+    if !runtime_features.is_empty() {
+        anyhow::bail!("deploy static target must be zero-runtime");
     }
     Ok(())
 }
@@ -5233,7 +5319,31 @@ fn normalized_artifact_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildProfile {
+    Development,
+    Production,
+}
+
+impl BuildProfile {
+    const fn from_prod_flag(prod: bool) -> Self {
+        if prod {
+            Self::Production
+        } else {
+            Self::Development
+        }
+    }
+
+    const fn is_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
 fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
+    cmd_build_with_profile(path, out, BuildProfile::Development)
+}
+
+fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
     report_diagnostics(&loaded.diagnostics, &loaded.files)?;
@@ -5253,6 +5363,9 @@ fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
             render_static_page(&lowered).map(|html| (PathBuf::from(bundle.path.clone()), html))
         })
         .transpose()?;
+    let static_page_path = static_page
+        .as_ref()
+        .map(|(path, _)| normalized_artifact_path(&path.display().to_string()));
     let server_artifact_path = "server/app.orv-runtime.json";
     let server_launch_path = "server/launch.json";
     let server_artifact = manifest.capabilities.has_server.then(|| {
@@ -5270,7 +5383,7 @@ fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", out.display()))?;
     write_json(
         &out.join("build-manifest.json"),
-        &serde_json::to_value(manifest)?,
+        &serde_json::to_value(&manifest)?,
     )?;
     write_json(
         &out.join("bundle-plan.json"),
@@ -5281,12 +5394,12 @@ fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
         &serde_json::to_value(origin_map)?,
     )?;
     write_json(&out.join("project-graph.json"), &graph)?;
-    if let Some(server_artifact) = server_artifact {
+    if let Some(server_artifact) = &server_artifact {
         write_json(
             &out.join(server_artifact_path),
-            &serde_json::to_value(&server_artifact)?,
+            &serde_json::to_value(server_artifact)?,
         )?;
-        let launch = orv_compiler::server_launch_artifact(server_artifact_path, &server_artifact);
+        let launch = orv_compiler::server_launch_artifact(server_artifact_path, server_artifact);
         write_json(
             &out.join(server_launch_path),
             &serde_json::to_value(launch)?,
@@ -5295,7 +5408,87 @@ fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
     }
+    if profile.is_production() {
+        write_prod_deploy_artifacts(
+            out,
+            &entry,
+            &manifest,
+            server_artifact.as_ref(),
+            static_page_path.as_deref(),
+            server_artifact_path,
+        )?;
+    }
     println!("build: wrote {}", out.display());
+    Ok(())
+}
+
+fn write_prod_deploy_artifacts(
+    out: &Path,
+    entry: &Path,
+    manifest: &orv_compiler::BuildManifest,
+    server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
+    static_page_path: Option<&str>,
+    server_artifact_path: &str,
+) -> anyhow::Result<()> {
+    let server = if let Some(server_artifact) = server_artifact {
+        let entrypoint = "deploy/server.sh";
+        write_prod_server_entrypoint(out, server_artifact_path)?;
+        serde_json::json!({
+            "runtime": server_artifact.runtime.clone(),
+            "artifact": server_artifact_path,
+            "entrypoint": entrypoint,
+            "protocol": "http1",
+            "routes": server_artifact.routes.clone(),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    let static_target = static_page_path.map_or(serde_json::Value::Null, |path| {
+        serde_json::json!({
+            "path": path,
+            "runtime_features": [],
+        })
+    });
+    let deploy = serde_json::json!({
+        "schema_version": 1,
+        "profile": "prod",
+        "entry": entry.display().to_string(),
+        "runtime": manifest.runtime.clone(),
+        "runtime_features": manifest.capabilities.runtime_features.clone(),
+        "server": server,
+        "static": static_target,
+    });
+    write_json(&out.join("deploy").join("manifest.json"), &deploy)
+}
+
+fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
+    let script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BUILD_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+exec orv run-artifact "$BUILD_DIR/{server_artifact_path}" "$@"
+"#
+    );
+    let path = out.join("deploy").join("server.sh");
+    write_text(&path, &script)?;
+    set_executable_if_supported(&path)
+}
+
+#[cfg(unix)]
+fn set_executable_if_supported(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("failed to stat {}: {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| anyhow::anyhow!("failed to chmod {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable_if_supported(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -9680,6 +9873,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_prod_subcommand_flag_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "build",
+            "fixtures/e2e/hello.orv",
+            "--out",
+            "target/orv-prod-build-test",
+            "--prod",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn build_writes_manifest_origin_map_and_project_graph() {
         let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
         let out = temp_output_dir("build-artifacts");
@@ -9804,6 +10012,43 @@ entry = "src/main.orv"
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
 
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("build-prod-artifacts");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy_manifest_path = out.join("deploy").join("manifest.json");
+        let server_entrypoint_path = out.join("deploy").join("server.sh");
+        assert!(
+            deploy_manifest_path.is_file(),
+            "missing {}",
+            deploy_manifest_path.display()
+        );
+        assert!(
+            server_entrypoint_path.is_file(),
+            "missing {}",
+            server_entrypoint_path.display()
+        );
+        let deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
+        assert_eq!(deploy["schema_version"], 1);
+        assert_eq!(deploy["profile"], "prod");
+        assert_eq!(deploy["entry"], path.display().to_string());
+        assert_eq!(deploy["server"]["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(deploy["server"]["entrypoint"], "deploy/server.sh");
+        assert!(deploy["server"]["routes"]
+            .as_array()
+            .expect("server routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
+        assert!(script.contains("orv run-artifact"));
+
+        cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(&out);
     }
 
