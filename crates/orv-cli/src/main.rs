@@ -7312,6 +7312,7 @@ fn verify_deploy_server_target(
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
+    let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
         anyhow::bail!("deploy server runtime_image must be {ORV_REFERENCE_RUNTIME_IMAGE}");
@@ -7358,6 +7359,14 @@ fn verify_deploy_server_target(
         dockerfile,
         runtime_image,
         artifact.listen.as_ref(),
+    )?;
+    verify_deploy_runbook_artifact(
+        dir,
+        runbook,
+        compose,
+        routes_artifact,
+        artifact.listen.as_ref(),
+        &artifact.routes,
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
@@ -7473,6 +7482,43 @@ fn verify_deploy_compose_artifact(
         }
         if !compose.contains(&port.environment) {
             anyhow::bail!("deploy compose must configure PORT");
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_runbook_artifact(
+    dir: &Path,
+    path: &str,
+    compose_path: &str,
+    routes_artifact: &str,
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    routes: &[orv_compiler::ServerRouteArtifact],
+) -> anyhow::Result<()> {
+    let runbook_path = dir.join(path);
+    if !runbook_path.is_file() {
+        anyhow::bail!("missing deploy runbook: {}", runbook_path.display());
+    }
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", runbook_path.display()))?;
+    let compose_command = format!("docker compose -f {compose_path} up --build");
+    if !runbook.contains(&compose_command) {
+        anyhow::bail!("deploy runbook must include compose launch command");
+    }
+    if !runbook.contains(routes_artifact) {
+        anyhow::bail!("deploy runbook must reference {routes_artifact}");
+    }
+    if let Some(port) = deploy_runbook_port_assignment(listen) {
+        if !runbook.contains(&port) {
+            anyhow::bail!("deploy runbook must document {port}");
+        }
+    }
+    for route in routes {
+        let route_line = format!("- {} {}", route.method, route.path);
+        if !runbook.contains(&route_line) {
+            let method = &route.method;
+            let path = &route.path;
+            anyhow::bail!("deploy runbook must list route {method} {path}");
         }
     }
     Ok(())
@@ -8572,6 +8618,21 @@ fn deploy_compose_port(
     })
 }
 
+fn deploy_runbook_port_assignment(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+) -> Option<String> {
+    let listen = listen?;
+    if let Some(port) = listen.port.filter(|port| *port > 0) {
+        return Some(format!("PORT={port}"));
+    }
+    let env = listen.env.as_ref()?;
+    let variable = &env.variable;
+    if let Some(default_port) = env.default_port.filter(|port| *port > 0) {
+        return Some(format!("PORT=${{{variable}:-{default_port}}}"));
+    }
+    Some(format!("PORT=${{{variable}}}"))
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
@@ -8749,6 +8810,7 @@ fn write_prod_deploy_artifacts(
         let container = "deploy/container.json";
         let dockerfile = "deploy/Dockerfile";
         let compose = "deploy/compose.yaml";
+        let runbook = "deploy/README.md";
         write_prod_server_entrypoint(out, targets.server_artifact_path)?;
         write_prod_routes_artifact(out, targets.server_artifact_path, server_artifact)?;
         write_prod_container_artifacts(
@@ -8760,6 +8822,7 @@ fn write_prod_deploy_artifacts(
             server_artifact,
         )?;
         write_prod_compose_artifact(out, dockerfile, server_artifact)?;
+        write_prod_deploy_runbook(out, compose, routes_artifact, server_artifact)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "artifact": targets.server_artifact_path,
@@ -8768,6 +8831,7 @@ fn write_prod_deploy_artifacts(
             "container": container,
             "dockerfile": dockerfile,
             "compose": compose,
+            "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
             "listen": server_artifact.listen.clone(),
@@ -8885,6 +8949,41 @@ fn write_prod_compose_artifact(
 {port}"#
     );
     write_text(&out.join("deploy").join("compose.yaml"), &compose)
+}
+
+fn write_prod_deploy_runbook(
+    out: &Path,
+    compose_path: &str,
+    routes_artifact: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
+        .map(|port| format!("{port} "))
+        .unwrap_or_default();
+    let routes = server_artifact
+        .routes
+        .iter()
+        .map(|route| format!("- {} {}\n", route.method, route.path))
+        .collect::<String>();
+    let runbook = format!(
+        r#"# orv deploy
+
+## Run
+
+```sh
+{port_prefix}docker compose -f {compose_path} up --build
+```
+
+## Artifacts
+
+- Compose: {compose_path}
+- Routes: {routes_artifact}
+
+## Routes
+
+{routes}"#
+    );
+    write_text(&out.join("deploy").join("README.md"), &runbook)
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -15155,6 +15254,7 @@ entry = "src/main.orv"
         let deploy_container_path = out.join("deploy").join("container.json");
         let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
         let deploy_compose_path = out.join("deploy").join("compose.yaml");
+        let deploy_runbook_path = out.join("deploy").join("README.md");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         assert!(
@@ -15178,6 +15278,11 @@ entry = "src/main.orv"
             deploy_compose_path.display()
         );
         assert!(
+            deploy_runbook_path.is_file(),
+            "missing {}",
+            deploy_runbook_path.display()
+        );
+        assert!(
             deploy_routes_path.is_file(),
             "missing {}",
             deploy_routes_path.display()
@@ -15197,6 +15302,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["container"], "deploy/container.json");
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
         assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
+        assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(
             deploy["server"]["runtime_image"],
             "ghcr.io/orv-lang/orv-reference:latest"
@@ -15236,6 +15342,10 @@ entry = "src/main.orv"
         assert!(compose.contains("ORV_RUNTIME_IMAGE: ghcr.io/orv-lang/orv-reference:latest"));
         assert!(compose.contains(r#""8080:8080""#));
         assert!(compose.contains(r#"PORT: "8080""#));
+        let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
+        assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
+        assert!(runbook.contains("PORT=8080"));
+        assert!(runbook.contains("- GET /ping"));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
         assert_eq!(routes["artifact"], "server/app.orv-runtime.json");
@@ -15368,6 +15478,26 @@ entry = "src/main.orv"
         let err = cmd_verify_build(&out).expect_err("compose port mismatch");
 
         assert!(err.to_string().contains("deploy compose must publish 8080"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_runbook_route_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-runbook-route-source");
+        let out = temp_output_dir("deploy-runbook-route-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let runbook_path = out.join("deploy").join("README.md");
+        let mut runbook = std::fs::read_to_string(&runbook_path).expect("runbook");
+        runbook = runbook.replace("- GET /ping", "- GET /wrong");
+        write_text(&runbook_path, &runbook).expect("write corrupt runbook");
+
+        let err = cmd_verify_build(&out).expect_err("runbook route mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy runbook must list route GET /ping"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
