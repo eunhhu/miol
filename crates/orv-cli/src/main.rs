@@ -24,7 +24,7 @@ use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
 use clap::{Parser, Subcommand, ValueEnum};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term::termcolor::WriteColor;
-use orv_diagnostics::{FileId, Span};
+use orv_diagnostics::{ByteRange, FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
 use orv_syntax::ast::{
     BinaryOp as AstBinaryOp, Block, ConstraintValue, Expr, ExprKind, FunctionBody, Program, Stmt,
@@ -156,6 +156,11 @@ enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+    /// First-party editor helper commands.
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommand,
+    },
     /// Editor/LSP helper commands.
     Lsp {
         #[command(subcommand)]
@@ -172,6 +177,15 @@ enum Command {
 enum InitTemplate {
     Basic,
     Shop,
+}
+
+#[derive(Subcommand)]
+enum EditorCommand {
+    /// 현재 파일의 first-party editor bootstrap snapshot JSON을 출력한다.
+    Snapshot {
+        /// 대상 파일 경로.
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -548,6 +562,15 @@ fn main() -> ExitCode {
                 }
             },
         },
+        Command::Editor { command } => match command {
+            EditorCommand::Snapshot { file } => match cmd_editor_snapshot(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -608,6 +631,13 @@ fn cmd_origins(path: &Path) -> anyhow::Result<()> {
 fn cmd_graph(path: &Path) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let value = project_graph_json_for_path(&entry)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_snapshot(path: &Path) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let value = editor_snapshot_json(&entry)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -1664,6 +1694,126 @@ fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 
 fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn editor_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    let origin_map = orv_compiler::origin_map(&lowered.program);
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(lsp_diagnostics_json(&loaded.diagnostics, &loaded.files));
+    diagnostics.extend(lsp_diagnostics_json(&resolved.diagnostics, &loaded.files));
+    diagnostics.extend(lsp_diagnostics_json(&lowered.diagnostics, &loaded.files));
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "entry": {
+            "path": path.display().to_string(),
+            "uri": lsp_file_uri_for_path(path),
+        },
+        "diagnostics": diagnostics,
+        "project_graph": project_graph_json(&loaded.graph, &origin_map),
+        "panels": {
+            "files": editor_files_panel_json(&loaded.files, &loaded.graph),
+            "routes": editor_routes_panel_json(&origin_map, &loaded.files),
+            "schema": editor_schema_panel_json(&loaded.graph, &loaded.files),
+            "domains": editor_domains_panel_json(&loaded.graph, &loaded.files),
+        },
+    }))
+}
+
+fn editor_files_panel_json(files: &[SourceFile], graph: &ProjectGraph) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .map(|file| {
+            let node_id = graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == ProjectNodeKind::File && node.file == file.id)
+                .map(|node| node.id);
+            serde_json::json!({
+                "file": file.id.0,
+                "name": file.path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or(""),
+                "path": file.path.display().to_string(),
+                "uri": lsp_file_uri_for_path(&file.path),
+                "node_id": node_id,
+            })
+        })
+        .collect()
+}
+
+fn editor_routes_panel_json(
+    origin_map: &orv_compiler::OriginMap,
+    files: &[SourceFile],
+) -> Vec<serde_json::Value> {
+    origin_map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "route")
+        .map(|entry| {
+            let (method, path) = entry
+                .name
+                .split_once(' ')
+                .unwrap_or((entry.name.as_str(), ""));
+            serde_json::json!({
+                "origin_id": entry.id,
+                "method": method,
+                "path": path,
+                "name": entry.name,
+                "location": editor_origin_location_json(entry.span, files),
+            })
+        })
+        .collect()
+}
+
+fn editor_schema_panel_json(graph: &ProjectGraph, files: &[SourceFile]) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                ProjectNodeKind::Struct | ProjectNodeKind::Enum | ProjectNodeKind::TypeAlias
+            )
+        })
+        .map(|node| editor_project_node_panel_item(node, files))
+        .collect()
+}
+
+fn editor_domains_panel_json(graph: &ProjectGraph, files: &[SourceFile]) -> Vec<serde_json::Value> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, ProjectNodeKind::Define | ProjectNodeKind::Domain))
+        .map(|node| editor_project_node_panel_item(node, files))
+        .collect()
+}
+
+fn editor_project_node_panel_item(
+    node: &orv_project::ProjectNode,
+    files: &[SourceFile],
+) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": node.id,
+        "kind": node_kind(node.kind),
+        "name": node.name,
+        "location": lsp_location_json(node, files),
+    })
+}
+
+fn editor_origin_location_json(
+    span: orv_compiler::OriginSpan,
+    files: &[SourceFile],
+) -> serde_json::Value {
+    let span = Span::new(FileId(span.file), ByteRange::new(span.start, span.end));
+    let uri = files.iter().find(|file| file.id == span.file).map_or_else(
+        || "file://<unknown>".to_string(),
+        |file| lsp_file_uri_for_path(&file.path),
+    );
+    serde_json::json!({
+        "uri": uri,
+        "range": lsp_range_json(span, files),
+    })
 }
 
 fn lsp_snapshot_json(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -16052,6 +16202,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_snapshot_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "editor", "snapshot", "src/main.orv"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -17141,6 +17299,51 @@ entry = "src/main.orv"
             .expect("client targets")
             .iter()
             .any(|target| target["kind"] == "client_wasm"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_snapshot_outputs_graph_backed_panels() {
+        let dir = temp_output_dir("editor-snapshot");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"struct User { id: int }
+define Auth() -> { @out "auth" }
+@server {
+  @listen 8080
+  @route GET /users/:id { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write source");
+
+        let snapshot = editor_snapshot_json(&path).expect("editor snapshot");
+
+        assert_eq!(snapshot["schema_version"], 1);
+        assert!(snapshot["panels"]["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("app.orv"))));
+        assert!(snapshot["panels"]["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/users/:id"));
+        assert!(snapshot["panels"]["schema"]
+            .as_array()
+            .expect("schema")
+            .iter()
+            .any(|item| item["kind"] == "struct" && item["name"] == "User"));
+        assert!(snapshot["panels"]["domains"]
+            .as_array()
+            .expect("domains")
+            .iter()
+            .any(|item| item["kind"] == "define" && item["name"] == "Auth"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
