@@ -713,11 +713,22 @@ orv verify-build dist\n\
 orv run-build dist\n\
 ```\n\
 \n\
+## Deploy\n\
+\n\
+After `orv build . --prod --out dist`, use generated deploy runbook:\n\
+\n\
+```sh\n\
+cd dist\n\
+PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
+```\n\
+\n\
 ## Deploy artifacts\n\
 \n\
 - `deploy/manifest.json`\n\
 - `deploy/container.json`\n\
 - `deploy/Dockerfile`\n\
+- `deploy/compose.yaml`\n\
+- `deploy/README.md`\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
 \n\
@@ -9757,6 +9768,10 @@ test "checkout failing runtime body" {
         assert!(guide.contains("orv check ."));
         assert!(guide.contains("orv build . --prod --out dist"));
         assert!(guide.contains("orv verify-build dist"));
+        assert!(guide.contains("deploy/README.md"));
+        assert!(guide.contains("deploy/compose.yaml"));
+        assert!(guide.contains("cd dist"));
+        assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));

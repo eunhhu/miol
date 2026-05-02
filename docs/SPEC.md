@@ -3064,7 +3064,7 @@ mock-server = "0.2.0"
 | `orv test <path> --filter <name> --list` | `.orv` test block 파일 탐색 + reference runtime 실행 또는 발견 목록 JSON 출력 |
 | `orv lsp snapshot/reveal/serve --stdio` | 에디터 bootstrap JSON, production reveal, LSP initialize/diagnostic/symbol/code-lens/code-action/folding/selection/semantic-tokens/definition/references/highlight/rename/hover/completion 처리 |
 | `orv dap serve --stdio` | DAP initialize/launch/configurationDone/setBreakpoints/setFunctionBreakpoints/dataBreakpointInfo/setDataBreakpoints/breakpointLocations/gotoTargets/stepInTargets/exceptionInfo/threads/stackTrace/scopes/variables/setVariable/evaluate/setExpression/completions/loadedSources/modules/source/continue/reverseContinue/goto/stepIn/stepBack/restartFrame/disconnect/terminate/terminateThreads bootstrap |
-| `orv init <dir> --name <name> [--template basic\|shop]` | 최소 프로젝트 또는 쇼핑몰 회원/결제/배송 route scaffold와 검증 README 생성 |
+| `orv init <dir> --name <name> [--template basic\|shop]` | 최소 프로젝트 또는 쇼핑몰 회원/결제/배송 route scaffold와 검증/Compose 배포 README 생성 |
 | `orv db plan/verify/apply/migrate/rollback/backup/restore/recover/archive/squash` | schema diff dry-run/verify, snapshot apply/history/squash, 선택적 JSON data snapshot migrate/rollback, local backup/restore, WAL record recovery/archive manifest/file target copy |
 
 로드맵 CLI:
