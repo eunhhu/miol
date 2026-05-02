@@ -3291,32 +3291,7 @@ impl DapSession {
             }),
         ];
         if let Some(async_runtime) = &launched.async_runtime {
-            variables.extend([
-                serde_json::json!({
-                    "name": "runtimeKind",
-                    "value": async_runtime.kind,
-                    "type": "string",
-                    "variablesReference": 0,
-                }),
-                serde_json::json!({
-                    "name": "runtimeAsyncState",
-                    "value": async_runtime.state,
-                    "type": "string",
-                    "variablesReference": 0,
-                }),
-                serde_json::json!({
-                    "name": "runtimeResumeCount",
-                    "value": async_runtime.resume_count.to_string(),
-                    "type": "usize",
-                    "variablesReference": 0,
-                }),
-                serde_json::json!({
-                    "name": "runtimePauseCount",
-                    "value": async_runtime.pause_count.to_string(),
-                    "type": "usize",
-                    "variablesReference": 0,
-                }),
-            ]);
+            variables.extend(dap_async_runtime_variables(async_runtime));
         }
         Ok(serde_json::json!({
             "variables": variables,
@@ -4524,6 +4499,55 @@ fn dap_async_route_json(route: &DapAsyncRouteState) -> serde_json::Value {
     })
 }
 
+fn dap_async_routes_display(routes: &[DapAsyncRouteState]) -> String {
+    routes
+        .iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn dap_async_runtime_variables(async_runtime: &DapAsyncRuntimeState) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "runtimeKind",
+            "value": async_runtime.kind,
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeAsyncState",
+            "value": async_runtime.state,
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeResumeCount",
+            "value": async_runtime.resume_count.to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimePauseCount",
+            "value": async_runtime.pause_count.to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeRouteCount",
+            "value": async_runtime.routes.len().to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeRoutes",
+            "value": dap_async_routes_display(&async_runtime.routes),
+            "type": "string",
+            "variablesReference": 0,
+        }),
+    ]
+}
+
 fn dap_runtime_frames(
     frames: &[orv_runtime::DebugFrame],
     files: &[SourceFile],
@@ -5222,22 +5246,25 @@ fn dap_evaluate_project_value(
         "runtimeStatus" => Some((launched.runtime.status.clone(), "string".to_string())),
         "stdout" => Some((launched.runtime.stdout.clone(), "string".to_string())),
         "runtimeError" => Some((launched.runtime.error.clone(), "string".to_string())),
-        "runtimeKind" => launched
-            .async_runtime
-            .as_ref()
-            .map(|runtime| (runtime.kind.clone(), "string".to_string())),
-        "runtimeAsyncState" => launched
-            .async_runtime
-            .as_ref()
-            .map(|runtime| (runtime.state.clone(), "string".to_string())),
-        "runtimeResumeCount" => launched
-            .async_runtime
-            .as_ref()
-            .map(|runtime| (runtime.resume_count.to_string(), "usize".to_string())),
-        "runtimePauseCount" => launched
-            .async_runtime
-            .as_ref()
-            .map(|runtime| (runtime.pause_count.to_string(), "usize".to_string())),
+        _ => dap_evaluate_async_runtime_value(launched, expression),
+    }
+}
+
+fn dap_evaluate_async_runtime_value(
+    launched: &DapLaunchState,
+    expression: &str,
+) -> Option<(String, String)> {
+    let runtime = launched.async_runtime.as_ref()?;
+    match expression {
+        "runtimeKind" => Some((runtime.kind.clone(), "string".to_string())),
+        "runtimeAsyncState" => Some((runtime.state.clone(), "string".to_string())),
+        "runtimeResumeCount" => Some((runtime.resume_count.to_string(), "usize".to_string())),
+        "runtimePauseCount" => Some((runtime.pause_count.to_string(), "usize".to_string())),
+        "runtimeRouteCount" => Some((runtime.routes.len().to_string(), "usize".to_string())),
+        "runtimeRoutes" => Some((
+            dap_async_routes_display(&runtime.routes),
+            "string".to_string(),
+        )),
         _ => None,
     }
 }
@@ -5269,6 +5296,8 @@ fn dap_completion_targets_json(launched: &DapLaunchState, prefix: &str) -> Vec<s
                 "runtimeAsyncState",
                 "runtimeResumeCount",
                 "runtimePauseCount",
+                "runtimeRouteCount",
+                "runtimeRoutes",
             ]
             .into_iter()
             .filter(|expression| expression.starts_with(prefix))
@@ -11681,8 +11710,8 @@ let total: int = add(2, 3)
                 "type": "request",
                 "command": "completions",
                 "arguments": {
-                    "text": "runtimeA",
-                    "column": 9,
+                    "text": "runtime",
+                    "column": 8,
                     "line": 1,
                 },
             }))
@@ -11715,6 +11744,81 @@ let total: int = add(2, 3)
             .expect("completion targets")
             .iter()
             .any(|target| target["label"] == "runtimeAsyncState" && target["type"] == "property"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_long_running_exposes_async_route_inventory() {
+        let dir = temp_output_dir("dap-server-async-routes");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 232,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let variables = session
+            .message_response(&serde_json::json!({
+                "seq": 233,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 1,
+                },
+            }))
+            .expect("variables response");
+        let routes = session
+            .message_response(&serde_json::json!({
+                "seq": 234,
+                "type": "request",
+                "command": "evaluate",
+                "arguments": {
+                    "expression": "runtimeRoutes",
+                },
+            }))
+            .expect("route evaluate response");
+        let completions = session
+            .message_response(&serde_json::json!({
+                "seq": 235,
+                "type": "request",
+                "command": "completions",
+                "arguments": {
+                    "text": "runtimeR",
+                    "column": 9,
+                    "line": 1,
+                },
+            }))
+            .expect("completions response");
+
+        assert_eq!(launch["body"]["runtime"]["async"]["route_count"], 1);
+        assert_eq!(
+            launch["body"]["runtime"]["async"]["routes"][0]["path"],
+            "/ping"
+        );
+        assert!(variables["body"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .any(|variable| variable["name"] == "runtimeRouteCount" && variable["value"] == "1"));
+        assert_eq!(routes["success"], true, "{routes}");
+        assert_eq!(routes["body"]["result"], "GET /ping");
+        assert!(completions["body"]["targets"]
+            .as_array()
+            .expect("completion targets")
+            .iter()
+            .any(|target| target["label"] == "runtimeRoutes" && target["type"] == "property"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
