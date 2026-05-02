@@ -116,6 +116,9 @@ enum Command {
         /// HMR dev session artifact를 출력한다.
         #[arg(long)]
         hmr: bool,
+        /// watch dev session artifact를 출력한다.
+        #[arg(long)]
+        watch: bool,
     },
     /// build artifact 디렉터리에서 origin id를 원본 코드/production descriptor로 reveal한다.
     Reveal {
@@ -405,7 +408,12 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Dev { file, out, hmr } => match cmd_dev(&file, &out, hmr) {
+        Command::Dev {
+            file,
+            out,
+            hmr,
+            watch,
+        } => match cmd_dev(&file, &out, hmr, watch) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -6519,7 +6527,8 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     verify_bundle_targets(dir, &plan)?;
     verify_manifest_artifacts(dir, &manifest)?;
     verify_deploy_manifest_if_present(dir)?;
-    verify_dev_hmr_session_if_present(dir, &plan)
+    verify_dev_hmr_session_if_present(dir, &plan)?;
+    verify_dev_watch_session_if_present(dir, &plan)
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -6812,6 +6821,118 @@ fn verify_dev_hmr_session_if_present(dir: &Path, plan: &serde_json::Value) -> an
     }
     if json_str(reload, "fallback", "dev session reload")? != "full-reload" {
         anyhow::bail!("dev session reload fallback must be full-reload");
+    }
+    Ok(())
+}
+
+fn verify_dev_watch_session_if_present(dir: &Path, plan: &serde_json::Value) -> anyhow::Result<()> {
+    let session_path = dir.join("dev").join("watch.json");
+    if !session_path.is_file() {
+        return Ok(());
+    }
+    let session = read_json_value(&session_path)?;
+    if session
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("dev watch session schema_version must be 1");
+    }
+    if json_str(&session, "mode", "dev watch session")? != "watch" {
+        anyhow::bail!("dev watch session mode must be watch");
+    }
+    if json_str(&session, "source_bundle", "dev watch session")? != "source-bundle.json" {
+        anyhow::bail!("dev watch session source_bundle must be source-bundle.json");
+    }
+    verify_dev_watch_set(dir, plan, &session, "dev watch session")?;
+    let loop_config = session
+        .get("loop")
+        .ok_or_else(|| anyhow::anyhow!("dev watch session loop must be an object"))?;
+    if json_str(loop_config, "strategy", "dev watch session loop")? != "poll" {
+        anyhow::bail!("dev watch session loop strategy must be poll");
+    }
+    if json_str(loop_config, "run", "dev watch session loop")? != "build-verify-run" {
+        anyhow::bail!("dev watch session loop run must be build-verify-run");
+    }
+    let interval_ms = loop_config
+        .get("interval_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("dev watch session loop interval_ms must be a number"))?;
+    if interval_ms == 0 {
+        anyhow::bail!("dev watch session loop interval_ms must be positive");
+    }
+    let reload = session
+        .get("reload")
+        .ok_or_else(|| anyhow::anyhow!("dev watch session reload must be an object"))?;
+    if json_str(reload, "fallback", "dev watch session reload")? != "full-reload" {
+        anyhow::bail!("dev watch session reload fallback must be full-reload");
+    }
+    let transport = session
+        .get("transport")
+        .ok_or_else(|| anyhow::anyhow!("dev watch session transport must be an object"))?;
+    if json_str(transport, "kind", "dev watch session transport")? != "manifest" {
+        anyhow::bail!("dev watch session transport kind must be manifest");
+    }
+    Ok(())
+}
+
+fn verify_dev_watch_set(
+    dir: &Path,
+    plan: &serde_json::Value,
+    session: &serde_json::Value,
+    context: &str,
+) -> anyhow::Result<()> {
+    let watch = session
+        .get("watch")
+        .ok_or_else(|| anyhow::anyhow!("{context} watch must be an object"))?;
+    let session_sources = watch
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} watch.sources must be an array"))?;
+    let session_targets = watch
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} watch.targets must be an array"))?;
+    let source_bundle = read_json_value(&dir.join("source-bundle.json"))?;
+    let expected_sources = source_bundle
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("source-bundle.json files must be an array"))?;
+    for source in expected_sources {
+        let path = json_str(source, "path", "source bundle file")?;
+        let content_hash = json_str(source, "content_hash", "source bundle file")?;
+        if !session_sources.iter().any(|session_source| {
+            session_source
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                == Some(path)
+                && session_source
+                    .get("content_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(content_hash)
+        }) {
+            anyhow::bail!("{context} missing source {path}");
+        }
+    }
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    for bundle in bundles {
+        let kind = json_str(bundle, "kind", "bundle target")?;
+        let path = json_str(bundle, "path", "bundle target")?;
+        if !session_targets.iter().any(|session_target| {
+            session_target
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some(kind)
+                && session_target
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(path)
+        }) {
+            anyhow::bail!("{context} missing bundle target {kind}:{path}");
+        }
     }
     Ok(())
 }
@@ -7341,10 +7462,12 @@ fn cmd_run_build(dir: &Path) -> anyhow::Result<()> {
     run_build_with_writer(dir, &mut stdout)
 }
 
-fn cmd_dev(path: &Path, out: &Path, hmr: bool) -> anyhow::Result<()> {
+fn cmd_dev(path: &Path, out: &Path, hmr: bool, watch: bool) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     if hmr {
-        dev_with_writer_with_options(path, out, true, &mut stdout)
+        dev_with_writer_with_options(path, out, true, watch, &mut stdout)
+    } else if watch {
+        dev_with_writer_with_options(path, out, false, true, &mut stdout)
     } else {
         dev_with_writer(path, out, &mut stdout)
     }
@@ -7355,13 +7478,14 @@ fn dev_with_writer<W: std::io::Write>(
     out: &Path,
     writer: &mut W,
 ) -> anyhow::Result<()> {
-    dev_with_writer_with_options(path, out, false, writer)
+    dev_with_writer_with_options(path, out, false, false, writer)
 }
 
 fn dev_with_writer_with_options<W: std::io::Write>(
     path: &Path,
     out: &Path,
     hmr: bool,
+    watch: bool,
     writer: &mut W,
 ) -> anyhow::Result<()> {
     cmd_build(path, out)?;
@@ -7369,10 +7493,63 @@ fn dev_with_writer_with_options<W: std::io::Write>(
     if hmr {
         write_dev_hmr_session(out)?;
     }
+    if watch {
+        write_dev_watch_session(out, hmr)?;
+    }
     run_build_with_writer(out, writer)
 }
 
 fn write_dev_hmr_session(out: &Path) -> anyhow::Result<()> {
+    let (sources, targets, has_client_target) = dev_session_inputs(out)?;
+    let session = serde_json::json!({
+        "schema_version": 1,
+        "mode": "hmr",
+        "source_bundle": "source-bundle.json",
+        "watch": {
+            "sources": sources,
+            "targets": targets,
+        },
+        "reload": {
+            "strategy": if has_client_target { "hot-reload" } else { "full-reload" },
+            "fallback": "full-reload",
+            "state": if has_client_target { "preserve-sig-state-when-compatible" } else { "stateless" },
+        },
+    });
+    write_json(&out.join("dev").join("session.json"), &session)
+}
+
+fn write_dev_watch_session(out: &Path, hmr: bool) -> anyhow::Result<()> {
+    let (sources, targets, has_client_target) = dev_session_inputs(out)?;
+    let session = serde_json::json!({
+        "schema_version": 1,
+        "mode": "watch",
+        "source_bundle": "source-bundle.json",
+        "watch": {
+            "sources": sources,
+            "targets": targets,
+        },
+        "loop": {
+            "strategy": "poll",
+            "interval_ms": 500,
+            "run": "build-verify-run",
+            "hmr": hmr,
+        },
+        "reload": {
+            "strategy": if hmr && has_client_target { "hot-reload" } else { "full-reload" },
+            "fallback": "full-reload",
+            "state": if hmr && has_client_target { "preserve-sig-state-when-compatible" } else { "stateless" },
+        },
+        "transport": {
+            "kind": "manifest",
+            "path": "dev/watch.json",
+        },
+    });
+    write_json(&out.join("dev").join("watch.json"), &session)
+}
+
+fn dev_session_inputs(
+    out: &Path,
+) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>, bool)> {
     let source_bundle = read_json_value(&out.join("source-bundle.json"))?;
     let bundle_plan = read_json_value(&out.join("bundle-plan.json"))?;
     let sources = source_bundle
@@ -7412,21 +7589,7 @@ fn write_dev_hmr_session(out: &Path) -> anyhow::Result<()> {
             Some("client_page" | "client_js" | "client_wasm")
         )
     });
-    let session = serde_json::json!({
-        "schema_version": 1,
-        "mode": "hmr",
-        "source_bundle": "source-bundle.json",
-        "watch": {
-            "sources": sources,
-            "targets": targets,
-        },
-        "reload": {
-            "strategy": if has_client_target { "hot-reload" } else { "full-reload" },
-            "fallback": "full-reload",
-            "state": if has_client_target { "preserve-sig-state-when-compatible" } else { "stateless" },
-        },
-    });
-    write_json(&out.join("dev").join("session.json"), &session)
+    Ok((sources, targets, has_client_target))
 }
 
 fn json_string_field<'a>(
@@ -13893,6 +14056,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn dev_watch_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "dev", "src/main.orv", "--watch"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -14316,7 +14487,8 @@ entry = "src/main.orv"
         let build_out = out.join("dist");
         let mut stdout = Vec::new();
 
-        dev_with_writer_with_options(&entry, &build_out, true, &mut stdout).expect("dev hmr");
+        dev_with_writer_with_options(&entry, &build_out, true, false, &mut stdout)
+            .expect("dev hmr");
         let session_path = build_out.join("dev").join("session.json");
         let mut session = read_json_value(&session_path).expect("dev session");
         session["watch"]["targets"] = serde_json::Value::Array(
@@ -14335,6 +14507,30 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("dev session missing bundle target client_wasm:client/app.wasm"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_invalid_dev_watch_session_manifest() {
+        let out = temp_output_dir("verify-build-dev-watch-session");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, "@out @html { @body { @h1 \"Watch\" } }").expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, false, true, &mut stdout)
+            .expect("dev watch");
+        let session_path = build_out.join("dev").join("watch.json");
+        let mut session = read_json_value(&session_path).expect("dev watch session");
+        session["loop"]["interval_ms"] = serde_json::json!(0);
+        write_json(&session_path, &session).expect("write corrupt dev watch session");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid dev watch session");
+
+        assert!(err
+            .to_string()
+            .contains("dev watch session loop interval_ms must be positive"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -14813,7 +15009,8 @@ entry = "src/main.orv"
         let mut stdout = Vec::new();
         let canonical_entry = std::fs::canonicalize(&entry).expect("canonical entry");
 
-        dev_with_writer_with_options(&entry, &build_out, true, &mut stdout).expect("dev hmr");
+        dev_with_writer_with_options(&entry, &build_out, true, false, &mut stdout)
+            .expect("dev hmr");
 
         let session =
             read_json_value(&build_out.join("dev").join("session.json")).expect("dev session");
@@ -14846,6 +15043,46 @@ entry = "src/main.orv"
                         .any(|feature| feature == "client_wasm")
             }));
         cmd_verify_build(&build_out).expect("verify dev hmr build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn dev_watch_writes_watch_session_manifest() {
+        let out = temp_output_dir("dev-watch-session");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, "@out @html { @body { @h1 \"Watch\" } }").expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+        let canonical_entry = std::fs::canonicalize(&entry).expect("canonical entry");
+
+        dev_with_writer_with_options(&entry, &build_out, false, true, &mut stdout)
+            .expect("dev watch");
+
+        let watch =
+            read_json_value(&build_out.join("dev").join("watch.json")).expect("watch session");
+        assert_eq!(watch["schema_version"], 1);
+        assert_eq!(watch["mode"], "watch");
+        assert_eq!(watch["source_bundle"], "source-bundle.json");
+        assert_eq!(watch["loop"]["strategy"], "poll");
+        assert_eq!(watch["loop"]["run"], "build-verify-run");
+        assert_eq!(watch["reload"]["strategy"], "full-reload");
+        assert!(watch["watch"]["sources"]
+            .as_array()
+            .expect("watch sources")
+            .iter()
+            .any(|source| {
+                source["path"] == canonical_entry.display().to_string()
+                    && source["content_hash"]
+                        .as_str()
+                        .is_some_and(|hash| hash.starts_with("fnv1a64:"))
+            }));
+        assert!(watch["watch"]["targets"]
+            .as_array()
+            .expect("watch targets")
+            .iter()
+            .any(|target| target["kind"] == "static_page" && target["path"] == "pages/index.html"));
+        cmd_verify_build(&build_out).expect("verify dev watch build");
         let _ = std::fs::remove_dir_all(&out);
     }
 
