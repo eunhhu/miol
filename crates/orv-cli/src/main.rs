@@ -113,6 +113,9 @@ enum Command {
         /// dev artifact 출력 디렉터리.
         #[arg(long, short = 'o', default_value = "target/orv-dev")]
         out: PathBuf,
+        /// HMR dev session artifact를 출력한다.
+        #[arg(long)]
+        hmr: bool,
     },
     /// build artifact 디렉터리에서 origin id를 원본 코드/production descriptor로 reveal한다.
     Reveal {
@@ -399,7 +402,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Dev { file, out } => match cmd_dev(&file, &out) {
+        Command::Dev { file, out, hmr } => match cmd_dev(&file, &out, hmr) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -7056,9 +7059,13 @@ fn cmd_run_build(dir: &Path) -> anyhow::Result<()> {
     run_build_with_writer(dir, &mut stdout)
 }
 
-fn cmd_dev(path: &Path, out: &Path) -> anyhow::Result<()> {
+fn cmd_dev(path: &Path, out: &Path, hmr: bool) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    dev_with_writer(path, out, &mut stdout)
+    if hmr {
+        dev_with_writer_with_options(path, out, true, &mut stdout)
+    } else {
+        dev_with_writer(path, out, &mut stdout)
+    }
 }
 
 fn dev_with_writer<W: std::io::Write>(
@@ -7066,9 +7073,89 @@ fn dev_with_writer<W: std::io::Write>(
     out: &Path,
     writer: &mut W,
 ) -> anyhow::Result<()> {
+    dev_with_writer_with_options(path, out, false, writer)
+}
+
+fn dev_with_writer_with_options<W: std::io::Write>(
+    path: &Path,
+    out: &Path,
+    hmr: bool,
+    writer: &mut W,
+) -> anyhow::Result<()> {
     cmd_build(path, out)?;
     verify_build_dir(out)?;
+    if hmr {
+        write_dev_hmr_session(out)?;
+    }
     run_build_with_writer(out, writer)
+}
+
+fn write_dev_hmr_session(out: &Path) -> anyhow::Result<()> {
+    let source_bundle = read_json_value(&out.join("source-bundle.json"))?;
+    let bundle_plan = read_json_value(&out.join("bundle-plan.json"))?;
+    let sources = source_bundle
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("source-bundle.json files must be an array"))?
+        .iter()
+        .map(|source| {
+            Ok(serde_json::json!({
+                "path": json_string_field(source, "path", "source bundle file")?,
+                "content_hash": json_string_field(source, "content_hash", "source bundle file")?,
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let targets = bundle_plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle-plan.json bundles must be an array"))?
+        .iter()
+        .map(|target| {
+            let runtime_features = target
+                .get("runtime_features")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("bundle target runtime_features must be an array")
+                })?;
+            Ok(serde_json::json!({
+                "kind": json_string_field(target, "kind", "bundle target")?,
+                "path": json_string_field(target, "path", "bundle target")?,
+                "runtime_features": runtime_features,
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let has_client_target = targets.iter().any(|target| {
+        matches!(
+            target.get("kind").and_then(serde_json::Value::as_str),
+            Some("client_page" | "client_js" | "client_wasm")
+        )
+    });
+    let session = serde_json::json!({
+        "schema_version": 1,
+        "mode": "hmr",
+        "source_bundle": "source-bundle.json",
+        "watch": {
+            "sources": sources,
+            "targets": targets,
+        },
+        "reload": {
+            "strategy": if has_client_target { "hot-reload" } else { "full-reload" },
+            "fallback": "full-reload",
+            "state": if has_client_target { "preserve-sig-state-when-compatible" } else { "stateless" },
+        },
+    });
+    write_json(&out.join("dev").join("session.json"), &session)
+}
+
+fn json_string_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    context: &str,
+) -> anyhow::Result<&'a str> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{context} {field} must be a string"))
 }
 
 fn run_build_with_writer<W: std::io::Write>(dir: &Path, writer: &mut W) -> anyhow::Result<()> {
@@ -13268,6 +13355,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn dev_hmr_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "dev", "src/main.orv", "--hmr"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -14136,6 +14231,55 @@ entry = "src/main.orv"
             String::from_utf8(stdout).expect("stdout utf-8"),
             "<html><body><h1>Dev</h1></body></html>"
         );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn dev_hmr_writes_session_manifest_for_client_page() {
+        let out = temp_output_dir("dev-hmr-session");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+        let canonical_entry = std::fs::canonicalize(&entry).expect("canonical entry");
+
+        dev_with_writer_with_options(&entry, &build_out, true, &mut stdout).expect("dev hmr");
+
+        let session =
+            read_json_value(&build_out.join("dev").join("session.json")).expect("dev session");
+        assert_eq!(session["schema_version"], 1);
+        assert_eq!(session["mode"], "hmr");
+        assert_eq!(session["source_bundle"], "source-bundle.json");
+        assert_eq!(session["reload"]["strategy"], "hot-reload");
+        assert_eq!(session["reload"]["fallback"], "full-reload");
+        assert!(session["watch"]["sources"]
+            .as_array()
+            .expect("watch sources")
+            .iter()
+            .any(|source| {
+                source["path"] == canonical_entry.display().to_string()
+                    && source["content_hash"]
+                        .as_str()
+                        .is_some_and(|hash| hash.starts_with("fnv1a64:"))
+            }));
+        assert!(session["watch"]["targets"]
+            .as_array()
+            .expect("watch targets")
+            .iter()
+            .any(|target| {
+                target["kind"] == "client_wasm"
+                    && target["path"] == "client/app.wasm"
+                    && target["runtime_features"]
+                        .as_array()
+                        .expect("runtime features")
+                        .iter()
+                        .any(|feature| feature == "client_wasm")
+            }));
         let _ = std::fs::remove_dir_all(&out);
     }
 
