@@ -2123,7 +2123,7 @@ await @db.transaction @hint isolation=serializable {
 | `serializable` | 최고 일관성, 금융 트랜잭션 |
 | `snapshot` | MVCC 스냅샷 |
 
-**현재 구현:** MVP 레퍼런스 런타임의 `@db`는 프로세스 메모리 안의 테이블 맵으로 동작한다. `create/find/update/delete`, 필터, 정렬, 제한, 간단한 집계와 벡터 거리 정렬을 검증하기 위한 실행 모델이다. 명시적 `@db.save(path)` / `@db.load(path)`는 JSON snapshot 파일로 현재 DB 상태를 저장/복구할 수 있다. `@db.wal(path)`는 JSONL WAL 파일을 replay하고 이후 `create/update/delete/upsert` mutation을 append+fsync 한 뒤 메모리에 적용한다. `@db.checkpoint()`는 현재 DB 상태를 snapshot WAL record 한 줄로 압축하고 replay 시 row id/next id를 보존한다. `@db.savepoint()` / `@db.rollback(point)`은 메모리 상태를 캡처/복원하며, WAL-backed rollback은 checkpoint를 써서 replay에서도 복원 상태가 유지되게 한다. WAL-backed `@db.transaction` rollback도 메모리 상태를 복원한 뒤 checkpoint를 써서 replay에서도 실패한 mutation이 살아나지 않게 한다. WAL replay는 crash로 찢긴 마지막 EOF record를 무시하고 앞의 fsync된 record를 복구한다. CLI `orv db plan <file> --applied <schema.json>`은 현재 `struct` schema snapshot과 적용된 schema snapshot을 비교해 `create_struct`/`add_field`/`change_field`/`drop_field` dry-run JSON을 출력한다. `orv db apply <file> --schema <schema.json> --history <history.json>`와 `orv db migrate <file> --schema <schema.json> --history <history.json>`은 현재 schema snapshot을 적용된 schema 파일로 저장하고, 요청 시 schema hash와 actions를 migration history에 append하며, 이후 plan 결과가 비도록 만든다. `orv db rollback --schema <schema.json>`은 apply 직전 schema snapshot 백업을 복원한다. 외부 DB 어댑터, 데이터 마이그레이션 실행, 데이터 rollback/squash, WAL archive, 전체 crash matrix 검증은 아직 구현되어 있지 않다.
+**현재 구현:** MVP 레퍼런스 런타임의 `@db`는 프로세스 메모리 안의 테이블 맵으로 동작한다. `create/find/update/delete`, 필터, 정렬, 제한, 간단한 집계와 벡터 거리 정렬을 검증하기 위한 실행 모델이다. 명시적 `@db.save(path)` / `@db.load(path)`는 JSON snapshot 파일로 현재 DB 상태를 저장/복구할 수 있다. `@db.wal(path)`는 JSONL WAL 파일을 replay하고 이후 `create/update/delete/upsert` mutation을 append+fsync 한 뒤 메모리에 적용한다. `@db.checkpoint()`는 현재 DB 상태를 snapshot WAL record 한 줄로 압축하고 replay 시 row id/next id를 보존한다. `@db.savepoint()` / `@db.rollback(point)`은 메모리 상태를 캡처/복원하며, WAL-backed rollback은 checkpoint를 써서 replay에서도 복원 상태가 유지되게 한다. WAL-backed `@db.transaction` rollback도 메모리 상태를 복원한 뒤 checkpoint를 써서 replay에서도 실패한 mutation이 살아나지 않게 한다. WAL replay는 crash로 찢긴 마지막 EOF record를 무시하고 앞의 fsync된 record를 복구한다. CLI `orv db plan <file> --applied <schema.json>`은 현재 `struct` schema snapshot과 적용된 schema snapshot을 비교해 `create_struct`/`add_field`/`change_field`/`drop_field` dry-run JSON을 출력한다. `orv db apply <file> --schema <schema.json> --history <history.json>`와 `orv db migrate <file> --schema <schema.json> --history <history.json>`은 현재 schema snapshot을 적용된 schema 파일로 저장하고, 요청 시 schema hash와 actions를 migration history에 append하며, 이후 plan 결과가 비도록 만든다. `orv db migrate <file> --schema <schema.json> --data <data.json>`은 같은 schema diff를 `@db.save` JSON snapshot에 적용해 새 struct table을 빈 table로 만들고, 제거된 struct table을 삭제하며, 추가 필드는 기존 row에 `null`로 채우고, 삭제 필드는 row에서 제거한다. `orv db rollback --schema <schema.json> --data <data.json>`은 apply/migrate 직전 schema/data snapshot 백업을 함께 복원한다. 외부 DB 어댑터, 데이터 squash, WAL archive, 전체 crash matrix 검증은 아직 구현되어 있지 않다.
 
 **로드맵 보장:**
 - Write-Ahead Log (WAL) + fsync로 내구성 보장
@@ -2167,8 +2167,9 @@ Applying 0003_add_user_avatar.orv... OK
 | 명령 | 동작 |
 |------|------|
 | `orv db plan` | 현재 struct vs 마지막 적용 스키마 diff → 마이그레이션 dry-run 출력 |
-| `orv db apply` | 생성된 마이그레이션 실행 + 스냅샷 업데이트 |
-| `orv db rollback` | 최근 마이그레이션 역적용 (가능한 경우) |
+| `orv db apply` | 현재 schema snapshot 적용 + 이력 기록 |
+| `orv db migrate` | schema snapshot 적용 + 선택적 JSON data snapshot add/drop field 변환 |
+| `orv db rollback` | 최근 schema/data snapshot 백업 복원 (가능한 경우) |
 | `orv db squash` | 여러 마이그레이션을 하나로 압축 (초기 빌드용) |
 
 **생성 규칙:**
@@ -3052,7 +3053,7 @@ mock-server = "0.2.0"
 | `orv lsp snapshot/reveal/serve --stdio` | 에디터 bootstrap JSON, production reveal, LSP initialize/diagnostic/symbol/code-lens/code-action/folding/selection/semantic-tokens/definition/references/highlight/rename/hover/completion 처리 |
 | `orv dap serve --stdio` | DAP initialize/launch/configurationDone/setBreakpoints/breakpointLocations/gotoTargets/exceptionInfo/threads/stackTrace/scopes/variables/setVariable/evaluate/setExpression/completions/loadedSources/modules/source/continue/reverseContinue/goto/step/stepBack/disconnect/terminate bootstrap |
 | `orv init <dir> --name <name>` | 최소 `orv.toml` + `src/main.orv` 프로젝트 scaffold 생성 |
-| `orv db plan/apply/migrate/rollback` | schema diff dry-run, snapshot apply/migrate/history, rollback |
+| `orv db plan/apply/migrate/rollback` | schema diff dry-run, snapshot apply/history, 선택적 JSON data snapshot migrate/rollback |
 
 로드맵 CLI:
 

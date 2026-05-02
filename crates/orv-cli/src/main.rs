@@ -179,12 +179,18 @@ enum DbCommand {
         /// migration apply 이력을 기록할 JSON 경로.
         #[arg(long)]
         history: Option<PathBuf>,
+        /// 함께 변환할 @db.save JSON data snapshot 경로.
+        #[arg(long)]
+        data: Option<PathBuf>,
     },
     /// 마지막 적용 전 schema snapshot으로 되돌린다.
     Rollback {
         /// 되돌릴 적용 schema snapshot JSON 경로.
         #[arg(long)]
         schema: PathBuf,
+        /// 함께 되돌릴 @db.save JSON data snapshot 경로.
+        #[arg(long)]
+        data: Option<PathBuf>,
     },
 }
 
@@ -351,20 +357,26 @@ fn main() -> ExitCode {
                 file,
                 schema,
                 history,
-            } => match cmd_db_migrate(&file, &schema, history.as_deref()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
+                data,
+            } => {
+                match cmd_db_migrate_with_data(&file, &schema, history.as_deref(), data.as_deref())
+                {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
-            DbCommand::Rollback { schema } => match cmd_db_rollback(&schema) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
+            }
+            DbCommand::Rollback { schema, data } => {
+                match cmd_db_rollback_with_data(&schema, data.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -653,10 +665,28 @@ fn cmd_db_migrate(path: &Path, schema: &Path, history: Option<&Path>) -> anyhow:
     cmd_db_apply_with_history(path, schema, history)
 }
 
+fn cmd_db_migrate_with_data(
+    path: &Path,
+    schema: &Path,
+    history: Option<&Path>,
+    data: Option<&Path>,
+) -> anyhow::Result<()> {
+    cmd_db_apply_with_data(path, schema, history, data)
+}
+
 fn cmd_db_apply_with_history(
     path: &Path,
     schema: &Path,
     history: Option<&Path>,
+) -> anyhow::Result<()> {
+    cmd_db_apply_with_data(path, schema, history, None)
+}
+
+fn cmd_db_apply_with_data(
+    path: &Path,
+    schema: &Path,
+    history: Option<&Path>,
+    data: Option<&Path>,
 ) -> anyhow::Result<()> {
     let snapshot = current_db_schema_snapshot(path)?;
     let previous = if schema.is_file() {
@@ -665,8 +695,20 @@ fn cmd_db_apply_with_history(
         empty_db_schema_snapshot()
     };
     let actions = db_schema_diff_actions(&previous, &snapshot);
+    let migrated_data = if let Some(data) = data {
+        Some(migrated_db_data_snapshot(data, &actions)?)
+    } else {
+        None
+    };
     backup_schema_for_rollback(schema)?;
+    if let Some(data) = data {
+        backup_json_for_rollback(data)?;
+    }
     write_json_atomic(schema, &snapshot)?;
+    if let (Some(data), Some(migrated_data)) = (data, migrated_data.as_ref()) {
+        write_json_atomic(data, migrated_data)?;
+        println!("db data: {} migrated", data.display());
+    }
     if let Some(history) = history {
         append_db_history(history, path, &snapshot, actions)?;
     }
@@ -675,24 +717,125 @@ fn cmd_db_apply_with_history(
 }
 
 fn cmd_db_rollback(schema: &Path) -> anyhow::Result<()> {
+    cmd_db_rollback_with_data(schema, None)
+}
+
+fn cmd_db_rollback_with_data(schema: &Path, data: Option<&Path>) -> anyhow::Result<()> {
     let rollback = rollback_schema_path(schema);
     if !rollback.is_file() {
         anyhow::bail!("no rollback schema snapshot at {}", rollback.display());
     }
     let snapshot = read_json_value(&rollback)?;
+    let data_snapshot = if let Some(data) = data {
+        let rollback = rollback_schema_path(data);
+        if !rollback.is_file() {
+            anyhow::bail!("no rollback data snapshot at {}", rollback.display());
+        }
+        let snapshot = read_json_value(&rollback)?;
+        Some((data, rollback, snapshot))
+    } else {
+        None
+    };
     write_json_atomic(schema, &snapshot)?;
     std::fs::remove_file(&rollback)
         .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", rollback.display()))?;
+    if let Some((data, rollback, snapshot)) = data_snapshot {
+        write_json_atomic(data, &snapshot)?;
+        std::fs::remove_file(&rollback)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", rollback.display()))?;
+        println!("db data: {} rolled back", data.display());
+    }
     println!("db schema: {} rolled back", schema.display());
     Ok(())
 }
 
 fn backup_schema_for_rollback(schema: &Path) -> anyhow::Result<()> {
-    if schema.is_file() {
-        let current = read_json_value(schema)?;
-        write_json_atomic(&rollback_schema_path(schema), &current)?;
+    backup_json_for_rollback(schema)
+}
+
+fn backup_json_for_rollback(path: &Path) -> anyhow::Result<()> {
+    if path.is_file() {
+        let current = read_json_value(path)?;
+        write_json_atomic(&rollback_schema_path(path), &current)?;
     }
     Ok(())
+}
+
+fn migrated_db_data_snapshot(
+    data: &Path,
+    actions: &[serde_json::Value],
+) -> anyhow::Result<serde_json::Value> {
+    let mut snapshot = read_json_value(data)?;
+    let tables = snapshot
+        .get_mut("tables")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("db data snapshot tables must be an object"))?;
+    for action in actions {
+        let Some(kind) = action.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "create_struct" => {
+                let struct_name = required_action_string(action, "struct")?;
+                tables
+                    .entry(struct_name.to_string())
+                    .or_insert_with(|| serde_json::json!({ "next_id": 1, "rows": [] }));
+            }
+            "drop_struct" => {
+                let struct_name = required_action_string(action, "struct")?;
+                tables.remove(struct_name);
+            }
+            "add_field" => {
+                let struct_name = required_action_string(action, "struct")?;
+                let field_name = required_action_string(action, "field")?;
+                if let Some(rows) = db_data_rows_mut(tables, struct_name)? {
+                    for row in rows {
+                        let row = row.as_object_mut().ok_or_else(|| {
+                            anyhow::anyhow!("db data row in {struct_name} must be an object")
+                        })?;
+                        row.entry(field_name.to_string())
+                            .or_insert(serde_json::Value::Null);
+                    }
+                }
+            }
+            "drop_field" => {
+                let struct_name = required_action_string(action, "struct")?;
+                let field_name = required_action_string(action, "field")?;
+                if let Some(rows) = db_data_rows_mut(tables, struct_name)? {
+                    for row in rows {
+                        let row = row.as_object_mut().ok_or_else(|| {
+                            anyhow::anyhow!("db data row in {struct_name} must be an object")
+                        })?;
+                        row.remove(field_name);
+                    }
+                }
+            }
+            "change_field" => {}
+            _ => {}
+        }
+    }
+    Ok(snapshot)
+}
+
+fn required_action_string<'a>(action: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {
+    action
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("db migration action missing string `{key}`"))
+}
+
+fn db_data_rows_mut<'a>(
+    tables: &'a mut serde_json::Map<String, serde_json::Value>,
+    struct_name: &str,
+) -> anyhow::Result<Option<&'a mut Vec<serde_json::Value>>> {
+    let Some(table) = tables.get_mut(struct_name) else {
+        return Ok(None);
+    };
+    let rows = table
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("db data table {struct_name} rows must be an array"))?;
+    Ok(Some(rows))
 }
 
 fn append_db_history(
