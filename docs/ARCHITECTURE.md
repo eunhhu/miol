@@ -128,7 +128,7 @@ HIR → tree-walking 실행
 HIR → origin map JSON
 ```
 
-현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, bundle plan을 읽어 source span, graph node, route descriptor 또는 client bundle target을 JSON으로 반환한다. 프로덕션 trace와 editor reveal을 origin map에 연결하는 단계는 로드맵이다.
+현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, bundle plan을 읽어 source span, graph node, route descriptor 또는 client bundle target을 JSON으로 반환한다. `orv editor reveal <dir> <origin-id>`는 같은 origin id를 first-party editor focus/source/production navigation payload로 변환한다. 실제 production trace capture를 origin map에 연결하는 단계는 로드맵이다.
 
 ### 4.6단계: 초기 build artifact (orv-compiler + orv-cli)
 
@@ -212,7 +212,7 @@ dist/
 - `orv origins <file>` — HIR 기반 origin map JSON 출력
 - `orv graph <file>` — AST ProjectGraph v1 + HIR origin map/edge JSON 출력
 - `orv test <path> --filter <name> --list` — `.orv` 파일을 찾아 `test "name"` 블록이 있는 파일을 reference runtime 으로 실행하거나 발견 목록 JSON 출력
-- `orv editor snapshot <file>` — first-party editor bootstrap JSON과 Files/Routes/Schema/Domains 패널 입력 출력
+- `orv editor snapshot/reveal` — first-party editor bootstrap JSON과 build-origin focus/source/production navigation payload 출력
 - `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact, HTML-only static page, 또는 client page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/container/Dockerfile/Compose/runbook/entrypoint 추가
 - `orv verify-build <dir>` — build manifest/plan target 존재, source bundle hash, deploy container/runtime image/Compose/runbook contract, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap, optional dev HMR/watch session 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증

@@ -186,6 +186,13 @@ enum EditorCommand {
         /// 대상 파일 경로.
         file: PathBuf,
     },
+    /// build artifact origin id를 first-party editor navigation JSON으로 변환한다.
+    Reveal {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// reveal 할 origin id.
+        origin_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -570,6 +577,13 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::Reveal { dir, origin_id } => match cmd_editor_reveal(&dir, &origin_id) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -638,6 +652,12 @@ fn cmd_graph(path: &Path) -> anyhow::Result<()> {
 fn cmd_editor_snapshot(path: &Path) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let value = editor_snapshot_json(&entry)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
+    let value = editor_reveal_json(dir, origin_id)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -1813,6 +1833,77 @@ fn editor_origin_location_json(
     serde_json::json!({
         "uri": uri,
         "range": lsp_range_json(span, files),
+    })
+}
+
+fn editor_reveal_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json::Value> {
+    let reveal = reveal_origin_json(dir, origin_id)?;
+    let source = reveal
+        .get("source")
+        .ok_or_else(|| anyhow::anyhow!("reveal source missing"))?;
+    let path = json_str(source, "path", "reveal source")?;
+    let start = json_u32(source, "start", "reveal source")?;
+    let end = json_u32(source, "end", "reveal source")?;
+    let source_text = source
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .map_or_else(
+            || {
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("failed to read reveal source {path}: {e}"))
+            },
+            Ok,
+        )?;
+    let origin = reveal
+        .get("origin")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let project_graph = reveal
+        .get("project_graph")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let production = reveal
+        .get("production")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "origin": origin,
+        "focus": editor_reveal_focus_json(&origin, &project_graph, origin_id),
+        "source": {
+            "file": source.get("file").cloned().unwrap_or(serde_json::Value::Null),
+            "path": path,
+            "snippet": source.get("snippet").cloned().unwrap_or(serde_json::Value::Null),
+            "location": {
+                "uri": path,
+                "range": lsp_range_for_source(&source_text, start, end),
+            },
+        },
+        "project_graph": project_graph,
+        "production": production,
+    }))
+}
+
+fn editor_reveal_focus_json(
+    origin: &serde_json::Value,
+    project_graph: &serde_json::Value,
+    origin_id: &str,
+) -> serde_json::Value {
+    let origin_kind = origin
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let panel = match origin_kind {
+        "route" => "routes",
+        "struct" | "enum" | "type_alias" => "schema",
+        "define" | "domain" => "domains",
+        _ => "source",
+    };
+    serde_json::json!({
+        "origin_id": origin_id,
+        "panel": panel,
+        "node_id": project_graph.get("id").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -16210,6 +16301,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_reveal_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "editor", "reveal", "dist", "ori_1"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -17225,12 +17324,12 @@ entry = "src/main.orv"
         let path = dir.join("app.orv");
         std::fs::write(
             &path,
-            r#"@server {
+            r"@server {
   @listen 0
   @route GET /ping {
     @respond 200 { ok: true }
   }
-}"#,
+}",
         )
         .expect("write source");
         let out = dir.join("dist");
@@ -17299,6 +17398,52 @@ entry = "src/main.orv"
             .expect("client targets")
             .iter()
             .any(|target| target["kind"] == "client_wasm"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_reveal_focuses_route_origin_for_native_navigation() {
+        let dir = temp_output_dir("editor-reveal");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+
+        let reveal = editor_reveal_json(&out, &route.id).expect("editor reveal");
+
+        assert_eq!(reveal["schema_version"], 1);
+        assert_eq!(reveal["origin"]["id"], route.id);
+        assert_eq!(reveal["focus"]["panel"], "routes");
+        assert_eq!(reveal["focus"]["origin_id"], route.id);
+        assert_eq!(reveal["source"]["location"]["range"]["start"]["line"], 2);
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@route GET /ping")));
+        assert!(reveal["production"]["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
