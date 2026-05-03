@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use codespan_reporting::files::SimpleFiles;
@@ -127,6 +128,15 @@ enum Command {
         /// watch dev session artifact를 출력한다.
         #[arg(long)]
         watch: bool,
+        /// persistent watch loop를 실행한다.
+        #[arg(long)]
+        watch_loop: bool,
+        /// watch loop 반복 횟수. 생략하면 계속 실행한다.
+        #[arg(long)]
+        watch_iterations: Option<u64>,
+        /// watch loop poll interval milliseconds.
+        #[arg(long, default_value_t = 500)]
+        watch_interval_ms: u64,
     },
     /// build artifact 디렉터리에서 origin id를 원본 코드/production descriptor로 reveal한다.
     Reveal {
@@ -469,7 +479,18 @@ fn main() -> ExitCode {
             out,
             hmr,
             watch,
-        } => match cmd_dev(&file, &out, hmr, watch) {
+            watch_loop,
+            watch_iterations,
+            watch_interval_ms,
+        } => match cmd_dev(
+            &file,
+            &out,
+            hmr,
+            watch,
+            watch_loop,
+            watch_iterations,
+            watch_interval_ms,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -9462,7 +9483,8 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     verify_manifest_artifacts(dir, &manifest)?;
     verify_deploy_manifest_if_present(dir)?;
     verify_dev_hmr_session_if_present(dir, &plan)?;
-    verify_dev_watch_session_if_present(dir, &plan)
+    verify_dev_watch_session_if_present(dir, &plan)?;
+    verify_dev_watch_events_if_present(dir)
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -9824,6 +9846,79 @@ fn verify_dev_watch_session_if_present(dir: &Path, plan: &serde_json::Value) -> 
     }
     if json_str(transport, "path", "dev watch session transport")? != "dev/watch.json" {
         anyhow::bail!("dev watch session transport path must be dev/watch.json");
+    }
+    Ok(())
+}
+
+fn verify_dev_watch_events_if_present(dir: &Path) -> anyhow::Result<()> {
+    let events_path = dir.join("dev").join("events.json");
+    if !events_path.is_file() {
+        return Ok(());
+    }
+    let events = read_json_value(&events_path)?;
+    if events
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("dev watch events schema_version must be 1");
+    }
+    if json_str(&events, "mode", "dev watch events")? != "watch-loop" {
+        anyhow::bail!("dev watch events mode must be watch-loop");
+    }
+    if json_str(&events, "source_bundle", "dev watch events")? != "source-bundle.json" {
+        anyhow::bail!("dev watch events source_bundle must be source-bundle.json");
+    }
+    let transport = events
+        .get("transport")
+        .ok_or_else(|| anyhow::anyhow!("dev watch events transport must be an object"))?;
+    if json_str(transport, "kind", "dev watch events transport")? != "manifest" {
+        anyhow::bail!("dev watch events transport kind must be manifest");
+    }
+    if json_str(transport, "path", "dev watch events transport")? != "dev/events.json" {
+        anyhow::bail!("dev watch events transport path must be dev/events.json");
+    }
+    let loop_config = events
+        .get("loop")
+        .ok_or_else(|| anyhow::anyhow!("dev watch events loop must be an object"))?;
+    if json_str(loop_config, "strategy", "dev watch events loop")? != "poll" {
+        anyhow::bail!("dev watch events loop strategy must be poll");
+    }
+    if json_str(loop_config, "run", "dev watch events loop")? != "build-verify-run" {
+        anyhow::bail!("dev watch events loop run must be build-verify-run");
+    }
+    let interval_ms = loop_config
+        .get("interval_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("dev watch events loop interval_ms must be a number"))?;
+    if interval_ms == 0 {
+        anyhow::bail!("dev watch events loop interval_ms must be positive");
+    }
+    let event_items = events
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("dev watch events events must be an array"))?;
+    if event_items.is_empty() {
+        anyhow::bail!("dev watch events must contain at least one event");
+    }
+    for event in event_items {
+        if event
+            .get("iteration")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            anyhow::bail!("dev watch event iteration must be a number");
+        }
+        let action = json_str(event, "action", "dev watch event")?;
+        if !matches!(action, "build-verify-run" | "skip") {
+            anyhow::bail!("dev watch event action must be build-verify-run or skip");
+        }
+        if json_str(event, "status", "dev watch event")? != "ok" {
+            anyhow::bail!("dev watch event status must be ok");
+        }
+        if json_str(event, "watch", "dev watch event")? != "dev/watch.json" {
+            anyhow::bail!("dev watch event watch must be dev/watch.json");
+        }
     }
     Ok(())
 }
@@ -10711,8 +10806,26 @@ fn cmd_run_build(dir: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     run_build_with_writer_with_trace(dir, trace, &mut stdout)
 }
 
-fn cmd_dev(path: &Path, out: &Path, hmr: bool, watch: bool) -> anyhow::Result<()> {
+fn cmd_dev(
+    path: &Path,
+    out: &Path,
+    hmr: bool,
+    watch: bool,
+    watch_loop: bool,
+    watch_iterations: Option<u64>,
+    watch_interval_ms: u64,
+) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
+    if watch_loop {
+        return dev_watch_loop_with_writer(
+            path,
+            out,
+            hmr,
+            watch_iterations,
+            watch_interval_ms,
+            &mut stdout,
+        );
+    }
     if hmr {
         dev_with_writer_with_options(path, out, true, watch, &mut stdout)
     } else if watch {
@@ -10720,6 +10833,125 @@ fn cmd_dev(path: &Path, out: &Path, hmr: bool, watch: bool) -> anyhow::Result<()
     } else {
         dev_with_writer(path, out, &mut stdout)
     }
+}
+
+fn dev_watch_loop_with_writer<W: std::io::Write>(
+    path: &Path,
+    out: &Path,
+    hmr: bool,
+    iterations: Option<u64>,
+    interval_ms: u64,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    if interval_ms == 0 {
+        anyhow::bail!("watch loop interval_ms must be positive");
+    }
+    if iterations == Some(0) {
+        anyhow::bail!("watch loop iterations must be positive");
+    }
+
+    let mut events = Vec::new();
+    let mut previous_signature: Option<String> = None;
+    let mut iteration = 0_u64;
+    loop {
+        iteration = iteration.saturating_add(1);
+        let reason = match &previous_signature {
+            None => "initial",
+            Some(signature) => {
+                let current = dev_watch_current_source_signature(out)?;
+                if &current == signature {
+                    "unchanged"
+                } else {
+                    "changed"
+                }
+            }
+        };
+        if reason == "unchanged" {
+            events.push(dev_watch_loop_event(iteration, reason, "skip", "ok", None));
+        } else {
+            dev_with_writer_with_options(path, out, hmr, true, writer)?;
+            let signature = dev_watch_current_source_signature(out)?;
+            events.push(dev_watch_loop_event(
+                iteration,
+                reason,
+                "build-verify-run",
+                "ok",
+                Some(&signature),
+            ));
+            previous_signature = Some(signature);
+        }
+        write_dev_watch_events(out, hmr, interval_ms, &events)?;
+
+        if iterations.is_some_and(|limit| iteration >= limit) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+    Ok(())
+}
+
+fn dev_watch_loop_event(
+    iteration: u64,
+    reason: &str,
+    action: &str,
+    status: &str,
+    source_signature: Option<&str>,
+) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "iteration": iteration,
+        "reason": reason,
+        "action": action,
+        "status": status,
+        "watch": "dev/watch.json",
+    });
+    if let Some(signature) = source_signature {
+        event["source_signature"] = serde_json::json!(signature);
+    }
+    event
+}
+
+fn write_dev_watch_events(
+    out: &Path,
+    hmr: bool,
+    interval_ms: u64,
+    events: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "mode": "watch-loop",
+        "source_bundle": "source-bundle.json",
+        "loop": {
+            "strategy": "poll",
+            "interval_ms": interval_ms,
+            "run": "build-verify-run",
+            "hmr": hmr,
+        },
+        "transport": {
+            "kind": "manifest",
+            "path": "dev/events.json",
+        },
+        "events": events,
+    });
+    write_json(&out.join("dev").join("events.json"), &value)
+}
+
+fn dev_watch_current_source_signature(out: &Path) -> anyhow::Result<String> {
+    let session = read_json_value(&out.join("dev").join("watch.json"))?;
+    let sources = session
+        .pointer("/watch/sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("dev watch session watch.sources must be an array"))?;
+    let mut current = Vec::with_capacity(sources.len());
+    for source in sources {
+        let path = json_str(source, "path", "dev watch source")?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read watched source {path}: {e}"))?;
+        current.push(serde_json::json!({
+            "path": path,
+            "content_hash": format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
+        }));
+    }
+    stable_json_hash(&serde_json::Value::Array(current))
 }
 
 fn dev_with_writer<W: std::io::Write>(
@@ -19210,6 +19442,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn dev_watch_loop_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "dev",
+            "src/main.orv",
+            "--watch-loop",
+            "--watch-iterations",
+            "1",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -21019,6 +21266,46 @@ define Auth() -> { @out "auth" }
             .iter()
             .any(|target| target["kind"] == "static_page" && target["path"] == "pages/index.html"));
         cmd_verify_build(&build_out).expect("verify dev watch build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn dev_watch_loop_writes_bounded_event_manifest() {
+        let out = temp_output_dir("dev-watch-loop");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, "@out @html { @body { @h1 \"Loop\" } }").expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_watch_loop_with_writer(&entry, &build_out, false, Some(2), 1, &mut stdout)
+            .expect("dev watch loop");
+
+        let events =
+            read_json_value(&build_out.join("dev").join("events.json")).expect("watch events");
+        assert_eq!(events["schema_version"], 1);
+        assert_eq!(events["mode"], "watch-loop");
+        assert_eq!(events["loop"]["strategy"], "poll");
+        assert_eq!(events["loop"]["run"], "build-verify-run");
+        assert_eq!(events["loop"]["interval_ms"], 1);
+        assert_eq!(events["transport"]["path"], "dev/events.json");
+        assert_eq!(events["events"][0]["iteration"], 1);
+        assert_eq!(events["events"][0]["reason"], "initial");
+        assert_eq!(events["events"][0]["action"], "build-verify-run");
+        assert_eq!(events["events"][0]["status"], "ok");
+        assert!(events["events"][0]["source_signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty()));
+        assert_eq!(events["events"][1]["iteration"], 2);
+        assert_eq!(events["events"][1]["reason"], "unchanged");
+        assert_eq!(events["events"][1]["action"], "skip");
+        assert_eq!(events["events"][1]["status"], "ok");
+        assert!(events["events"][1]["source_signature"].is_null());
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "<html><body><h1>Loop</h1></body></html>"
+        );
+        cmd_verify_build(&build_out).expect("verify dev watch loop build");
         let _ = std::fs::remove_dir_all(&out);
     }
 

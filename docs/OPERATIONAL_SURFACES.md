@@ -20,6 +20,8 @@
 
 Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project].entry`, or a project directory containing `orv.toml`.
 
+`orv dev --hmr` writes `dev/session.json`, `orv dev --watch` writes `dev/watch.json`, and `orv dev --watch-loop [--watch-iterations <n>]` runs the poll-loop build/verify/run path while writing `dev/events.json` rebuild/skip events.
+
 ## Editor And LSP
 
 `orv editor snapshot <file>` emits first-party editor bootstrap JSON with diagnostics, ProjectGraph, Files/Routes/Schema/Domains panel inputs, and source-hash watch sources. `orv editor reveal <dir> <origin-id>` maps build artifact origins to editor focus/source/production navigation payloads. `orv editor runtime <file>` reuses DAP trace/runtime helpers for runtime inspection pane JSON. `orv editor export <file> --out <dir>` writes `state.json` plus a static `index.html` shell with panel lists, runtime frame inspection, and optional trace navigation. `orv editor trace <dir> --trace <trace.json>` maps captured request frames back to source/production navigation.
