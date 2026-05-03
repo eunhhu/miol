@@ -3681,6 +3681,7 @@ impl DapSession {
                 }))
             }
             "launch" => self.launch_result(request),
+            "attach" => self.attach_result(request),
             "restart" => self.restart_result(request),
             "configurationDone" => self.configuration_done_result(),
             "cancel" => Ok(serde_json::json!({})),
@@ -3857,6 +3858,20 @@ impl DapSession {
             "projectGraphNodes": loaded.graph.nodes.len(),
             "diagnostics": diagnostic_count,
             "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
+        }))
+    }
+
+    fn attach_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let mut arguments = request
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let arguments_object = arguments
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("attach.arguments must be an object"))?;
+        arguments_object.insert("attachRuntime".to_string(), serde_json::Value::Bool(true));
+        self.launch_result(&serde_json::json!({
+            "arguments": arguments,
         }))
     }
 
@@ -13769,6 +13784,64 @@ let total: int = add(2, 3)
             .expect("completion targets")
             .iter()
             .any(|target| target["label"] == "runtimeRoutes" && target["type"] == "property"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_attach_request_enables_runtime_transport() {
+        let dir = temp_output_dir("dap-attach-runtime");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "@server { @listen 0 @route GET /ping { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        let attach = session
+            .message_response(&serde_json::json!({
+                "seq": 236,
+                "type": "request",
+                "command": "attach",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "attachRuntimeMode": "inProcess",
+                },
+            }))
+            .expect("attach response");
+        assert_eq!(attach["type"], "response");
+        assert_eq!(attach["command"], "attach");
+        assert_eq!(attach["success"], true, "{attach}");
+        assert_eq!(
+            attach["body"]["runtime"]["async"]["transport"]["kind"],
+            "in-process"
+        );
+        assert_eq!(
+            attach["body"]["runtime"]["async"]["transport"]["state"],
+            "detached"
+        );
+        session
+            .message_response(&serde_json::json!({
+                "seq": 237,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let address = session
+            .launched
+            .as_ref()
+            .and_then(|launched| launched.async_runtime.as_ref())
+            .and_then(|runtime| runtime.transport.as_ref())
+            .and_then(|transport| transport.address.clone())
+            .expect("in-process runtime address");
+
+        let response = send_raw_http(&address, "/ping");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
