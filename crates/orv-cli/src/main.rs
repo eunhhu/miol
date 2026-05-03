@@ -431,6 +431,14 @@ enum EditorCommand {
         #[arg(long = "control", value_enum)]
         controls: Vec<EditorDebugControl>,
     },
+    /// exported editor state 의 debug session runner를 실행한다.
+    RunDebug {
+        /// `orv editor export`가 쓴 state.json 경로.
+        state: PathBuf,
+        /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
+        #[arg(long = "control", value_enum)]
+        controls: Vec<EditorDebugControl>,
+    },
     /// first-party editor static UI artifact를 출력한다.
     Export {
         /// 대상 파일 경로.
@@ -1002,6 +1010,15 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::RunDebug { state, controls } => {
+                match cmd_editor_run_debug(&state, &controls) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             EditorCommand::Export {
                 file,
                 out,
@@ -1304,6 +1321,12 @@ fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
 fn cmd_editor_debug(path: &Path, controls: &[EditorDebugControl]) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let value = editor_debug_session_json(&entry, controls)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_run_debug(state: &Path, controls: &[EditorDebugControl]) -> anyhow::Result<()> {
+    let value = editor_debug_runner_session_json(state, controls)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4640,6 +4663,32 @@ fn editor_debug_session_json(
     }))
 }
 
+fn editor_debug_runner_session_json(
+    state_path: &Path,
+    controls: &[EditorDebugControl],
+) -> anyhow::Result<serde_json::Value> {
+    let state = read_json_value(state_path)?;
+    if state.get("kind").and_then(serde_json::Value::as_str) != Some("orv.editor.export") {
+        anyhow::bail!("editor debug runner state must be an orv.editor.export artifact");
+    }
+    let runner = state
+        .pointer("/debug/session_runner")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("editor export state missing debug.session_runner"))?;
+    if runner.get("kind").and_then(serde_json::Value::as_str) != Some("orv.editor.debug.runner") {
+        anyhow::bail!("editor debug runner kind is invalid");
+    }
+    let program = json_str(&runner, "program", "editor debug runner")?;
+    let debug = editor_debug_session_json(Path::new(program), controls)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.debug.runner.result",
+        "state": state_path.display().to_string(),
+        "runner": runner,
+        "debug": debug,
+    }))
+}
+
 fn editor_debug_adapter_json() -> serde_json::Value {
     serde_json::json!({
         "protocol": "dap",
@@ -4656,7 +4705,7 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
             "protocol": "dap",
             "framing": "content-length",
         },
-        "command": ["orv", "editor", "debug", program, "--control", EditorDebugControl::Next.cli_value()],
+        "command": ["orv", "editor", "run-debug", "state.json", "--control", EditorDebugControl::Next.cli_value()],
         "session": {
             "launch": {
                 "live": true,
@@ -24297,6 +24346,23 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_run_debug_subcommand_accepts_exported_state() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "run-debug",
+            "target/orv-editor/state.json",
+            "--control",
+            "next",
+            "--control",
+            "step-in",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn editor_trace_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -26973,8 +27039,8 @@ define Auth() -> { @out "auth" }
             serde_json::json!([
                 "orv",
                 "editor",
-                "debug",
-                path.display().to_string(),
+                "run-debug",
+                "state.json",
                 "--control",
                 "next"
             ])
@@ -27121,6 +27187,33 @@ define Auth() -> { @out "auth" }
             })
             .count();
         assert!(step_stops >= 2, "{debug}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_executes_exported_session_runner() {
+        let dir = temp_output_dir("editor-run-debug");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+        cmd_editor_export(&path, &out).expect("editor export");
+
+        let run = editor_debug_runner_session_json(
+            &out.join("state.json"),
+            &[EditorDebugControl::Next, EditorDebugControl::Next],
+        )
+        .expect("run exported debug runner");
+
+        assert_eq!(run["kind"], "orv.editor.debug.runner.result");
+        assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
+        assert_eq!(run["debug"]["transport"]["framing"], "content-length");
+        assert_eq!(run["debug"]["transport"]["request_count"], 5);
+        assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 

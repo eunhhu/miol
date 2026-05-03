@@ -10,7 +10,7 @@
 
 - `orv init <dir> --name <name> [--template basic|shop]`
 - `orv run/dev/check/dump/origins/graph/test`
-- `orv editor snapshot/reveal/runtime/export/trace`
+- `orv editor snapshot/reveal/runtime/debug/run-debug/export/trace`
 - `orv lsp snapshot/reveal/serve --stdio`
 - `orv dap serve --stdio`
 - `orv build <file-or-orv.toml> --out <dir> [--prod]`
@@ -50,7 +50,7 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 
 ## Editor And LSP
 
-`orv editor snapshot <file>` emits first-party editor bootstrap JSON with diagnostics, ProjectGraph, Files/Routes/Schema/Domains panel inputs, and source-hash watch sources. `orv editor reveal <dir> <origin-id>` maps build artifact origins to editor focus/source/production navigation payloads. `orv editor runtime <file>` reuses DAP trace/runtime helpers for runtime inspection pane JSON. `orv editor debug <file> --control <continue|pause|next|step-in|step-out|restart|disconnect>` runs an initialize/live-launch/control/stackTrace sequence over the same Content-Length DAP transport and emits the response/event frames for native editor wiring; repeated `--control` values run in order inside one session. `orv editor export <file> --out <dir>` writes `state.json` plus a static `index.html` shell with panel lists, ProjectGraph visualization, runtime frame inspection, DAP adapter launch/live/attach configuration wiring, live-control request payloads, native-host `session_runner` command metadata, executable breakpoint source lines, and optional trace navigation. `orv editor trace <dir> --trace <trace.json>` maps captured request frames back to source/production navigation and embeds the `/__orv/trace/events` EventSource transport URL when a server artifact has a stable listen endpoint.
+`orv editor snapshot <file>` emits first-party editor bootstrap JSON with diagnostics, ProjectGraph, Files/Routes/Schema/Domains panel inputs, and source-hash watch sources. `orv editor reveal <dir> <origin-id>` maps build artifact origins to editor focus/source/production navigation payloads. `orv editor runtime <file>` reuses DAP trace/runtime helpers for runtime inspection pane JSON. `orv editor debug <file> --control <continue|pause|next|step-in|step-out|restart|disconnect>` runs an initialize/live-launch/control/stackTrace sequence over the same Content-Length DAP transport and emits the response/event frames for native editor wiring; repeated `--control` values run in order inside one session. `orv editor run-debug <state.json> --control <...>` reads an exported `debug.session_runner`, replays the controls through one DAP session for the recorded program, and emits runner result JSON for native host execution. `orv editor export <file> --out <dir>` writes `state.json` plus a static `index.html` shell with panel lists, ProjectGraph visualization, runtime frame inspection, DAP adapter launch/live/attach configuration wiring, live-control request payloads, native-host `session_runner` command metadata, executable breakpoint source lines, and optional trace navigation. `orv editor trace <dir> --trace <trace.json>` maps captured request frames back to source/production navigation and embeds the `/__orv/trace/events` EventSource transport URL when a server artifact has a stable listen endpoint.
 
 `orv lsp serve --stdio` currently handles:
 
