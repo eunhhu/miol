@@ -218,6 +218,7 @@ dist/
 - `orv lock [dir-or-orv.toml] [--check]` — `orv.toml` project/dependency metadata를 deterministic `orv.lock` JSON으로 고정하거나 최신성 검증
 - `orv workspace new <member> [--root <dir>] [--name <name>]` — workspace root manifest member 등록과 member project scaffold 생성
 - `orv workspace graph [root] [--out <dir>]` — workspace member graph/files/dependencies와 member 간 path dependency edge artifact 출력
+- `orv workspace build [root] --out <dir> [--prod]` — 각 workspace member를 기존 build pipeline으로 빌드/검증하고 top-level workspace build manifest 출력
 - `orv verify-build <dir>` — build manifest/plan target 존재, source bundle hash, deploy container/runtime image/Compose/runbook contract, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap, optional dev HMR/watch/transport/event/server manifest 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증
 - `orv check-artifact <file>` — server runtime artifact source bundle 재분석

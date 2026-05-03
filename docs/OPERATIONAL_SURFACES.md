@@ -18,6 +18,7 @@
 - `orv lock [dir-or-orv.toml] [--check]`
 - `orv workspace new <member> [--root <dir>] [--name <name>]`
 - `orv workspace graph [root] [--out <dir>]`
+- `orv workspace build [root] [--out <dir>] [--prod]`
 - `orv verify-build/verify-artifact/check-artifact/check-build`
 - `orv run-artifact/run-build/reveal`
 - `orv db plan/verify/apply/migrate/rollback/backup/restore/recover/archive/squash`
@@ -35,6 +36,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 `orv workspace new <member> [--root <dir>] [--name <name>]` creates a basic member project and records the relative member path in root `orv.toml` `[workspace].members` with resolver `2`.
 
 `orv workspace graph [root] [--out <dir>]` reads root `[workspace].members`, loads each member entry through the shared ProjectGraph pipeline, records member graphs/files/dependencies, and emits path dependency edges between workspace members. With `--out`, it writes `workspace-graph.json`.
+
+`orv workspace build [root] --out <dir> [--prod]` reuses the normal build pipeline for every workspace member, verifies each member build directory, writes member artifacts under `members/<member>`, and emits `workspace-build.json` plus `workspace-graph.json` as the top-level workspace build contract.
 
 ## Editor And LSP
 

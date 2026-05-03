@@ -285,6 +285,18 @@ enum WorkspaceCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Workspace member build artifact들을 한 디렉터리 아래 생성한다.
+    Build {
+        /// workspace root 디렉터리.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// workspace build artifact 출력 디렉터리.
+        #[arg(long, short = 'o', default_value = "target/orv-workspace-build")]
+        out: PathBuf,
+        /// member build를 production profile로 생성한다.
+        #[arg(long)]
+        prod: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -672,6 +684,15 @@ fn main() -> ExitCode {
             },
             WorkspaceCommand::Graph { root, out } => {
                 match cmd_workspace_graph(&root, out.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            WorkspaceCommand::Build { root, out, prod } => {
+                match cmd_workspace_build(&root, &out, BuildProfile::from_prod_flag(prod)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -1253,6 +1274,66 @@ fn cmd_workspace_graph(root: &Path, out: Option<&Path>) -> anyhow::Result<()> {
     } else {
         println!("{}", serde_json::to_string_pretty(&graph)?);
     }
+    Ok(())
+}
+
+fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow::Result<()> {
+    let graph = workspace_graph_json(root)?;
+    let graph_path = out.join("workspace-graph.json");
+    write_json(&graph_path, &graph)?;
+
+    let members = graph
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace graph members must be an array"))?;
+    let mut member_builds = Vec::with_capacity(members.len());
+    for member in members {
+        let member_path =
+            workspace_member_string(Path::new(json_str(member, "path", "workspace member")?))?;
+        let name = json_str(member, "name", "workspace member")?;
+        let entry = json_str(member, "entry", "workspace member")?;
+        let build_dir = format!("members/{member_path}");
+        let member_out = out.join(&build_dir);
+        cmd_build_with_profile(&root.join(entry), &member_out, profile)?;
+        cmd_verify_build(&member_out)?;
+        member_builds.push(serde_json::json!({
+            "path": member_path,
+            "name": name,
+            "entry": entry,
+            "build_dir": build_dir,
+            "manifest": format!("{build_dir}/build-manifest.json"),
+            "verified": true,
+        }));
+    }
+
+    let dependency_edges = graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .map(|edges| {
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge.get("kind").and_then(serde_json::Value::as_str) == Some("path_dependency")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.workspace.build",
+        "profile": profile.as_str(),
+        "root": root.display().to_string(),
+        "workspace_graph": "workspace-graph.json",
+        "stats": {
+            "member_count": member_builds.len(),
+            "dependency_edge_count": dependency_edges.len(),
+        },
+        "members": member_builds,
+        "dependency_edges": dependency_edges,
+    });
+    write_json(&out.join("workspace-build.json"), &manifest)?;
+    println!("workspace build: wrote {}", out.display());
     Ok(())
 }
 
@@ -12832,6 +12913,13 @@ impl BuildProfile {
     const fn is_production(self) -> bool {
         matches!(self, Self::Production)
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "dev",
+            Self::Production => "prod",
+        }
+    }
 }
 
 fn cmd_build(path: &Path, out: &Path) -> anyhow::Result<()> {
@@ -21039,6 +21127,29 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn workspace_build_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "workspace",
+            "build",
+            "demo",
+            "--out",
+            "target/orv-workspace-build",
+            "--prod",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Workspace { command } = parsed.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Build { root, out, prod } = command else {
+            panic!("expected workspace build command");
+        };
+        assert_eq!(root, PathBuf::from("demo"));
+        assert_eq!(out, PathBuf::from("target/orv-workspace-build"));
+        assert!(prod);
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -21917,6 +22028,83 @@ entry = "src/main.orv"
         assert!(out.join("workspace-graph.json").is_file());
         let written = read_json_value(&out.join("workspace-graph.json")).expect("read written");
         assert_eq!(written["stats"]["member_count"], 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_build_writes_member_builds_and_workspace_manifest() {
+        let root = temp_output_dir("workspace-build");
+        std::fs::create_dir_all(root.join("apps/web/src")).expect("create web src");
+        std::fs::create_dir_all(root.join("shared/models/src")).expect("create models src");
+        std::fs::write(
+            root.join("orv.toml"),
+            r#"[workspace]
+resolver = "2"
+members = ["apps/web", "shared/models"]
+"#,
+        )
+        .expect("write root manifest");
+        std::fs::write(
+            root.join("apps/web/orv.toml"),
+            r#"[project]
+name = "web"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+models = { path = "../../shared/models", version = "0.1.0" }
+"#,
+        )
+        .expect("write web manifest");
+        std::fs::write(
+            root.join("shared/models/orv.toml"),
+            r#"[project]
+name = "models"
+version = "0.1.0"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write models manifest");
+        std::fs::write(
+            root.join("apps/web/src/main.orv"),
+            r#"@out @html { @body { @h1 "Web" } }"#,
+        )
+        .expect("write web source");
+        std::fs::write(
+            root.join("shared/models/src/main.orv"),
+            r#"@out @html { @body { @h1 "Models" } }"#,
+        )
+        .expect("write models source");
+
+        let out = root.join("target/orv-workspace-build");
+        cmd_workspace_build(&root, &out, BuildProfile::Development).expect("workspace build");
+
+        assert!(out.join("workspace-graph.json").is_file());
+        assert!(out.join("members/apps/web/build-manifest.json").is_file());
+        assert!(out
+            .join("members/shared/models/build-manifest.json")
+            .is_file());
+        let manifest = read_json_value(&out.join("workspace-build.json")).expect("read manifest");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["kind"], "orv.workspace.build");
+        assert_eq!(manifest["profile"], "dev");
+        assert_eq!(manifest["stats"]["member_count"], 2);
+        assert_eq!(manifest["workspace_graph"], "workspace-graph.json");
+        assert!(manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .any(|member| member["path"] == "apps/web"
+                && member["build_dir"] == "members/apps/web"
+                && member["manifest"] == "members/apps/web/build-manifest.json"));
+        assert!(manifest["dependency_edges"]
+            .as_array()
+            .expect("dependency edges")
+            .iter()
+            .any(|edge| edge["kind"] == "path_dependency"
+                && edge["from"] == "apps/web"
+                && edge["to"] == "shared/models"));
 
         let _ = std::fs::remove_dir_all(root);
     }
