@@ -82,7 +82,8 @@ pub struct RequestCtx {
     pub query: HashMap<String, String>,
     /// 요청 헤더.
     pub headers: HashMap<String, String>,
-    /// 파싱된 body. MVP 는 JSON 파싱 전 원문 문자열이거나 void.
+    /// 파싱된 body. JSON/form bodies are exposed as objects; unknown content
+    /// types remain raw strings, and empty bodies are void.
     pub body: Value,
 }
 
@@ -3513,6 +3514,9 @@ impl<W: Write> Interp<W> {
         }
 
         self.html_push(&format!("<{name}{attrs}>"));
+        if is_html_void_tag(name) {
+            return Ok(());
+        }
         for arg in args {
             match &arg.kind {
                 HirExprKind::Assign { .. } => {}
@@ -3649,6 +3653,26 @@ fn is_event_attr(name: &str) -> bool {
         return false;
     };
     rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+fn is_html_void_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn html_escape_text(s: &str) -> String {
@@ -6912,7 +6936,7 @@ let third: int = 3
         .unwrap();
         assert_eq!(
             out,
-            "<html><a href=\"/home\" class=\"nav-link\">Home</a><input type=\"email\" required></input><button onClick=\"handler\">Click</button></html>\n"
+            "<html><a href=\"/home\" class=\"nav-link\">Home</a><input type=\"email\" required><button onClick=\"handler\">Click</button></html>\n"
         );
     }
 
@@ -7197,6 +7221,29 @@ let third: int = 3
         assert_eq!(
             String::from_utf8(raw.bytes).unwrap(),
             "<html><body><h1>Home</h1></body></html>"
+        );
+    }
+
+    #[test]
+    fn serve_html_void_input_records_unclosed_form_control() {
+        let (_, resp) = run_handler(
+            r#"{
+                @serve @html {
+                    @body {
+                        @form action="/members" method=post {
+                            @input type=email name=email required
+                            @button type=submit "Join"
+                        }
+                    }
+                }
+            }"#,
+            RequestCtx::default(),
+        );
+        let resp = resp.expect("response recorded");
+        let raw = resp.raw_body.expect("html raw body");
+        assert_eq!(
+            String::from_utf8(raw.bytes).unwrap(),
+            "<html><body><form action=\"/members\" method=\"post\"><input type=\"email\" name=\"email\" required><button type=\"submit\">Join</button></form></body></html>"
         );
     }
 

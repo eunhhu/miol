@@ -811,16 +811,26 @@ async fn request_body_value(
             ));
         }
     };
-    let is_json = headers
+    let content_type = headers
         .get("content-type")
-        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
-        .unwrap_or(false);
+        .map(|ct| ct.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_json = content_type.starts_with("application/json");
+    let is_form_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
     if body_bytes.is_empty() {
         Ok(Value::Void)
     } else if is_json {
         serde_json::from_slice::<serde_json::Value>(&body_bytes)
             .map(json_to_value)
             .map_err(|e| plain_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
+    } else if is_form_urlencoded {
+        let raw = String::from_utf8_lossy(&body_bytes).into_owned();
+        Ok(Value::Object(
+            parse_query(&raw)
+                .into_iter()
+                .map(|(key, value)| (key, Value::Str(value)))
+                .collect(),
+        ))
     } else {
         Ok(Value::Str(
             String::from_utf8_lossy(&body_bytes).into_owned(),
@@ -1628,6 +1638,39 @@ mod tests {
         (status, ct, origin, bytes)
     }
 
+    async fn send_request_with_content_type(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: String,
+        content_type: &str,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let uri: hyper::Uri = path.parse().expect("uri");
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost")
+            .header("content-type", content_type)
+            .body(Full::new(Bytes::from(body)))
+            .expect("build req");
+        let resp = sender.send_request(req).await.expect("send");
+        let status = resp.status().as_u16();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
+        (status, ct, bytes)
+    }
+
     /// 요청을 쏘고 (status, content-type, body 바이트) 튜플로 돌려준다.
     ///
     /// Request body 는 `body` 가 `Some` 이면 application/json 으로 보낸다.
@@ -1839,6 +1882,55 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["received"]["name"], serde_json::json!("alice"));
             assert_eq!(json["received"]["age"], serde_json::json!(30));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serves_post_route_with_form_urlencoded_body() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r"@server {
+                    @listen 0
+                    @route POST /members {
+                        @respond 201 {
+                            handle: @body.handle,
+                            email: @body.email,
+                            name: @body.name
+                        }
+                    }
+                }",
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, body) = send_request_with_content_type(
+                addr,
+                "POST",
+                "/members",
+                "handle=ada&email=ada%40example.test&name=Ada+Lovelace".to_string(),
+                "application/x-www-form-urlencoded; charset=utf-8",
+            )
+            .await;
+            assert_eq!(status, 201);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["handle"], serde_json::json!("ada"));
+            assert_eq!(json["email"], serde_json::json!("ada@example.test"));
+            assert_eq!(json["name"], serde_json::json!("Ada Lovelace"));
 
             handle.abort();
         })
@@ -2242,6 +2334,9 @@ mod tests {
             assert_eq!(home_ct.as_deref(), Some("text/html; charset=utf-8"));
             let home_html = String::from_utf8(home_body).expect("home html");
             assert!(home_html.contains("<h1>Miol Shop</h1>"));
+            assert!(home_html.contains("<form action=\"/products\" method=\"post\">"));
+            assert!(home_html.contains("<input type=\"number\" name=\"stock\" required>"));
+            assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /shipments"));
 
@@ -2269,11 +2364,40 @@ mod tests {
                 serde_json::json!("kettle")
             );
 
+            let (form_product_status, _, form_product_body) = send_request_with_content_type(
+                addr,
+                "POST",
+                "/products",
+                "sku=mug&name=Mug&price=1200&stock=3".to_string(),
+                "application/x-www-form-urlencoded",
+            )
+            .await;
+            assert_eq!(form_product_status, 201);
+            let form_product: serde_json::Value =
+                serde_json::from_slice(&form_product_body).expect("form product json");
+            assert_eq!(form_product["product"]["sku"], serde_json::json!("mug"));
+            assert_eq!(form_product["product"]["stock"], serde_json::json!(3));
+
             let (list_status, _, list_body) = send_request(addr, "GET", "/products", None).await;
             assert_eq!(list_status, 200);
             let list: serde_json::Value = serde_json::from_slice(&list_body).expect("list json");
-            assert_eq!(list["products"].as_array().map(Vec::len), Some(1));
+            assert_eq!(list["products"].as_array().map(Vec::len), Some(2));
             assert_eq!(list["products"][0]["name"], serde_json::json!("Kettle"));
+
+            let (form_order_status, _, form_order_body) = send_request_with_content_type(
+                addr,
+                "POST",
+                "/orders",
+                "customer=bea&sku=mug&quantity=2&total=2400".to_string(),
+                "application/x-www-form-urlencoded",
+            )
+            .await;
+            assert_eq!(form_order_status, 201);
+            let form_order: serde_json::Value =
+                serde_json::from_slice(&form_order_body).expect("form order json");
+            assert_eq!(form_order["order"]["customer"], serde_json::json!("bea"));
+            assert_eq!(form_order["order"]["quantity"], serde_json::json!(2));
+            assert_eq!(form_order["remainingStock"], serde_json::json!(1));
 
             let order_payload = serde_json::json!({
                 "customer": "ada",

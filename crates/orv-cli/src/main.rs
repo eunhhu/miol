@@ -867,6 +867,8 @@ orv verify-build dist\n\
 orv run-build dist\n\
 ```\n\
 \n\
+Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
+\n\
 ## Deploy\n\
 \n\
 After `orv build . --prod --out dist`, use generated deploy runbook:\n\
@@ -11450,6 +11452,8 @@ test "checkout failing runtime body" {
         assert!(source.contains("@listen 8080"));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
+        assert!(source.contains("@form action=\"/products\" method=post"));
+        assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
@@ -11476,6 +11480,8 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(guide.contains("Browser home"));
+        assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));

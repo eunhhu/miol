@@ -3,8 +3,9 @@
 // =====================================================
 //
 // This fixture is the first HTTP/DB vertical slice for the shopping-mall
-// north-star: product CRUD surface, request body JSON, route params, and
-// request-to-request persistence through the shared in-memory DB.
+// north-star: product CRUD surface, JSON/form request bodies, route params,
+// browser starter forms, and request-to-request persistence through the shared
+// in-memory DB.
 
 @server {
   @listen 0
@@ -18,6 +19,64 @@
       @body {
         @h1 "Miol Shop"
         @p "Catalog, member signup, payment capture, and shipment booking are ready."
+        @section {
+          class="shop-actions"
+          @h2 "Browser checkout forms"
+          @form action="/products" method=post {
+            @h3 "Add product"
+            @label "SKU"
+            @input type=text name=sku required
+            @label "Name"
+            @input type=text name=name required
+            @label "Price"
+            @input type=number name=price required
+            @label "Stock"
+            @input type=number name=stock required
+            @button type=submit "Create product"
+          }
+          @form action="/members" method=post {
+            @h3 "Join member"
+            @label "Handle"
+            @input type=text name=handle required
+            @label "Name"
+            @input type=text name=name required
+            @label "Email"
+            @input type=email name=email required
+            @button type=submit "Create member"
+          }
+          @form action="/orders" method=post {
+            @h3 "Reserve order"
+            @label "Customer"
+            @input type=text name=customer required
+            @label "SKU"
+            @input type=text name=sku required
+            @label "Quantity"
+            @input type=number name=quantity required
+            @label "Total"
+            @input type=number name=total required
+            @button type=submit "Reserve order"
+          }
+          @form action="/payments" method=post {
+            @h3 "Capture payment"
+            @label "Order ID"
+            @input type=number name=orderId required
+            @label "Amount"
+            @input type=number name=amount required
+            @label "Method"
+            @input type=text name=method value=card required
+            @button type=submit "Capture payment"
+          }
+          @form action="/shipments" method=post {
+            @h3 "Book shipment"
+            @label "Order ID"
+            @input type=number name=orderId required
+            @label "Carrier"
+            @input type=text name=carrier value=post required
+            @label "Address"
+            @input type=text name=address required
+            @button type=submit "Book shipment"
+          }
+        }
         @ul {
           @li "POST /products"
           @li "POST /members"
@@ -30,7 +89,14 @@
   }
 
   @route POST /products {
-    let product = await @db.create("Product", @body)
+    let price: int = @body.price as int
+    let stock: int = @body.stock as int
+    let product = await @db.create("Product", {
+      sku: @body.sku,
+      name: @body.name,
+      price: price,
+      stock: stock
+    })
     @respond 201 { product: product }
   }
 
@@ -55,20 +121,22 @@
   }
 
   @route POST /orders {
+    let quantity: int = @body.quantity as int
+    let total: int = @body.total as int
     let product = await @db.find("Product", { sku: @body.sku })
     if product == void {
       @respond 404 { err: "product_not_found", sku: @body.sku }
     }
-    if product.stock < @body.quantity {
+    if product.stock < quantity {
       @respond 409 { err: "out_of_stock", sku: @body.sku, stock: product.stock }
     }
-    let remainingStock = product.stock - @body.quantity
+    let remainingStock = product.stock - quantity
     await @db.update("Product", { sku: @body.sku }, { stock: remainingStock })
     let order = await @db.create("Order", {
       customer: @body.customer,
       sku: @body.sku,
-      quantity: @body.quantity,
-      total: @body.total,
+      quantity: quantity,
+      total: total,
       status: "reserved"
     })
     @respond 201 { order: order, remainingStock: remainingStock }
@@ -80,42 +148,45 @@
   }
 
   @route POST /payments {
-    let order = await @db.find("Order", { id: @body.orderId })
+    let orderId: int = @body.orderId as int
+    let amount: int = @body.amount as int
+    let order = await @db.find("Order", { id: orderId })
     if order == void {
-      @respond 404 { err: "order_not_found", orderId: @body.orderId }
+      @respond 404 { err: "order_not_found", orderId: orderId }
     }
-    if order.total != @body.amount {
+    if order.total != amount {
       @respond 400 {
         err: "amount_mismatch",
         expected: order.total,
-        actual: @body.amount
+        actual: amount
       }
     }
     let payment = await @db.create("Payment", {
-      orderId: @body.orderId,
-      amount: @body.amount,
+      orderId: orderId,
+      amount: amount,
       method: @body.method,
       status: "captured"
     })
-    await @db.update("Order", { id: @body.orderId }, { status: "paid" })
-    let paidOrder = await @db.find("Order", { id: @body.orderId })
+    await @db.update("Order", { id: orderId }, { status: "paid" })
+    let paidOrder = await @db.find("Order", { id: orderId })
     @respond 201 { payment: payment, order: paidOrder }
   }
 
   @route POST /shipments {
-    let payment = await @db.find("Payment", { orderId: @body.orderId })
+    let orderId: int = @body.orderId as int
+    let payment = await @db.find("Payment", { orderId: orderId })
     if payment == void {
-      @respond 402 { err: "payment_required", orderId: @body.orderId }
+      @respond 402 { err: "payment_required", orderId: orderId }
     }
     let shipment = await @db.create("Shipment", {
-      orderId: @body.orderId,
+      orderId: orderId,
       carrier: @body.carrier,
       address: @body.address,
       status: "ready",
       tracking: "TRK-LOCAL"
     })
-    await @db.update("Order", { id: @body.orderId }, { status: "shipped" })
-    let shippedOrder = await @db.find("Order", { id: @body.orderId })
+    await @db.update("Order", { id: orderId }, { status: "shipped" })
+    let shippedOrder = await @db.find("Order", { id: orderId })
     @respond 201 { shipment: shipment, order: shippedOrder }
   }
 
