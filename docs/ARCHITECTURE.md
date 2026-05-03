@@ -2,7 +2,7 @@
 
 ## 개요
 
-orv는 Rust workspace로 구성된 10개 크레이트의 파이프라인 아키텍처를 따른다. 현재 구현은 `.orv` 소스를 로드/파싱/해석/분석한 뒤 HIR을 레퍼런스 tree-walking 런타임으로 실행하는 MVP다. `orv-compiler`는 HIR 기반 origin map과 build manifest artifact를 생성할 수 있고, `@server` 런타임은 매칭된 route origin id를 HTTP 응답 헤더로 노출한다. `orv init`은 최소 `orv.toml`/`src/main.orv` 프로젝트 또는 `--template shop` 쇼핑몰 route scaffold와 검증/배포 README를 만들고, source-entry CLI는 단일 파일뿐 아니라 `orv.toml` `[project].entry`와 프로젝트 디렉터리 입력도 받는다. `orv build`는 현재 manifest/origin-map/project-graph/source-bundle/source-bundled server runtime artifact JSON과 reference server launch artifact 디렉터리를 만들며, HTML-only entry는 zero-runtime `pages/index.html` 정적 페이지도 출력한다. `let sig` 또는 HTML await가 필요한 client entry는 non-zero-runtime `pages/index.html` shell, source-bundle/wasm target metadata를 노출하고 `orv_start` WASM export를 호출하는 `client/app.js` bootstrap, `orv.client` custom section과 `orv_start` export를 담은 `client/app.wasm` callable placeholder로 client bundle 계약을 고정한다. `orv build --prod`는 여기에 `deploy/manifest.json`, `deploy/routes.json`, `deploy/container.json`, `deploy/Dockerfile`, `deploy/compose.yaml`, request trace capture/editor trace 명령을 담은 `deploy/README.md`, `deploy/server.sh` reference server entrypoint를 추가한다. CLI는 build directory target, deploy manifest, server/client/source-bundle artifact 검증, artifact 재분석, reference runtime 실행, build directory launch 실행, build artifact origin reveal을 할 수 있다. native 서버 바이너리와 실제 클라이언트 WASM/JS 코드젠은 아직 구현되지 않은 컴파일러 로드맵이다.
+orv는 Rust workspace로 구성된 10개 크레이트의 파이프라인 아키텍처를 따른다. 현재 구현은 `.orv` 소스를 로드/파싱/해석/분석한 뒤 HIR을 레퍼런스 tree-walking 런타임으로 실행하는 MVP다. `orv-compiler`는 HIR 기반 origin map과 build manifest artifact를 생성할 수 있고, `@server` 런타임은 매칭된 route origin id를 HTTP 응답 헤더로 노출한다. `orv init`은 최소 `orv.toml`/`src/main.orv` 프로젝트 또는 `--template shop` 쇼핑몰 `GET /` HTML 홈과 회원/결제/배송 route scaffold 및 검증/배포 README를 만들고, source-entry CLI는 단일 파일뿐 아니라 `orv.toml` `[project].entry`와 프로젝트 디렉터리 입력도 받는다. `orv build`는 현재 manifest/origin-map/project-graph/source-bundle/source-bundled server runtime artifact JSON과 reference server launch artifact 디렉터리를 만들며, HTML-only entry는 zero-runtime `pages/index.html` 정적 페이지도 출력한다. `let sig` 또는 HTML await가 필요한 client entry는 non-zero-runtime `pages/index.html` shell, source-bundle/wasm target metadata를 노출하고 `orv_start` WASM export를 호출하는 `client/app.js` bootstrap, `orv.client` custom section과 `orv_start` export를 담은 `client/app.wasm` callable placeholder로 client bundle 계약을 고정한다. `orv build --prod`는 여기에 `deploy/manifest.json`, `deploy/routes.json`, `deploy/container.json`, `deploy/Dockerfile`, `deploy/compose.yaml`, request trace capture/editor trace 명령을 담은 `deploy/README.md`, `deploy/server.sh` reference server entrypoint를 추가한다. CLI는 build directory target, deploy manifest, server/client/source-bundle artifact 검증, artifact 재분석, reference runtime 실행, build directory launch 실행, build artifact origin reveal을 할 수 있다. native 서버 바이너리와 실제 클라이언트 WASM/JS 코드젠은 아직 구현되지 않은 컴파일러 로드맵이다.
 
 이 문서는 **현재 구현 구조와 데이터 흐름**을 설명하는 문서다. 언어 문법과 의미론의 공식 기준은 `docs/SPEC.md`이며, 이 문서는 그 사양을 구현 관점에서 해설한다.
 
@@ -205,7 +205,7 @@ dist/
 ### CLI (orv-cli)
 
 `clap` 기반 CLI로 다음 커맨드를 제공한다:
-- `orv init <dir> --name <name> [--template basic|shop]` — 최소 프로젝트 또는 쇼핑몰 route scaffold/검증/Compose 배포 README 생성
+- `orv init <dir> --name <name> [--template basic|shop]` — 최소 프로젝트 또는 쇼핑몰 `GET /` HTML 홈, route scaffold, 검증/Compose 배포 README 생성
 - `orv run <file>` — 파일을 로드/검사한 뒤 레퍼런스 런타임으로 실행
 - `orv check <file>` — 파싱, 이름 해석, 타입/도메인 진단만 수행
 - `orv dump <file>` — AST 디버그 출력

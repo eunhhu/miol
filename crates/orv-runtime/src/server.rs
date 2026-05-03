@@ -2219,7 +2219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_shopping_mall_covers_catalog_and_order_flow() {
+    async fn fixture_shopping_mall_covers_home_catalog_and_order_flow() {
         run_on_localset(async {
             let ServerTestCase {
                 listen,
@@ -2236,6 +2236,14 @@ mod tests {
             )
             .await
             .expect("spawn");
+
+            let (home_status, home_ct, home_body) = send_request(addr, "GET", "/", None).await;
+            assert_eq!(home_status, 200);
+            assert_eq!(home_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let home_html = String::from_utf8(home_body).expect("home html");
+            assert!(home_html.contains("<h1>Miol Shop</h1>"));
+            assert!(home_html.contains("POST /payments"));
+            assert!(home_html.contains("POST /shipments"));
 
             let (health_status, _, health_body) = send_request(addr, "GET", "/health", None).await;
             assert_eq!(health_status, 200);

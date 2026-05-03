@@ -888,6 +888,7 @@ PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
 \n\
 ## Routes\n\
 \n\
+- `GET /`\n\
 - `GET /health`\n\
 - `POST /products`\n\
 - `GET /products`\n\
@@ -11447,6 +11448,8 @@ test "checkout failing runtime body" {
         let entry = dir.join("src").join("main.orv");
         let source = std::fs::read_to_string(&entry).expect("entry source");
         assert!(source.contains("@listen 8080"));
+        assert!(source.contains("@route GET / {\n"));
+        assert!(source.contains("@serve @html"));
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
@@ -11473,6 +11476,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(guide.contains("GET /"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
@@ -11491,6 +11495,7 @@ test "checkout failing runtime body" {
             read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
         let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
         for (method, path) in [
+            ("GET", "/"),
             ("POST", "/members"),
             ("POST", "/payments"),
             ("POST", "/shipments"),

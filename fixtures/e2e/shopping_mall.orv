@@ -13,6 +13,22 @@
     @respond 200 { ok: true, service: "shopping" }
   }
 
+  @route GET / {
+    @serve @html {
+      @body {
+        @h1 "Miol Shop"
+        @p "Catalog, member signup, payment capture, and shipment booking are ready."
+        @ul {
+          @li "POST /products"
+          @li "POST /members"
+          @li "POST /orders"
+          @li "POST /payments"
+          @li "POST /shipments"
+        }
+      }
+    }
+  }
+
   @route POST /products {
     let product = await @db.create("Product", @body)
     @respond 201 { product: product }
