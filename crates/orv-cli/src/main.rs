@@ -12142,6 +12142,14 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("WebAssembly.instantiate") {
         anyhow::bail!("client_js bundle does not instantiate wasm");
     }
+    if !source.contains("readInitialRender")
+        || !source.contains("orv_render_ptr")
+        || !source.contains("orv_render_len")
+        || !source.contains("TextDecoder")
+        || !source.contains("root.innerHTML")
+    {
+        anyhow::bail!("client_js bundle does not decode initial render from wasm");
+    }
     if !source.contains(CLIENT_WASM_START_EXPORT) {
         anyhow::bail!("client_js bundle does not call {CLIENT_WASM_START_EXPORT}");
     }
@@ -12202,8 +12210,52 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_wasm ORV metadata must include client_wasm runtime feature");
     }
+    let initial_render = metadata
+        .get("initial_render")
+        .ok_or_else(|| anyhow::anyhow!("client_wasm ORV metadata missing initial_render"))?;
+    if initial_render
+        .get("content_type")
+        .and_then(serde_json::Value::as_str)
+        != Some("text/html")
+    {
+        anyhow::bail!("client_wasm initial_render content_type is invalid");
+    }
+    if initial_render
+        .get("encoding")
+        .and_then(serde_json::Value::as_str)
+        != Some("utf-8")
+    {
+        anyhow::bail!("client_wasm initial_render encoding is invalid");
+    }
+    if initial_render
+        .get("html_hash")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        anyhow::bail!("client_wasm initial_render html_hash is required");
+    }
+    if initial_render
+        .get("ptr_export")
+        .and_then(serde_json::Value::as_str)
+        != Some(CLIENT_WASM_RENDER_PTR_EXPORT)
+        || initial_render
+            .get("len_export")
+            .and_then(serde_json::Value::as_str)
+            != Some(CLIENT_WASM_RENDER_LEN_EXPORT)
+        || initial_render
+            .get("memory_export")
+            .and_then(serde_json::Value::as_str)
+            != Some(CLIENT_WASM_MEMORY_EXPORT)
+    {
+        anyhow::bail!("client_wasm initial_render export metadata is invalid");
+    }
     if !client_wasm_exports_function(&bytes, CLIENT_WASM_START_EXPORT)? {
         anyhow::bail!("client_wasm bundle must export `{CLIENT_WASM_START_EXPORT}`");
+    }
+    if !client_wasm_exports_function(&bytes, CLIENT_WASM_RENDER_PTR_EXPORT)?
+        || !client_wasm_exports_function(&bytes, CLIENT_WASM_RENDER_LEN_EXPORT)?
+    {
+        anyhow::bail!("client_wasm bundle must export initial render pointer and length");
     }
     Ok(())
 }
@@ -14849,6 +14901,11 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let source_bundle_value = serde_json::to_value(&source_bundle)?;
     let source_bundle_hash = stable_json_hash(&source_bundle_value)?;
     write_json(&out.join("source-bundle.json"), &source_bundle_value)?;
+    let client_initial_render = if manifest.capabilities.client_wasm {
+        Some(render_static_page(&lowered)?)
+    } else {
+        None
+    };
     if let Some(server_artifact) = &server_artifact {
         write_json(
             &out.join(server_artifact_path),
@@ -14866,6 +14923,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let client_source_binding = ClientSourceBinding {
         source_bundle: &source_bundle,
         source_bundle_hash: &source_bundle_hash,
+        initial_render: client_initial_render.as_deref().unwrap_or(""),
     };
     let client_bundle_targets = ClientBundleTargets {
         page: client_page_path.as_deref(),
@@ -14917,10 +14975,11 @@ fn write_client_bundle_artifacts(
     let wasm_path = targets
         .wasm
         .ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
-    write_client_wasm_placeholder(
+    write_client_wasm_bundle(
         &out.join(wasm_path),
         binding.source_bundle,
         binding.source_bundle_hash,
+        binding.initial_render,
     )?;
     write_client_js_loader(
         &out.join(js_path),
@@ -14934,6 +14993,7 @@ fn write_client_bundle_artifacts(
 struct ClientSourceBinding<'a> {
     source_bundle: &'a orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &'a str,
+    initial_render: &'a str,
 }
 
 struct ClientBundleTargets<'a> {
@@ -15435,10 +15495,14 @@ const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
-fn write_client_wasm_placeholder(
+const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
+const CLIENT_WASM_RENDER_LEN_EXPORT: &str = "orv_render_len";
+const CLIENT_WASM_MEMORY_EXPORT: &str = "memory";
+fn write_client_wasm_bundle(
     path: &Path,
     source_bundle: &orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &str,
+    initial_render: &str,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -15446,20 +15510,24 @@ fn write_client_wasm_placeholder(
     }
     std::fs::write(
         path,
-        client_wasm_placeholder_bytes(source_bundle, source_bundle_hash),
+        client_wasm_bundle_bytes(source_bundle, source_bundle_hash, initial_render)?,
     )
     .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
 }
 
-fn client_wasm_placeholder_bytes(
+fn client_wasm_bundle_bytes(
     source_bundle: &orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &str,
-) -> Vec<u8> {
+    initial_render: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let render_bytes = initial_render.as_bytes();
+    let render_len = i32::try_from(render_bytes.len())
+        .map_err(|_| anyhow::anyhow!("client initial render exceeds wasm32 i32 length"))?;
     let mut bytes = WASM_MODULE_HEADER.to_vec();
     let mut custom_section = Vec::new();
     push_wasm_len(&mut custom_section, CLIENT_WASM_CUSTOM_SECTION_NAME.len());
     custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
-    let payload = client_wasm_metadata_json(source_bundle, source_bundle_hash);
+    let payload = client_wasm_metadata_json(source_bundle, source_bundle_hash, initial_render);
     custom_section.extend_from_slice(payload.as_bytes());
 
     bytes.push(0);
@@ -15467,37 +15535,75 @@ fn client_wasm_placeholder_bytes(
     bytes.extend(custom_section);
 
     let mut type_section = Vec::new();
-    push_wasm_u32_leb(&mut type_section, 1);
+    push_wasm_u32_leb(&mut type_section, 2);
     type_section.push(0x60);
     push_wasm_u32_leb(&mut type_section, 0);
     push_wasm_u32_leb(&mut type_section, 0);
+    type_section.push(0x60);
+    push_wasm_u32_leb(&mut type_section, 0);
+    push_wasm_u32_leb(&mut type_section, 1);
+    type_section.push(0x7f);
     push_wasm_section(&mut bytes, 1, &type_section);
 
     let mut function_section = Vec::new();
-    push_wasm_u32_leb(&mut function_section, 1);
+    push_wasm_u32_leb(&mut function_section, 3);
     push_wasm_u32_leb(&mut function_section, 0);
+    push_wasm_u32_leb(&mut function_section, 1);
+    push_wasm_u32_leb(&mut function_section, 1);
     push_wasm_section(&mut bytes, 3, &function_section);
 
+    let mut memory_section = Vec::new();
+    push_wasm_u32_leb(&mut memory_section, 1);
+    memory_section.push(0x00);
+    push_wasm_u32_leb(&mut memory_section, wasm_min_pages(render_bytes.len())?);
+    push_wasm_section(&mut bytes, 5, &memory_section);
+
     let mut export_section = Vec::new();
-    push_wasm_u32_leb(&mut export_section, 1);
+    push_wasm_u32_leb(&mut export_section, 4);
     push_wasm_len(&mut export_section, CLIENT_WASM_START_EXPORT.len());
     export_section.extend_from_slice(CLIENT_WASM_START_EXPORT.as_bytes());
     export_section.push(0);
     push_wasm_u32_leb(&mut export_section, 0);
+    push_wasm_len(&mut export_section, CLIENT_WASM_RENDER_PTR_EXPORT.len());
+    export_section.extend_from_slice(CLIENT_WASM_RENDER_PTR_EXPORT.as_bytes());
+    export_section.push(0);
+    push_wasm_u32_leb(&mut export_section, 1);
+    push_wasm_len(&mut export_section, CLIENT_WASM_RENDER_LEN_EXPORT.len());
+    export_section.extend_from_slice(CLIENT_WASM_RENDER_LEN_EXPORT.as_bytes());
+    export_section.push(0);
+    push_wasm_u32_leb(&mut export_section, 2);
+    push_wasm_len(&mut export_section, CLIENT_WASM_MEMORY_EXPORT.len());
+    export_section.extend_from_slice(CLIENT_WASM_MEMORY_EXPORT.as_bytes());
+    export_section.push(2);
+    push_wasm_u32_leb(&mut export_section, 0);
     push_wasm_section(&mut bytes, 7, &export_section);
 
     let mut code_section = Vec::new();
-    push_wasm_u32_leb(&mut code_section, 1);
+    push_wasm_u32_leb(&mut code_section, 3);
     push_wasm_u32_leb(&mut code_section, 2);
     push_wasm_u32_leb(&mut code_section, 0);
     code_section.push(0x0b);
+    push_wasm_const_i32_function(&mut code_section, 0);
+    push_wasm_const_i32_function(&mut code_section, render_len);
     push_wasm_section(&mut bytes, 10, &code_section);
-    bytes
+    if !render_bytes.is_empty() {
+        let mut data_section = Vec::new();
+        push_wasm_u32_leb(&mut data_section, 1);
+        data_section.push(0x00);
+        data_section.push(0x41);
+        push_wasm_u32_leb(&mut data_section, 0);
+        data_section.push(0x0b);
+        push_wasm_len(&mut data_section, render_bytes.len());
+        data_section.extend_from_slice(render_bytes);
+        push_wasm_section(&mut bytes, 11, &data_section);
+    }
+    Ok(bytes)
 }
 
 fn client_wasm_metadata_json(
     source_bundle: &orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &str,
+    initial_render: &str,
 ) -> String {
     serde_json::json!({
         "schema_version": 1,
@@ -15505,8 +15611,33 @@ fn client_wasm_metadata_json(
         "source_bundle": CLIENT_WASM_SOURCE_BUNDLE_PATH,
         "source_bundle_hash": source_bundle_hash,
         "entry": &source_bundle.entry,
+        "initial_render": {
+            "content_type": "text/html",
+            "encoding": "utf-8",
+            "html_hash": format!("{:016x}", fnv1a64(initial_render.as_bytes())),
+            "byte_length": initial_render.len(),
+            "ptr_export": CLIENT_WASM_RENDER_PTR_EXPORT,
+            "len_export": CLIENT_WASM_RENDER_LEN_EXPORT,
+            "memory_export": CLIENT_WASM_MEMORY_EXPORT,
+        },
     })
     .to_string()
+}
+
+fn wasm_min_pages(byte_len: usize) -> anyhow::Result<u32> {
+    let pages = byte_len.div_ceil(65_536).max(1);
+    u32::try_from(pages)
+        .map_err(|_| anyhow::anyhow!("client initial render exceeds wasm32 memory page count"))
+}
+
+fn push_wasm_const_i32_function(out: &mut Vec<u8>, value: i32) {
+    let mut body = Vec::new();
+    push_wasm_u32_leb(&mut body, 0);
+    body.push(0x41);
+    push_wasm_i32_leb(&mut body, value);
+    body.push(0x0b);
+    push_wasm_len(out, body.len());
+    out.extend(body);
 }
 
 fn push_wasm_section(out: &mut Vec<u8>, id: u8, section: &[u8]) {
@@ -15531,6 +15662,19 @@ fn push_wasm_u32_leb(out: &mut Vec<u8>, mut value: u32) {
         if value == 0 {
             break;
         }
+    }
+}
+
+fn push_wasm_i32_leb(out: &mut Vec<u8>, mut value: i32) {
+    loop {
+        let byte = (value as u8) & 0x7f;
+        value >>= 7;
+        let done = (value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0);
+        if done {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
     }
 }
 
@@ -15582,11 +15726,28 @@ async function loadSourceBundle() {
   return sourceBundle;
 }
 
+function readInitialRender(instance) {
+  const { memory, orv_render_ptr, orv_render_len } = instance.exports;
+  if (!(memory instanceof WebAssembly.Memory) || typeof orv_render_ptr !== "function" || typeof orv_render_len !== "function") {
+    return "";
+  }
+  const ptr = Number(orv_render_ptr());
+  const len = Number(orv_render_len());
+  if (!Number.isSafeInteger(ptr) || !Number.isSafeInteger(len) || ptr < 0 || len < 0) {
+    throw new Error("orv client render exports returned invalid bounds");
+  }
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+}
+
 async function main() {
   const sourceBundle = await loadSourceBundle();
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
   const { instance } = await WebAssembly.instantiate(bytes, {});
+  const initialRender = readInitialRender(instance);
+  if (root && initialRender) {
+    root.innerHTML = initialRender;
+  }
   if (typeof instance.exports.orv_start === "function") {
     instance.exports.orv_start();
   }
@@ -25417,6 +25578,21 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn client_wasm_i32_const_uses_signed_leb128_boundaries() {
+        let mut body = Vec::new();
+        push_wasm_const_i32_function(&mut body, 64);
+        assert_eq!(body, [0x05, 0x00, 0x41, 0xc0, 0x00, 0x0b]);
+
+        body.clear();
+        push_wasm_const_i32_function(&mut body, 127);
+        assert_eq!(body, [0x05, 0x00, 0x41, 0xff, 0x00, 0x0b]);
+
+        body.clear();
+        push_wasm_const_i32_function(&mut body, 128);
+        assert_eq!(body, [0x05, 0x00, 0x41, 0x80, 0x01, 0x0b]);
+    }
+
+    #[test]
     fn build_writes_client_wasm_for_signal_html_entry() {
         let out = temp_output_dir("build-client-wasm");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -25478,6 +25654,19 @@ models = { path = "../../shared/models", version = "2.0.0" }
             wasm_metadata["source_bundle_hash"],
             expected_source_bundle_hash
         );
+        assert_eq!(wasm_metadata["initial_render"]["content_type"], "text/html");
+        assert_eq!(wasm_metadata["initial_render"]["encoding"], "utf-8");
+        assert!(wasm_metadata["initial_render"]["html_hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()));
+        assert!(
+            client_wasm_exports_function(&wasm, "orv_render_ptr").expect("render ptr export"),
+            "client wasm must export render pointer"
+        );
+        assert!(
+            client_wasm_exports_function(&wasm, "orv_render_len").expect("render len export"),
+            "client wasm must export render length"
+        );
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
         assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
@@ -25491,6 +25680,10 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(loader.contains("runtimeFeatures"));
         assert!(loader.contains("WebAssembly.instantiate"));
         assert!(loader.contains("orv_start"));
+        assert!(loader.contains("orv_render_ptr"));
+        assert!(loader.contains("orv_render_len"));
+        assert!(loader.contains("TextDecoder"));
+        assert!(loader.contains("root.innerHTML"));
         assert!(loader.contains("app.wasm"));
         let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
             .expect("client page");
