@@ -12261,21 +12261,34 @@ fn fetch_dependency_package(
     let source = json_str(dependency, "source", "lock dependency")?;
     let version = json_str(dependency, "version", "lock dependency")?;
     let checksum = json_str(dependency, "checksum", "lock dependency")?;
-    let package_root = match source {
-        "path" => path_dependency_project_root(root, dependency)?,
-        "registry" => registry_dependency_project_root(root, dependency)?,
+    let fetched = match source {
+        "path" => FetchedDependency::ProjectRoot(path_dependency_project_root(root, dependency)?),
+        "registry" => registry_dependency_source(root, dependency)?,
         other => anyhow::bail!("unsupported dependency source `{other}`"),
     };
-    let entry = project_entry_path(&package_root)?;
-    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
-    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
-    let source_bundle = orv_compiler::source_bundle_artifact(
-        entry.display().to_string(),
-        loaded
-            .files
-            .iter()
-            .map(|file| (file.path.display().to_string(), file.source.clone())),
-    );
+    let resolved_url;
+    let resolved_path;
+    let source_bundle = match fetched {
+        FetchedDependency::ProjectRoot(package_root) => {
+            let entry = project_entry_path(&package_root)?;
+            let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+            report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+            resolved_path = Some(package_root.display().to_string());
+            resolved_url = None;
+            orv_compiler::source_bundle_artifact(
+                entry.display().to_string(),
+                loaded
+                    .files
+                    .iter()
+                    .map(|file| (file.path.display().to_string(), file.source.clone())),
+            )
+        }
+        FetchedDependency::SourceBundle { url, artifact } => {
+            resolved_path = None;
+            resolved_url = Some(url);
+            artifact
+        }
+    };
     orv_compiler::verify_source_bundle_artifact(&source_bundle)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
     let package_dir = format!(
@@ -12288,6 +12301,8 @@ fn fetch_dependency_package(
         &out.join(&source_bundle_path),
         &serde_json::to_value(&source_bundle)?,
     )?;
+    let source_entry = source_bundle.entry.clone();
+    let source_file_count = source_bundle.files.len();
 
     let mut package = serde_json::json!({
         "name": name,
@@ -12295,12 +12310,17 @@ fn fetch_dependency_package(
         "source": source,
         "version": version,
         "checksum": checksum,
-        "resolved_path": package_root.display().to_string(),
-        "entry": entry.display().to_string(),
+        "entry": source_entry,
         "source_bundle": source_bundle_path,
-        "source_file_count": loaded.files.len(),
+        "source_file_count": source_file_count,
         "verified": true,
     });
+    if let Some(path) = resolved_path {
+        package["resolved_path"] = serde_json::json!(path);
+    }
+    if let Some(url) = resolved_url {
+        package["resolved_url"] = serde_json::json!(url);
+    }
     if source == "path" {
         package["path"] = serde_json::json!(json_str(dependency, "path", "path dependency")?);
     } else {
@@ -12322,18 +12342,35 @@ fn path_dependency_project_root(
     }
 }
 
-fn registry_dependency_project_root(
+enum FetchedDependency {
+    ProjectRoot(PathBuf),
+    SourceBundle {
+        url: String,
+        artifact: orv_compiler::SourceBundleArtifact,
+    },
+}
+
+fn registry_dependency_source(
     root: &Path,
     dependency: &serde_json::Value,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<FetchedDependency> {
     let registry = json_str(dependency, "registry", "registry dependency")?;
-    if registry == "registry.orv.dev"
-        || registry.starts_with("http://")
-        || registry.starts_with("https://")
-    {
+    if registry.starts_with("https://") {
         anyhow::bail!(
-            "remote registry download is not implemented yet; use a file:// or relative registry path"
+            "https registry download is not implemented yet; use http:// or file:// registry paths"
         );
+    }
+    if registry.starts_with("http://") {
+        let url = registry_source_bundle_url(
+            registry,
+            json_str(dependency, "name", "registry dependency")?,
+            json_str(dependency, "version", "registry dependency")?,
+        );
+        let artifact = download_http_source_bundle(&url)?;
+        return Ok(FetchedDependency::SourceBundle { url, artifact });
+    }
+    if registry == "registry.orv.dev" {
+        anyhow::bail!("remote registry download requires an explicit http:// or file:// registry");
     }
     let registry_root = registry.strip_prefix("file://").map_or_else(
         || {
@@ -12346,9 +12383,84 @@ fn registry_dependency_project_root(
         },
         PathBuf::from,
     );
-    Ok(registry_root
-        .join(json_str(dependency, "name", "registry dependency")?)
-        .join(json_str(dependency, "version", "registry dependency")?))
+    Ok(FetchedDependency::ProjectRoot(
+        registry_root
+            .join(json_str(dependency, "name", "registry dependency")?)
+            .join(json_str(dependency, "version", "registry dependency")?),
+    ))
+}
+
+fn registry_source_bundle_url(registry: &str, name: &str, version: &str) -> String {
+    format!(
+        "{}/{}/{}/source-bundle.json",
+        registry.trim_end_matches('/'),
+        name,
+        version
+    )
+}
+
+fn download_http_source_bundle(url: &str) -> anyhow::Result<orv_compiler::SourceBundleArtifact> {
+    let body = http_get_string(url)?;
+    let artifact: orv_compiler::SourceBundleArtifact = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("failed to parse registry source bundle {url}: {e}"))?;
+    orv_compiler::verify_source_bundle_artifact(&artifact)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    Ok(artifact)
+}
+
+fn http_get_string(url: &str) -> anyhow::Result<String> {
+    let (host, port, path) = parse_http_url(url)?;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| anyhow::anyhow!("failed to connect to registry {host}:{port}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| anyhow::anyhow!("failed to configure registry read timeout: {e}"))?;
+    std::io::Write::write_all(
+        &mut stream,
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to send registry request {url}: {e}"))?;
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response)
+        .map_err(|e| anyhow::anyhow!("failed to read registry response {url}: {e}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("registry response missing HTTP header terminator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|e| anyhow::anyhow!("registry response headers are not UTF-8: {e}"))?;
+    let status = headers.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 200") && !status.starts_with("HTTP/1.0 200") {
+        anyhow::bail!("registry request {url} failed with {status}");
+    }
+    String::from_utf8(response[header_end + 4..].to_vec())
+        .map_err(|e| anyhow::anyhow!("registry response body is not UTF-8: {e}"))
+}
+
+fn parse_http_url(url: &str) -> anyhow::Result<(String, u16, String)> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        anyhow::bail!("registry URL must start with http://");
+    };
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, "/"), |(authority, path)| {
+            (authority, path.strip_prefix('/').unwrap_or(path))
+        });
+    if authority.is_empty() {
+        anyhow::bail!("registry URL host must not be empty");
+    }
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        let port = port
+            .parse::<u16>()
+            .map_err(|e| anyhow::anyhow!("registry URL port must be a u16: {e}"))?;
+        (host.to_string(), port)
+    } else {
+        (authority.to_string(), 80)
+    };
+    if host.is_empty() {
+        anyhow::bail!("registry URL host must not be empty");
+    }
+    Ok((host, port, format!("/{}", path.trim_start_matches('/'))))
 }
 
 fn dependency_cache_component(value: &str) -> String {
@@ -14454,6 +14566,37 @@ entry = "src/main.orv"
         let mut response = String::new();
         std::io::Read::read_to_string(&mut stream, &mut response)?;
         Ok(response)
+    }
+
+    fn spawn_one_shot_http_json(path: &'static str, body: Vec<u8>) -> (String, JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind registry");
+        let addr = listener.local_addr().expect("registry address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept registry request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") && request.len() < 4096 {
+                let read =
+                    std::io::Read::read(&mut stream, &mut buffer).expect("read registry request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1")),
+                "{request}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes())
+                .expect("write registry response head");
+            std::io::Write::write_all(&mut stream, &body).expect("write registry response body");
+        });
+        (format!("http://{addr}"), handle)
     }
 
     fn dap_test_request(
@@ -22363,6 +22506,51 @@ entry = "src/main.orv"
             .expect("auth source bundle");
         read_source_bundle_artifact(&out.join("packages/dependencies/ui/source-bundle.json"))
             .expect("ui source bundle");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fetch_downloads_dependency_source_bundle_from_http_registry() {
+        let dir = temp_output_dir("project-fetch-http");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::write(dir.join("src/main.orv"), "@out \"fetch-http\"\n").expect("write entry");
+        let bundle = orv_compiler::source_bundle_artifact(
+            "registry/auth/1.2.3/src/main.orv",
+            [(
+                "registry/auth/1.2.3/src/main.orv",
+                r#"@out @html { @body { @p "Auth" } }"#,
+            )],
+        );
+        let body = serde_json::to_vec_pretty(&serde_json::to_value(&bundle).expect("bundle json"))
+            .expect("bundle bytes");
+        let (registry, handle) = spawn_one_shot_http_json("/auth/1.2.3/source-bundle.json", body);
+        std::fs::write(
+            dir.join("orv.toml"),
+            format!(
+                "[project]\nname = \"shop\"\nversion = \"0.1.0\"\nentry = \"src/main.orv\"\n\n[dependencies]\nauth = {{ version = \"1.2.3\", registry = \"{registry}\" }}\n"
+            ),
+        )
+        .expect("write manifest");
+        cmd_lock(&dir, false).expect("write lock");
+
+        let out = dir.join("target/orv-deps");
+        cmd_fetch(&dir, &out).expect("fetch dependencies");
+        handle.join().expect("registry served request");
+
+        let manifest = read_json_value(&out.join("deps-manifest.json")).expect("read manifest");
+        assert!(manifest["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .any(|package| package["name"] == "auth"
+                && package["source"] == "registry"
+                && package["resolved_url"] == format!("{registry}/auth/1.2.3/source-bundle.json")
+                && package["source_bundle"] == "packages/dependencies/auth/source-bundle.json"));
+        let downloaded =
+            read_source_bundle_artifact(&out.join("packages/dependencies/auth/source-bundle.json"))
+                .expect("downloaded source bundle");
+        assert_eq!(downloaded.entry, "registry/auth/1.2.3/src/main.orv");
 
         let _ = std::fs::remove_dir_all(dir);
     }

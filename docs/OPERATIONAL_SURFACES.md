@@ -32,7 +32,7 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 
 `orv lock [dir-or-orv.toml]` reads `[project]`, `[dependencies]`, and `[dev-dependencies]` from `orv.toml`, writes deterministic JSON `orv.lock` entries sorted by package name, preserves registry/path sources, and adds stable `fnv1a64` checksums. `--check` compares the existing lockfile without writing.
 
-`orv fetch [dir-or-orv.toml] --out <dir>` verifies that `orv.lock` matches `orv.toml`, materializes path dependencies and local/file registry dependencies into source-bundle cache artifacts, and writes `deps-manifest.json`. Remote registry download remains explicit roadmap work.
+`orv fetch [dir-or-orv.toml] --out <dir>` verifies that `orv.lock` matches `orv.toml`, materializes path dependencies, local/file registry dependencies, and HTTP registry `/<package>/<version>/source-bundle.json` artifacts into source-bundle cache artifacts, and writes `deps-manifest.json`. HTTPS/TLS registry transport and full semver registry resolution remain explicit roadmap work.
 
 `orv add <pkg> <version> [--dev] [--path <path>] [--registry <url>] [--manifest <dir-or-orv.toml>]` edits the selected dependency section and regenerates `orv.lock`; `orv remove <pkg> [--dev] [--manifest <dir-or-orv.toml>]` removes from the selected section and regenerates the lockfile.
 
