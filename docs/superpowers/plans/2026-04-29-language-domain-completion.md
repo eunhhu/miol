@@ -62,6 +62,8 @@
 
 **Editor trace summary delta (2026-05-03):** `orv editor trace` now adds per-frame request labels, route/status classes, aggregate status buckets, and a trace-file-hash live refresh contract so the exported editor shell can render captured traffic without recomputing request summaries in UI code. The exported shell also renders status buckets and client-side trace filters for all/2xx/3xx/4xx/5xx/other traffic.
 
+**Editor runtime frame inspector delta (2026-05-03):** `orv editor export` now renders runtime frame counts, selectable runtime frame rows, and a selected-frame detail pane sourced from the same DAP runtime frame JSON used by `orv editor runtime`, including source line, locals, call stack, and per-frame output.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure

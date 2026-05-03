@@ -22,7 +22,7 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 
 ## Editor And LSP
 
-`orv editor snapshot <file>` emits first-party editor bootstrap JSON with diagnostics, ProjectGraph, Files/Routes/Schema/Domains panel inputs, and source-hash watch sources. `orv editor reveal <dir> <origin-id>` maps build artifact origins to editor focus/source/production navigation payloads. `orv editor runtime <file>` reuses DAP trace/runtime helpers for runtime inspection pane JSON. `orv editor export <file> --out <dir>` writes `state.json` plus a static `index.html` shell. `orv editor trace <dir> --trace <trace.json>` maps captured request frames back to source/production navigation.
+`orv editor snapshot <file>` emits first-party editor bootstrap JSON with diagnostics, ProjectGraph, Files/Routes/Schema/Domains panel inputs, and source-hash watch sources. `orv editor reveal <dir> <origin-id>` maps build artifact origins to editor focus/source/production navigation payloads. `orv editor runtime <file>` reuses DAP trace/runtime helpers for runtime inspection pane JSON. `orv editor export <file> --out <dir>` writes `state.json` plus a static `index.html` shell with panel lists, runtime frame inspection, and optional trace navigation. `orv editor trace <dir> --trace <trace.json>` maps captured request frames back to source/production navigation.
 
 `orv lsp serve --stdio` currently handles:
 

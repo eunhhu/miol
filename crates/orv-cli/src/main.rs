@@ -2350,6 +2350,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let schema_count = json_array_count(state.pointer("/snapshot/panels/schema"));
     let domain_count = json_array_count(state.pointer("/snapshot/panels/domains"));
     let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
+    let runtime_frame_count = json_array_count(state.pointer("/runtime/frames"));
     let trace_count = json_array_count(state.pointer("/trace/frames"));
     let trace_status_counts = editor_trace_status_counts_from_state(state);
     let runtime_status = state
@@ -2378,6 +2379,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(&mut html, "<span>Routes<b>{route_count}</b></span>")?;
     write!(&mut html, "<span>Schema<b>{schema_count}</b></span>")?;
     write!(&mut html, "<span>Domains<b>{domain_count}</b></span>")?;
+    write!(
+        &mut html,
+        "<span>Runtime Frames<b>{runtime_frame_count}</b></span>"
+    )?;
     write!(&mut html, "<span>Trace<b>{trace_count}</b></span>")?;
     html.push_str("</nav></aside>\n");
     html.push_str("<header class=\"topbar\">");
@@ -2412,13 +2417,19 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         html_escape_text(runtime_status),
         html_escape_text(stdout)
     )?;
-    html.push_str("</section>\n</section>\n");
+    html.push_str("</section>\n");
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Runtime Frames</h2><div class=\"metric\">{runtime_frame_count}</div><ul id=\"runtime-frame-list\" class=\"list\"></ul></section>"
+    )?;
+    html.push_str("<section class=\"panel\"><h2>Selected Runtime</h2><pre id=\"runtime-frame-detail\" class=\"detail\"></pre></section>");
+    html.push_str("</section>\n");
     html.push_str("</main>\n");
     html.push_str("<script id=\"orv-editor-state\" type=\"application/json\">");
     html.push_str(&state_json);
     html.push_str("</script>\n");
     html.push_str(
-        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
+        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
     );
     Ok(html)
 }
@@ -20633,6 +20644,38 @@ define Auth() -> { @out "auth" }
             state["runtime"]["runtime"]["stdout"],
             "editor-export-ready\n"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_renders_runtime_frame_inspector() {
+        let dir = temp_output_dir("editor-export-runtime-frames");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let total: int = 41\nlet next: int = total + 1\n@out next\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+
+        cmd_editor_export(&path, &out).expect("editor export");
+
+        let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let state = read_json_value(&out.join("state.json")).expect("editor state");
+        assert!(html.contains("id=\"runtime-frame-list\""));
+        assert!(html.contains("id=\"runtime-frame-detail\""));
+        assert!(html.contains("renderRuntimeDetail"));
+        assert!(html.contains("Runtime Frames"));
+        let frames = state["runtime"]["frames"]
+            .as_array()
+            .expect("runtime frames");
+        assert!(!frames.is_empty());
+        assert!(frames.iter().any(|frame| {
+            frame["locals"]
+                .as_array()
+                .is_some_and(|locals| locals.iter().any(|local| local["name"] == "next"))
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
