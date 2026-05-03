@@ -305,6 +305,15 @@ enum WorkspaceCommand {
         #[arg(long, short = 'o', default_value = "target/orv-workspace-lock")]
         out: PathBuf,
     },
+    /// Workspace member dependency cache들을 한 디렉터리 아래 생성한다.
+    Fetch {
+        /// workspace root 디렉터리.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// workspace dependency artifact 출력 디렉터리.
+        #[arg(long, short = 'o', default_value = "target/orv-workspace-deps")]
+        out: PathBuf,
+    },
     /// Workspace member build artifact들을 한 디렉터리 아래 생성한다.
     Build {
         /// workspace root 디렉터리.
@@ -722,6 +731,13 @@ fn main() -> ExitCode {
                 }
             }
             WorkspaceCommand::Lock { root, out } => match cmd_workspace_lock(&root, &out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            WorkspaceCommand::Fetch { root, out } => match cmd_workspace_fetch(&root, &out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1391,6 +1407,87 @@ fn cmd_workspace_lock(root: &Path, out: &Path) -> anyhow::Result<()> {
     });
     write_json(&out.join("workspace-lock.json"), &manifest)?;
     println!("workspace lock: wrote {}", out.display());
+    Ok(())
+}
+
+fn cmd_workspace_fetch(root: &Path, out: &Path) -> anyhow::Result<()> {
+    cmd_workspace_lock(root, out)?;
+    let workspace_lock = read_json_value(&out.join("workspace-lock.json"))?;
+    let lock_order = workspace_lock
+        .get("lock_order")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace-lock.json lock_order must be an array"))?
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("workspace lock_order entries must be strings"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let members = workspace_lock
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace-lock.json members must be an array"))?;
+    let member_lookup = members
+        .iter()
+        .map(|member| {
+            Ok((
+                json_str(member, "path", "workspace lock member")?.to_string(),
+                member,
+            ))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
+    let mut member_fetches = Vec::with_capacity(lock_order.len());
+    let mut package_count = 0usize;
+    for member_path in &lock_order {
+        let member = member_lookup
+            .get(member_path)
+            .ok_or_else(|| anyhow::anyhow!("workspace fetch member `{member_path}` not found"))?;
+        let member_path = workspace_member_string(Path::new(json_str(
+            member,
+            "path",
+            "workspace lock member",
+        )?))?;
+        let lockfile = json_str(member, "lockfile", "workspace lock member")?;
+        let lock = read_json_value(&out.join(lockfile))?;
+        let deps_dir = format!("members/{member_path}/deps");
+        let deps_manifest = fetch_lock_dependencies(
+            &root.join(&member_path),
+            &out.join(&deps_dir),
+            &lock,
+            "orv.lock",
+        )?;
+        let member_package_count = deps_manifest["stats"]["package_count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default();
+        package_count += member_package_count;
+        member_fetches.push(serde_json::json!({
+            "path": member_path,
+            "lockfile": lockfile,
+            "deps_manifest": format!("{deps_dir}/deps-manifest.json"),
+            "package_count": member_package_count,
+            "packages": deps_manifest.get("packages").cloned().unwrap_or_else(|| serde_json::json!([])),
+        }));
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.workspace.dependencies",
+        "root": root.display().to_string(),
+        "workspace_graph": "workspace-graph.json",
+        "workspace_lock": "workspace-lock.json",
+        "stats": {
+            "member_count": member_fetches.len(),
+            "package_count": package_count,
+        },
+        "fetch_order": lock_order,
+        "members": member_fetches,
+    });
+    write_json(&out.join("workspace-fetch.json"), &manifest)?;
+    println!("workspace fetch: wrote {}", out.display());
     Ok(())
 }
 
@@ -12666,6 +12763,17 @@ fn cmd_fetch(path: &Path, out: &Path) -> anyhow::Result<()> {
         anyhow::bail!("orv.lock is out of date; run `orv lock` before `orv fetch`");
     }
 
+    fetch_lock_dependencies(root, out, &lock, "orv.lock")?;
+    println!("fetch: wrote {}", out.display());
+    Ok(())
+}
+
+fn fetch_lock_dependencies(
+    root: &Path,
+    out: &Path,
+    lock: &serde_json::Value,
+    lockfile: &str,
+) -> anyhow::Result<serde_json::Value> {
     let mut packages = Vec::new();
     for key in ["dependencies", "dev_dependencies"] {
         let entries = lock
@@ -12681,15 +12789,14 @@ fn cmd_fetch(path: &Path, out: &Path) -> anyhow::Result<()> {
         "schema_version": 1,
         "kind": "orv.dependencies",
         "root": root.display().to_string(),
-        "lockfile": "orv.lock",
+        "lockfile": lockfile,
         "stats": {
             "package_count": packages.len(),
         },
         "packages": packages,
     });
     write_json(&out.join("deps-manifest.json"), &manifest)?;
-    println!("fetch: wrote {}", out.display());
-    Ok(())
+    Ok(manifest)
 }
 
 fn fetch_dependency_package(
@@ -22231,6 +22338,27 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn workspace_fetch_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "workspace",
+            "fetch",
+            "demo",
+            "--out",
+            "target/orv-workspace-deps",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Workspace { command } = parsed.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Fetch { root, out } = command else {
+            panic!("expected workspace fetch command");
+        };
+        assert_eq!(root, PathBuf::from("demo"));
+        assert_eq!(out, PathBuf::from("target/orv-workspace-deps"));
+    }
+
+    #[test]
     fn workspace_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -23704,6 +23832,44 @@ entry = "src/main.orv"
                 && member["lockfile"] == "members/apps/web/orv.lock"
                 && member["dependencies"][0]["source"] == "path"
                 && member["dependencies"][0]["path"] == "../../shared/models"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_fetch_writes_member_dependency_caches() {
+        let root = workspace_build_fixture("workspace-fetch");
+        let out = root.join("target/orv-workspace-fetch");
+        cmd_workspace_fetch(&root, &out).expect("workspace fetch");
+
+        assert!(out.join("workspace-graph.json").is_file());
+        assert!(out.join("workspace-lock.json").is_file());
+        assert!(out.join("workspace-fetch.json").is_file());
+        assert!(out
+            .join("members/apps/web/deps/deps-manifest.json")
+            .is_file());
+        assert!(out
+            .join("members/apps/web/deps/packages/dependencies/models/source-bundle.json")
+            .is_file());
+        assert!(out
+            .join("members/shared/models/deps/deps-manifest.json")
+            .is_file());
+        let manifest = read_json_value(&out.join("workspace-fetch.json")).expect("read fetch");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["kind"], "orv.workspace.dependencies");
+        assert_eq!(manifest["stats"]["member_count"], 2);
+        assert_eq!(manifest["stats"]["package_count"], 1);
+        assert_eq!(
+            manifest["fetch_order"],
+            serde_json::json!(["shared/models", "apps/web"])
+        );
+        assert!(manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .any(|member| member["path"] == "apps/web"
+                && member["deps_manifest"] == "members/apps/web/deps/deps-manifest.json"
+                && member["package_count"] == 1));
 
         let _ = std::fs::remove_dir_all(root);
     }
