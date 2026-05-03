@@ -3662,6 +3662,7 @@ impl DapSession {
                     "supportsPauseRequest": true,
                     "supportsCancelRequest": true,
                     "supportsInstructionBreakpoints": true,
+                    "supportsDisassembleRequest": true,
                     "supportsOrvRuntimeAttach": true,
                     "supportsOrvRuntimeTracePath": true,
                     "exceptionBreakpointFilters": [
@@ -3709,6 +3710,7 @@ impl DapSession {
             "loadedSources" => self.loaded_sources_result(),
             "modules" => self.modules_result(request),
             "source" => self.source_result(request),
+            "disassemble" => self.disassemble_result(request),
             "continue" => self.continue_result(request),
             "reverseContinue" => self.reverse_continue_result(request),
             "goto" => self.goto_result(request),
@@ -4043,6 +4045,38 @@ impl DapSession {
         Ok(serde_json::json!({
             "content": content,
             "mimeType": "text/x-orv",
+        }))
+    }
+
+    fn disassemble_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before disassemble"))?;
+        let memory_reference = request
+            .pointer("/arguments/memoryReference")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("disassemble.arguments.memoryReference is required"))?;
+        let instruction_offset = request
+            .pointer("/arguments/instructionOffset")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let start = dap_disassemble_start_index(memory_reference, instruction_offset)?;
+        let available = launched.frames.len().saturating_sub(start);
+        let instruction_count = request
+            .pointer("/arguments/instructionCount")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(available);
+        Ok(serde_json::json!({
+            "instructions": launched
+                .frames
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(instruction_count)
+                .map(|(index, frame)| dap_disassembled_instruction_json(index, frame))
+                .collect::<Vec<_>>(),
         }))
     }
 
@@ -6143,6 +6177,51 @@ fn dap_stack_frame_json(
             "uri": source_uri,
         },
         "line": line,
+        "column": 1,
+    })
+}
+
+fn dap_disassemble_start_index(
+    memory_reference: &str,
+    instruction_offset: i64,
+) -> anyhow::Result<usize> {
+    let frame = memory_reference
+        .strip_prefix("orv:frame:")
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported ORV disassemble memoryReference `{memory_reference}`")
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            anyhow::anyhow!("invalid ORV disassemble memoryReference `{memory_reference}`")
+        })?;
+    if frame == 0 {
+        anyhow::bail!("invalid ORV disassemble memoryReference `{memory_reference}`");
+    }
+    let base = frame - 1;
+    if instruction_offset < 0 {
+        Ok(base.saturating_sub(
+            usize::try_from(instruction_offset.saturating_abs()).unwrap_or(usize::MAX),
+        ))
+    } else {
+        Ok(base.saturating_add(usize::try_from(instruction_offset).unwrap_or(usize::MAX)))
+    }
+}
+
+fn dap_disassembled_instruction_json(index: usize, frame: &DapFrameState) -> serde_json::Value {
+    let name = frame
+        .stack
+        .last()
+        .map_or("orv entry", |stack| stack.name.as_str());
+    serde_json::json!({
+        "address": format!("orv:frame:{}", index.saturating_add(1)),
+        "instruction": format!("{name} line {}", frame.line),
+        "location": {
+            "name": frame.source.name,
+            "path": frame.source.path.display().to_string(),
+            "sourceReference": 0,
+            "uri": frame.source.uri,
+        },
+        "line": frame.line,
         "column": 1,
     })
 }
@@ -11936,6 +12015,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsPauseRequest"], true);
         assert_eq!(response["body"]["supportsCancelRequest"], true);
         assert_eq!(response["body"]["supportsInstructionBreakpoints"], true);
+        assert_eq!(response["body"]["supportsDisassembleRequest"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
     }
@@ -11986,6 +12066,59 @@ function greet(user: User): string -> "hello"
             breakpoint["message"],
             "ORV runtime has source frames, not stable instruction addresses"
         );
+    }
+
+    #[test]
+    fn dap_disassemble_returns_source_frame_pseudo_instructions() {
+        let dir = temp_output_dir("dap-disassemble");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 78,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 79,
+                "type": "request",
+                "command": "disassemble",
+                "arguments": {
+                    "memoryReference": "orv:frame:1",
+                    "instructionOffset": 0,
+                    "instructionCount": 2,
+                },
+            }))
+            .expect("disassemble response");
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 79);
+        assert_eq!(response["command"], "disassemble");
+        assert_eq!(response["success"], true, "{response}");
+        let instructions = response["body"]["instructions"]
+            .as_array()
+            .expect("instructions");
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0]["address"], "orv:frame:1");
+        assert_eq!(instructions[0]["instruction"], "orv entry line 1");
+        assert_eq!(
+            instructions[0]["location"]["path"],
+            canonical_source.display().to_string()
+        );
+        assert_eq!(instructions[0]["line"], 1);
+        assert_eq!(instructions[1]["address"], "orv:frame:2");
+        assert_eq!(instructions[1]["instruction"], "orv entry line 2");
+        assert_eq!(instructions[1]["line"], 2);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
