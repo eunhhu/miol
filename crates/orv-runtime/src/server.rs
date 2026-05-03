@@ -37,8 +37,8 @@ use tokio::net::TcpListener;
 
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
-    eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env, RequestCtx,
-    ResponseCtx, RuntimeError, Value,
+    eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env,
+    run_with_writer_in_env_with_db, RequestCtx, ResponseCtx, RuntimeError, Value,
 };
 
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
@@ -140,8 +140,9 @@ pub(crate) fn run_server(
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
+    db: DbHandle,
 ) -> Result<Value, RuntimeError> {
-    run_server_with_request_trace_path(listen, routes, body_stmts, captured_env, None)
+    run_server_with_request_trace_path(listen, routes, body_stmts, captured_env, db, None)
 }
 
 pub(crate) fn run_server_with_request_trace_path(
@@ -149,11 +150,19 @@ pub(crate) fn run_server_with_request_trace_path(
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
+    db: DbHandle,
     request_trace_path: Option<std::path::PathBuf>,
 ) -> Result<Value, RuntimeError> {
     let mut stdout = std::io::stdout().lock();
-    let (port, entries, captured_env) =
-        prepare_server_state(listen, routes, body_stmts, captured_env, &mut stdout, false)?;
+    let (port, entries, captured_env, db) = prepare_server_state(
+        listen,
+        routes,
+        body_stmts,
+        captured_env,
+        db,
+        &mut stdout,
+        false,
+    )?;
 
     // 4) tokio current_thread 런타임 생성. 전용 런타임이라 스레드 이동 제약이
     //    없고, `!Send` HIR 값(Rc 기반 Value)도 요청 핸들러 안에서 그대로 사용
@@ -179,6 +188,7 @@ pub(crate) fn run_server_with_request_trace_path(
             listener,
             LocalRoutes::new(entries),
             LocalCapturedEnv::new(captured_env),
+            db,
             None,
             request_trace_path,
             shutdown_signal(),
@@ -292,7 +302,7 @@ fn run_attached_server_thread(
     startup: &mpsc::SyncSender<AttachedStartup>,
 ) -> Result<(), String> {
     let mut boot_output = Vec::new();
-    let (port, entries, captured_env) =
+    let (port, entries, captured_env, db) =
         attached_server_state(program, &mut boot_output).map_err(|e| e.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -319,6 +329,7 @@ fn run_attached_server_thread(
             listener,
             LocalRoutes::new(entries),
             LocalCapturedEnv::new(captured_env),
+            db,
             Some(request_frames),
             async move {
                 let _ = shutdown_rx.await;
@@ -365,6 +376,7 @@ fn attached_server_state<W: std::io::Write>(
         routes,
         body_stmts,
         captured_env,
+        new_db_handle(),
         boot_writer,
         true,
     )
@@ -419,11 +431,12 @@ where
     S: std::future::Future<Output = ()> + 'static,
 {
     let mut boot_buf: Vec<u8> = Vec::new();
-    let (port, entries, captured_env) = prepare_server_state(
+    let (port, entries, captured_env, db) = prepare_server_state(
         listen,
         routes,
         body_stmts,
         captured_env,
+        new_db_handle(),
         &mut boot_buf,
         true,
     )?;
@@ -437,7 +450,7 @@ where
     let table = LocalRoutes::new(entries);
     let captured_env = LocalCapturedEnv::new(captured_env);
     let handle = tokio::task::spawn_local(async move {
-        let _ = serve_loop(listener, table, captured_env, None, shutdown).await;
+        let _ = serve_loop(listener, table, captured_env, db, None, shutdown).await;
     });
     Ok((addr, handle, boot_buf))
 }
@@ -456,11 +469,12 @@ where
     S: std::future::Future<Output = ()> + 'static,
 {
     let mut boot_buf: Vec<u8> = Vec::new();
-    let (port, entries, captured_env) = prepare_server_state(
+    let (port, entries, captured_env, db) = prepare_server_state(
         listen,
         routes,
         body_stmts,
         captured_env,
+        new_db_handle(),
         &mut boot_buf,
         true,
     )?;
@@ -478,6 +492,7 @@ where
             listener,
             table,
             captured_env,
+            db,
             None,
             Some(request_trace_path),
             shutdown,
@@ -487,14 +502,15 @@ where
     Ok((addr, handle, boot_buf))
 }
 
-/// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 환경)`.
-type PreparedServerState = (u16, Vec<RouteEntry>, HashMap<NameId, Value>);
+/// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 환경, 공유 DB)`.
+type PreparedServerState = (u16, Vec<RouteEntry>, HashMap<NameId, Value>, DbHandle);
 
 fn prepare_server_state<W: std::io::Write>(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
+    db: DbHandle,
     boot_writer: &mut W,
     allow_ephemeral_port: bool,
 ) -> Result<PreparedServerState, RuntimeError> {
@@ -509,7 +525,7 @@ fn prepare_server_state<W: std::io::Write>(
             items: body_stmts.to_vec(),
             span: body_stmts[0].span(),
         };
-        run_with_writer_in_env(&boot_program, captured_env, boot_writer)?
+        run_with_writer_in_env_with_db(&boot_program, captured_env, db.clone(), boot_writer)?
     };
 
     // 2) listen 포트 결정. 운영 경로는 @listen 없으면 에러, 테스트 경로는 `0`
@@ -520,7 +536,7 @@ fn prepare_server_state<W: std::io::Write>(
     //    variant 만 넣기로 계약했으므로 그 외는 에러.
     let entries = collect_routes(routes)?;
 
-    Ok((port, entries, captured_env))
+    Ok((port, entries, captured_env, db))
 }
 
 fn resolve_listen_port(
@@ -598,16 +614,16 @@ async fn serve_loop<S>(
     listener: TcpListener,
     routes: LocalRoutes,
     captured_env: LocalCapturedEnv,
+    db: DbHandle,
     request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
     S: std::future::Future<Output = ()>,
 {
-    // C_db: 서버 수명 동안 공유하는 in-memory DB. 각 요청 handler 는 이 단일
-    // 인스턴스를 받아 `@db.create`/`@db.find` 등을 호출하며, 요청 간 상태가
-    // 유지된다.
-    let db = new_db_handle();
+    // C_db: 서버 수명 동안 공유하는 DB handle. Server boot body가 `@db.wal`
+    // 또는 `@db.load`로 구성한 persistence 설정도 같은 handle을 통해 route
+    // handler에 전달된다.
     // shutdown 은 단일 해상도 이벤트라 `tokio::pin!` 로 고정해 `select!` 에서
     // `&mut` 참조로 폴링한다. 이렇게 해야 매 반복에서 future 를 소비하지 않고
     // 재진입이 가능하다.
@@ -666,6 +682,7 @@ async fn serve_loop_with_request_trace_file<S>(
     listener: TcpListener,
     routes: LocalRoutes,
     captured_env: LocalCapturedEnv,
+    db: DbHandle,
     request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
     request_trace_path: Option<std::path::PathBuf>,
     shutdown: S,
@@ -682,6 +699,7 @@ where
         listener,
         routes,
         captured_env,
+        db,
         request_frames.clone(),
         shutdown,
     )
@@ -2319,13 +2337,16 @@ mod tests {
     /// `fixtures/e2e/<name>` 를 읽어 production 과 같은 server prep 입력으로
     /// 바꾼다. fixture 는 대개 `@server` 단일 표현식이지만, helper 함수 같은
     /// top-level 바인딩이 추가되어도 captured env 로 흘러간다.
-    fn extract_server_from_fixture(name: &str) -> ServerTestCase {
+    fn read_e2e_fixture(name: &str) -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/e2e")
             .join(name);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        extract_server_case(&src)
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    fn extract_server_from_fixture(name: &str) -> ServerTestCase {
+        extract_server_case(&read_e2e_fixture(name))
     }
 
     #[tokio::test]
@@ -2421,12 +2442,22 @@ mod tests {
     #[tokio::test]
     async fn fixture_shopping_mall_covers_home_catalog_and_order_flow() {
         run_on_localset(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let wal_path = std::env::temp_dir().join(format!(
+                "orv-shopping-fixture-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            let src = read_e2e_fixture("shopping_mall.orv")
+                .replace("data/shop.wal.jsonl", &wal_path.display().to_string());
             let ServerTestCase {
                 listen,
                 routes,
                 body_stmts,
                 captured_env,
-            } = extract_server_from_fixture("shopping_mall.orv");
+            } = extract_server_case(&src);
             let (addr, handle, _boot) = spawn_for_test(
                 listen.as_deref(),
                 &routes,
@@ -2620,6 +2651,78 @@ mod tests {
             );
 
             handle.abort();
+
+            let restored =
+                crate::db::InMemoryDb::load_wal(&wal_path).expect("replay shopping fixture wal");
+            let snapshot = restored.snapshot_json();
+            assert_eq!(
+                snapshot["tables"]["Member"]["rows"][0]["handle"],
+                serde_json::json!("ada")
+            );
+            assert_eq!(
+                snapshot["tables"]["Shipment"]["rows"][0]["tracking"],
+                serde_json::json!("TRK-LOCAL")
+            );
+            let _ = std::fs::remove_file(wal_path);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn server_body_wal_persists_route_db_mutations() {
+        run_on_localset(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "orv-server-db-wal-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(&format!(
+                r#"@server {{
+                    @listen 0
+                    @db.wal "{}"
+                    @route POST /members {{
+                        let member = await @db.create("Member", @body)
+                        @respond 201 {{ member: member }}
+                    }}
+                }}"#,
+                path.display()
+            ));
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let payload = serde_json::json!({
+                "handle": "ada",
+                "email": "ada@example.test"
+            })
+            .to_string();
+            let (status, _, body) = send_request(addr, "POST", "/members", Some(payload)).await;
+            assert_eq!(status, 201);
+            let created: serde_json::Value = serde_json::from_slice(&body).expect("member json");
+            assert_eq!(created["member"]["handle"], serde_json::json!("ada"));
+            handle.abort();
+
+            let restored = crate::db::InMemoryDb::load_wal(&path).expect("replay server wal");
+            let snapshot = restored.snapshot_json();
+            assert_eq!(
+                snapshot["tables"]["Member"]["rows"][0]["handle"],
+                serde_json::json!("ada")
+            );
+            let _ = std::fs::remove_file(path);
         })
         .await;
     }

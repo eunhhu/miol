@@ -1966,6 +1966,14 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
 \n\
+Persistent data: `data/shop.wal.jsonl`. The runtime replays this WAL on startup and appends product, member, order, payment, and shipment mutations before applying them.\n\
+\n\
+Archive the local WAL before deploy or backup rotation:\n\
+\n\
+```sh\n\
+orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json\n\
+```\n\
+\n\
 ## Deploy\n\
 \n\
 After `orv build . --prod --out dist`, use generated deploy runbook:\n\
@@ -15950,6 +15958,7 @@ test "checkout failing runtime body" {
         let entry = dir.join("src").join("main.orv");
         let source = std::fs::read_to_string(&entry).expect("entry source");
         assert!(source.contains("@listen 8080"));
+        assert!(source.contains("@db.wal \"data/shop.wal.jsonl\""));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
         assert!(source.contains("@form action=\"/products\" method=post"));
@@ -15980,6 +15989,10 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
+        assert!(
+            guide.contains("orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json")
+        );
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("GET /"));

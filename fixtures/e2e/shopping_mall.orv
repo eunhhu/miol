@@ -4,11 +4,12 @@
 //
 // This fixture is the first HTTP/DB vertical slice for the shopping-mall
 // north-star: product CRUD surface, JSON/form request bodies, route params,
-// browser starter forms, and request-to-request persistence through the shared
-// in-memory DB.
+// browser starter forms, and restart-safe reference persistence through the
+// shared WAL-backed DB.
 
 @server {
   @listen 0
+  @db.wal "data/shop.wal.jsonl"
 
   @route GET /health {
     @respond 200 { ok: true, service: "shopping" }

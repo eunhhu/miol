@@ -536,6 +536,18 @@ pub(crate) fn run_with_writer_in_env<W: Write>(
     run_with_writer_in_env_with_options(program, env, writer, RuntimeOptions::default())
 }
 
+pub(crate) fn run_with_writer_in_env_with_db<W: Write>(
+    program: &HirProgram,
+    env: HashMap<NameId, Value>,
+    db: DbHandle,
+    writer: &mut W,
+) -> Result<HashMap<NameId, Value>, RuntimeError> {
+    let mut interp = Interp::new_with_env(writer, env);
+    interp.db = db;
+    interp.run(program)?;
+    Ok(interp.env)
+}
+
 pub(crate) fn run_with_writer_in_env_with_options<W: Write>(
     program: &HirProgram,
     env: HashMap<NameId, Value>,
@@ -1023,6 +1035,7 @@ impl<W: Write> Interp<W> {
                     routes,
                     body_stmts,
                     self.env.clone(),
+                    self.db.clone(),
                     self.runtime_options.request_trace_path.clone(),
                 )
             }
