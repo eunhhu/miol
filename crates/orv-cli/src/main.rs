@@ -12612,6 +12612,9 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document editor trace navigation command");
     }
+    if !runbook.contains("/__orv/trace/events") {
+        anyhow::bail!("deploy runbook must document live trace event stream endpoint");
+    }
     if let Some(port) = deploy_runbook_port_assignment(listen) {
         if !runbook.contains(&port) {
             anyhow::bail!("deploy runbook must document {port}");
@@ -14582,6 +14585,27 @@ fn deploy_runbook_port_assignment(
     Some(format!("PORT=${{{variable}}}"))
 }
 
+fn deploy_runbook_trace_events_url(listen: Option<&orv_compiler::ServerListenArtifact>) -> String {
+    let port = listen
+        .and_then(|listen| {
+            listen
+                .port
+                .filter(|port| *port > 0)
+                .map(|port| port.to_string())
+                .or_else(|| {
+                    listen.env.as_ref().map(|env| {
+                        let variable = &env.variable;
+                        env.default_port.filter(|port| *port > 0).map_or_else(
+                            || format!("${{{variable}}}"),
+                            |port| format!("${{{variable}:-{port}}}"),
+                        )
+                    })
+                })
+        })
+        .unwrap_or_else(|| "8080".to_string());
+    format!("http://127.0.0.1:{port}/__orv/trace/events")
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
@@ -14909,6 +14933,7 @@ fn write_prod_deploy_runbook(
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
         .unwrap_or_default();
+    let trace_events_url = deploy_runbook_trace_events_url(server_artifact.listen.as_ref());
     let routes = server_artifact
         .routes
         .iter()
@@ -14932,6 +14957,7 @@ fn write_prod_deploy_runbook(
 
 ```sh
 ./deploy/server.sh --trace deploy/request-trace.json
+curl -N {trace_events_url}
 orv editor trace . --trace deploy/request-trace.json
 ```
 
@@ -23121,6 +23147,7 @@ entry = "src/main.orv"
         assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
         assert!(runbook.contains("PORT=8080"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
+        assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("- GET /ping"));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");

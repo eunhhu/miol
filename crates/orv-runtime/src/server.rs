@@ -51,6 +51,7 @@ use crate::interp::{
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const ORV_ORIGIN_ID_HEADER: &str = "x-orv-origin-id";
 const ORV_RUNTIME_REQUEST_TRACE_PATH_ENV: &str = "ORV_RUNTIME_REQUEST_TRACE_PATH";
+const ORV_TRACE_EVENTS_PATH: &str = "/__orv/trace/events";
 
 /// `@server` 가 수집한 단일 라우트 — handler HIR 의 스냅샷.
 ///
@@ -727,6 +728,12 @@ async fn handle_request(
         Err(response) => return response,
     };
 
+    if method == "GET" && path == ORV_TRACE_EVENTS_PATH {
+        if let Some(request_frames) = request_frames.as_ref() {
+            return request_trace_events_response(request_frames);
+        }
+    }
+
     // 라우트 매칭 — 선형 탐색. method 는 "*" wildcard 허용.
     let mut matched: Option<(RouteEntry, HashMap<String, String>)> = None;
     for entry in routes.iter() {
@@ -881,6 +888,22 @@ fn record_request_frame(
             frames.push(frame);
         }
     }
+}
+
+fn request_trace_events_response(
+    request_frames: &Arc<Mutex<Vec<ServerRequestFrame>>>,
+) -> Response<Full<Bytes>> {
+    let frames = request_frames
+        .lock()
+        .map_or_else(|_| Vec::new(), |frames| frames.clone());
+    let payload = serde_json::to_string(&request_trace_json(&frames)).unwrap_or_default();
+    let body = format!("event: orv:trace\ndata: {payload}\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Full::new(Bytes::from(body)))
+        .expect("valid trace event stream response")
 }
 
 /// Build the shared production request trace JSON document.
@@ -1805,6 +1828,57 @@ mod tests {
             assert_eq!(trace["frames"][0]["path"], "/ping");
             assert_eq!(trace["frames"][0]["status"], 200);
             let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn request_trace_events_endpoint_streams_captured_frames() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                "@server {
+                    @listen 0
+                    @route GET /ping { @respond 200 { ok: true } }
+                }",
+            );
+            let dir = std::env::temp_dir()
+                .join(format!("orv-runtime-trace-events-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let trace_path = dir.join("trace").join("requests.json");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (addr, handle, _boot) = spawn_for_test_with_request_trace_file(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                trace_path,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, _) = send_request(addr, "GET", "/ping", None).await;
+            assert_eq!(status, 200);
+            let (stream_status, content_type, _origin, body) =
+                send_request_full(addr, "GET", "/__orv/trace/events", None).await;
+
+            assert_eq!(stream_status, 200);
+            assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+            let body = String::from_utf8(body).expect("event stream utf8");
+            assert!(body.contains("event: orv:trace"));
+            assert!(body.contains("\"kind\":\"orv.production.trace\""));
+            assert!(body.contains("\"frame_count\":1"));
+            assert!(body.contains("\"path\":\"/ping\""));
+            shutdown_tx.send(()).expect("shutdown send");
+            handle.await.expect("server task join");
+            let _ = std::fs::remove_dir_all(dir);
         })
         .await;
     }
