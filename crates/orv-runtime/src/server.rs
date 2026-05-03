@@ -915,14 +915,31 @@ fn request_trace_events_response(
     let frames = request_frames
         .lock()
         .map_or_else(|_| Vec::new(), |frames| frames.clone());
-    let payload = serde_json::to_string(&request_trace_json(&frames)).unwrap_or_default();
-    let body = format!("event: orv:trace\ndata: {payload}\n\n");
+    let body = request_trace_events_body(&frames);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .body(Full::new(Bytes::from(body)))
         .expect("valid trace event stream response")
+}
+
+fn request_trace_events_body(frames: &[ServerRequestFrame]) -> String {
+    let mut body = String::new();
+    let payload = serde_json::to_string(&request_trace_json(frames)).unwrap_or_default();
+    body.push_str("event: orv:trace\n");
+    body.push_str("data: ");
+    body.push_str(&payload);
+    body.push_str("\n\n");
+    for (index, frame) in frames.iter().enumerate() {
+        let payload = serde_json::to_string(&request_trace_frame_event_json(index, frame))
+            .unwrap_or_default();
+        body.push_str("event: orv:trace.frame\n");
+        body.push_str("data: ");
+        body.push_str(&payload);
+        body.push_str("\n\n");
+    }
+    body
 }
 
 /// Build the shared production request trace JSON document.
@@ -936,6 +953,15 @@ pub fn request_trace_json(frames: &[ServerRequestFrame]) -> serde_json::Value {
             .iter()
             .map(request_frame_json)
             .collect::<Vec<_>>(),
+    })
+}
+
+fn request_trace_frame_event_json(index: usize, frame: &ServerRequestFrame) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.production.trace.frame",
+        "index": index,
+        "frame": request_frame_json(frame),
     })
 }
 
@@ -1895,6 +1921,56 @@ mod tests {
             assert!(body.contains("\"kind\":\"orv.production.trace\""));
             assert!(body.contains("\"frame_count\":1"));
             assert!(body.contains("\"path\":\"/ping\""));
+            shutdown_tx.send(()).expect("shutdown send");
+            handle.await.expect("server task join");
+            let _ = std::fs::remove_dir_all(dir);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn request_trace_events_endpoint_emits_per_frame_events() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                "@server {
+                    @listen 0
+                    @route GET /ping { @respond 200 { ok: true } }
+                }",
+            );
+            let dir = std::env::temp_dir().join(format!(
+                "orv-runtime-trace-frame-events-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let trace_path = dir.join("trace").join("requests.json");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (addr, handle, _boot) = spawn_for_test_with_request_trace_file(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                trace_path,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("spawn");
+
+            assert_eq!(send_request(addr, "GET", "/ping", None).await.0, 200);
+            assert_eq!(send_request(addr, "GET", "/ping", None).await.0, 200);
+            let (_, _, _, body) = send_request_full(addr, "GET", "/__orv/trace/events", None).await;
+
+            let body = String::from_utf8(body).expect("event stream utf8");
+            assert_eq!(body.matches("event: orv:trace.frame").count(), 2);
+            assert!(body.contains("\"kind\":\"orv.production.trace.frame\""));
+            assert!(body.contains("\"index\":0"));
+            assert!(body.contains("\"index\":1"));
             shutdown_tx.send(()).expect("shutdown send");
             handle.await.expect("server task join");
             let _ = std::fs::remove_dir_all(dir);

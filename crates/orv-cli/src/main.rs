@@ -4341,28 +4341,75 @@ fn editor_trace_stream_json(dir: &Path, events: &Path) -> anyhow::Result<serde_j
         .map_err(|e| anyhow::anyhow!("event stream {} must be UTF-8: {e}", events.display()))?;
     let parsed_events = parse_editor_event_source_events(&body);
     let mut trace_events = Vec::new();
+    let mut trace_frame_events = Vec::new();
     for (index, event) in parsed_events.iter().enumerate() {
-        if event.event != "orv:trace" {
-            continue;
+        match event.event.as_str() {
+            "orv:trace" => {
+                let trace_value: serde_json::Value =
+                    serde_json::from_str(&event.data).map_err(|e| {
+                        anyhow::anyhow!("failed to parse trace event {index} data as JSON: {e}")
+                    })?;
+                let trace_path = format!("{}#event:{index}", events.display());
+                let live_refresh =
+                    editor_trace_stream_live_refresh_json(dir, events, &content_hash)?;
+                let trace =
+                    editor_trace_payload_json(dir, &trace_path, &trace_value, &live_refresh)?;
+                trace_events.push(serde_json::json!({
+                    "index": index,
+                    "event": event.event,
+                    "data_bytes": event.data.len(),
+                    "trace": trace,
+                }));
+            }
+            "orv:trace.frame" => {
+                let frame_value: serde_json::Value =
+                    serde_json::from_str(&event.data).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to parse trace frame event {index} data as JSON: {e}"
+                        )
+                    })?;
+                let frame = frame_value
+                    .get("frame")
+                    .cloned()
+                    .unwrap_or_else(|| frame_value.clone());
+                trace_frame_events.push(serde_json::json!({
+                    "index": index,
+                    "event": event.event,
+                    "data_bytes": event.data.len(),
+                    "frame": frame,
+                }));
+            }
+            _ => {}
         }
-        let trace_value: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
-            anyhow::anyhow!("failed to parse trace event {index} data as JSON: {e}")
-        })?;
-        let trace_path = format!("{}#event:{index}", events.display());
-        let live_refresh = editor_trace_stream_live_refresh_json(dir, events, &content_hash)?;
-        let trace = editor_trace_payload_json(dir, &trace_path, &trace_value, &live_refresh)?;
-        trace_events.push(serde_json::json!({
-            "index": index,
-            "event": event.event,
-            "data_bytes": event.data.len(),
-            "trace": trace,
-        }));
     }
-    let latest = trace_events
-        .last()
-        .and_then(|event| event.get("trace"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let latest = if let Some(trace) = trace_events.last().and_then(|event| event.get("trace")) {
+        trace.clone()
+    } else if trace_frame_events.is_empty() {
+        serde_json::Value::Null
+    } else {
+        let frames = trace_frame_events
+            .iter()
+            .filter_map(|event| event.get("frame").cloned())
+            .collect::<Vec<_>>();
+        let trace_value = serde_json::json!({
+            "schema_version": 1,
+            "kind": "orv.production.trace",
+            "frame_count": frames.len(),
+            "frames": frames,
+        });
+        let trace_path = format!("{}#frames", events.display());
+        let live_refresh = editor_trace_stream_live_refresh_json(dir, events, &content_hash)?;
+        editor_trace_payload_json(dir, &trace_path, &trace_value, &live_refresh)?
+    };
+    let mut event_values = Vec::with_capacity(trace_events.len() + trace_frame_events.len());
+    event_values.extend(trace_events);
+    event_values.extend(trace_frame_events);
+    event_values.sort_by_key(|event| {
+        event
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.trace.stream",
@@ -4372,10 +4419,11 @@ fn editor_trace_stream_json(dir: &Path, events: &Path) -> anyhow::Result<serde_j
             "content_type": "text/event-stream",
             "content_hash": content_hash,
             "event_count": parsed_events.len(),
-            "trace_event_count": trace_events.len(),
+            "trace_event_count": event_values.iter().filter(|event| event["event"] == "orv:trace").count(),
+            "trace_frame_event_count": event_values.iter().filter(|event| event["event"] == "orv:trace.frame").count(),
         },
         "latest": latest,
-        "events": trace_events,
+        "events": event_values,
     }))
 }
 
@@ -27133,6 +27181,66 @@ define Auth() -> { @out "auth" }
             stream["latest"]["live_refresh"]["transport"]["url"],
             "http://127.0.0.1:8080/__orv/trace/events"
         );
+        assert_eq!(stream["latest"]["frames"][0]["origin_id"], route.id);
+        assert_eq!(
+            stream["latest"]["frames"][0]["navigation"]["focus"]["panel"],
+            "routes"
+        );
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn editor_trace_stream_consumes_trace_frame_events() {
+        let (src_dir, path) = prod_server_source("editor-trace-frame-stream-source");
+        let out = temp_output_dir("editor-trace-frame-stream");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let frame = serde_json::json!({
+            "method": "GET",
+            "path": "/ping",
+            "status": 200,
+            "route_origin_id": route.id,
+        });
+        let events_path = src_dir.join("trace-frame-events.sse");
+        std::fs::write(
+            &events_path,
+            format!(
+                "event: orv:trace.frame\ndata: {}\n\nevent: orv:trace.frame\ndata: {}\n\n",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "orv.production.trace.frame",
+                    "index": 0,
+                    "frame": frame,
+                }))
+                .expect("frame event"),
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "orv.production.trace.frame",
+                    "index": 1,
+                    "frame": frame,
+                }))
+                .expect("frame event"),
+            ),
+        )
+        .expect("write trace frame events");
+
+        let stream = editor_trace_stream_json(&out, &events_path).expect("editor trace stream");
+
+        assert_eq!(stream["event_stream"]["trace_event_count"], 0);
+        assert_eq!(stream["event_stream"]["trace_frame_event_count"], 2);
+        assert_eq!(stream["events"][0]["event"], "orv:trace.frame");
+        assert_eq!(stream["latest"]["kind"], "orv.editor.trace");
+        assert_eq!(stream["latest"]["trace"]["frame_count"], 2);
         assert_eq!(stream["latest"]["frames"][0]["origin_id"], route.id);
         assert_eq!(
             stream["latest"]["frames"][0]["navigation"]["focus"]["panel"],
