@@ -14573,19 +14573,21 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
     }
+    let client_source_binding = ClientSourceBinding {
+        source_bundle: &source_bundle,
+        source_bundle_hash: &source_bundle_hash,
+    };
+    let client_bundle_targets = ClientBundleTargets {
+        page: client_page_path.as_deref(),
+        js: client_js_path.as_deref(),
+        wasm: client_wasm_path.as_deref(),
+    };
     write_client_bundle_artifacts(
         out,
         &entry,
         manifest.capabilities.client_wasm,
-        ClientSourceBinding {
-            source_bundle: &source_bundle,
-            source_bundle_hash: &source_bundle_hash,
-        },
-        ClientBundleTargets {
-            page: client_page_path.as_deref(),
-            js: client_js_path.as_deref(),
-            wasm: client_wasm_path.as_deref(),
-        },
+        &client_source_binding,
+        &client_bundle_targets,
     )?;
     if profile.is_production() {
         write_prod_deploy_artifacts(
@@ -14610,8 +14612,8 @@ fn write_client_bundle_artifacts(
     out: &Path,
     entry: &Path,
     enabled: bool,
-    binding: ClientSourceBinding<'_>,
-    targets: ClientBundleTargets<'_>,
+    binding: &ClientSourceBinding<'_>,
+    targets: &ClientBundleTargets<'_>,
 ) -> anyhow::Result<()> {
     if !enabled {
         return Ok(());
