@@ -16,6 +16,7 @@
 - `orv build <file-or-orv.toml> --out <dir> [--prod]`
 - `orv add/remove`
 - `orv lock [dir-or-orv.toml] [--check]`
+- `orv workspace new <member> [--root <dir>] [--name <name>]`
 - `orv verify-build/verify-artifact/check-artifact/check-build`
 - `orv run-artifact/run-build/reveal`
 - `orv db plan/verify/apply/migrate/rollback/backup/restore/recover/archive/squash`
@@ -29,6 +30,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 `orv lock [dir-or-orv.toml]` reads `[project]`, `[dependencies]`, and `[dev-dependencies]` from `orv.toml`, writes deterministic JSON `orv.lock` entries sorted by package name, preserves registry/path sources, and adds stable `fnv1a64` checksums. `--check` compares the existing lockfile without writing.
 
 `orv add <pkg> <version> [--dev] [--path <path>] [--registry <url>] [--manifest <dir-or-orv.toml>]` edits the selected dependency section and regenerates `orv.lock`; `orv remove <pkg> [--dev] [--manifest <dir-or-orv.toml>]` removes from the selected section and regenerates the lockfile.
+
+`orv workspace new <member> [--root <dir>] [--name <name>]` creates a basic member project and records the relative member path in root `orv.toml` `[workspace].members` with resolver `2`.
 
 ## Editor And LSP
 

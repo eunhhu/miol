@@ -215,6 +215,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = InitTemplate::Basic)]
         template: InitTemplate,
     },
+    /// Workspace helper commands.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// orv 테스트를 실행한다.
     Test {
         /// 테스트를 찾을 파일 또는 디렉터리.
@@ -253,6 +258,24 @@ enum Command {
 enum InitTemplate {
     Basic,
     Shop,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// 워크스페이스 member 프로젝트를 생성하고 root manifest에 등록한다.
+    New {
+        /// 생성할 member 경로.
+        member: PathBuf,
+        /// workspace root 디렉터리.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// member 프로젝트 이름.
+        #[arg(long)]
+        name: Option<String>,
+        /// 생성할 starter template.
+        #[arg(long, value_enum, default_value_t = InitTemplate::Basic)]
+        template: InitTemplate,
+    },
 }
 
 #[derive(Subcommand)]
@@ -624,6 +647,20 @@ fn main() -> ExitCode {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             }
+        },
+        Command::Workspace { command } => match command {
+            WorkspaceCommand::New {
+                member,
+                root,
+                name,
+                template,
+            } => match cmd_workspace_new(&root, &member, name.as_deref(), template) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
         Command::Test { path, filter, list } => match cmd_test(&path, filter.as_deref(), list) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1162,6 +1199,30 @@ fn cmd_init(dir: &Path, name: Option<&str>, template: InitTemplate) -> anyhow::R
         write_new_text_file(&dir.join("README.md"), &shop_init_readme(&project_name))?;
     }
     println!("init: {} created", dir.display());
+    Ok(())
+}
+
+fn cmd_workspace_new(
+    root: &Path,
+    member: &Path,
+    name: Option<&str>,
+    template: InitTemplate,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", root.display()))?;
+    let root_manifest = root.join("orv.toml");
+    let mut manifest = if root_manifest.is_file() {
+        read_toml_manifest(&root_manifest)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let member_path = workspace_member_string(member)?;
+    add_workspace_member_to_manifest(&mut manifest, member)?;
+
+    let project_name = name.map_or_else(|| workspace_member_project_name(member), str::to_string);
+    cmd_init(&root.join(&member_path), Some(&project_name), template)?;
+    write_toml_manifest_atomic(&root_manifest, &manifest)?;
+    println!("workspace: added {member_path}");
     Ok(())
 }
 
@@ -2396,6 +2457,60 @@ const fn dependency_section(dev: bool) -> &'static str {
     } else {
         "dependencies"
     }
+}
+
+fn add_workspace_member_to_manifest(
+    manifest: &mut toml::Value,
+    member: &Path,
+) -> anyhow::Result<String> {
+    let member = workspace_member_string(member)?;
+    let root = manifest
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("orv.toml root must be a table"))?;
+    let workspace = root
+        .entry("workspace".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("workspace must be a table"))?;
+    workspace
+        .entry("resolver".to_string())
+        .or_insert_with(|| toml::Value::String("2".to_string()));
+    let members = workspace
+        .entry("members".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("workspace.members must be an array"))?;
+    if members.iter().any(|item| item.as_str() == Some(&member)) {
+        return Ok(member);
+    }
+    members.push(toml::Value::String(member.clone()));
+    members
+        .sort_by(|left, right| toml_value_str_or_empty(left).cmp(toml_value_str_or_empty(right)));
+    Ok(member)
+}
+
+fn workspace_member_string(member: &Path) -> anyhow::Result<String> {
+    if member.is_absolute() {
+        anyhow::bail!("workspace member path must be relative");
+    }
+    let member = member.to_string_lossy().replace('\\', "/");
+    if member.trim().is_empty() || member.split('/').any(|segment| segment == "..") {
+        anyhow::bail!("workspace member path must be a non-empty relative path");
+    }
+    Ok(member)
+}
+
+fn workspace_member_project_name(member: &Path) -> String {
+    member
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("member")
+        .to_string()
+}
+
+fn toml_value_str_or_empty(value: &toml::Value) -> &str {
+    value.as_str().unwrap_or("")
 }
 
 fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -20630,6 +20745,34 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn workspace_new_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "workspace",
+            "new",
+            "apps/web",
+            "--root",
+            "demo",
+            "--name",
+            "web",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Workspace { command } = parsed.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::New {
+            member,
+            root,
+            name,
+            template,
+        } = command;
+        assert_eq!(member, PathBuf::from("apps/web"));
+        assert_eq!(root, PathBuf::from("demo"));
+        assert_eq!(name.as_deref(), Some("web"));
+        assert_eq!(template, InitTemplate::Basic);
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -21372,6 +21515,63 @@ mock-server = "0.2.0"
         assert_eq!(lock["dev_dependencies"][0]["name"], "ui");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_new_updates_root_manifest_and_creates_member_project() {
+        let root = temp_output_dir("workspace-new");
+        std::fs::create_dir_all(&root).expect("create workspace root");
+
+        cmd_workspace_new(
+            &root,
+            Path::new("apps/web"),
+            Some("web"),
+            InitTemplate::Basic,
+        )
+        .expect("workspace new");
+
+        let root_manifest =
+            std::fs::read_to_string(root.join("orv.toml")).expect("read root manifest");
+        let root_manifest = toml::from_str::<toml::Value>(&root_manifest).expect("parse root");
+        assert_eq!(root_manifest["workspace"]["resolver"].as_str(), Some("2"));
+        assert_eq!(
+            root_manifest["workspace"]["members"][0].as_str(),
+            Some("apps/web")
+        );
+
+        let member_manifest =
+            std::fs::read_to_string(root.join("apps/web/orv.toml")).expect("read member manifest");
+        let member_manifest =
+            toml::from_str::<toml::Value>(&member_manifest).expect("parse member");
+        assert_eq!(member_manifest["project"]["name"].as_str(), Some("web"));
+        assert_eq!(
+            member_manifest["project"]["entry"].as_str(),
+            Some("src/main.orv")
+        );
+        assert!(root.join("apps/web/src/main.orv").is_file());
+
+        cmd_workspace_new(
+            &root,
+            Path::new("shared/models"),
+            Some("models"),
+            InitTemplate::Basic,
+        )
+        .expect("workspace new second member");
+        let root_manifest =
+            std::fs::read_to_string(root.join("orv.toml")).expect("read root manifest");
+        let root_manifest = toml::from_str::<toml::Value>(&root_manifest).expect("parse root");
+        let members = root_manifest["workspace"]["members"]
+            .as_array()
+            .expect("members");
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .any(|member| member.as_str() == Some("apps/web")));
+        assert!(members
+            .iter()
+            .any(|member| member.as_str() == Some("shared/models")));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
