@@ -147,6 +147,8 @@ miol/
 
 DB PITR 세부: `orv db restore --archive <archive.json> --data <data.json> --at <RFC3339>`는 hash-verified WAL archive manifest를 지정 시점까지 재생해 `@db.save` 호환 snapshot으로 복원한다. archive manifest의 relative source WAL path는 현재 cwd가 아니라 manifest 파일 디렉터리 기준으로 해석된다.
 
+DB adapter 세부: reference runtime의 `@db.connect`는 `memory://` handle만 허용하고 외부 adapter URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
+
 Package lock 세부: `orv lock`은 prerelease/build metadata 포함 exact version을 그대로 고정하고, local/file/HTTP/HTTPS registry `index.json`이 있으면 `*`, `x`, segment wildcard, caret, tilde, whitespace-AND comparator, `||` disjunction range를 exact version으로 해석하며 원래 range는 `requested_version`으로 보존한다. `auth_token_env`는 secret 대신 env var 이름만 lockfile에 보존하고 HTTP/HTTPS registry index/fetch 요청에 Bearer token을 붙인다.
 
 Workspace package 세부: `orv workspace graph --view`는 member 간 path dependency edge에 target member name/version과 requested version을 기록하고, requested version이 target member version과 맞지 않으면 실패하며, JSON과 static HTML workspace graph view를 출력한다. `orv workspace lock [root] --out <dir>`은 workspace graph/path dependency edge를 재사용해 member를 dependency-first 순서로 lock하고, `members/<member>/orv.lock`과 top-level `workspace-lock.json` artifact를 출력한다. `orv workspace fetch [root] --out <dir>`은 그 lock artifact를 member별 dependency cache로 materialize하고 `workspace-fetch.json`을 출력한다.

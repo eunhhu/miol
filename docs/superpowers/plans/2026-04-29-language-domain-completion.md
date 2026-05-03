@@ -16,6 +16,8 @@
 
 **DB archive delta (2026-05-03):** `orv db recover` now accepts `--archive <archive.json>` as an alternative to raw `--wal`, resolves file archive targets, verifies archived WAL hash/byte count before replay, and resolves relative source WAL paths against the archive manifest directory. `orv db restore --archive <archive.json> --data <data.json> --at <RFC3339>` now exposes the same hash-verified archive replay as a PITR restore surface. Remaining DB persistence work is remote archive targets, external adapters, and full crash matrix coverage.
 
+**DB adapter safety delta (2026-05-03):** `@db.connect` now accepts the reference `memory://` adapter and rejects external adapter URLs such as `postgres://` until real adapter implementations exist, avoiding a false-success in-memory handle for production-looking connection strings.
+
 **Shop scaffold delta (2026-05-03):** `orv init --template shop` now writes the shopping route scaffold with a browser `GET /` HTML home route, product/member/order/payment/shipment POST forms, form-urlencoded `@body` parsing, and a README with check/build/verify/run-build commands, browser home URL, generated deploy runbook/Compose launch guidance, and the member/payment/shipment route inventory. Remaining shop north-star work is native server deployment, real payment/shipping adapters, persistent external DB adapters, and richer storefront/admin UI.
 
 **Deploy route inventory delta (2026-05-03):** `orv build --prod` now writes `deploy/routes.json` for server builds and `orv verify-build` checks that it matches the server runtime artifact, giving deploy/reveal tooling a standalone route inventory before native bundling.

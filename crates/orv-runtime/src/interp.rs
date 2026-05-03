@@ -4899,7 +4899,17 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
         "transaction" => Ok(args.last().cloned().unwrap_or(Value::Void)),
         "schema" => Ok(Value::Void),
         "analyze" => Ok(Value::Void),
-        "connect" => Ok(Value::Db(db.clone())),
+        "connect" => {
+            if let Some(url) = args.first() {
+                let url = require_str(url, "db connect url")?;
+                if !url.starts_with("memory://") {
+                    return Err(RuntimeError::native(format!(
+                        "external db adapters are not implemented for `{url}`; supported scheme is memory://"
+                    )));
+                }
+            }
+            Ok(Value::Db(db.clone()))
+        }
         "save" => {
             let path = args
                 .first()
@@ -8155,6 +8165,16 @@ let found = external.find("User", { name: "Ada" })
         )
         .unwrap();
         assert_eq!(out, "Ada\n");
+    }
+
+    #[test]
+    fn db_connect_rejects_unimplemented_external_adapter_urls() {
+        let err = run_str(r#"let external = @db.connect "postgres://localhost/shop""#)
+            .expect_err("external adapter must fail until implemented");
+
+        assert!(err
+            .to_string()
+            .contains("external db adapters are not implemented"));
     }
 
     #[test]
