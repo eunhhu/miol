@@ -2626,6 +2626,9 @@ impl LspSession {
             Some(method @ ("textDocument/documentColor" | "textDocument/colorPresentation")) => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.color_result(method, request))
             }
+            Some("textDocument/linkedEditingRange") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.linked_editing_range_result(request))
+            }
             Some("textDocument/references") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.references_result(request))
             }
@@ -2750,6 +2753,7 @@ impl LspSession {
                     "callHierarchyProvider": true,
                     "typeHierarchyProvider": true,
                     "colorProvider": true,
+                    "linkedEditingRangeProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
                     "renameProvider": {
@@ -3040,6 +3044,24 @@ impl LspSession {
             .ok_or_else(|| anyhow::anyhow!("callHierarchy item.uri must be a string"))?;
         let path = lsp_file_uri_path(uri)?;
         Ok((self.loaded_project_for_path(&path)?, name))
+    }
+
+    fn linked_editing_range_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(lsp_linked_editing_range_json(&file.source, name))
     }
 
     fn references_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -8486,18 +8508,34 @@ fn lsp_reference_locations_json(files: &[SourceFile], name: &str) -> Vec<serde_j
     files
         .iter()
         .flat_map(|file| {
-            identifier_occurrences(&file.source, name)
+            lsp_identifier_ranges_json(&file.source, name)
                 .into_iter()
-                .map(move |(start, end)| {
+                .map(move |range| {
                     serde_json::json!({
                         "uri": lsp_file_uri_for_path(&file.path),
-                        "range": lsp_range_for_source(
-                            &file.source,
-                            u32::try_from(start).unwrap_or(u32::MAX),
-                            u32::try_from(end).unwrap_or(u32::MAX),
-                        ),
+                        "range": range,
                     })
                 })
+        })
+        .collect()
+}
+
+fn lsp_linked_editing_range_json(source: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ranges": lsp_identifier_ranges_json(source, name),
+        "wordPattern": "[A-Za-z_][A-Za-z0-9_]*",
+    })
+}
+
+fn lsp_identifier_ranges_json(source: &str, name: &str) -> Vec<serde_json::Value> {
+    identifier_occurrences(source, name)
+        .into_iter()
+        .map(|(start, end)| {
+            lsp_range_for_source(
+                source,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            )
         })
         .collect()
 }
@@ -12781,6 +12819,7 @@ function greet(user: User): string -> "hello"
             "callHierarchyProvider",
             "monikerProvider",
             "colorProvider",
+            "linkedEditingRangeProvider",
             "referencesProvider",
             "documentHighlightProvider",
             "workspaceSymbolProvider",
@@ -18081,6 +18120,45 @@ let u: User = { id: 1 }
         assert_eq!(presentations.len(), 1);
         assert_eq!(presentations[0]["label"], "#336699");
         assert_eq!(presentations[0]["textEdit"]["newText"], "#336699");
+    }
+
+    #[test]
+    fn lsp_linked_editing_range_returns_identifier_ranges() {
+        let dir = temp_output_dir("lsp-linked-editing-range");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "let total = 1\nlet next = total + 1\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let use_line = source_text.lines().nth(1).expect("use line");
+        let use_character = use_line.find("total").expect("identifier use");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "textDocument/linkedEditingRange",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": use_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 34);
+        assert!(response.get("error").is_none(), "{response}");
+        let result = response["result"]
+            .as_object()
+            .expect("linked editing result");
+        let ranges = result["ranges"].as_array().expect("linked ranges");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0]["start"]["line"], 0);
+        assert_eq!(ranges[0]["start"]["character"], 4);
+        assert_eq!(ranges[1]["start"]["line"], 1);
+        assert_eq!(ranges[1]["start"]["character"], use_character);
+        assert_eq!(result["wordPattern"], "[A-Za-z_][A-Za-z0-9_]*");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
