@@ -3383,7 +3383,8 @@ fn workspace_graph_json(root: &Path) -> anyhow::Result<serde_json::Value> {
         member_paths.insert(member.clone());
         member_values.push(workspace_member_graph_json(root, member)?);
     }
-    let edges = workspace_graph_edges(root, &members, &member_paths)?;
+    let member_packages = workspace_member_package_map(&member_values)?;
+    let edges = workspace_graph_edges(root, &members, &member_paths, &member_packages)?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.workspace.graph",
@@ -3396,6 +3397,28 @@ fn workspace_graph_json(root: &Path) -> anyhow::Result<serde_json::Value> {
         "members": member_values,
         "edges": edges,
     }))
+}
+
+struct WorkspaceMemberPackage {
+    name: String,
+    version: String,
+}
+
+fn workspace_member_package_map(
+    members: &[serde_json::Value],
+) -> anyhow::Result<HashMap<String, WorkspaceMemberPackage>> {
+    members
+        .iter()
+        .map(|member| {
+            Ok((
+                json_str(member, "path", "workspace member")?.to_string(),
+                WorkspaceMemberPackage {
+                    name: json_str(member, "name", "workspace member")?.to_string(),
+                    version: json_str(member, "version", "workspace member")?.to_string(),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn workspace_members(
@@ -3465,11 +3488,25 @@ fn workspace_dependency_values(manifest: &toml::Value, section: &str) -> Vec<ser
                 "name": name,
                 "section": section,
             });
-            if let Some(path) = value
-                .as_table()
-                .and_then(|table| table.get("path"))
-                .and_then(toml::Value::as_str)
-            {
+            if let Some(version) = value.as_str().or_else(|| {
+                value
+                    .as_table()
+                    .and_then(|table| table.get("version"))
+                    .and_then(toml::Value::as_str)
+            }) {
+                dependency["version"] = serde_json::json!(version);
+            }
+            if let Some(table) = value.as_table() {
+                if let Some(registry) = table.get("registry").and_then(toml::Value::as_str) {
+                    dependency["registry"] = serde_json::json!(registry);
+                }
+            }
+            if let Some(path) = value.as_table().and_then(|table| {
+                table
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+            }) {
                 dependency["source"] = serde_json::json!("path");
                 dependency["path"] = serde_json::json!(path);
             } else {
@@ -3488,6 +3525,7 @@ fn workspace_graph_edges(
     root: &Path,
     members: &[String],
     member_paths: &HashSet<String>,
+    member_packages: &HashMap<String, WorkspaceMemberPackage>,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut edges = members
         .iter()
@@ -3506,7 +3544,8 @@ fn workspace_graph_edges(
             member,
             &manifest,
             member_paths,
-        ));
+            member_packages,
+        )?);
     }
     Ok(edges)
 }
@@ -3516,34 +3555,60 @@ fn workspace_path_dependency_edges(
     member: &str,
     manifest: &toml::Value,
     member_paths: &HashSet<String>,
-) -> Vec<serde_json::Value> {
-    ["dependencies", "dev-dependencies"]
-        .into_iter()
-        .flat_map(|section| {
-            manifest
-                .get(section)
-                .and_then(toml::Value::as_table)
-                .into_iter()
-                .flat_map(move |dependencies| {
-                    dependencies.iter().filter_map(move |(name, value)| {
-                        let path = value
-                            .as_table()
-                            .and_then(|table| table.get("path"))
-                            .and_then(toml::Value::as_str)?;
-                        let target = workspace_dependency_target(root, member, path)?;
-                        member_paths.contains(&target).then(|| {
-                            serde_json::json!({
-                                "kind": "path_dependency",
-                                "from": member,
-                                "to": target,
-                                "package": name,
-                                "section": section,
-                            })
-                        })
-                    })
-                })
-        })
-        .collect()
+    member_packages: &HashMap<String, WorkspaceMemberPackage>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut edges = Vec::new();
+    for section in ["dependencies", "dev-dependencies"] {
+        let Some(dependencies) = manifest.get(section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (name, value) in dependencies {
+            let Some(table) = value.as_table() else {
+                continue;
+            };
+            let Some(path) = table
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(target) = workspace_dependency_target(root, member, path) else {
+                continue;
+            };
+            if !member_paths.contains(&target) {
+                continue;
+            }
+            let target_package = member_packages.get(&target).ok_or_else(|| {
+                anyhow::anyhow!("workspace member `{target}` has no package metadata")
+            })?;
+            let requested_version = table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .filter(|version| !version.trim().is_empty());
+            let mut edge = serde_json::json!({
+                "kind": "path_dependency",
+                "from": member,
+                "to": target,
+                "package": name,
+                "section": section,
+                "target_name": target_package.name,
+                "target_version": target_package.version,
+            });
+            if let Some(requested_version) = requested_version {
+                if !workspace_member_version_matches(requested_version, &target_package.version) {
+                    anyhow::bail!(
+                        "workspace dependency {member} -> {target} requests `{requested_version}` but target version is `{}`",
+                        target_package.version
+                    );
+                }
+                edge["requested_version"] = serde_json::json!(requested_version);
+                edge["version_match"] = serde_json::json!(true);
+            }
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
 }
 
 fn workspace_dependency_target(root: &Path, member: &str, dependency: &str) -> Option<String> {
@@ -3552,6 +3617,16 @@ fn workspace_dependency_target(root: &Path, member: &str, dependency: &str) -> O
         .strip_prefix(normalize_workspace_fs_path(root))
         .ok()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn workspace_member_version_matches(requested: &str, actual: &str) -> bool {
+    let Some(actual) = parse_semver_version(actual) else {
+        return requested == actual;
+    };
+    parse_semver_version(requested).map_or_else(
+        || registry_version_matches(requested, &actual),
+        |exact| actual == exact,
+    )
 }
 
 fn workspace_relative_path(root: &Path, path: &Path) -> String {
@@ -23748,13 +23823,41 @@ entry = "src/main.orv"
             .any(|edge| edge["kind"] == "path_dependency"
                 && edge["from"] == "apps/web"
                 && edge["to"] == "shared/models"
-                && edge["package"] == "models"));
+                && edge["package"] == "models"
+                && edge["requested_version"] == "0.1.0"
+                && edge["target_name"] == "models"
+                && edge["target_version"] == "0.1.0"
+                && edge["version_match"] == true));
 
         let out = root.join("target/orv-workspace");
         cmd_workspace_graph(&root, Some(&out)).expect("write workspace graph");
         assert!(out.join("workspace-graph.json").is_file());
         let written = read_json_value(&out.join("workspace-graph.json")).expect("read written");
         assert_eq!(written["stats"]["member_count"], 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_graph_rejects_member_path_dependency_version_mismatch() {
+        let root = workspace_build_fixture("workspace-graph-version-mismatch");
+        std::fs::write(
+            root.join("apps/web/orv.toml"),
+            r#"[project]
+name = "web"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+models = { path = "../../shared/models", version = "2.0.0" }
+"#,
+        )
+        .expect("write mismatched web manifest");
+
+        let error = workspace_graph_json(&root).expect_err("version mismatch");
+        assert!(error.to_string().contains(
+            "workspace dependency apps/web -> shared/models requests `2.0.0` but target version is `0.1.0`"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
