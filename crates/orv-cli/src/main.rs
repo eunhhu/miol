@@ -4105,15 +4105,15 @@ fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Val
             "frame_count": editor_frames.len(),
             "status_counts": editor_trace_status_counts_json(&status_counts),
         },
-        "live_refresh": editor_trace_live_refresh_json(trace)?,
+        "live_refresh": editor_trace_live_refresh_json(dir, trace)?,
         "frames": editor_frames,
     }))
 }
 
-fn editor_trace_live_refresh_json(trace: &Path) -> anyhow::Result<serde_json::Value> {
+fn editor_trace_live_refresh_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Value> {
     let bytes = std::fs::read(trace)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", trace.display()))?;
-    Ok(serde_json::json!({
+    let mut refresh = serde_json::json!({
         "strategy": "trace-file-hash",
         "watch": {
             "trace": {
@@ -4121,7 +4121,30 @@ fn editor_trace_live_refresh_json(trace: &Path) -> anyhow::Result<serde_json::Va
                 "content_hash": format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
             },
         },
-    }))
+    });
+    if let Some(transport) = editor_trace_live_transport_json(dir)? {
+        refresh["transport"] = transport;
+    }
+    Ok(refresh)
+}
+
+fn editor_trace_live_transport_json(dir: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let path = dir.join("server").join("app.orv-runtime.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let artifact = read_server_artifact(&path)?;
+    let Some(listen) = artifact.listen.as_ref() else {
+        return Ok(None);
+    };
+    if listen.port == Some(0) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "kind": "event-source",
+        "event": "orv:trace",
+        "url": deploy_runbook_trace_events_url(Some(listen)),
+    })))
 }
 
 #[derive(Default)]
@@ -25198,6 +25221,35 @@ define Auth() -> { @out "auth" }
                     .as_str()
                     .is_some_and(|hash| hash.starts_with("fnv1a64:"))));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_trace_exposes_live_trace_event_stream_transport() {
+        let (src_dir, path) = prod_server_source("editor-trace-live-transport-source");
+        let out = temp_output_dir("editor-trace-live-transport");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let trace_path = src_dir.join("production-trace.json");
+        write_json(
+            &trace_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "orv.production.trace",
+                "frames": [],
+            }),
+        )
+        .expect("write trace");
+
+        let trace = editor_trace_json(&out, &trace_path).expect("editor trace");
+
+        assert_eq!(trace["live_refresh"]["transport"]["kind"], "event-source");
+        assert_eq!(trace["live_refresh"]["transport"]["event"], "orv:trace");
+        assert_eq!(
+            trace["live_refresh"]["transport"]["url"],
+            "http://127.0.0.1:8080/__orv/trace/events"
+        );
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
