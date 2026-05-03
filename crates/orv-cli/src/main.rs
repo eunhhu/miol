@@ -2650,6 +2650,10 @@ impl LspSession {
                 Ok(result) => lsp_jsonrpc_result(&id, &result),
                 Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
             },
+            Some("textDocument/inlayHint") => match self.inlay_hint_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
             Some("textDocument/completion") => match self.completion_result(request) {
                 Ok(result) => lsp_jsonrpc_result(&id, &result),
                 Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
@@ -2713,6 +2717,7 @@ impl LspSession {
                     "signatureHelpProvider": {
                         "triggerCharacters": ["(", ","],
                     },
+                    "inlayHintProvider": true,
                     "completionProvider": {
                         "triggerCharacters": ["@", ".", ":"],
                     },
@@ -2981,6 +2986,24 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_signature_help_json(function, active_parameter))
+    }
+
+    fn inlay_hint_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let requested_range = lsp_request_range(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let start = lsp_position_to_byte(&file.source, requested_range.0);
+        let end = lsp_position_to_byte(&file.source, requested_range.1);
+        Ok(serde_json::Value::Array(lsp_inlay_hints_json(
+            &loaded.program,
+            &file.source,
+            start,
+            end,
+        )))
     }
 
     fn document_symbol_result(
@@ -7664,6 +7687,123 @@ fn lsp_signature_parameter_label(param: &orv_syntax::ast::Param) -> String {
     )
 }
 
+fn lsp_inlay_hints_json(
+    program: &Program,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Vec<serde_json::Value> {
+    let functions = program
+        .items
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Function(function) => Some(function.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut hints = Vec::new();
+    for function in functions {
+        let mut search_from = start.min(source.len());
+        let end = end.min(source.len());
+        while let Some(relative) = source[search_from..end].find(function.name.name.as_str()) {
+            let name_start = search_from + relative;
+            let Some(open) = lsp_call_open_after_name(source, name_start, &function.name.name)
+            else {
+                search_from = name_start.saturating_add(function.name.name.len());
+                continue;
+            };
+            if lsp_call_is_function_declaration(source, name_start) {
+                search_from = open.saturating_add(1);
+                continue;
+            }
+            for (index, argument_start) in lsp_call_argument_starts(source, open, end)
+                .into_iter()
+                .enumerate()
+                .take(function.params.len())
+            {
+                let label = format!("{}:", function.params[index].name.name);
+                let position =
+                    byte_position(source, u32::try_from(argument_start).unwrap_or(u32::MAX));
+                hints.push(serde_json::json!({
+                    "position": {
+                        "line": position.0,
+                        "character": position.1,
+                    },
+                    "label": label,
+                    "kind": 2,
+                    "paddingRight": true,
+                }));
+            }
+            search_from = open.saturating_add(1);
+        }
+    }
+    hints
+}
+
+fn lsp_call_open_after_name(source: &str, name_start: usize, name: &str) -> Option<usize> {
+    if name_start > 0 && is_identifier_byte(source.as_bytes()[name_start - 1]) {
+        return None;
+    }
+    let name_end = name_start.checked_add(name.len())?;
+    if source
+        .as_bytes()
+        .get(name_end)
+        .is_some_and(|byte| is_identifier_byte(*byte))
+    {
+        return None;
+    }
+    let offset = source[name_end..].find(|ch: char| !ch.is_whitespace())?;
+    let open = name_end + offset;
+    (source.as_bytes().get(open) == Some(&b'(')).then_some(open)
+}
+
+fn lsp_call_is_function_declaration(source: &str, name_start: usize) -> bool {
+    source[..name_start]
+        .split_whitespace()
+        .last()
+        .is_some_and(|word| matches!(word, "function" | "define"))
+}
+
+fn lsp_call_argument_starts(source: &str, open: usize, end: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let bytes = source.as_bytes();
+    let limit = end.min(bytes.len());
+    let mut depth = 0usize;
+    let mut index = open.saturating_add(1);
+    while index < limit {
+        match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' if depth == 0 => {
+                index += 1;
+            }
+            b')' if depth == 0 => break,
+            _ => break,
+        }
+    }
+    if index < limit && bytes[index] != b')' {
+        starts.push(index);
+    }
+    while index < limit {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' if depth == 0 => break,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                index += 1;
+                while index < limit && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                if index < limit && bytes[index] != b')' {
+                    starts.push(index);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    starts
+}
+
 fn lsp_function_signature_stmt<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionStmt> {
     program.items.iter().find_map(|stmt| match stmt {
         Stmt::Function(function) if function.name.name == name => Some(function.as_ref()),
@@ -12095,6 +12235,10 @@ function greet(user: User): string -> "hello"
         assert_eq!(
             response["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"][0],
             "("
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["inlayHintProvider"],
+            true
         );
         assert_eq!(
             response["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
@@ -17095,6 +17239,50 @@ let u: User = { id: 1 }
         assert_eq!(signature["label"], "add(left: int, right: int): int");
         assert_eq!(signature["parameters"][0]["label"], "left: int");
         assert_eq!(signature["parameters"][1]["label"], "right: int");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_inlay_hint_returns_function_parameter_labels() {
+        let dir = temp_output_dir("lsp-inlay-hint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text =
+            "function add(left: int, right: int): int -> left + right\nlet total: int = add(1, 2)\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let call_line = source_text.lines().nth(1).expect("call line");
+        let first_arg = call_line.find('1').expect("first argument");
+        let second_arg = call_line.find('2').expect("second argument");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "textDocument/inlayHint",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 1, "character": call_line.len() },
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 19);
+        assert!(response.get("error").is_none(), "{response}");
+        let hints = response["result"].as_array().expect("inlay hints");
+        assert!(hints.iter().any(|hint| {
+            hint["label"] == "left:"
+                && hint["kind"] == 2
+                && hint["position"]["line"] == 1
+                && hint["position"]["character"] == first_arg
+        }));
+        assert!(hints.iter().any(|hint| {
+            hint["label"] == "right:"
+                && hint["kind"] == 2
+                && hint["position"]["line"] == 1
+                && hint["position"]["character"] == second_arg
+        }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
