@@ -521,6 +521,7 @@ name = "orv-runtime"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

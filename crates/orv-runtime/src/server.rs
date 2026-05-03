@@ -20,13 +20,16 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::thread;
 
 use bytes::Bytes;
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -34,6 +37,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, HirStmt, NameId};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
@@ -102,6 +106,126 @@ impl LocalCapturedEnv {
 
     fn snapshot(&self) -> HashMap<NameId, Value> {
         self.0.as_ref().clone()
+    }
+}
+
+type ServerResponse = Response<RuntimeBody>;
+
+enum RuntimeBody {
+    Full(Option<Bytes>),
+    Trace(TraceEventBody),
+}
+
+impl RuntimeBody {
+    fn full(body: impl Into<Bytes>) -> Self {
+        Self::Full(Some(body.into()))
+    }
+
+    fn trace(initial: String, rx: tokio_mpsc::UnboundedReceiver<Bytes>) -> Self {
+        Self::Trace(TraceEventBody {
+            initial: Some(Bytes::from(initial)),
+            rx,
+        })
+    }
+}
+
+impl HttpBody for RuntimeBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            Self::Full(body) => Poll::Ready(body.take().map(|bytes| Ok(Frame::data(bytes)))),
+            Self::Trace(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self, Self::Full(None))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::new();
+        if let Self::Full(Some(bytes)) = self {
+            hint.set_exact(bytes.len() as u64);
+        }
+        hint
+    }
+}
+
+struct TraceEventBody {
+    initial: Option<Bytes>,
+    rx: tokio_mpsc::UnboundedReceiver<Bytes>,
+}
+
+impl HttpBody for TraceEventBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(initial) = self.initial.take() {
+            return Poll::Ready(Some(Ok(Frame::data(initial))));
+        }
+        Pin::new(&mut self.rx)
+            .poll_recv(cx)
+            .map(|item| item.map(|bytes| Ok(Frame::data(bytes))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+struct TraceState {
+    frames: Arc<Mutex<Vec<ServerRequestFrame>>>,
+    subscribers: Arc<Mutex<Vec<tokio_mpsc::UnboundedSender<Bytes>>>>,
+}
+
+impl TraceState {
+    fn new() -> Self {
+        Self {
+            frames: Arc::new(Mutex::new(Vec::new())),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn frames_handle(&self) -> Arc<Mutex<Vec<ServerRequestFrame>>> {
+        Arc::clone(&self.frames)
+    }
+
+    fn frames(&self) -> Vec<ServerRequestFrame> {
+        self.frames
+            .lock()
+            .map_or_else(|_| Vec::new(), |frames| frames.clone())
+    }
+
+    fn subscribe(&self) -> tokio_mpsc::UnboundedReceiver<Bytes> {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.push(tx);
+        }
+        rx
+    }
+
+    fn record(&self, frame: ServerRequestFrame) {
+        let index = if let Ok(mut frames) = self.frames.lock() {
+            let index = frames.len();
+            frames.push(frame.clone());
+            index
+        } else {
+            0
+        };
+        let event = Bytes::from(request_trace_frame_event_body(index, &frame));
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
     }
 }
 
@@ -174,7 +298,8 @@ pub(crate) fn run_server_with_request_trace_path(
         .map_err(|e| RuntimeError::native(format!("tokio runtime init failed: {e}")))?;
 
     let request_trace_path = request_trace_path.or_else(runtime_request_trace_path_from_env);
-    runtime.block_on(async move {
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async move {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let listener = TcpListener::bind(addr)
             .await
@@ -194,7 +319,7 @@ pub(crate) fn run_server_with_request_trace_path(
             shutdown_signal(),
         )
         .await
-    })?;
+    }))?;
 
     Ok(Value::Void)
 }
@@ -308,7 +433,8 @@ fn run_attached_server_thread(
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime init failed: {e}"))?;
-    runtime.block_on(async move {
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async move {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| format!("attached server bind failed: {e}"))?;
@@ -316,7 +442,8 @@ fn run_attached_server_thread(
             .local_addr()
             .map_err(|e| format!("attached server local_addr failed: {e}"))?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let request_frames = Arc::new(Mutex::new(Vec::new()));
+        let trace_state = TraceState::new();
+        let request_frames = trace_state.frames_handle();
         startup
             .send(Ok((
                 addr,
@@ -330,14 +457,14 @@ fn run_attached_server_thread(
             LocalRoutes::new(entries),
             LocalCapturedEnv::new(captured_env),
             db,
-            Some(request_frames),
+            Some(trace_state),
             async move {
                 let _ = shutdown_rx.await;
             },
         )
         .await
         .map_err(|e| e.to_string())
-    })
+    }))
 }
 
 fn attached_server_state<W: std::io::Write>(
@@ -616,7 +743,7 @@ async fn serve_loop<S>(
     routes: LocalRoutes,
     captured_env: LocalCapturedEnv,
     db: DbHandle,
-    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
+    trace_state: Option<TraceState>,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
@@ -646,35 +773,29 @@ where
         let routes = routes.clone();
         let captured_env = captured_env.clone();
         let db = db.clone();
-        let request_frames = request_frames.clone();
+        let trace_state = trace_state.clone();
         let client_ip = peer.ip().to_string();
-        // MVP: 커넥션 직렬 처리. tokio::task::spawn 은 `!Send` Future 를 못
-        // 받고, spawn_local 은 LocalSet 안에서만 동작한다. 동시 요청 처리가
-        // 필요한 순간(C6 이후)에 LocalSet 경로를 도입한다. 현재는 요청당 지연
-        // 이 짧고 통합 테스트도 순차라 직렬이 더 단순하다.
         let service = service_fn(move |req| {
             let routes = routes.clone();
             let captured_env = captured_env.clone();
             let db = db.clone();
-            let request_frames = request_frames.clone();
+            let trace_state = trace_state.clone();
             let client_ip = client_ip.clone();
             async move {
                 Ok::<_, Infallible>(
-                    handle_request(req, routes, captured_env, db, client_ip, request_frames).await,
+                    handle_request(req, routes, captured_env, db, client_ip, trace_state).await,
                 )
             }
         });
-        // MVP: keep-alive 차단. `serve_connection().await` 는 연결이 닫힐 때
-        // 까지 반환하지 않아서, 직렬 accept 루프에서 keep-alive 한 클라이언트가
-        // 뒤따르는 모든 요청을 굶길 수 있다. C6 이후 `LocalSet + spawn_local`
-        // 도입하며 함께 다시 켠다.
-        if let Err(e) = hyper::server::conn::http1::Builder::new()
-            .keep_alive(false)
-            .serve_connection(io, service)
-            .await
-        {
-            eprintln!("connection error: {e}");
-        }
+        tokio::task::spawn_local(async move {
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(io, service)
+                .await
+            {
+                eprintln!("connection error: {e}");
+            }
+        });
     }
 }
 
@@ -684,32 +805,26 @@ async fn serve_loop_with_request_trace_file<S>(
     routes: LocalRoutes,
     captured_env: LocalCapturedEnv,
     db: DbHandle,
-    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
+    trace_state: Option<TraceState>,
     request_trace_path: Option<std::path::PathBuf>,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
     S: std::future::Future<Output = ()>,
 {
-    let request_frames = request_frames.or_else(|| {
-        request_trace_path
-            .as_ref()
-            .map(|_| Arc::new(Mutex::new(Vec::new())))
-    });
+    let trace_state =
+        trace_state.or_else(|| request_trace_path.as_ref().map(|_| TraceState::new()));
     serve_loop(
         listener,
         routes,
         captured_env,
         db,
-        request_frames.clone(),
+        trace_state.clone(),
         shutdown,
     )
     .await?;
-    if let (Some(path), Some(request_frames)) = (request_trace_path, request_frames) {
-        let frames = request_frames
-            .lock()
-            .map_or_else(|_| Vec::new(), |frames| frames.clone());
-        write_request_trace_file(&path, &frames)?;
+    if let (Some(path), Some(trace_state)) = (request_trace_path, trace_state) {
+        write_request_trace_file(&path, &trace_state.frames())?;
     }
     Ok(())
 }
@@ -720,14 +835,15 @@ fn runtime_request_trace_path_from_env() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     req: Request<Incoming>,
     routes: LocalRoutes,
     captured_env: LocalCapturedEnv,
     db: DbHandle,
     client_ip: String,
-    request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
-) -> Response<Full<Bytes>> {
+    trace_state: Option<TraceState>,
+) -> ServerResponse {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     // hyper 는 요청 경로의 trailing `/` 를 그대로 보존한다. curl 사용자가 흔히
@@ -748,8 +864,8 @@ async fn handle_request(
     };
 
     if method == "GET" && path == ORV_TRACE_EVENTS_PATH {
-        if let Some(request_frames) = request_frames.as_ref() {
-            return request_trace_events_response(request_frames);
+        if let Some(trace_state) = trace_state.as_ref() {
+            return request_trace_events_response(trace_state);
         }
     }
 
@@ -768,7 +884,7 @@ async fn handle_request(
     let Some((entry, params)) = matched else {
         let response = plain_response(StatusCode::NOT_FOUND, "Not Found".into());
         record_request_frame(
-            request_frames.as_ref(),
+            trace_state.as_ref(),
             ServerRequestFrame {
                 method,
                 path,
@@ -829,10 +945,10 @@ async fn handle_request(
 
     let response = match outcome.response {
         Some(resp) => response_from_respond(resp, Some(&entry.origin_id)),
-        None => default_response(outcome.value, Some(&entry.origin_id)),
+        None => default_response(&outcome.value, Some(&entry.origin_id)),
     };
     record_request_frame(
-        request_frames.as_ref(),
+        trace_state.as_ref(),
         ServerRequestFrame {
             method: frame_method,
             path: frame_path,
@@ -851,7 +967,7 @@ async fn handle_request(
 async fn request_body_value(
     req: Request<Incoming>,
     headers: &HashMap<String, String>,
-) -> Result<Value, Response<Full<Bytes>>> {
+) -> Result<Value, ServerResponse> {
     // `Limited` 로 크기 상한을 걸어 거대 POST 의 메모리 폭주를 차단. 초과 시
     // 413 응답.
     let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
@@ -898,29 +1014,21 @@ async fn request_body_value(
     }
 }
 
-fn record_request_frame(
-    request_frames: Option<&Arc<Mutex<Vec<ServerRequestFrame>>>>,
-    frame: ServerRequestFrame,
-) {
-    if let Some(request_frames) = request_frames {
-        if let Ok(mut frames) = request_frames.lock() {
-            frames.push(frame);
-        }
+fn record_request_frame(trace_state: Option<&TraceState>, frame: ServerRequestFrame) {
+    if let Some(trace_state) = trace_state {
+        trace_state.record(frame);
     }
 }
 
-fn request_trace_events_response(
-    request_frames: &Arc<Mutex<Vec<ServerRequestFrame>>>,
-) -> Response<Full<Bytes>> {
-    let frames = request_frames
-        .lock()
-        .map_or_else(|_| Vec::new(), |frames| frames.clone());
+fn request_trace_events_response(trace_state: &TraceState) -> ServerResponse {
+    let frames = trace_state.frames();
     let body = request_trace_events_body(&frames);
+    let rx = trace_state.subscribe();
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(body)))
+        .body(RuntimeBody::trace(body, rx))
         .expect("valid trace event stream response")
 }
 
@@ -932,14 +1040,15 @@ fn request_trace_events_body(frames: &[ServerRequestFrame]) -> String {
     body.push_str(&payload);
     body.push_str("\n\n");
     for (index, frame) in frames.iter().enumerate() {
-        let payload = serde_json::to_string(&request_trace_frame_event_json(index, frame))
-            .unwrap_or_default();
-        body.push_str("event: orv:trace.frame\n");
-        body.push_str("data: ");
-        body.push_str(&payload);
-        body.push_str("\n\n");
+        body.push_str(&request_trace_frame_event_body(index, frame));
     }
     body
+}
+
+fn request_trace_frame_event_body(index: usize, frame: &ServerRequestFrame) -> String {
+    let payload =
+        serde_json::to_string(&request_trace_frame_event_json(index, frame)).unwrap_or_default();
+    format!("event: orv:trace.frame\ndata: {payload}\n\n")
 }
 
 /// Build the shared production request trace JSON document.
@@ -1013,7 +1122,7 @@ fn request_body_display(value: &Value) -> String {
     serde_json::to_string(&value_to_json(value)).unwrap_or_default()
 }
 
-fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response<Full<Bytes>> {
+fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> ServerResponse {
     let status = u16::try_from(resp.status)
         .ok()
         .and_then(|s| StatusCode::from_u16(s).ok())
@@ -1024,7 +1133,7 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response
     if let Some(loc) = resp.location {
         return response_builder(status, origin_id)
             .header("location", loc)
-            .body(Full::new(Bytes::new()))
+            .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
 
@@ -1034,7 +1143,7 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response
     if let Some(raw) = resp.raw_body {
         return response_builder(status, origin_id)
             .header("content-type", raw.content_type)
-            .body(Full::new(Bytes::from(raw.bytes)))
+            .body(RuntimeBody::full(Bytes::from(raw.bytes)))
             .expect("valid response");
     }
 
@@ -1043,14 +1152,14 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> Response
     // 기대하므로, payload 값과 무관하게 no-body 경로를 우선한다.
     if status_disallows_body(status) || matches!(resp.payload, Value::Void) {
         return response_builder(status, origin_id)
-            .body(Full::new(Bytes::new()))
+            .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
     let json = value_to_json(&resp.payload);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
     response_builder(status, origin_id)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
 }
 
@@ -1060,20 +1169,20 @@ fn status_disallows_body(status: StatusCode) -> bool {
         || status == StatusCode::NOT_MODIFIED
 }
 
-fn default_response(value: Value, origin_id: Option<&str>) -> Response<Full<Bytes>> {
+fn default_response(value: &Value, origin_id: Option<&str>) -> ServerResponse {
     // handler 가 `@respond` 없이 값으로 끝나면 그 값을 JSON 으로 200 응답.
     // Void 는 빈 200. 이렇게 하면 `@route GET /health { "ok" }` 같은 간단한
     // 핸들러가 그대로 동작한다.
     if matches!(value, Value::Void) {
         return response_builder(StatusCode::OK, origin_id)
-            .body(Full::new(Bytes::new()))
+            .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
-    let json = value_to_json(&value);
+    let json = value_to_json(value);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
     response_builder(StatusCode::OK, origin_id)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
 }
 
@@ -1085,11 +1194,11 @@ fn response_builder(status: StatusCode, origin_id: Option<&str>) -> hyper::http:
     builder
 }
 
-fn plain_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+fn plain_response(status: StatusCode, body: String) -> ServerResponse {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
 }
 
@@ -1711,10 +1820,8 @@ mod tests {
         let uri: hyper::Uri = path.parse().expect("uri");
         // body 가 없으면 빈 Full<Bytes> 로 통일 — 핸드셰이크 센더가 단일 body
         // 타입만 받으므로 if/else 분기에서 타입을 섞을 수 없다.
-        let (bytes, has_body) = match body {
-            Some(b) => (Bytes::from(b), true),
-            None => (Bytes::new(), false),
-        };
+        let (bytes, has_body) =
+            body.map_or_else(|| (Bytes::new(), false), |b| (Bytes::from(b), true));
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -1730,14 +1837,40 @@ mod tests {
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let origin = resp
             .headers()
             .get(TEST_ORIGIN_HEADER)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
         (status, ct, origin, bytes)
+    }
+
+    async fn open_trace_event_stream(
+        addr: SocketAddr,
+    ) -> (u16, Option<String>, hyper::body::Incoming) {
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/__orv/trace/events")
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .expect("build req");
+        let resp = sender.send_request(req).await.expect("send");
+        let status = resp.status().as_u16();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(std::string::ToString::to_string);
+        (status, ct, resp.into_body())
     }
 
     async fn send_request_with_content_type(
@@ -1768,7 +1901,7 @@ mod tests {
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
         (status, ct, bytes)
     }
@@ -1911,12 +2044,18 @@ mod tests {
 
             let (status, _, _) = send_request(addr, "GET", "/ping", None).await;
             assert_eq!(status, 200);
-            let (stream_status, content_type, _origin, body) =
-                send_request_full(addr, "GET", "/__orv/trace/events", None).await;
+            let (stream_status, content_type, mut body) = open_trace_event_stream(addr).await;
 
             assert_eq!(stream_status, 200);
             assert_eq!(content_type.as_deref(), Some("text/event-stream"));
-            let body = String::from_utf8(body).expect("event stream utf8");
+            let body = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .expect("trace event timeout")
+                .expect("trace event")
+                .expect("trace event frame")
+                .into_data()
+                .expect("trace event data");
+            let body = String::from_utf8(body.to_vec()).expect("event stream utf8");
             assert!(body.contains("event: orv:trace"));
             assert!(body.contains("\"kind\":\"orv.production.trace\""));
             assert!(body.contains("\"frame_count\":1"));
@@ -1964,13 +2103,98 @@ mod tests {
 
             assert_eq!(send_request(addr, "GET", "/ping", None).await.0, 200);
             assert_eq!(send_request(addr, "GET", "/ping", None).await.0, 200);
-            let (_, _, _, body) = send_request_full(addr, "GET", "/__orv/trace/events", None).await;
+            let (_, _, mut body) = open_trace_event_stream(addr).await;
 
-            let body = String::from_utf8(body).expect("event stream utf8");
+            let body = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .expect("trace event timeout")
+                .expect("trace event")
+                .expect("trace event frame")
+                .into_data()
+                .expect("trace event data");
+            let body = String::from_utf8(body.to_vec()).expect("event stream utf8");
             assert_eq!(body.matches("event: orv:trace.frame").count(), 2);
             assert!(body.contains("\"kind\":\"orv.production.trace.frame\""));
             assert!(body.contains("\"index\":0"));
             assert!(body.contains("\"index\":1"));
+            shutdown_tx.send(()).expect("shutdown send");
+            handle.await.expect("server task join");
+            let _ = std::fs::remove_dir_all(dir);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn request_trace_events_endpoint_stays_open_for_new_frames() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                "@server {
+                    @listen 0
+                    @route GET /ping { @respond 200 { ok: true } }
+                }",
+            );
+            let dir = std::env::temp_dir().join(format!(
+                "orv-runtime-trace-open-stream-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let trace_path = dir.join("trace").join("requests.json");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (addr, handle, _boot) = spawn_for_test_with_request_trace_file(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                trace_path,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("spawn");
+
+            let (status, content_type, mut body) = open_trace_event_stream(addr).await;
+            assert_eq!(status, 200);
+            assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+            let first = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .expect("initial event timeout")
+                .expect("initial event")
+                .expect("initial event frame")
+                .into_data()
+                .expect("initial data");
+            let first = String::from_utf8(first.to_vec()).expect("initial utf8");
+            assert!(first.contains("event: orv:trace"));
+            assert!(first.contains("\"frame_count\":0"));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), body.frame())
+                    .await
+                    .is_err(),
+                "trace stream ended before new request frames"
+            );
+
+            let ping = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                send_request(addr, "GET", "/ping", None),
+            )
+            .await
+            .expect("ping while trace stream is open");
+            assert_eq!(ping.0, 200);
+            let next = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .expect("frame event timeout")
+                .expect("frame event")
+                .expect("frame event frame")
+                .into_data()
+                .expect("frame data");
+            let next = String::from_utf8(next.to_vec()).expect("frame utf8");
+            assert!(next.contains("event: orv:trace.frame"));
+            assert!(next.contains("\"path\":\"/ping\""));
             shutdown_tx.send(()).expect("shutdown send");
             handle.await.expect("server task join");
             let _ = std::fs::remove_dir_all(dir);
