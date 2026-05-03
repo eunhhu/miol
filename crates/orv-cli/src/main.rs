@@ -3418,6 +3418,7 @@ struct DapBreakpoint {
     verified: bool,
     condition: Option<String>,
     hit_condition: Option<String>,
+    log_message: Option<String>,
     message: Option<String>,
 }
 
@@ -4117,6 +4118,12 @@ impl DapSession {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::trim)
                                 .filter(|condition| !condition.is_empty())
+                                .map(str::to_string),
+                            log_message: breakpoint
+                                .get("logMessage")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|message| !message.is_empty())
                                 .map(str::to_string),
                             message: (!verified)
                                 .then(|| "no executable ORV node on this line".to_string()),
@@ -5291,24 +5298,40 @@ impl DapSession {
             launched
                 .frames
                 .iter()
+                .enumerate()
                 .skip(start)
                 .take(end.saturating_sub(start).saturating_add(1))
-                .map(|frame| frame.output.clone())
+                .flat_map(|(index, frame)| {
+                    let mut outputs = Vec::new();
+                    if !frame.output.is_empty() {
+                        outputs.push(("stdout".to_string(), frame.output.clone()));
+                    }
+                    outputs.extend(
+                        self.logpoint_outputs(&launched.frames, index)
+                            .into_iter()
+                            .map(|output| ("console".to_string(), output)),
+                    );
+                    outputs
+                })
                 .collect()
         });
-        for output in outputs {
-            self.queue_stdout_output(&output);
+        for (category, output) in outputs {
+            self.queue_output(&category, &output);
         }
     }
 
     fn queue_stdout_output(&mut self, output: &str) {
+        self.queue_output("stdout", output);
+    }
+
+    fn queue_output(&mut self, category: &str, output: &str) {
         if output.is_empty() {
             return;
         }
         self.queue_event(
             "output",
             serde_json::json!({
-                "category": "stdout",
+                "category": category,
                 "output": output,
             }),
         );
@@ -5328,7 +5351,7 @@ impl DapSession {
         self.breakpoints.get(&normalized).and_then(|breakpoints| {
             breakpoints
                 .iter()
-                .find(|breakpoint| breakpoint.verified)
+                .find(|breakpoint| breakpoint.verified && breakpoint.log_message.is_none())
                 .map(|breakpoint| breakpoint.line)
         })
     }
@@ -5385,6 +5408,7 @@ impl DapSession {
             .is_some_and(|breakpoints| {
                 breakpoints.iter().any(|breakpoint| {
                     breakpoint.verified
+                        && breakpoint.log_message.is_none()
                         && breakpoint.line == frame.line
                         && dap_breakpoint_condition_matches(frame, breakpoint.condition.as_deref())
                         && self.line_breakpoint_hit_condition_matches(
@@ -5394,6 +5418,37 @@ impl DapSession {
                             breakpoint,
                         )
                 })
+            })
+    }
+
+    fn logpoint_outputs(&self, frames: &[DapFrameState], index: usize) -> Vec<String> {
+        let Some(frame) = frames.get(index) else {
+            return Vec::new();
+        };
+        let normalized = dap_normalize_path(&frame.source.path);
+        self.breakpoints
+            .get(&normalized)
+            .map_or_else(Vec::new, |breakpoints| {
+                breakpoints
+                    .iter()
+                    .filter(|breakpoint| {
+                        breakpoint.verified
+                            && breakpoint.line == frame.line
+                            && breakpoint.log_message.is_some()
+                            && dap_breakpoint_condition_matches(
+                                frame,
+                                breakpoint.condition.as_deref(),
+                            )
+                            && self.line_breakpoint_hit_condition_matches(
+                                frames,
+                                index,
+                                &normalized,
+                                breakpoint,
+                            )
+                    })
+                    .filter_map(|breakpoint| breakpoint.log_message.as_deref())
+                    .map(dap_logpoint_output)
+                    .collect()
             })
     }
 
@@ -6335,6 +6390,14 @@ fn dap_frame_local_value<'a>(frame: &'a DapFrameState, name: &str) -> Option<&'a
         .iter()
         .find(|local| local.name == name)
         .map(|local| local.value.as_str())
+}
+
+fn dap_logpoint_output(message: &str) -> String {
+    let mut output = message.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
 }
 
 fn dap_breakpoint_condition_matches(frame: &DapFrameState, condition: Option<&str>) -> bool {
@@ -12531,6 +12594,88 @@ function greet(user: User): string -> "hello"
                 && event["body"]["threadId"] == 1
         }));
         assert!(!events
+            .iter()
+            .any(|event| event["type"] == "event" && event["event"] == "terminated"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_logpoint_outputs_without_stopping() {
+        let dir = temp_output_dir("dap-logpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 164,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": source.display().to_string(),
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 2,
+                            "logMessage": "middle reached",
+                        },
+                    ],
+                },
+            }))
+            .expect("breakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 165,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let first_stack = session
+            .message_response(&serde_json::json!({
+                "seq": 166,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first stack response");
+        session.drain_pending_events();
+        let continue_response = session
+            .message_response(&serde_json::json!({
+                "seq": 167,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let events = session.drain_pending_events();
+
+        assert_eq!(first_stack["body"]["stackFrames"][0]["line"], 1);
+        assert_eq!(continue_response["success"], true, "{continue_response}");
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "output"
+                && event["body"]["category"] == "console"
+                && event["body"]["output"] == "middle reached\n"
+        }));
+        assert!(!events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "breakpoint"
+        }));
+        assert!(events
             .iter()
             .any(|event| event["type"] == "event" && event["event"] == "terminated"));
         let _ = std::fs::remove_dir_all(dir);
