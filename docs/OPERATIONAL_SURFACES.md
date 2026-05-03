@@ -19,6 +19,7 @@
 - `orv fetch [dir-or-orv.toml] [--out <dir>]`
 - `orv workspace new <member> [--root <dir>] [--name <name>]`
 - `orv workspace graph [root] [--out <dir>]`
+- `orv workspace lock [root] [--out <dir>]`
 - `orv workspace build [root] [--out <dir>] [--prod] [--incremental]`
 - `orv verify-build/verify-artifact/check-artifact/check-build`
 - `orv run-artifact/run-build/reveal`
@@ -39,6 +40,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 `orv workspace new <member> [--root <dir>] [--name <name>]` creates a basic member project and records the relative member path in root `orv.toml` `[workspace].members` with resolver `2`.
 
 `orv workspace graph [root] [--out <dir>]` reads root `[workspace].members`, loads each member entry through the shared ProjectGraph pipeline, records member graphs/files/dependencies, and emits path dependency edges between workspace members. With `--out`, it writes `workspace-graph.json`.
+
+`orv workspace lock [root] --out <dir>` reads the same workspace graph, orders members dependency-first from path dependency edges, writes per-member lockfiles under `members/<member>/orv.lock`, and emits `workspace-lock.json` with member project metadata, dependency lists, path dependency edges, lock order, and package counts without mutating member source directories.
 
 `orv workspace build [root] --out <dir> [--prod] [--incremental]` reuses the normal build pipeline for every workspace member, orders member builds dependency-first from path dependency edges, verifies each member build directory, writes member artifacts under `members/<member>`, and emits `workspace-build.json` plus `workspace-graph.json` as the top-level workspace build contract. With `--incremental`, unchanged member source-bundle input hashes are skipped when the previous verified build is still valid; rebuilt dependencies force dependent members to rebuild.
 

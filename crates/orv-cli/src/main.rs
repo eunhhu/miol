@@ -296,6 +296,15 @@ enum WorkspaceCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Workspace member lockfile들을 한 디렉터리 아래 생성한다.
+    Lock {
+        /// workspace root 디렉터리.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// workspace lock artifact 출력 디렉터리.
+        #[arg(long, short = 'o', default_value = "target/orv-workspace-lock")]
+        out: PathBuf,
+    },
     /// Workspace member build artifact들을 한 디렉터리 아래 생성한다.
     Build {
         /// workspace root 디렉터리.
@@ -712,6 +721,13 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            WorkspaceCommand::Lock { root, out } => match cmd_workspace_lock(&root, &out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
             WorkspaceCommand::Build {
                 root,
                 out,
@@ -1303,6 +1319,78 @@ fn cmd_workspace_graph(root: &Path, out: Option<&Path>) -> anyhow::Result<()> {
     } else {
         println!("{}", serde_json::to_string_pretty(&graph)?);
     }
+    Ok(())
+}
+
+fn cmd_workspace_lock(root: &Path, out: &Path) -> anyhow::Result<()> {
+    let graph = workspace_graph_json(root)?;
+    write_json(&out.join("workspace-graph.json"), &graph)?;
+
+    let lock_order = workspace_build_order(&graph)?;
+    let dependency_edges = workspace_path_dependency_edges_from_graph(&graph)?;
+    let members = graph
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace graph members must be an array"))?;
+    let member_lookup = members
+        .iter()
+        .map(|member| {
+            Ok((
+                json_str(member, "path", "workspace member")?.to_string(),
+                member,
+            ))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
+    let mut member_locks = Vec::with_capacity(lock_order.len());
+    let mut package_count = 0usize;
+    for member_path in &lock_order {
+        let member = member_lookup
+            .get(member_path)
+            .ok_or_else(|| anyhow::anyhow!("workspace lock member `{member_path}` not found"))?;
+        let member_path =
+            workspace_member_string(Path::new(json_str(member, "path", "workspace member")?))?;
+        let lock = project_lock_json(&root.join(&member_path).join("orv.toml"))?;
+        let dependencies = lock
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let dev_dependencies = lock
+            .get("dev_dependencies")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        package_count += dependencies.len() + dev_dependencies.len();
+        let lockfile = format!("members/{member_path}/orv.lock");
+        write_json(&out.join(&lockfile), &lock)?;
+        member_locks.push(serde_json::json!({
+            "path": member_path,
+            "name": json_str(member, "name", "workspace member")?,
+            "entry": json_str(member, "entry", "workspace member")?,
+            "lockfile": lockfile,
+            "project": lock.get("project").cloned().unwrap_or(serde_json::Value::Null),
+            "dependencies": dependencies,
+            "dev_dependencies": dev_dependencies,
+        }));
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.workspace.lock",
+        "root": root.display().to_string(),
+        "workspace_graph": "workspace-graph.json",
+        "stats": {
+            "member_count": member_locks.len(),
+            "dependency_edge_count": dependency_edges.len(),
+            "package_count": package_count,
+        },
+        "lock_order": lock_order,
+        "members": member_locks,
+        "dependency_edges": dependency_edges,
+    });
+    write_json(&out.join("workspace-lock.json"), &manifest)?;
+    println!("workspace lock: wrote {}", out.display());
     Ok(())
 }
 
@@ -22122,6 +22210,27 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn workspace_lock_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "workspace",
+            "lock",
+            "demo",
+            "--out",
+            "target/orv-workspace-lock",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Workspace { command } = parsed.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Lock { root, out } = command else {
+            panic!("expected workspace lock command");
+        };
+        assert_eq!(root, PathBuf::from("demo"));
+        assert_eq!(out, PathBuf::from("target/orv-workspace-lock"));
+    }
+
+    #[test]
     fn workspace_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -23565,6 +23674,36 @@ entry = "src/main.orv"
             .any(|edge| edge["kind"] == "path_dependency"
                 && edge["from"] == "apps/web"
                 && edge["to"] == "shared/models"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_lock_writes_member_locks_and_workspace_manifest() {
+        let root = workspace_build_fixture("workspace-lock");
+        let out = root.join("target/orv-workspace-lock");
+        cmd_workspace_lock(&root, &out).expect("workspace lock");
+
+        assert!(out.join("workspace-graph.json").is_file());
+        assert!(out.join("workspace-lock.json").is_file());
+        assert!(out.join("members/shared/models/orv.lock").is_file());
+        assert!(out.join("members/apps/web/orv.lock").is_file());
+        let manifest = read_json_value(&out.join("workspace-lock.json")).expect("read lock");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["kind"], "orv.workspace.lock");
+        assert_eq!(manifest["stats"]["member_count"], 2);
+        assert_eq!(
+            manifest["lock_order"],
+            serde_json::json!(["shared/models", "apps/web"])
+        );
+        assert!(manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .any(|member| member["path"] == "apps/web"
+                && member["lockfile"] == "members/apps/web/orv.lock"
+                && member["dependencies"][0]["source"] == "path"
+                && member["dependencies"][0]["path"] == "../../shared/models"));
 
         let _ = std::fs::remove_dir_all(root);
     }

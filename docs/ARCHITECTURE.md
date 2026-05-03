@@ -219,6 +219,7 @@ dist/
 - `orv fetch [dir-or-orv.toml] --out <dir>` — 최신 lockfile에서 path/local registry 및 optional Bearer auth HTTP registry source-bundle dependency cache와 `deps-manifest.json` 출력
 - `orv workspace new <member> [--root <dir>] [--name <name>]` — workspace root manifest member 등록과 member project scaffold 생성
 - `orv workspace graph [root] [--out <dir>]` — workspace member graph/files/dependencies와 member 간 path dependency edge artifact 출력
+- `orv workspace lock [root] --out <dir>` — dependency-first member lockfile artifact들과 `workspace-lock.json` 출력
 - `orv workspace build [root] --out <dir> [--prod] [--incremental]` — path dependency edge 기반 dependency-first 순서로 각 workspace member를 기존 build pipeline으로 빌드/검증하고 unchanged source hash member는 skip 하는 top-level workspace build manifest 출력
 - `orv verify-build <dir>` — build manifest/plan target 존재, source bundle hash, deploy container/runtime image/Compose/runbook contract, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap, optional dev HMR/watch/transport/event/server manifest 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증
