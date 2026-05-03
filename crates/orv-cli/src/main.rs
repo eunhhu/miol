@@ -2719,11 +2719,14 @@ fn read_json_from_http(url: &str) -> anyhow::Result<serde_json::Value> {
 }
 
 fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
-    if requested == "*" {
+    if is_wildcard_segment(requested) {
         return true;
     }
     let Some(base) = requested.strip_prefix('^').and_then(parse_semver_version) else {
-        return false;
+        if let Some(base) = requested.strip_prefix('~').and_then(parse_semver_version) {
+            return version >= &base && version.major == base.major && version.minor == base.minor;
+        }
+        return wildcard_version_matches(requested, version).unwrap_or(false);
     };
     if version < &base {
         return false;
@@ -2735,6 +2738,33 @@ fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
     } else {
         version.major == 0 && version.minor == 0 && version.patch == base.patch
     }
+}
+
+fn wildcard_version_matches(requested: &str, version: &SemverVersion) -> Option<bool> {
+    let parts = requested.split('.').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let wildcard_at = parts.iter().position(|part| is_wildcard_segment(part))?;
+    if !parts[wildcard_at..]
+        .iter()
+        .all(|part| is_wildcard_segment(part))
+    {
+        return None;
+    }
+    let numbers = parts[..wildcard_at]
+        .iter()
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    match numbers.as_slice() {
+        [major] => Some(version.major == *major),
+        [major, minor] => Some(version.major == *major && version.minor == *minor),
+        _ => None,
+    }
+}
+
+fn is_wildcard_segment(segment: &str) -> bool {
+    matches!(segment, "*" | "x" | "X")
 }
 
 fn parse_semver_version(version: &str) -> Option<SemverVersion> {
@@ -22707,6 +22737,90 @@ auth = { version = "^1.2.0", registry = "registry" }
         assert_eq!(lock["dependencies"][0]["name"], "auth");
         assert_eq!(lock["dependencies"][0]["version"], "1.3.0");
         assert_eq!(lock["dependencies"][0]["requested_version"], "^1.2.0");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_tilde_version_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-tilde");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0/src")).expect("create 1.2.0");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.9/src")).expect("create 1.2.9");
+        std::fs::create_dir_all(dir.join("registry/auth/1.3.0/src")).expect("create 1.3.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-tilde\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.0","1.2.9","1.3.0"]}"#,
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = "~1.2.0", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.2.9");
+        assert_eq!(lock["dependencies"][0]["requested_version"], "~1.2.0");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_segment_wildcard_versions_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-wildcard");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0/src")).expect("create auth 1.2.0");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.9/src")).expect("create auth 1.2.9");
+        std::fs::create_dir_all(dir.join("registry/auth/1.3.0/src")).expect("create auth 1.3.0");
+        std::fs::create_dir_all(dir.join("registry/ui/1.0.0/src")).expect("create ui 1.0.0");
+        std::fs::create_dir_all(dir.join("registry/ui/1.4.0/src")).expect("create ui 1.4.0");
+        std::fs::create_dir_all(dir.join("registry/ui/2.0.0/src")).expect("create ui 2.0.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-wildcard\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.0","1.2.9","1.3.0"]}"#,
+        )
+        .expect("write auth index");
+        std::fs::write(
+            dir.join("registry/ui/index.json"),
+            r#"{"versions":["1.0.0","1.4.0","2.0.0"]}"#,
+        )
+        .expect("write ui index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = "1.2.*", registry = "registry" }
+ui = { version = "1.*", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.2.9");
+        assert_eq!(lock["dependencies"][0]["requested_version"], "1.2.*");
+        assert_eq!(lock["dependencies"][1]["name"], "ui");
+        assert_eq!(lock["dependencies"][1]["version"], "1.4.0");
+        assert_eq!(lock["dependencies"][1]["requested_version"], "1.*");
 
         let _ = std::fs::remove_dir_all(dir);
     }
