@@ -24,6 +24,8 @@
 
 **Server listen artifact delta (2026-05-03):** origin maps now include `listen` nodes, server runtime artifacts preserve listen origin/static/env port descriptors, `server/launch.json` must match that listen descriptor during `orv verify-build`, and prod builds reject static test-only `@listen 0`. Remaining deployment work is native runtime images.
 
+**Graph view delta (2026-05-03):** `orv graph <file> --view --out <dir>` now writes `graph.json` plus a static `index.html` graph view with source/semantic depth stats, SVG node/edge visualization, ProjectGraph node rows, and semantic origin rows. Remaining graph work is interactive filtering/layout and workspace-scale graph navigation.
+
 **DAP exception filter delta (2026-05-03):** `orv dap serve --stdio` now stores `setExceptionBreakpoints` diagnostics/runtime selections and only marks launch stops as `exception` when the active filter covers the runtime status. Remaining DAP work is richer editor UI wiring.
 
 **DAP cancel/instruction-breakpoint delta (2026-05-03):** `orv dap serve --stdio` now advertises and accepts DAP `cancel` requests as synchronous no-op success responses, avoiding client-visible unsupported-command errors for adapters that send cancellation frames. It also accepts `setInstructionBreakpoints` and returns explicit unverified breakpoint entries because ORV currently exposes source runtime frames rather than stable instruction addresses.

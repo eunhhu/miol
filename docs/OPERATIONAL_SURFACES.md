@@ -20,6 +20,8 @@
 
 Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project].entry`, or a project directory containing `orv.toml`.
 
+`orv graph <file> --view --out <dir>` writes `graph.json` and a static `index.html` ProjectGraph view with source/semantic depth stats, node/edge visualization, and origin rows.
+
 `orv dev --hmr` writes `dev/session.json`, `dev/transport.json`, and `dev/hmr-client.js` for the reference EventSource HMR browser transport; `orv dev --watch` writes `dev/watch.json`; and `orv dev --watch-loop [--watch-iterations <n>]` runs the poll-loop build/verify/run path while writing `dev/events.json` rebuild/skip events.
 
 ## Editor And LSP
