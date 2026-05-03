@@ -34,7 +34,7 @@
 
 **Runtime request trace file delta (2026-05-03):** Normal `@server` runtime execution now honors `orv run-artifact/run-build --trace <path>` and `ORV_RUNTIME_REQUEST_TRACE_PATH`, writing the same `orv.production.trace` file on graceful shutdown so run/build/deploy processes have a non-DAP production trace capture path. Remaining trace work is live streaming/transport and richer native editor consumption.
 
-**Editor trace summary delta (2026-05-03):** `orv editor trace` now adds per-frame request labels, route/status classes, and aggregate status buckets so the exported editor shell can render captured traffic without recomputing request summaries in UI code. The exported shell also renders status buckets and client-side trace filters for all/2xx/3xx/4xx/5xx/other traffic.
+**Editor trace summary delta (2026-05-03):** `orv editor trace` now adds per-frame request labels, route/status classes, aggregate status buckets, and a trace-file-hash live refresh contract so the exported editor shell can render captured traffic without recomputing request summaries in UI code. The exported shell also renders status buckets and client-side trace filters for all/2xx/3xx/4xx/5xx/other traffic.
 
 ---
 

@@ -2076,7 +2076,22 @@ fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Val
             "frame_count": editor_frames.len(),
             "status_counts": editor_trace_status_counts_json(&status_counts),
         },
+        "live_refresh": editor_trace_live_refresh_json(trace)?,
         "frames": editor_frames,
+    }))
+}
+
+fn editor_trace_live_refresh_json(trace: &Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(trace)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", trace.display()))?;
+    Ok(serde_json::json!({
+        "strategy": "trace-file-hash",
+        "watch": {
+            "trace": {
+                "path": trace.display().to_string(),
+                "content_hash": format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
+            },
+        },
     }))
 }
 
@@ -18559,6 +18574,14 @@ entry = "src/main.orv"
         assert_eq!(trace["schema_version"], 1);
         assert_eq!(trace["kind"], "orv.editor.trace");
         assert_eq!(trace["trace"]["frame_count"], 1);
+        assert_eq!(trace["live_refresh"]["strategy"], "trace-file-hash");
+        assert_eq!(
+            trace["live_refresh"]["watch"]["trace"]["path"],
+            trace_path.display().to_string()
+        );
+        assert!(trace["live_refresh"]["watch"]["trace"]["content_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("fnv1a64:")));
         assert_eq!(trace["frames"][0]["request"]["method"], "GET");
         assert_eq!(trace["frames"][0]["request"]["path"], "/ping");
         assert_eq!(trace["frames"][0]["origin_id"], route.id);
