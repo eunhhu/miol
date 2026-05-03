@@ -2602,7 +2602,9 @@ fn registry_table_lock_dependency(
         .get("registry")
         .and_then(toml::Value::as_str)
         .unwrap_or("registry.orv.dev");
-    registry_lock_dependency_with_source(root, section, name, version, registry)
+    let auth_token_env =
+        toml_optional_string(table, "auth_token_env", "dependency.auth_token_env")?;
+    registry_lock_dependency_with_source(root, section, name, version, registry, auth_token_env)
 }
 
 fn registry_lock_dependency(
@@ -2611,7 +2613,7 @@ fn registry_lock_dependency(
     name: &str,
     version: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    registry_lock_dependency_with_source(root, section, name, version, "registry.orv.dev")
+    registry_lock_dependency_with_source(root, section, name, version, "registry.orv.dev", None)
 }
 
 fn registry_lock_dependency_with_source(
@@ -2620,6 +2622,7 @@ fn registry_lock_dependency_with_source(
     name: &str,
     version: &str,
     registry: &str,
+    auth_token_env: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
     if version.trim().is_empty() {
         anyhow::bail!("{section}.{name} version must not be empty");
@@ -2627,7 +2630,7 @@ fn registry_lock_dependency_with_source(
     if registry.trim().is_empty() {
         anyhow::bail!("{section}.{name} registry must not be empty");
     }
-    let resolved = resolve_registry_version(root, name, version, registry)?;
+    let resolved = resolve_registry_version(root, name, version, registry, auth_token_env)?;
     let resolved_changed = resolved != version;
     let mut entry = serde_json::json!({
         "name": name,
@@ -2638,6 +2641,9 @@ fn registry_lock_dependency_with_source(
     });
     if resolved_changed {
         entry["requested_version"] = serde_json::json!(version);
+    }
+    if let Some(auth_token_env) = auth_token_env {
+        entry["auth_token_env"] = serde_json::json!(auth_token_env);
     }
     Ok(entry)
 }
@@ -2710,11 +2716,12 @@ fn resolve_registry_version(
     name: &str,
     requested: &str,
     registry: &str,
+    auth_token_env: Option<&str>,
 ) -> anyhow::Result<String> {
     if parse_semver_version(requested).is_some() {
         return Ok(requested.to_string());
     }
-    let versions = registry_index_versions(root, name, registry)?;
+    let versions = registry_index_versions(root, name, registry, auth_token_env)?;
     let resolved = versions
         .into_iter()
         .filter(|version| registry_version_matches(requested, version))
@@ -2727,12 +2734,13 @@ fn registry_index_versions(
     root: &Path,
     name: &str,
     registry: &str,
+    auth_token_env: Option<&str>,
 ) -> anyhow::Result<Vec<SemverVersion>> {
     let index = if registry.starts_with("http://") {
-        read_json_from_http(&format!(
-            "{}/{name}/index.json",
-            registry.trim_end_matches('/')
-        ))?
+        read_json_from_http(
+            &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
+            auth_token_env,
+        )?
     } else if registry.starts_with("https://") {
         anyhow::bail!("https registry index resolution is not implemented yet")
     } else if registry == "registry.orv.dev" {
@@ -2768,8 +2776,11 @@ fn registry_index_versions(
         .collect()
 }
 
-fn read_json_from_http(url: &str) -> anyhow::Result<serde_json::Value> {
-    let source = http_get_string(url)?;
+fn read_json_from_http(
+    url: &str,
+    auth_token_env: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let source = http_get_string_with_auth(url, auth_token_env)?;
     serde_json::from_str(&source).map_err(|e| anyhow::anyhow!("failed to parse {url}: {e}"))
 }
 
@@ -2970,6 +2981,20 @@ fn toml_string<'a>(
         .and_then(toml::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("{context} must be a non-empty string"))
+}
+
+fn toml_optional_string<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+    context: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    let Some(value) = table.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) else {
+        anyhow::bail!("{context} must be a non-empty string");
+    };
+    Ok(Some(value))
 }
 
 fn read_toml_manifest(manifest: &Path) -> anyhow::Result<toml::Value> {
@@ -12459,6 +12484,21 @@ fn json_str<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> anyho
         .ok_or_else(|| anyhow::anyhow!("{context} field `{key}` must be a string"))
 }
 
+fn json_optional_str<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+    context: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{context} field `{key}` must be a non-empty string"))
+}
+
 fn json_u32(value: &serde_json::Value, key: &str, context: &str) -> anyhow::Result<u32> {
     let raw = value
         .get(key)
@@ -12639,6 +12679,11 @@ fn fetch_dependency_package(
     } else {
         package["registry"] =
             serde_json::json!(json_str(dependency, "registry", "registry dependency")?);
+        if let Some(auth_token_env) =
+            json_optional_str(dependency, "auth_token_env", "registry dependency")?
+        {
+            package["auth_token_env"] = serde_json::json!(auth_token_env);
+        }
     }
     Ok(package)
 }
@@ -12679,7 +12724,10 @@ fn registry_dependency_source(
             json_str(dependency, "name", "registry dependency")?,
             json_str(dependency, "version", "registry dependency")?,
         );
-        let artifact = download_http_source_bundle(&url)?;
+        let artifact = download_http_source_bundle(
+            &url,
+            json_optional_str(dependency, "auth_token_env", "registry dependency")?,
+        )?;
         return Ok(FetchedDependency::SourceBundle { url, artifact });
     }
     if registry == "registry.orv.dev" {
@@ -12712,8 +12760,11 @@ fn registry_source_bundle_url(registry: &str, name: &str, version: &str) -> Stri
     )
 }
 
-fn download_http_source_bundle(url: &str) -> anyhow::Result<orv_compiler::SourceBundleArtifact> {
-    let body = http_get_string(url)?;
+fn download_http_source_bundle(
+    url: &str,
+    auth_token_env: Option<&str>,
+) -> anyhow::Result<orv_compiler::SourceBundleArtifact> {
+    let body = http_get_string_with_auth(url, auth_token_env)?;
     let artifact: orv_compiler::SourceBundleArtifact = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("failed to parse registry source bundle {url}: {e}"))?;
     orv_compiler::verify_source_bundle_artifact(&artifact)
@@ -12721,18 +12772,23 @@ fn download_http_source_bundle(url: &str) -> anyhow::Result<orv_compiler::Source
     Ok(artifact)
 }
 
-fn http_get_string(url: &str) -> anyhow::Result<String> {
+fn http_get_string_with_auth(url: &str, auth_token_env: Option<&str>) -> anyhow::Result<String> {
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = std::net::TcpStream::connect((host.as_str(), port))
         .map_err(|e| anyhow::anyhow!("failed to connect to registry {host}:{port}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| anyhow::anyhow!("failed to configure registry read timeout: {e}"))?;
-    std::io::Write::write_all(
-        &mut stream,
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .map_err(|e| anyhow::anyhow!("failed to send registry request {url}: {e}"))?;
+    let authorization = registry_authorization_header(auth_token_env)?;
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+    if let Some(authorization) = authorization {
+        request.push_str("Authorization: ");
+        request.push_str(&authorization);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to send registry request {url}: {e}"))?;
     let mut response = Vec::new();
     std::io::Read::read_to_end(&mut stream, &mut response)
         .map_err(|e| anyhow::anyhow!("failed to read registry response {url}: {e}"))?;
@@ -12748,6 +12804,21 @@ fn http_get_string(url: &str) -> anyhow::Result<String> {
     }
     String::from_utf8(response[header_end + 4..].to_vec())
         .map_err(|e| anyhow::anyhow!("registry response body is not UTF-8: {e}"))
+}
+
+fn registry_authorization_header(auth_token_env: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(auth_token_env) = auth_token_env else {
+        return Ok(None);
+    };
+    let token = std::env::var(auth_token_env)
+        .map_err(|_| anyhow::anyhow!("registry auth token env `{auth_token_env}` is not set"))?;
+    if token.trim().is_empty() {
+        anyhow::bail!("registry auth token env `{auth_token_env}` must not be empty");
+    }
+    if token.contains('\r') || token.contains('\n') {
+        anyhow::bail!("registry auth token env `{auth_token_env}` must not contain newlines");
+    }
+    Ok(Some(format!("Bearer {token}")))
 }
 
 fn parse_http_url(url: &str) -> anyhow::Result<(String, u16, String)> {
@@ -14882,6 +14953,22 @@ entry = "src/main.orv"
     }
 
     fn spawn_one_shot_http_json(path: &'static str, body: Vec<u8>) -> (String, JoinHandle<()>) {
+        spawn_one_shot_http_json_with_optional_auth(path, body, None)
+    }
+
+    fn spawn_one_shot_http_json_with_auth(
+        path: &'static str,
+        body: Vec<u8>,
+        expected_authorization: &'static str,
+    ) -> (String, JoinHandle<()>) {
+        spawn_one_shot_http_json_with_optional_auth(path, body, Some(expected_authorization))
+    }
+
+    fn spawn_one_shot_http_json_with_optional_auth(
+        path: &'static str,
+        body: Vec<u8>,
+        expected_authorization: Option<&'static str>,
+    ) -> (String, JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind registry");
         let addr = listener.local_addr().expect("registry address");
         let handle = std::thread::spawn(move || {
@@ -14901,6 +14988,14 @@ entry = "src/main.orv"
                 request.starts_with(&format!("GET {path} HTTP/1.1")),
                 "{request}"
             );
+            if let Some(expected_authorization) = expected_authorization {
+                assert!(
+                    request
+                        .lines()
+                        .any(|line| line == format!("Authorization: {expected_authorization}")),
+                    "{request}"
+                );
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -22869,6 +22964,53 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn fetch_sends_bearer_token_for_authenticated_http_registry() {
+        let dir = temp_output_dir("project-fetch-http-auth");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::write(dir.join("src/main.orv"), "@out \"fetch-http-auth\"\n")
+            .expect("write entry");
+        let bundle = orv_compiler::source_bundle_artifact(
+            "registry/auth/1.2.3/src/main.orv",
+            [(
+                "registry/auth/1.2.3/src/main.orv",
+                r#"@out @html { @body { @p "Auth" } }"#,
+            )],
+        );
+        let body = serde_json::to_vec_pretty(&serde_json::to_value(&bundle).expect("bundle json"))
+            .expect("bundle bytes");
+        let (registry, handle) = spawn_one_shot_http_json_with_auth(
+            "/auth/1.2.3/source-bundle.json",
+            body,
+            "Bearer orv-test-token",
+        );
+        std::env::set_var("ORV_TEST_REGISTRY_TOKEN_AUTH_FETCH", "orv-test-token");
+        std::fs::write(
+            dir.join("orv.toml"),
+            format!(
+                "[project]\nname = \"shop\"\nversion = \"0.1.0\"\nentry = \"src/main.orv\"\n\n[dependencies]\nauth = {{ version = \"1.2.3\", registry = \"{registry}\", auth_token_env = \"ORV_TEST_REGISTRY_TOKEN_AUTH_FETCH\" }}\n"
+            ),
+        )
+        .expect("write manifest");
+        cmd_lock(&dir, false).expect("write lock");
+
+        let out = dir.join("target/orv-deps");
+        cmd_fetch(&dir, &out).expect("fetch dependencies");
+        handle.join().expect("registry served request");
+        std::env::remove_var("ORV_TEST_REGISTRY_TOKEN_AUTH_FETCH");
+
+        let manifest = read_json_value(&out.join("deps-manifest.json")).expect("read manifest");
+        assert!(manifest["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .any(|package| package["name"] == "auth"
+                && package["source"] == "registry"
+                && package["auth_token_env"] == "ORV_TEST_REGISTRY_TOKEN_AUTH_FETCH"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lock_resolves_caret_version_from_local_registry_index() {
         let dir = temp_output_dir("project-lock-registry-index");
         std::fs::create_dir_all(dir.join("src")).expect("create project src");
@@ -22899,6 +23041,41 @@ auth = { version = "^1.2.0", registry = "registry" }
         let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
         assert_eq!(lock["dependencies"][0]["name"], "auth");
         assert_eq!(lock["dependencies"][0]["version"], "1.3.0");
+        assert_eq!(lock["dependencies"][0]["requested_version"], "^1.2.0");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_sends_bearer_token_for_authenticated_http_registry_index() {
+        let dir = temp_output_dir("project-lock-http-auth-index");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-http-auth\"\n").expect("write entry");
+        let (registry, handle) = spawn_one_shot_http_json_with_auth(
+            "/auth/index.json",
+            br#"{"versions":["1.2.0","1.3.0"]}"#.to_vec(),
+            "Bearer orv-index-token",
+        );
+        std::env::set_var("ORV_TEST_REGISTRY_TOKEN_AUTH_INDEX", "orv-index-token");
+        std::fs::write(
+            dir.join("orv.toml"),
+            format!(
+                "[project]\nname = \"shop\"\nversion = \"0.1.0\"\nentry = \"src/main.orv\"\n\n[dependencies]\nauth = {{ version = \"^1.2.0\", registry = \"{registry}\", auth_token_env = \"ORV_TEST_REGISTRY_TOKEN_AUTH_INDEX\" }}\n"
+            ),
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+        handle.join().expect("registry served request");
+        std::env::remove_var("ORV_TEST_REGISTRY_TOKEN_AUTH_INDEX");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.3.0");
+        assert_eq!(
+            lock["dependencies"][0]["auth_token_env"],
+            "ORV_TEST_REGISTRY_TOKEN_AUTH_INDEX"
+        );
         assert_eq!(lock["dependencies"][0]["requested_version"], "^1.2.0");
 
         let _ = std::fs::remove_dir_all(dir);
