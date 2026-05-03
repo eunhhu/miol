@@ -4341,12 +4341,72 @@ fn editor_runtime_stack_json(frame: &DapStackFrameState) -> serde_json::Value {
     })
 }
 
+fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "adapter": editor_debug_adapter_json(),
+        "configurations": editor_debug_configurations_json(path),
+        "breakpoint_sources": editor_debug_breakpoint_sources_json(&loaded.files),
+    }))
+}
+
+fn editor_debug_adapter_json() -> serde_json::Value {
+    serde_json::json!({
+        "protocol": "dap",
+        "command": ["orv", "dap", "serve", "--stdio"],
+    })
+}
+
+fn editor_debug_configurations_json(path: &Path) -> Vec<serde_json::Value> {
+    let program = path.display().to_string();
+    vec![
+        serde_json::json!({
+            "name": "Launch ORV",
+            "type": "orv",
+            "request": "launch",
+            "program": program.clone(),
+        }),
+        serde_json::json!({
+            "name": "Live Launch ORV",
+            "type": "orv",
+            "request": "launch",
+            "program": program.clone(),
+            "live": true,
+        }),
+        serde_json::json!({
+            "name": "Attach ORV Runtime",
+            "type": "orv",
+            "request": "attach",
+            "program": program,
+            "attachRuntimeMode": "inProcess",
+        }),
+    ]
+}
+
+fn editor_debug_breakpoint_sources_json(files: &[SourceFile]) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let source = dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX));
+            let lines = dap_verified_breakpoint_lines(&file.path).unwrap_or_default();
+            serde_json::json!({
+                "source": dap_source_json(&source),
+                "line_count": lines.len(),
+                "lines": lines,
+            })
+        })
+        .collect()
+}
+
 fn editor_export_state_json(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.export",
         "snapshot": editor_snapshot_json(path)?,
         "runtime": editor_runtime_json(path)?,
+        "debug": editor_debug_json(path)?,
     }))
 }
 
@@ -4419,6 +4479,8 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
     let graph_panel = editor_graph_panel_from_state(state);
     let runtime_frame_count = json_array_count(state.pointer("/runtime/frames"));
+    let debug_config_count = json_array_count(state.pointer("/debug/configurations"));
+    let debug_breakpoint_count = editor_debug_breakpoint_count_from_state(state);
     let trace_count = json_array_count(state.pointer("/trace/frames"));
     let trace_status_counts = editor_trace_status_counts_from_state(state);
     let runtime_status = state
@@ -4457,6 +4519,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<span>Runtime Frames<b>{runtime_frame_count}</b></span>"
     )?;
+    write!(&mut html, "<span>Debug<b>{debug_config_count}</b></span>")?;
     write!(&mut html, "<span>Trace<b>{trace_count}</b></span>")?;
     html.push_str("</nav></aside>\n");
     html.push_str("<header class=\"topbar\">");
@@ -4482,7 +4545,16 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<section class=\"panel\"><h2>Diagnostics</h2><div class=\"metric\">{diagnostic_count}</div><p class=\"muted\">Project loader, resolver, and analyzer diagnostics.</p></section>"
     )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Debug</h2><div class=\"metric\">{debug_config_count}</div><p class=\"muted\">DAP launch and attach configurations.</p><ul id=\"debug-config-list\" class=\"list\"></ul></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Breakpoints</h2><div class=\"metric\">{debug_breakpoint_count}</div><p class=\"muted\">Executable source lines for DAP setBreakpoints.</p><ul id=\"debug-breakpoint-list\" class=\"list\"></ul></section>"
+    )?;
     write_editor_graph_panel_html(&mut html, &graph_panel)?;
+    html.push_str("<section class=\"panel\"><h2>Selected Debug</h2><pre id=\"debug-detail\" class=\"detail\"></pre></section>");
     write_trace_panel_html(&mut html, trace_count, &trace_status_counts)?;
     html.push_str("<section class=\"panel\"><h2>Selected Trace</h2><pre id=\"trace-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
@@ -4504,7 +4576,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str(&state_json);
     html.push_str("</script>\n");
     html.push_str(
-        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
+        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderDebugDetail(value){\n  const target = document.getElementById('debug-detail');\n  if (!target) return;\n  if (!value) {\n    target.textContent = 'No debug item selected.';\n    return;\n  }\n  target.textContent = JSON.stringify(value, null, 2);\n}\nfunction debugBreakpointRows(state){\n  const rows = [];\n  for (const group of state.debug?.breakpoint_sources || []) {\n    for (const line of group.lines || []) {\n      rows.push({source: group.source || {}, line});\n    }\n  }\n  return rows;\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const debugConfigs = state.debug?.configurations || [];\n  put('debug-config-list', debugConfigs, item => item.name || item.request || 'debug', renderDebugDetail);\n  const debugBreakpoints = debugBreakpointRows(state);\n  put('debug-breakpoint-list', debugBreakpoints, breakpoint => {\n    const source = breakpoint.source || {};\n    return `${source.name || source.path || 'source'}:${breakpoint.line}`;\n  }, breakpoint => renderDebugDetail({\n    command: 'setBreakpoints',\n    arguments: {\n      source: breakpoint.source,\n      breakpoints: [{line: breakpoint.line}]\n    }\n  }));\n  renderDebugDetail(debugConfigs[0]);\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n}\nrenderEditorState();\n</script>\n</body>\n</html>\n",
     );
     Ok(html)
 }
@@ -4543,6 +4615,18 @@ fn write_trace_panel_html(
     }
     html.push_str("</div><ul id=\"trace-list\" class=\"list\"></ul></section>");
     Ok(())
+}
+
+fn editor_debug_breakpoint_count_from_state(state: &serde_json::Value) -> usize {
+    state
+        .pointer("/debug/breakpoint_sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |sources| {
+            sources
+                .iter()
+                .map(|source| json_array_count(source.get("lines")))
+                .sum()
+        })
 }
 
 fn editor_trace_status_counts_from_state(state: &serde_json::Value) -> EditorTraceStatusCounts {
@@ -25173,6 +25257,50 @@ define Auth() -> { @out "auth" }
                 .as_array()
                 .is_some_and(|locals| locals.iter().any(|local| local["name"] == "next"))
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_embeds_dap_debug_wiring() {
+        let dir = temp_output_dir("editor-export-debug");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let total: int = 41\nlet next: int = total + 1\n@out next\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+
+        cmd_editor_export(&path, &out).expect("editor export");
+
+        let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let state = read_json_value(&out.join("state.json")).expect("editor state");
+        assert_eq!(state["debug"]["schema_version"], 1);
+        assert_eq!(state["debug"]["adapter"]["protocol"], "dap");
+        assert_eq!(
+            state["debug"]["adapter"]["command"],
+            serde_json::json!(["orv", "dap", "serve", "--stdio"])
+        );
+        assert!(state["debug"]["configurations"]
+            .as_array()
+            .expect("debug configurations")
+            .iter()
+            .any(|config| config["name"] == "Live Launch ORV" && config["live"] == true));
+        let breakpoint_sources = state["debug"]["breakpoint_sources"]
+            .as_array()
+            .expect("breakpoint sources");
+        assert!(breakpoint_sources.iter().any(|source| {
+            source["source"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("app.orv"))
+                && source["lines"]
+                    .as_array()
+                    .is_some_and(|lines| lines.iter().any(|line| line == 1))
+        }));
+        assert!(html.contains("id=\"debug-config-list\""));
+        assert!(html.contains("id=\"debug-breakpoint-list\""));
+        assert!(html.contains("renderDebugDetail"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
