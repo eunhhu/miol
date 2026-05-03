@@ -72,7 +72,7 @@
 
 **Editor runtime frame inspector delta (2026-05-03):** `orv editor export` now renders runtime frame counts, selectable runtime frame rows, and a selected-frame detail pane sourced from the same DAP runtime frame JSON used by `orv editor runtime`, including source line, locals, call stack, and per-frame output.
 
-**Editor DAP wiring delta (2026-05-03):** `orv editor export` now embeds `orv dap serve --stdio` adapter command metadata, launch/live-launch/attach configuration JSON, executable source breakpoint lines, selectable debug config rows, and `setBreakpoints` request previews in the static shell. Remaining DAP/editor work is native interactive controls over a live DAP transport.
+**Editor DAP wiring delta (2026-05-03):** `orv editor export` now embeds `orv dap serve --stdio` adapter command metadata, launch/live-launch/attach configuration JSON, continue/pause/step/restart/disconnect request payloads, executable source breakpoint lines, selectable debug config/control rows, and `setBreakpoints` request previews in the static shell. Remaining DAP/editor work is native interactive controls over a live DAP transport.
 
 ---
 
