@@ -2726,7 +2726,9 @@ fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
         if let Some(base) = requested.strip_prefix('~').and_then(parse_semver_version) {
             return version >= &base && version.major == base.major && version.minor == base.minor;
         }
-        return wildcard_version_matches(requested, version).unwrap_or(false);
+        return wildcard_version_matches(requested, version)
+            .or_else(|| comparator_range_matches(requested, version))
+            .unwrap_or(false);
     };
     if version < &base {
         return false;
@@ -2738,6 +2740,54 @@ fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
     } else {
         version.major == 0 && version.minor == 0 && version.patch == base.patch
     }
+}
+
+fn comparator_range_matches(requested: &str, version: &SemverVersion) -> Option<bool> {
+    let tokens = requested.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens
+        .iter()
+        .map(|token| comparator_matches(token, version))
+        .collect::<Option<Vec<_>>>()
+        .map(|matches| matches.into_iter().all(|matched| matched))
+}
+
+fn comparator_matches(token: &str, version: &SemverVersion) -> Option<bool> {
+    let (operator, raw_version) = parse_comparator_token(token)?;
+    let base = parse_semver_version(raw_version)?;
+    Some(match operator {
+        ComparatorOperator::Greater => version > &base,
+        ComparatorOperator::GreaterEqual => version >= &base,
+        ComparatorOperator::Less => version < &base,
+        ComparatorOperator::LessEqual => version <= &base,
+        ComparatorOperator::Equal => version == &base,
+    })
+}
+
+fn parse_comparator_token(token: &str) -> Option<(ComparatorOperator, &str)> {
+    for (prefix, operator) in [
+        (">=", ComparatorOperator::GreaterEqual),
+        ("<=", ComparatorOperator::LessEqual),
+        (">", ComparatorOperator::Greater),
+        ("<", ComparatorOperator::Less),
+        ("=", ComparatorOperator::Equal),
+    ] {
+        if let Some(raw_version) = token.strip_prefix(prefix) {
+            return Some((operator, raw_version));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum ComparatorOperator {
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+    Equal,
 }
 
 fn wildcard_version_matches(requested: &str, version: &SemverVersion) -> Option<bool> {
@@ -22821,6 +22871,46 @@ ui = { version = "1.*", registry = "registry" }
         assert_eq!(lock["dependencies"][1]["name"], "ui");
         assert_eq!(lock["dependencies"][1]["version"], "1.4.0");
         assert_eq!(lock["dependencies"][1]["requested_version"], "1.*");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_compound_comparator_version_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-comparator");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0/src")).expect("create 1.2.0");
+        std::fs::create_dir_all(dir.join("registry/auth/1.9.0/src")).expect("create 1.9.0");
+        std::fs::create_dir_all(dir.join("registry/auth/2.0.0/src")).expect("create 2.0.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-comparator\"\n")
+            .expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.0","1.9.0","2.0.0"]}"#,
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = ">=1.2.0 <2.0.0", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.9.0");
+        assert_eq!(
+            lock["dependencies"][0]["requested_version"],
+            ">=1.2.0 <2.0.0"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
