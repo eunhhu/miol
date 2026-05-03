@@ -511,3 +511,67 @@ fn db_archive_file_target_copies_wal_and_manifest() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_restore_archive_at_recovers_point_in_time_snapshot() {
+    let dir = temp_dir("db-restore-archive-at");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let data = dir.join("data.json");
+    let target = dir.join("archive-target");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+{"schema_version":1,"op":"create","ts_unix_ms":2000,"table":"User","data":{"email":"b@example.com"}}
+{"schema_version":1,"op":"create","ts_unix_ms":3000,"table":"User","data":{"email":"c@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let archive_output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg(format!("file://{}", target.display()))
+        .output()
+        .expect("run db archive");
+    assert!(
+        archive_output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&archive_output.stdout),
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+    std::fs::remove_file(&wal).expect("remove source wal");
+
+    let restore = orv()
+        .args(["db", "restore"])
+        .arg("--archive")
+        .arg(&archive)
+        .arg("--data")
+        .arg(&data)
+        .arg("--at")
+        .arg("1970-01-01T00:00:02Z")
+        .output()
+        .expect("run db restore");
+    assert!(
+        restore.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    let restored = read_json(&data);
+    let rows = restored["tables"]["User"]["rows"]
+        .as_array()
+        .expect("restored rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["email"], "a@example.com");
+    assert_eq!(rows[1]["email"], "b@example.com");
+    assert!(!rows.iter().any(|row| row["email"] == "c@example.com"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}

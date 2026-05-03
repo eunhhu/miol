@@ -438,14 +438,20 @@ enum DbCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// local backup artifact에서 @db.save JSON data snapshot을 복원한다.
+    /// local backup artifact 또는 WAL archive에서 @db.save JSON data snapshot을 복원한다.
     Restore {
         /// 읽을 backup artifact JSON 경로.
         #[arg(long)]
-        backup: PathBuf,
+        backup: Option<PathBuf>,
+        /// 읽을 WAL archive manifest JSON 경로.
+        #[arg(long)]
+        archive: Option<PathBuf>,
         /// 복원할 @db.save JSON data snapshot 경로.
         #[arg(long)]
         data: PathBuf,
+        /// archive에서 복구할 RFC3339 point-in-time timestamp.
+        #[arg(long)]
+        at: Option<String>,
     },
     /// JSONL WAL을 재생해 @db.save JSON data snapshot으로 복구한다.
     Recover {
@@ -829,7 +835,17 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            DbCommand::Restore { backup, data } => match cmd_db_restore(&backup, &data) {
+            DbCommand::Restore {
+                backup,
+                archive,
+                data,
+                at,
+            } => match cmd_db_restore_from_inputs(
+                backup.as_deref(),
+                archive.as_deref(),
+                at.as_deref(),
+                &data,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -2280,6 +2296,27 @@ fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
     write_json_atomic(data, snapshot)?;
     println!("db data: {} restored", data.display());
     Ok(())
+}
+
+fn cmd_db_restore_from_inputs(
+    backup: Option<&Path>,
+    archive: Option<&Path>,
+    at: Option<&str>,
+    data: &Path,
+) -> anyhow::Result<()> {
+    match (backup, archive) {
+        (Some(backup), None) => {
+            if at.is_some() {
+                anyhow::bail!("db restore --at requires --archive");
+            }
+            cmd_db_restore(backup, data)
+        }
+        (None, Some(archive)) => {
+            cmd_db_recover_from_inputs(None, Some(archive), data, None, None, at)
+        }
+        (Some(_), Some(_)) => anyhow::bail!("db restore accepts only one of --backup or --archive"),
+        (None, None) => anyhow::bail!("db restore requires --backup or --archive"),
+    }
 }
 
 fn cmd_db_recover(
