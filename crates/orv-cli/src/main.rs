@@ -2577,91 +2577,70 @@ impl LspSession {
                 "id": id,
                 "result": serde_json::Value::Null,
             }),
-            Some("textDocument/documentSymbol") => match self.document_symbol_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/codeLens") => match self.code_lens_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/codeAction") => match self.code_action_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/documentLink") => match self.document_link_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/foldingRange") => match self.folding_range_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/selectionRange") => match self.selection_range_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
+            Some("textDocument/documentSymbol") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.document_symbol_result(request))
+            }
+            Some("textDocument/codeLens") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.code_lens_result(request))
+            }
+            Some("textDocument/codeAction") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.code_action_result(request))
+            }
+            Some("textDocument/documentLink") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.document_link_result(request))
+            }
+            Some("textDocument/foldingRange") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.folding_range_result(request))
+            }
+            Some("textDocument/selectionRange") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.selection_range_result(request))
+            }
             Some("textDocument/semanticTokens/full") => {
-                match self.semantic_tokens_result(request) {
-                    Ok(result) => lsp_jsonrpc_result(&id, &result),
-                    Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-                }
+                lsp_jsonrpc_result_or_invalid_params(&id, self.semantic_tokens_result(request))
             }
-            Some("textDocument/diagnostic") => {
-                match self.text_document_diagnostic_result(request) {
-                    Ok(result) => lsp_jsonrpc_result(&id, &result),
-                    Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-                }
+            Some("textDocument/diagnostic") => lsp_jsonrpc_result_or_invalid_params(
+                &id,
+                self.text_document_diagnostic_result(request),
+            ),
+            Some("workspace/diagnostic") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.workspace_diagnostic_result())
             }
-            Some("workspace/diagnostic") => match self.workspace_diagnostic_result() {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("workspace/executeCommand") => match self.execute_command_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/definition") => match self.definition_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/references") => match self.references_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/documentHighlight") => match self.document_highlight_result(request)
-            {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/prepareRename") => match self.prepare_rename_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/rename") => match self.rename_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/hover") => match self.hover_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/signatureHelp") => match self.signature_help_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/inlayHint") => match self.inlay_hint_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("textDocument/completion") => match self.completion_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
-            Some("workspace/symbol") => match self.workspace_symbol_result(request) {
-                Ok(result) => lsp_jsonrpc_result(&id, &result),
-                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
-            },
+            Some("workspace/executeCommand") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.execute_command_result(request))
+            }
+            Some("textDocument/definition" | "textDocument/declaration") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.definition_result(request))
+            }
+            Some("textDocument/typeDefinition") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.type_definition_result(request))
+            }
+            Some("textDocument/references") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.references_result(request))
+            }
+            Some("textDocument/documentHighlight") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.document_highlight_result(request))
+            }
+            Some("textDocument/prepareRename") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.prepare_rename_result(request))
+            }
+            Some("textDocument/rename") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.rename_result(request))
+            }
+            Some("textDocument/hover") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.hover_result(request))
+            }
+            Some("textDocument/signatureHelp") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.signature_help_result(request))
+            }
+            Some("textDocument/inlayHint") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.inlay_hint_result(request))
+            }
+            Some("textDocument/completion") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.completion_result(request))
+            }
+            Some("workspace/symbol") => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.workspace_symbol_result(request))
+            }
             Some(method) => lsp_jsonrpc_method_not_found(&id, method),
             None => lsp_jsonrpc_error(&id, -32600, "invalid request"),
         }
@@ -2708,6 +2687,8 @@ impl LspSession {
                     },
                     "workspaceSymbolProvider": true,
                     "definitionProvider": true,
+                    "declarationProvider": true,
+                    "typeDefinitionProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
                     "renameProvider": {
@@ -2825,6 +2806,27 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         let Some(node) = lsp_definition_node(&loaded.graph, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(lsp_location_json(node, &loaded.files))
+    }
+
+    fn type_definition_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(node) = lsp_type_definition_node(&loaded.graph, name) else {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_location_json(node, &loaded.files))
@@ -7626,6 +7628,19 @@ fn lsp_definition_node<'a>(
     })
 }
 
+fn lsp_type_definition_node<'a>(
+    graph: &'a ProjectGraph,
+    name: &str,
+) -> Option<&'a orv_project::ProjectNode> {
+    graph.nodes.iter().find(|node| {
+        node.name == name
+            && matches!(
+                node.kind,
+                ProjectNodeKind::Struct | ProjectNodeKind::Enum | ProjectNodeKind::TypeAlias
+            )
+    })
+}
+
 fn lsp_location_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serde_json::Value {
     let uri = files.iter().find(|file| file.id == node.file).map_or_else(
         || "file://<unknown>".to_string(),
@@ -7994,6 +8009,16 @@ fn lsp_jsonrpc_result(id: &serde_json::Value, result: &serde_json::Value) -> ser
         "id": id,
         "result": result,
     })
+}
+
+fn lsp_jsonrpc_result_or_invalid_params(
+    id: &serde_json::Value,
+    result: anyhow::Result<serde_json::Value>,
+) -> serde_json::Value {
+    match result {
+        Ok(result) => lsp_jsonrpc_result(id, &result),
+        Err(err) => lsp_jsonrpc_error(id, -32602, &err.to_string()),
+    }
 }
 
 fn lsp_jsonrpc_method_not_found(id: &serde_json::Value, method: &str) -> serde_json::Value {
@@ -12189,6 +12214,14 @@ function greet(user: User): string -> "hello"
         );
         assert_eq!(
             response["result"]["capabilities"]["definitionProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["declarationProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["typeDefinitionProvider"],
             true
         );
         assert_eq!(
@@ -17156,6 +17189,84 @@ let u: User = { id: 1 }
         }));
 
         assert_eq!(response["id"], 16);
+        assert!(response.get("error").is_none(), "{response}");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        assert_eq!(
+            response["result"]["uri"],
+            format!("file://{}", canonical_source.display())
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_declaration_returns_symbol_declaration_location() {
+        let dir = temp_output_dir("lsp-declaration");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text =
+            "function greet(name: string): string -> name\nlet message: string = greet(\"Ada\")\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let call_line = source_text.lines().nth(1).expect("call line");
+        let call_character = call_line.find("greet").expect("call name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/declaration",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": call_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 20);
+        assert!(response.get("error").is_none(), "{response}");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        assert_eq!(
+            response["result"]["uri"],
+            format!("file://{}", canonical_source.display())
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_type_definition_returns_type_declaration_location() {
+        let dir = temp_output_dir("lsp-type-definition");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r"struct User {
+  id: int
+}
+
+let u: User = { id: 1 }
+";
+        std::fs::write(&source, source_text).expect("write source");
+        let binding_line = source_text.lines().nth(4).expect("binding line");
+        let type_character = binding_line.find("User").expect("type name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 4,
+                    "character": type_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 21);
         assert!(response.get("error").is_none(), "{response}");
         let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
         assert_eq!(
