@@ -2609,13 +2609,12 @@ impl LspSession {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.execute_command_result(request))
             }
             Some(
-                "textDocument/definition"
+                method @ ("textDocument/definition"
                 | "textDocument/declaration"
-                | "textDocument/implementation",
-            ) => lsp_jsonrpc_result_or_invalid_params(&id, self.definition_result(request)),
-            Some("textDocument/typeDefinition") => {
-                lsp_jsonrpc_result_or_invalid_params(&id, self.type_definition_result(request))
-            }
+                | "textDocument/implementation"
+                | "textDocument/typeDefinition"
+                | "textDocument/moniker"),
+            ) => lsp_jsonrpc_result_or_invalid_params(&id, self.navigation_result(method, request)),
             Some(
                 method @ ("textDocument/prepareCallHierarchy"
                 | "textDocument/prepareTypeHierarchy"
@@ -2653,6 +2652,21 @@ impl LspSession {
             }
             Some(method) => lsp_jsonrpc_method_not_found(&id, method),
             None => lsp_jsonrpc_error(&id, -32600, "invalid request"),
+        }
+    }
+
+    fn navigation_result(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        match method {
+            "textDocument/definition"
+            | "textDocument/declaration"
+            | "textDocument/implementation" => self.definition_result(request),
+            "textDocument/typeDefinition" => self.type_definition_result(request),
+            "textDocument/moniker" => self.moniker_result(request),
+            _ => unreachable!("navigation method dispatch is filtered by jsonrpc_response"),
         }
     }
 
@@ -2717,6 +2731,7 @@ impl LspSession {
                     "declarationProvider": true,
                     "typeDefinitionProvider": true,
                     "implementationProvider": true,
+                    "monikerProvider": true,
                     "callHierarchyProvider": true,
                     "typeHierarchyProvider": true,
                     "referencesProvider": true,
@@ -2860,6 +2875,24 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_location_json(node, &loaded.files))
+    }
+
+    fn moniker_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(node) = lsp_definition_node(&loaded.graph, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(serde_json::Value::Array(vec![lsp_moniker_json(node)]))
     }
 
     fn prepare_call_hierarchy_result(
@@ -7927,6 +7960,29 @@ fn lsp_type_hierarchy_item_json(
     })
 }
 
+fn lsp_moniker_json(node: &orv_project::ProjectNode) -> serde_json::Value {
+    serde_json::json!({
+        "scheme": "orv",
+        "identifier": format!("{}:{}", lsp_moniker_symbol_kind(node.kind), node.name),
+        "unique": "project",
+        "kind": "export",
+        "data": {
+            "source_node": node.id,
+        },
+    })
+}
+
+const fn lsp_moniker_symbol_kind(kind: ProjectNodeKind) -> &'static str {
+    match kind {
+        ProjectNodeKind::Struct => "struct",
+        ProjectNodeKind::Enum => "enum",
+        ProjectNodeKind::TypeAlias => "type",
+        ProjectNodeKind::Function | ProjectNodeKind::Define => "function",
+        ProjectNodeKind::Domain => "domain",
+        ProjectNodeKind::File | ProjectNodeKind::Import => "symbol",
+    }
+}
+
 fn lsp_call_hierarchy_outgoing_calls(
     caller: &FunctionStmt,
     program: &Program,
@@ -12566,6 +12622,7 @@ function greet(user: User): string -> "hello"
             "implementationProvider",
             "typeHierarchyProvider",
             "callHierarchyProvider",
+            "monikerProvider",
             "referencesProvider",
             "documentHighlightProvider",
             "workspaceSymbolProvider",
@@ -17767,6 +17824,42 @@ let u: User = { id: 1 }
         assert_eq!(subtypes["id"], 30);
         assert!(subtypes.get("error").is_none(), "{subtypes}");
         assert_eq!(subtypes["result"].as_array().expect("subtypes").len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_moniker_returns_project_symbol_identifier() {
+        let dir = temp_output_dir("lsp-moniker");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text =
+            "struct User {\n  id: int\n}\n\nfunction greet(user: User): string -> \"hello\"\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let function_line = source_text.lines().nth(4).expect("function line");
+        let function_character = function_line.find("greet").expect("function name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "textDocument/moniker",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 4,
+                    "character": function_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 31);
+        assert!(response.get("error").is_none(), "{response}");
+        let monikers = response["result"].as_array().expect("monikers");
+        assert_eq!(monikers.len(), 1);
+        assert_eq!(monikers[0]["scheme"], "orv");
+        assert_eq!(monikers[0]["identifier"], "function:greet");
+        assert_eq!(monikers[0]["unique"], "project");
+        assert_eq!(monikers[0]["kind"], "export");
         let _ = std::fs::remove_dir_all(dir);
     }
 
