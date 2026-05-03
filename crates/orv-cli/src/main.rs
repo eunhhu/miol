@@ -8,6 +8,7 @@
 //! `orv build <file-or-orv.toml> --out <dir>`은 초기 build artifact directory 를 생성한다.
 //! `--prod`는 같은 artifact에 deploy manifest, route inventory, reference container
 //! contract, reference server entrypoint를 추가한다.
+//! `orv lock [dir-or-orv.toml]`은 프로젝트 의존성 metadata를 `orv.lock`으로 고정한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
@@ -109,6 +110,15 @@ enum Command {
     CheckBuild {
         /// 검사할 build artifact 디렉터리.
         dir: PathBuf,
+    },
+    /// orv.toml dependency metadata를 orv.lock artifact로 고정한다.
+    Lock {
+        /// orv.toml이 있는 프로젝트 디렉터리 또는 manifest 경로.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// 기존 orv.lock이 최신인지 확인하고 쓰지는 않는다.
+        #[arg(long)]
+        check: bool,
     },
     /// server runtime artifact source bundle을 재수화하고 실행한다.
     RunArtifact {
@@ -472,6 +482,13 @@ fn main() -> ExitCode {
             }
         },
         Command::CheckBuild { dir } => match cmd_check_build(&dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Lock { dir, check } => match cmd_lock(&dir, check) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -2036,6 +2053,16 @@ fn project_entry_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn project_manifest_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_dir() {
+        return Ok(path.join("orv.toml"));
+    }
+    if path.file_name().is_some_and(|name| name == "orv.toml") {
+        return Ok(path.to_path_buf());
+    }
+    anyhow::bail!("lock path must be a project directory or orv.toml")
+}
+
 fn project_manifest_entry_path(manifest: &Path) -> anyhow::Result<PathBuf> {
     let source = std::fs::read_to_string(manifest)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest.display()))?;
@@ -2049,6 +2076,136 @@ fn project_manifest_entry_path(manifest: &Path) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("{} must define [project].entry", manifest.display()))?;
     let base = manifest.parent().unwrap_or_else(|| Path::new("."));
     Ok(base.join(entry))
+}
+
+fn project_lock_json(manifest: &Path) -> anyhow::Result<serde_json::Value> {
+    let source = std::fs::read_to_string(manifest)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest.display()))?;
+    let value = toml::from_str::<toml::Value>(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", manifest.display()))?;
+    let project = value
+        .get("project")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("{} must define [project]", manifest.display()))?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.lock",
+        "project": {
+            "name": toml_string(project, "name", "[project].name")?,
+            "version": toml_string(project, "version", "[project].version")?,
+            "entry": toml_string(project, "entry", "[project].entry")?,
+        },
+        "dependencies": lock_dependency_entries(&value, "dependencies")?,
+        "dev_dependencies": lock_dependency_entries(&value, "dev-dependencies")?,
+    }))
+}
+
+fn lock_dependency_entries(
+    manifest: &toml::Value,
+    section: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let Some(table) = manifest.get(section).and_then(toml::Value::as_table) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = table
+        .iter()
+        .map(|(name, value)| lock_dependency_entry(section, name, value))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| {
+        json_str_or_empty(left, "name").cmp(json_str_or_empty(right, "name"))
+    });
+    Ok(entries)
+}
+
+fn lock_dependency_entry(
+    section: &str,
+    name: &str,
+    value: &toml::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut entry = match value {
+        toml::Value::String(version) => registry_lock_dependency(section, name, version)?,
+        toml::Value::Table(table) if table.contains_key("path") => {
+            path_lock_dependency(section, name, table)?
+        }
+        toml::Value::Table(table) => registry_table_lock_dependency(section, name, table)?,
+        _ => anyhow::bail!("{section}.{name} must be a version string or inline table"),
+    };
+    let checksum_input = entry.clone();
+    entry["checksum"] =
+        serde_json::json!(format!("fnv1a64:{}", stable_json_hash(&checksum_input)?));
+    Ok(entry)
+}
+
+fn registry_table_lock_dependency(
+    section: &str,
+    name: &str,
+    table: &toml::map::Map<String, toml::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let version = toml_string(table, "version", "dependency.version")?;
+    let registry = table
+        .get("registry")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("registry.orv.dev");
+    registry_lock_dependency_with_source(section, name, version, registry)
+}
+
+fn registry_lock_dependency(
+    section: &str,
+    name: &str,
+    version: &str,
+) -> anyhow::Result<serde_json::Value> {
+    registry_lock_dependency_with_source(section, name, version, "registry.orv.dev")
+}
+
+fn registry_lock_dependency_with_source(
+    section: &str,
+    name: &str,
+    version: &str,
+    registry: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if version.trim().is_empty() {
+        anyhow::bail!("{section}.{name} version must not be empty");
+    }
+    if registry.trim().is_empty() {
+        anyhow::bail!("{section}.{name} registry must not be empty");
+    }
+    Ok(serde_json::json!({
+        "name": name,
+        "section": section,
+        "source": "registry",
+        "registry": registry,
+        "version": version,
+    }))
+}
+
+fn path_lock_dependency(
+    section: &str,
+    name: &str,
+    table: &toml::map::Map<String, toml::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let path = toml_string(table, "path", "dependency.path")?;
+    if path.trim().is_empty() {
+        anyhow::bail!("{section}.{name} path must not be empty");
+    }
+    Ok(serde_json::json!({
+        "name": name,
+        "section": section,
+        "source": "path",
+        "path": path,
+        "version": table.get("version").and_then(toml::Value::as_str).unwrap_or("0.0.0"),
+    }))
+}
+
+fn toml_string<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+    context: &str,
+) -> anyhow::Result<&'a str> {
+    table
+        .get(field)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{context} must be a non-empty string"))
 }
 
 fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -11192,6 +11349,26 @@ fn cmd_check_build(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_lock(path: &Path, check: bool) -> anyhow::Result<()> {
+    let manifest = project_manifest_path(path)?;
+    let lock = project_lock_json(&manifest)?;
+    let lock_path = manifest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("orv.lock");
+    if check {
+        let existing = read_json_value(&lock_path)?;
+        if existing != lock {
+            anyhow::bail!("orv.lock is out of date; run `orv lock`");
+        }
+        println!("lock: {} verified", lock_path.display());
+    } else {
+        write_json_atomic(&lock_path, &lock)?;
+        println!("lock: wrote {}", lock_path.display());
+    }
+    Ok(())
+}
+
 fn cmd_run_artifact(path: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     run_artifact_with_writer_with_trace(path, trace, &mut stdout)
@@ -20179,6 +20356,17 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn lock_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "lock", "demo", "--check"])
+            .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Lock { dir, check } = parsed.command else {
+            panic!("expected lock command");
+        };
+        assert_eq!(dir, PathBuf::from("demo"));
+        assert!(check);
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -20794,6 +20982,64 @@ entry = "src/main.orv"
             out.join("pages").join("index.html").is_file(),
             "missing static page"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_writes_and_checks_deterministic_project_lockfile() {
+        let dir = temp_output_dir("project-lock");
+        std::fs::create_dir_all(dir.join("src")).expect("create src");
+        std::fs::write(dir.join("src").join("main.orv"), "@out \"lock\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+zeta = "2.0.0"
+auth = { version = "1.2.3", registry = "https://registry.orv.dev" }
+ui = { version = "0.1.0", path = "libs/ui" }
+
+[dev-dependencies]
+mock-server = "0.2.0"
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["schema_version"], 1);
+        assert_eq!(lock["kind"], "orv.lock");
+        assert_eq!(lock["project"]["name"], "shop");
+        assert_eq!(lock["project"]["version"], "0.1.0");
+        assert_eq!(lock["project"]["entry"], "src/main.orv");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.2.3");
+        assert_eq!(lock["dependencies"][0]["source"], "registry");
+        assert_eq!(
+            lock["dependencies"][0]["registry"],
+            "https://registry.orv.dev"
+        );
+        assert!(lock["dependencies"][0]["checksum"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("fnv1a64:")));
+        assert_eq!(lock["dependencies"][1]["name"], "ui");
+        assert_eq!(lock["dependencies"][1]["source"], "path");
+        assert_eq!(lock["dependencies"][1]["path"], "libs/ui");
+        assert_eq!(lock["dependencies"][2]["name"], "zeta");
+        assert_eq!(lock["dev_dependencies"][0]["name"], "mock-server");
+
+        cmd_lock(&dir, true).expect("check lock");
+
+        let mut stale = lock;
+        stale["dependencies"][0]["version"] = serde_json::json!("9.9.9");
+        write_json_atomic(&dir.join("orv.lock"), &stale).expect("write stale lock");
+        let err = cmd_lock(&dir, true).expect_err("stale lock");
+        assert!(err.to_string().contains("orv.lock is out of date"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

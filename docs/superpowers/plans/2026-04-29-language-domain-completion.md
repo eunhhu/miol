@@ -26,6 +26,8 @@
 
 **Graph view delta (2026-05-03):** `orv graph <file> --view --out <dir>` now writes `graph.json` plus a static `index.html` graph view with source/semantic depth stats, SVG node/edge visualization, ProjectGraph node rows, and semantic origin rows. Remaining graph work is interactive filtering/layout and workspace-scale graph navigation.
 
+**Package lock delta (2026-05-03):** `orv lock [dir-or-orv.toml]` now reads `[project]`, `[dependencies]`, and `[dev-dependencies]` metadata from `orv.toml`, writes deterministic JSON `orv.lock` entries with sorted package names, registry/path source metadata, versions, and stable `fnv1a64` checksums, and `--check` verifies the committed lockfile without rewriting it. Remaining package work is dependency resolution/download, workspace resolution, and `orv add/remove/workspace` commands.
+
 **DAP exception filter delta (2026-05-03):** `orv dap serve --stdio` now stores `setExceptionBreakpoints` diagnostics/runtime selections and only marks launch stops as `exception` when the active filter covers the runtime status. Remaining DAP work is richer editor UI wiring.
 
 **DAP cancel/instruction-breakpoint delta (2026-05-03):** `orv dap serve --stdio` now advertises and accepts DAP `cancel` requests as synchronous no-op success responses, avoiding client-visible unsupported-command errors for adapters that send cancellation frames. It also accepts `setInstructionBreakpoints` and returns explicit unverified breakpoint entries because ORV currently exposes source runtime frames rather than stable instruction addresses.

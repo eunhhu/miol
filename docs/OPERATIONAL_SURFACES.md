@@ -4,7 +4,7 @@
 
 ## CLI Surface
 
-현재 `orv-cli`는 프로젝트 scaffold, 로드/해석/분석/실행, graph/origin 출력, editor/LSP/DAP bootstrap, build artifact 생성/검증/실행, DB snapshot/migration workflow를 오케스트레이션한다.
+현재 `orv-cli`는 프로젝트 scaffold, 로드/해석/분석/실행, graph/origin 출력, editor/LSP/DAP bootstrap, build artifact 생성/검증/실행, lockfile 생성/검증, DB snapshot/migration workflow를 오케스트레이션한다.
 
 주요 command:
 
@@ -14,6 +14,7 @@
 - `orv lsp snapshot/reveal/serve --stdio`
 - `orv dap serve --stdio`
 - `orv build <file-or-orv.toml> --out <dir> [--prod]`
+- `orv lock [dir-or-orv.toml] [--check]`
 - `orv verify-build/verify-artifact/check-artifact/check-build`
 - `orv run-artifact/run-build/reveal`
 - `orv db plan/verify/apply/migrate/rollback/backup/restore/recover/archive/squash`
@@ -23,6 +24,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 `orv graph <file> --view --out <dir>` writes `graph.json` and a static `index.html` ProjectGraph view with source/semantic depth stats, node/edge visualization, and origin rows.
 
 `orv dev --hmr` writes `dev/session.json`, `dev/transport.json`, and `dev/hmr-client.js` for the reference EventSource HMR browser transport; `orv dev --watch` writes `dev/watch.json`; `orv dev --watch-loop [--watch-iterations <n>]` runs the poll-loop build/verify/run path while writing `dev/events.json`; and `orv dev --hmr --serve [--serve-port <port>]` starts the reference HTTP/1 HMR endpoint with `dev/server.json`, `/__orv/hmr/session`, and `/__orv/hmr/events`.
+
+`orv lock [dir-or-orv.toml]` reads `[project]`, `[dependencies]`, and `[dev-dependencies]` from `orv.toml`, writes deterministic JSON `orv.lock` entries sorted by package name, preserves registry/path sources, and adds stable `fnv1a64` checksums. `--check` compares the existing lockfile without writing.
 
 ## Editor And LSP
 
