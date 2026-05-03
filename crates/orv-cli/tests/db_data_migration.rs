@@ -575,3 +575,61 @@ fn db_restore_archive_at_recovers_point_in_time_snapshot() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn db_restore_archive_resolves_relative_wal_path_from_manifest_dir() {
+    let dir = temp_dir("db-restore-archive-relative-wal");
+    let caller = temp_dir("db-restore-archive-relative-caller");
+    std::fs::create_dir_all(&dir).expect("create archive dir");
+    std::fs::create_dir_all(&caller).expect("create caller dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let data = caller.join("data.json");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+"#,
+    )
+    .expect("write wal");
+
+    let archive_output = orv()
+        .current_dir(&dir)
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg("db.wal.jsonl")
+        .arg("--out")
+        .arg("archive.json")
+        .output()
+        .expect("run db archive");
+    assert!(
+        archive_output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&archive_output.stdout),
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+
+    let restore = orv()
+        .current_dir(&caller)
+        .args(["db", "restore"])
+        .arg("--archive")
+        .arg(&archive)
+        .arg("--data")
+        .arg(&data)
+        .output()
+        .expect("run db restore");
+    assert!(
+        restore.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    let restored = read_json(&data);
+    assert_eq!(
+        restored["tables"]["User"]["rows"][0]["email"],
+        "a@example.com"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(caller);
+}

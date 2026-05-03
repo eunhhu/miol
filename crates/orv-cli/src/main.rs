@@ -2496,9 +2496,21 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
         .pointer("/wal/path")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("db archive wal.path must be a string"))?;
-    let wal_path = PathBuf::from(wal_path);
+    let wal_path = db_archive_source_wal_path(archive, wal_path);
     verify_db_archive_wal(&manifest, &wal_path)?;
     Ok(wal_path)
+}
+
+fn db_archive_source_wal_path(archive: &Path, wal_path: &str) -> PathBuf {
+    let wal_path = PathBuf::from(wal_path);
+    if wal_path.is_absolute() {
+        return wal_path;
+    }
+    if let Some(parent) = archive.parent() {
+        parent.join(wal_path)
+    } else {
+        wal_path
+    }
 }
 
 fn verify_db_archive_wal(manifest: &serde_json::Value, wal: &Path) -> anyhow::Result<()> {
