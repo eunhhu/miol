@@ -9,6 +9,7 @@
 //! `--prod`는 같은 artifact에 deploy manifest, route inventory, reference container
 //! contract, reference server entrypoint를 추가한다.
 //! `orv lock [dir-or-orv.toml]`은 프로젝트 의존성 metadata를 `orv.lock`으로 고정한다.
+//! `orv add/remove`은 `orv.toml` dependency section 과 lockfile 을 함께 갱신한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
@@ -119,6 +120,36 @@ enum Command {
         /// 기존 orv.lock이 최신인지 확인하고 쓰지는 않는다.
         #[arg(long)]
         check: bool,
+    },
+    /// `orv.toml`에 dependency를 추가하고 `orv.lock`을 갱신한다.
+    Add {
+        /// 추가할 package 이름.
+        pkg: String,
+        /// registry dependency version. path dependency에서는 생략 가능하다.
+        version: Option<String>,
+        /// `orv.toml`이 있는 프로젝트 디렉터리 또는 manifest 경로.
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+        /// `[dev-dependencies]`에 추가한다.
+        #[arg(long)]
+        dev: bool,
+        /// path dependency 경로.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// registry source override.
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// `orv.toml`에서 dependency를 제거하고 `orv.lock`을 갱신한다.
+    Remove {
+        /// 제거할 package 이름.
+        pkg: String,
+        /// `orv.toml`이 있는 프로젝트 디렉터리 또는 manifest 경로.
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+        /// `[dev-dependencies]`에서 제거한다.
+        #[arg(long)]
+        dev: bool,
     },
     /// server runtime artifact source bundle을 재수화하고 실행한다.
     RunArtifact {
@@ -495,6 +526,36 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Add {
+            pkg,
+            version,
+            manifest,
+            dev,
+            path,
+            registry,
+        } => match cmd_add_dependency(
+            &manifest,
+            &pkg,
+            version.as_deref(),
+            dev,
+            path.as_deref(),
+            registry.as_deref(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Remove { pkg, manifest, dev } => {
+            match cmd_remove_dependency(&manifest, &pkg, dev) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::RunArtifact { file, trace } => match cmd_run_artifact(&file, trace.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -2206,6 +2267,135 @@ fn toml_string<'a>(
         .and_then(toml::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("{context} must be a non-empty string"))
+}
+
+fn read_toml_manifest(manifest: &Path) -> anyhow::Result<toml::Value> {
+    let source = std::fs::read_to_string(manifest)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest.display()))?;
+    toml::from_str::<toml::Value>(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", manifest.display()))
+}
+
+fn write_toml_manifest_atomic(manifest: &Path, value: &toml::Value) -> anyhow::Result<()> {
+    let temp = atomic_temp_path(manifest);
+    let source = toml::to_string_pretty(value)
+        .map_err(|e| anyhow::anyhow!("failed to serialize {}: {e}", manifest.display()))?;
+    std::fs::write(&temp, source)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", temp.display()))?;
+    std::fs::rename(&temp, manifest).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to replace {} with {}: {e}",
+            manifest.display(),
+            temp.display()
+        )
+    })
+}
+
+fn add_dependency_to_manifest(
+    manifest: &mut toml::Value,
+    name: &str,
+    version: Option<&str>,
+    dev: bool,
+    path: Option<&Path>,
+    registry: Option<&str>,
+) -> anyhow::Result<()> {
+    validate_dependency_name(name)?;
+    let section = dependency_section(dev);
+    let root = manifest
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("orv.toml root must be a table"))?;
+    let dependencies = root
+        .entry(section.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("{section} must be a table"))?;
+    dependencies.insert(
+        name.to_string(),
+        dependency_manifest_value(name, version, path, registry)?,
+    );
+    Ok(())
+}
+
+fn remove_dependency_from_manifest(
+    manifest: &mut toml::Value,
+    name: &str,
+    dev: bool,
+) -> anyhow::Result<()> {
+    validate_dependency_name(name)?;
+    let section = dependency_section(dev);
+    let root = manifest
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("orv.toml root must be a table"))?;
+    let dependencies = root
+        .get_mut(section)
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("{section}.{name} is not present"))?;
+    if dependencies.remove(name).is_none() {
+        anyhow::bail!("{section}.{name} is not present");
+    }
+    if dependencies.is_empty() {
+        root.remove(section);
+    }
+    Ok(())
+}
+
+fn dependency_manifest_value(
+    name: &str,
+    version: Option<&str>,
+    path: Option<&Path>,
+    registry: Option<&str>,
+) -> anyhow::Result<toml::Value> {
+    if let Some(path) = path {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "path".to_string(),
+            toml::Value::String(path.to_string_lossy().into_owned()),
+        );
+        table.insert(
+            "version".to_string(),
+            toml::Value::String(version.unwrap_or("0.0.0").to_string()),
+        );
+        return Ok(toml::Value::Table(table));
+    }
+    let version =
+        version.ok_or_else(|| anyhow::anyhow!("{name} registry dependency requires a version"))?;
+    if version.trim().is_empty() {
+        anyhow::bail!("{name} registry dependency version must not be empty");
+    }
+    if let Some(registry) = registry {
+        if registry.trim().is_empty() {
+            anyhow::bail!("{name} registry must not be empty");
+        }
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "version".to_string(),
+            toml::Value::String(version.to_string()),
+        );
+        table.insert(
+            "registry".to_string(),
+            toml::Value::String(registry.to_string()),
+        );
+        return Ok(toml::Value::Table(table));
+    }
+    Ok(toml::Value::String(version.to_string()))
+}
+
+fn validate_dependency_name(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("dependency name must not be empty");
+    }
+    if name.contains('@') {
+        anyhow::bail!("dependency name must not include @; pass the version separately");
+    }
+    Ok(())
+}
+
+const fn dependency_section(dev: bool) -> &'static str {
+    if dev {
+        "dev-dependencies"
+    } else {
+        "dependencies"
+    }
 }
 
 fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -11369,6 +11559,37 @@ fn cmd_lock(path: &Path, check: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_add_dependency(
+    path: &Path,
+    name: &str,
+    version: Option<&str>,
+    dev: bool,
+    dependency_path: Option<&Path>,
+    registry: Option<&str>,
+) -> anyhow::Result<()> {
+    let manifest_path = project_manifest_path(path)?;
+    let mut manifest = read_toml_manifest(&manifest_path)?;
+    add_dependency_to_manifest(&mut manifest, name, version, dev, dependency_path, registry)?;
+    write_toml_manifest_atomic(&manifest_path, &manifest)?;
+    cmd_lock(&manifest_path, false)?;
+    println!("dependency: added {} to {}", name, dependency_section(dev));
+    Ok(())
+}
+
+fn cmd_remove_dependency(path: &Path, name: &str, dev: bool) -> anyhow::Result<()> {
+    let manifest_path = project_manifest_path(path)?;
+    let mut manifest = read_toml_manifest(&manifest_path)?;
+    remove_dependency_from_manifest(&mut manifest, name, dev)?;
+    write_toml_manifest_atomic(&manifest_path, &manifest)?;
+    cmd_lock(&manifest_path, false)?;
+    println!(
+        "dependency: removed {} from {}",
+        name,
+        dependency_section(dev)
+    );
+    Ok(())
+}
+
 fn cmd_run_artifact(path: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     run_artifact_with_writer_with_trace(path, trace, &mut stdout)
@@ -20367,6 +20588,48 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn add_and_remove_subcommands_are_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "add",
+            "auth",
+            "1.2.3",
+            "--manifest",
+            "demo",
+            "--dev",
+            "--registry",
+            "https://registry.orv.dev",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Add {
+            pkg,
+            version,
+            manifest,
+            dev,
+            path,
+            registry,
+        } = parsed.command
+        else {
+            panic!("expected add command");
+        };
+        assert_eq!(pkg, "auth");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert_eq!(manifest, PathBuf::from("demo"));
+        assert!(dev);
+        assert!(path.is_none());
+        assert_eq!(registry.as_deref(), Some("https://registry.orv.dev"));
+
+        let parsed = Cli::try_parse_from(["orv", "remove", "auth", "--manifest", "demo"])
+            .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Remove { pkg, manifest, dev } = parsed.command else {
+            panic!("expected remove command");
+        };
+        assert_eq!(pkg, "auth");
+        assert_eq!(manifest, PathBuf::from("demo"));
+        assert!(!dev);
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -21039,6 +21302,74 @@ mock-server = "0.2.0"
         write_json_atomic(&dir.join("orv.lock"), &stale).expect("write stale lock");
         let err = cmd_lock(&dir, true).expect_err("stale lock");
         assert!(err.to_string().contains("orv.lock is out of date"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn add_and_remove_update_manifest_and_lockfile() {
+        let dir = temp_output_dir("project-add-remove");
+        std::fs::create_dir_all(dir.join("src")).expect("create src");
+        std::fs::write(dir.join("src").join("main.orv"), "@out \"deps\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("orv.toml"),
+            "[project]\nname = \"shop\"\nversion = \"0.1.0\"\nentry = \"src/main.orv\"\n",
+        )
+        .expect("write manifest");
+
+        cmd_add_dependency(
+            &dir,
+            "auth",
+            Some("1.2.3"),
+            false,
+            None,
+            Some("https://registry.orv.dev"),
+        )
+        .expect("add registry dependency");
+        cmd_add_dependency(
+            &dir,
+            "ui",
+            Some("0.1.0"),
+            true,
+            Some(Path::new("libs/ui")),
+            None,
+        )
+        .expect("add path dev dependency");
+
+        let manifest = std::fs::read_to_string(dir.join("orv.toml")).expect("read manifest");
+        let manifest = toml::from_str::<toml::Value>(&manifest).expect("parse manifest");
+        assert_eq!(
+            manifest["dependencies"]["auth"]["version"].as_str(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            manifest["dependencies"]["auth"]["registry"].as_str(),
+            Some("https://registry.orv.dev")
+        );
+        assert_eq!(
+            manifest["dev-dependencies"]["ui"]["path"].as_str(),
+            Some("libs/ui")
+        );
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dev_dependencies"][0]["name"], "ui");
+
+        cmd_remove_dependency(&dir, "auth", false).expect("remove registry dependency");
+
+        let manifest = std::fs::read_to_string(dir.join("orv.toml")).expect("read manifest");
+        let manifest = toml::from_str::<toml::Value>(&manifest).expect("parse manifest");
+        assert!(manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .is_none_or(toml::map::Map::is_empty));
+        assert_eq!(
+            manifest["dev-dependencies"]["ui"]["version"].as_str(),
+            Some("0.1.0")
+        );
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert!(lock["dependencies"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(lock["dev_dependencies"][0]["name"], "ui");
 
         let _ = std::fs::remove_dir_all(dir);
     }

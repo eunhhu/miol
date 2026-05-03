@@ -14,6 +14,7 @@
 - `orv lsp snapshot/reveal/serve --stdio`
 - `orv dap serve --stdio`
 - `orv build <file-or-orv.toml> --out <dir> [--prod]`
+- `orv add/remove`
 - `orv lock [dir-or-orv.toml] [--check]`
 - `orv verify-build/verify-artifact/check-artifact/check-build`
 - `orv run-artifact/run-build/reveal`
@@ -26,6 +27,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 `orv dev --hmr` writes `dev/session.json`, `dev/transport.json`, and `dev/hmr-client.js` for the reference EventSource HMR browser transport; `orv dev --watch` writes `dev/watch.json`; `orv dev --watch-loop [--watch-iterations <n>]` runs the poll-loop build/verify/run path while writing `dev/events.json`; and `orv dev --hmr --serve [--serve-port <port>]` starts the reference HTTP/1 HMR endpoint with `dev/server.json`, `/__orv/hmr/session`, and `/__orv/hmr/events`.
 
 `orv lock [dir-or-orv.toml]` reads `[project]`, `[dependencies]`, and `[dev-dependencies]` from `orv.toml`, writes deterministic JSON `orv.lock` entries sorted by package name, preserves registry/path sources, and adds stable `fnv1a64` checksums. `--check` compares the existing lockfile without writing.
+
+`orv add <pkg> <version> [--dev] [--path <path>] [--registry <url>] [--manifest <dir-or-orv.toml>]` edits the selected dependency section and regenerates `orv.lock`; `orv remove <pkg> [--dev] [--manifest <dir-or-orv.toml>]` removes from the selected section and regenerates the lockfile.
 
 ## Editor And LSP
 

@@ -214,6 +214,7 @@ dist/
 - `orv test <path> --filter <name> --list` — `.orv` 파일을 찾아 `test "name"` 블록이 있는 파일을 reference runtime 으로 실행하거나 발견 목록 JSON 출력
 - `orv editor snapshot/reveal/runtime/export/trace` — first-party editor bootstrap JSON, source-hash watch set, build-origin navigation payload, runtime inspection pane JSON, static editor shell artifact with ProjectGraph/panel-list/runtime-frame/trace-detail rendering and optional trace state, captured request trace navigation payload 출력
 - `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact, HTML-only static page, 또는 client page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/container/Dockerfile/Compose/runbook/entrypoint 추가
+- `orv add/remove` — `orv.toml` dependency section 편집과 lockfile 재생성
 - `orv lock [dir-or-orv.toml] [--check]` — `orv.toml` project/dependency metadata를 deterministic `orv.lock` JSON으로 고정하거나 최신성 검증
 - `orv verify-build <dir>` — build manifest/plan target 존재, source bundle hash, deploy container/runtime image/Compose/runbook contract, server artifact, static page zero-runtime shape, client page/JS/WASM bootstrap, optional dev HMR/watch/transport/event/server manifest 검증
 - `orv verify-artifact <file>` — server runtime artifact source hash/route descriptor 검증
