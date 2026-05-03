@@ -3717,6 +3717,7 @@ impl DapSession {
                     "supportsCancelRequest": true,
                     "supportsInstructionBreakpoints": true,
                     "supportsDisassembleRequest": true,
+                    "supportsReadMemoryRequest": true,
                     "supportsOrvRuntimeAttach": true,
                     "supportsOrvRuntimeTracePath": true,
                     "exceptionBreakpointFilters": [
@@ -3766,6 +3767,7 @@ impl DapSession {
             "modules" => self.modules_result(request),
             "source" => self.source_result(request),
             "disassemble" => self.disassemble_result(request),
+            "readMemory" => self.read_memory_result(request),
             "continue" => self.continue_result(request),
             "reverseContinue" => self.reverse_continue_result(request),
             "goto" => self.goto_result(request),
@@ -4146,6 +4148,59 @@ impl DapSession {
                 .take(instruction_count)
                 .map(|(index, frame)| dap_disassembled_instruction_json(index, frame))
                 .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn read_memory_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let launched = self
+            .launched
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("launch is required before readMemory"))?;
+        let memory_reference = request
+            .pointer("/arguments/memoryReference")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("readMemory.arguments.memoryReference is required"))?;
+        let frame_index = dap_memory_reference_frame_index(memory_reference, "readMemory")?;
+        let frame = launched
+            .frames
+            .get(frame_index)
+            .ok_or_else(|| anyhow::anyhow!("unknown ORV memoryReference `{memory_reference}`"))?;
+        let offset = request
+            .pointer("/arguments/offset")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if offset < 0 {
+            anyhow::bail!("readMemory.arguments.offset must be non-negative");
+        }
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        let count = request
+            .pointer("/arguments/count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("readMemory.arguments.count is required"))?;
+        let source = launched
+            .files
+            .iter()
+            .find(|file| dap_normalize_path(&file.path) == dap_normalize_path(&frame.source.path))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source `{}` is not part of the loaded project snapshot",
+                    frame.source.path.display()
+                )
+            })?;
+        let line = source
+            .source
+            .lines()
+            .nth(usize::try_from(frame.line.saturating_sub(1)).unwrap_or(usize::MAX))
+            .ok_or_else(|| anyhow::anyhow!("frame line {} is outside source", frame.line))?;
+        let bytes = line.as_bytes();
+        let start = offset.min(bytes.len());
+        let end = start.saturating_add(count).min(bytes.len());
+        let data = &bytes[start..end];
+        Ok(serde_json::json!({
+            "address": memory_reference,
+            "data": dap_base64_encode(data),
+            "unreadableBytes": count.saturating_sub(data.len()),
         }))
     }
 
@@ -6308,19 +6363,7 @@ fn dap_disassemble_start_index(
     memory_reference: &str,
     instruction_offset: i64,
 ) -> anyhow::Result<usize> {
-    let frame = memory_reference
-        .strip_prefix("orv:frame:")
-        .ok_or_else(|| {
-            anyhow::anyhow!("unsupported ORV disassemble memoryReference `{memory_reference}`")
-        })?
-        .parse::<usize>()
-        .map_err(|_| {
-            anyhow::anyhow!("invalid ORV disassemble memoryReference `{memory_reference}`")
-        })?;
-    if frame == 0 {
-        anyhow::bail!("invalid ORV disassemble memoryReference `{memory_reference}`");
-    }
-    let base = frame - 1;
+    let base = dap_memory_reference_frame_index(memory_reference, "disassemble")?;
     if instruction_offset < 0 {
         Ok(base.saturating_sub(
             usize::try_from(instruction_offset.saturating_abs()).unwrap_or(usize::MAX),
@@ -6328,6 +6371,52 @@ fn dap_disassemble_start_index(
     } else {
         Ok(base.saturating_add(usize::try_from(instruction_offset).unwrap_or(usize::MAX)))
     }
+}
+
+fn dap_memory_reference_frame_index(
+    memory_reference: &str,
+    command: &str,
+) -> anyhow::Result<usize> {
+    let frame = memory_reference
+        .strip_prefix("orv:frame:")
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported ORV {command} memoryReference `{memory_reference}`")
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            anyhow::anyhow!("invalid ORV {command} memoryReference `{memory_reference}`")
+        })?;
+    if frame == 0 {
+        anyhow::bail!("invalid ORV {command} memoryReference `{memory_reference}`");
+    }
+    Ok(frame - 1)
+}
+
+fn dap_base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(TABLE[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            TABLE[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                TABLE[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))],
+            ));
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(char::from(TABLE[usize::from(third & 0b0011_1111)]));
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
 }
 
 fn dap_disassembled_instruction_json(index: usize, frame: &DapFrameState) -> serde_json::Value {
@@ -12387,6 +12476,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsCancelRequest"], true);
         assert_eq!(response["body"]["supportsInstructionBreakpoints"], true);
         assert_eq!(response["body"]["supportsDisassembleRequest"], true);
+        assert_eq!(response["body"]["supportsReadMemoryRequest"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
     }
@@ -12489,6 +12579,47 @@ function greet(user: User): string -> "hello"
         assert_eq!(instructions[1]["address"], "orv:frame:2");
         assert_eq!(instructions[1]["instruction"], "orv entry line 2");
         assert_eq!(instructions[1]["line"], 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_read_memory_returns_base64_source_frame_bytes() {
+        let dir = temp_output_dir("dap-read-memory");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 80,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 81,
+                "type": "request",
+                "command": "readMemory",
+                "arguments": {
+                    "memoryReference": "orv:frame:1",
+                    "offset": 4,
+                    "count": 5,
+                },
+            }))
+            .expect("readMemory response");
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 81);
+        assert_eq!(response["command"], "readMemory");
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["body"]["address"], "orv:frame:1");
+        assert_eq!(response["body"]["data"], "Zmlyc3Q=");
+        assert_eq!(response["body"]["unreadableBytes"], 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

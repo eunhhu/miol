@@ -34,6 +34,8 @@
 
 **DAP attach request delta (2026-05-03):** `orv dap serve --stdio` now accepts the standard DAP `attach` request and routes it through the existing launch pipeline with `attachRuntime=true`, so attach configurations can use child-process or `attachRuntimeMode="inProcess"` server transports without relying on custom launch arguments.
 
+**DAP read memory delta (2026-05-03):** `orv dap serve --stdio` now advertises `supportsReadMemoryRequest` and maps `readMemory` over `orv:frame:<n>` source-frame memory references, returning base64 source-line byte slices from the launch-time project snapshot.
+
 **LSP signature help delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/signatureHelp`, returning function parameter labels, return type, and active parameter index for in-call cursor positions.
 
 **LSP inlay hint delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/inlayHint`, emitting parameter-name hints for direct function calls.
