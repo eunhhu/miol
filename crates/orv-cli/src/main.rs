@@ -2534,6 +2534,7 @@ fn project_lock_json(manifest: &Path) -> anyhow::Result<serde_json::Value> {
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest.display()))?;
     let value = toml::from_str::<toml::Value>(&source)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", manifest.display()))?;
+    let root = manifest.parent().unwrap_or_else(|| Path::new("."));
     let project = value
         .get("project")
         .and_then(toml::Value::as_table)
@@ -2546,12 +2547,13 @@ fn project_lock_json(manifest: &Path) -> anyhow::Result<serde_json::Value> {
             "version": toml_string(project, "version", "[project].version")?,
             "entry": toml_string(project, "entry", "[project].entry")?,
         },
-        "dependencies": lock_dependency_entries(&value, "dependencies")?,
-        "dev_dependencies": lock_dependency_entries(&value, "dev-dependencies")?,
+        "dependencies": lock_dependency_entries(root, &value, "dependencies")?,
+        "dev_dependencies": lock_dependency_entries(root, &value, "dev-dependencies")?,
     }))
 }
 
 fn lock_dependency_entries(
+    root: &Path,
     manifest: &toml::Value,
     section: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -2560,7 +2562,7 @@ fn lock_dependency_entries(
     };
     let mut entries = table
         .iter()
-        .map(|(name, value)| lock_dependency_entry(section, name, value))
+        .map(|(name, value)| lock_dependency_entry(root, section, name, value))
         .collect::<anyhow::Result<Vec<_>>>()?;
     entries.sort_by(|left, right| {
         json_str_or_empty(left, "name").cmp(json_str_or_empty(right, "name"))
@@ -2569,16 +2571,17 @@ fn lock_dependency_entries(
 }
 
 fn lock_dependency_entry(
+    root: &Path,
     section: &str,
     name: &str,
     value: &toml::Value,
 ) -> anyhow::Result<serde_json::Value> {
     let mut entry = match value {
-        toml::Value::String(version) => registry_lock_dependency(section, name, version)?,
+        toml::Value::String(version) => registry_lock_dependency(root, section, name, version)?,
         toml::Value::Table(table) if table.contains_key("path") => {
             path_lock_dependency(section, name, table)?
         }
-        toml::Value::Table(table) => registry_table_lock_dependency(section, name, table)?,
+        toml::Value::Table(table) => registry_table_lock_dependency(root, section, name, table)?,
         _ => anyhow::bail!("{section}.{name} must be a version string or inline table"),
     };
     let checksum_input = entry.clone();
@@ -2588,6 +2591,7 @@ fn lock_dependency_entry(
 }
 
 fn registry_table_lock_dependency(
+    root: &Path,
     section: &str,
     name: &str,
     table: &toml::map::Map<String, toml::Value>,
@@ -2597,18 +2601,20 @@ fn registry_table_lock_dependency(
         .get("registry")
         .and_then(toml::Value::as_str)
         .unwrap_or("registry.orv.dev");
-    registry_lock_dependency_with_source(section, name, version, registry)
+    registry_lock_dependency_with_source(root, section, name, version, registry)
 }
 
 fn registry_lock_dependency(
+    root: &Path,
     section: &str,
     name: &str,
     version: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    registry_lock_dependency_with_source(section, name, version, "registry.orv.dev")
+    registry_lock_dependency_with_source(root, section, name, version, "registry.orv.dev")
 }
 
 fn registry_lock_dependency_with_source(
+    root: &Path,
     section: &str,
     name: &str,
     version: &str,
@@ -2620,13 +2626,127 @@ fn registry_lock_dependency_with_source(
     if registry.trim().is_empty() {
         anyhow::bail!("{section}.{name} registry must not be empty");
     }
-    Ok(serde_json::json!({
+    let resolved = resolve_registry_version(root, name, version, registry)?;
+    let resolved_changed = resolved != version;
+    let mut entry = serde_json::json!({
         "name": name,
         "section": section,
         "source": "registry",
         "registry": registry,
-        "version": version,
-    }))
+        "version": resolved,
+    });
+    if resolved_changed {
+        entry["requested_version"] = serde_json::json!(version);
+    }
+    Ok(entry)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemverVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn resolve_registry_version(
+    root: &Path,
+    name: &str,
+    requested: &str,
+    registry: &str,
+) -> anyhow::Result<String> {
+    if parse_semver_version(requested).is_some() {
+        return Ok(requested.to_string());
+    }
+    let versions = registry_index_versions(root, name, registry)?;
+    let resolved = versions
+        .into_iter()
+        .filter(|version| registry_version_matches(requested, version))
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("no registry version for {name} matches `{requested}`"))?;
+    Ok(format!(
+        "{}.{}.{}",
+        resolved.major, resolved.minor, resolved.patch
+    ))
+}
+
+fn registry_index_versions(
+    root: &Path,
+    name: &str,
+    registry: &str,
+) -> anyhow::Result<Vec<SemverVersion>> {
+    let index = if registry.starts_with("http://") {
+        read_json_from_http(&format!(
+            "{}/{name}/index.json",
+            registry.trim_end_matches('/')
+        ))?
+    } else if registry.starts_with("https://") {
+        anyhow::bail!("https registry index resolution is not implemented yet")
+    } else if registry == "registry.orv.dev" {
+        anyhow::bail!("registry.orv.dev resolution is not implemented yet")
+    } else {
+        let root = registry.strip_prefix("file://").map_or_else(
+            || {
+                let path = PathBuf::from(registry);
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            },
+            PathBuf::from,
+        );
+        read_json_value(&root.join(name).join("index.json"))?
+    };
+    let versions = index
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("registry index versions must be an array"))?;
+    versions
+        .iter()
+        .map(|version| {
+            let raw = version
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("registry index versions must be strings"))?;
+            parse_semver_version(raw)
+                .ok_or_else(|| anyhow::anyhow!("registry version `{raw}` is not semver x.y.z"))
+        })
+        .collect()
+}
+
+fn read_json_from_http(url: &str) -> anyhow::Result<serde_json::Value> {
+    let source = http_get_string(url)?;
+    serde_json::from_str(&source).map_err(|e| anyhow::anyhow!("failed to parse {url}: {e}"))
+}
+
+fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
+    if requested == "*" {
+        return true;
+    }
+    let Some(base) = requested.strip_prefix('^').and_then(parse_semver_version) else {
+        return false;
+    };
+    if version < &base {
+        return false;
+    }
+    if base.major > 0 {
+        version.major == base.major
+    } else if base.minor > 0 {
+        version.major == 0 && version.minor == base.minor
+    } else {
+        version.major == 0 && version.minor == 0 && version.patch == base.patch
+    }
+}
+
+fn parse_semver_version(version: &str) -> Option<SemverVersion> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some(SemverVersion {
+        major,
+        minor,
+        patch,
+    })
 }
 
 fn path_lock_dependency(
@@ -22551,6 +22671,42 @@ entry = "src/main.orv"
             read_source_bundle_artifact(&out.join("packages/dependencies/auth/source-bundle.json"))
                 .expect("downloaded source bundle");
         assert_eq!(downloaded.entry, "registry/auth/1.2.3/src/main.orv");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_caret_version_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-index");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0/src")).expect("create 1.2.0");
+        std::fs::create_dir_all(dir.join("registry/auth/1.3.0/src")).expect("create 1.3.0");
+        std::fs::create_dir_all(dir.join("registry/auth/2.0.0/src")).expect("create 2.0.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-index\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.0","1.3.0","2.0.0"]}"#,
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = "^1.2.0", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.3.0");
+        assert_eq!(lock["dependencies"][0]["requested_version"], "^1.2.0");
 
         let _ = std::fs::remove_dir_all(dir);
     }
