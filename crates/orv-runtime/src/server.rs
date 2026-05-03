@@ -37,8 +37,8 @@ use tokio::net::TcpListener;
 
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
-    eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env,
-    run_with_writer_in_env_with_db, RequestCtx, ResponseCtx, RuntimeError, Value,
+    eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env_with_db, RequestCtx,
+    ResponseCtx, RuntimeError, Value,
 };
 
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
@@ -344,6 +344,7 @@ fn attached_server_state<W: std::io::Write>(
     program: &HirProgram,
     boot_writer: &mut W,
 ) -> Result<PreparedServerState, RuntimeError> {
+    let db = new_db_handle();
     let server_idx = program
         .items
         .iter()
@@ -358,7 +359,7 @@ fn attached_server_state<W: std::io::Write>(
                 .span()
                 .join(program.items[server_idx - 1].span()),
         };
-        run_with_writer_in_env(&prefix, HashMap::new(), boot_writer)?
+        run_with_writer_in_env_with_db(&prefix, HashMap::new(), db.clone(), boot_writer)?
     };
     let HirStmt::Expr(expr) = &program.items[server_idx] else {
         return Err(RuntimeError::native("attached runtime expected expression"));
@@ -376,7 +377,7 @@ fn attached_server_state<W: std::io::Write>(
         routes,
         body_stmts,
         captured_env,
-        new_db_handle(),
+        db,
         boot_writer,
         true,
     )
@@ -3033,6 +3034,50 @@ mod tests {
         if let Ok(Ok(_)) = probe {
             panic!("attached server still accepted connections after drop");
         }
+    }
+
+    #[tokio::test]
+    async fn attached_server_prefix_wal_persists_route_db_mutations() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-attached-db-wal-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let hir = lower_src(&format!(
+            r#"@db.wal "{}"
+            @server {{
+                @listen 0
+                @route POST /members {{
+                    let member = await @db.create("Member", @body)
+                    @respond 201 {{ member: member }}
+                }}
+            }}"#,
+            path.display()
+        ));
+        let server = spawn_attached_server(hir).expect("spawn attached server");
+        let addr = server.addr();
+
+        let payload = serde_json::json!({
+            "handle": "ada",
+            "email": "ada@example.test"
+        })
+        .to_string();
+        let (status, _, body) = send_request(addr, "POST", "/members", Some(payload)).await;
+        assert_eq!(status, 201);
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("member json");
+        assert_eq!(created["member"]["handle"], serde_json::json!("ada"));
+        drop(server);
+
+        let restored = crate::db::InMemoryDb::load_wal(&path).expect("replay attached wal");
+        let snapshot = restored.snapshot_json();
+        assert_eq!(
+            snapshot["tables"]["Member"]["rows"][0]["handle"],
+            serde_json::json!("ada")
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
