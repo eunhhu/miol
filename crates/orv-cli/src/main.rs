@@ -20,7 +20,7 @@
 //! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -1303,8 +1303,21 @@ fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow
         .get("members")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("workspace graph members must be an array"))?;
+    let build_order = workspace_build_order(&graph)?;
+    let member_lookup = members
+        .iter()
+        .map(|member| {
+            Ok((
+                json_str(member, "path", "workspace member")?.to_string(),
+                member,
+            ))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
     let mut member_builds = Vec::with_capacity(members.len());
-    for member in members {
+    for member_path in &build_order {
+        let member = member_lookup
+            .get(member_path)
+            .ok_or_else(|| anyhow::anyhow!("workspace build member `{member_path}` not found"))?;
         let member_path =
             workspace_member_string(Path::new(json_str(member, "path", "workspace member")?))?;
         let name = json_str(member, "name", "workspace member")?;
@@ -1346,12 +1359,77 @@ fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow
             "member_count": member_builds.len(),
             "dependency_edge_count": dependency_edges.len(),
         },
+        "build_order": build_order,
         "members": member_builds,
         "dependency_edges": dependency_edges,
     });
     write_json(&out.join("workspace-build.json"), &manifest)?;
     println!("workspace build: wrote {}", out.display());
     Ok(())
+}
+
+fn workspace_build_order(graph: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    let members = graph
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace graph members must be an array"))?;
+    let mut indegree = HashMap::new();
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    for member in members {
+        let path = json_str(member, "path", "workspace member")?.to_string();
+        indegree.insert(path.clone(), 0usize);
+        dependents.insert(path, Vec::new());
+    }
+    let edges = graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace graph edges must be an array"))?;
+    for edge in edges {
+        if edge.get("kind").and_then(serde_json::Value::as_str) != Some("path_dependency") {
+            continue;
+        }
+        let dependent = json_str(edge, "from", "workspace edge")?;
+        let dependency = json_str(edge, "to", "workspace edge")?;
+        if !indegree.contains_key(dependent) || !indegree.contains_key(dependency) {
+            anyhow::bail!(
+                "workspace dependency edge references unknown member `{dependent}` -> `{dependency}`"
+            );
+        }
+        *indegree
+            .get_mut(dependent)
+            .expect("dependent checked above") += 1;
+        dependents
+            .entry(dependency.to_string())
+            .or_default()
+            .push(dependent.to_string());
+    }
+    for edges in dependents.values_mut() {
+        edges.sort();
+        edges.dedup();
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(member, degree)| (*degree == 0).then_some(member.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(indegree.len());
+    while let Some(member) = ready.pop_first() {
+        if let Some(edges) = dependents.get(&member) {
+            for dependent in edges {
+                let degree = indegree
+                    .get_mut(dependent)
+                    .expect("dependent came from workspace member");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(dependent.clone());
+                }
+            }
+        }
+        order.push(member);
+    }
+    if order.len() != indegree.len() {
+        anyhow::bail!("workspace dependency graph contains a cycle");
+    }
+    Ok(order)
 }
 
 fn shop_init_template_source() -> String {
@@ -22362,6 +22440,17 @@ entry = "src/main.orv"
         assert_eq!(manifest["profile"], "dev");
         assert_eq!(manifest["stats"]["member_count"], 2);
         assert_eq!(manifest["workspace_graph"], "workspace-graph.json");
+        assert_eq!(
+            manifest["build_order"],
+            serde_json::json!(["shared/models", "apps/web"])
+        );
+        let member_paths = manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .map(|member| member["path"].as_str().expect("member path"))
+            .collect::<Vec<_>>();
+        assert_eq!(member_paths, ["shared/models", "apps/web"]);
         assert!(manifest["members"]
             .as_array()
             .expect("members")
