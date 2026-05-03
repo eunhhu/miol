@@ -11784,7 +11784,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
-            "client_wasm" => verify_client_wasm_target(&target)?,
+            "client_wasm" => verify_client_wasm_target(dir, &target)?,
             _ => {}
         }
     }
@@ -11893,7 +11893,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
+fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(target)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
     if bytes.len() < WASM_MODULE_HEADER.len() {
@@ -11927,6 +11927,18 @@ fn verify_client_wasm_target(target: &Path) -> anyhow::Result<()> {
         != Some(CLIENT_WASM_SOURCE_BUNDLE_PATH)
     {
         anyhow::bail!("client_wasm ORV metadata source_bundle is invalid");
+    }
+    let source_bundle = read_json_value(&dir.join("source-bundle.json"))?;
+    let expected_source_bundle_hash = stable_json_hash(&source_bundle)?;
+    if metadata
+        .get("source_bundle_hash")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_source_bundle_hash.as_str())
+    {
+        anyhow::bail!("client_wasm ORV metadata source_bundle_hash is invalid");
+    }
+    if metadata.get("entry") != source_bundle.get("entry") {
+        anyhow::bail!("client_wasm ORV metadata entry is invalid");
     }
     if !metadata
         .get("runtime_features")
@@ -12904,7 +12916,7 @@ fn verify_deploy_client_target(
     if !wasm_target.is_file() {
         anyhow::bail!("missing deploy client wasm: {}", wasm_target.display());
     }
-    verify_client_wasm_target(&wasm_target)
+    verify_client_wasm_target(dir, &wasm_target)
 }
 
 fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -14544,10 +14556,9 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         &serde_json::to_value(origin_map)?,
     )?;
     write_json(&out.join("project-graph.json"), &graph)?;
-    write_json(
-        &out.join("source-bundle.json"),
-        &serde_json::to_value(&source_bundle)?,
-    )?;
+    let source_bundle_value = serde_json::to_value(&source_bundle)?;
+    let source_bundle_hash = stable_json_hash(&source_bundle_value)?;
+    write_json(&out.join("source-bundle.json"), &source_bundle_value)?;
     if let Some(server_artifact) = &server_artifact {
         write_json(
             &out.join(server_artifact_path),
@@ -14566,9 +14577,15 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         out,
         &entry,
         manifest.capabilities.client_wasm,
-        client_page_path.as_deref(),
-        client_js_path.as_deref(),
-        client_wasm_path.as_deref(),
+        ClientSourceBinding {
+            source_bundle: &source_bundle,
+            source_bundle_hash: &source_bundle_hash,
+        },
+        ClientBundleTargets {
+            page: client_page_path.as_deref(),
+            js: client_js_path.as_deref(),
+            wasm: client_wasm_path.as_deref(),
+        },
     )?;
     if profile.is_production() {
         write_prod_deploy_artifacts(
@@ -14593,23 +14610,44 @@ fn write_client_bundle_artifacts(
     out: &Path,
     entry: &Path,
     enabled: bool,
-    client_page_path: Option<&str>,
-    client_js_path: Option<&str>,
-    client_wasm_path: Option<&str>,
+    binding: ClientSourceBinding<'_>,
+    targets: ClientBundleTargets<'_>,
 ) -> anyhow::Result<()> {
     if !enabled {
         return Ok(());
     }
-    let page_path =
-        client_page_path.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?;
-    let js_path =
-        client_js_path.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
-    let wasm_path =
-        client_wasm_path.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
-    write_client_wasm_placeholder(&out.join(wasm_path))?;
-    write_client_js_loader(&out.join(js_path))?;
+    let page_path = targets
+        .page
+        .ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?;
+    let js_path = targets
+        .js
+        .ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
+    let wasm_path = targets
+        .wasm
+        .ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
+    write_client_wasm_placeholder(
+        &out.join(wasm_path),
+        binding.source_bundle,
+        binding.source_bundle_hash,
+    )?;
+    write_client_js_loader(
+        &out.join(js_path),
+        binding.source_bundle,
+        binding.source_bundle_hash,
+    )?;
     let loader_src = relative_bundle_path(page_path, js_path);
     write_client_page_shell(&out.join(page_path), entry, &loader_src)
+}
+
+struct ClientSourceBinding<'a> {
+    source_bundle: &'a orv_compiler::SourceBundleArtifact,
+    source_bundle_hash: &'a str,
+}
+
+struct ClientBundleTargets<'a> {
+    page: Option<&'a str>,
+    js: Option<&'a str>,
+    wasm: Option<&'a str>,
 }
 
 fn validate_prod_server_listen(
@@ -15105,23 +15143,32 @@ const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
-const CLIENT_WASM_CUSTOM_SECTION_PAYLOAD: &str = r#"{"schema_version":1,"runtime_features":["client_wasm"],"source_bundle":"../source-bundle.json"}"#;
-
-fn write_client_wasm_placeholder(path: &Path) -> anyhow::Result<()> {
+fn write_client_wasm_placeholder(
+    path: &Path,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+    source_bundle_hash: &str,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, client_wasm_placeholder_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
+    std::fs::write(
+        path,
+        client_wasm_placeholder_bytes(source_bundle, source_bundle_hash),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))
 }
 
-fn client_wasm_placeholder_bytes() -> Vec<u8> {
+fn client_wasm_placeholder_bytes(
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+    source_bundle_hash: &str,
+) -> Vec<u8> {
     let mut bytes = WASM_MODULE_HEADER.to_vec();
     let mut custom_section = Vec::new();
     push_wasm_len(&mut custom_section, CLIENT_WASM_CUSTOM_SECTION_NAME.len());
     custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
-    custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_PAYLOAD.as_bytes());
+    let payload = client_wasm_metadata_json(source_bundle, source_bundle_hash);
+    custom_section.extend_from_slice(payload.as_bytes());
 
     bytes.push(0);
     push_wasm_len(&mut bytes, custom_section.len());
@@ -15156,6 +15203,20 @@ fn client_wasm_placeholder_bytes() -> Vec<u8> {
     bytes
 }
 
+fn client_wasm_metadata_json(
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+    source_bundle_hash: &str,
+) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "runtime_features": ["client_wasm"],
+        "source_bundle": CLIENT_WASM_SOURCE_BUNDLE_PATH,
+        "source_bundle_hash": source_bundle_hash,
+        "entry": &source_bundle.entry,
+    })
+    .to_string()
+}
+
 fn push_wasm_section(out: &mut Vec<u8>, id: u8, section: &[u8]) {
     out.push(id);
     push_wasm_len(out, section.len());
@@ -15181,13 +15242,20 @@ fn push_wasm_u32_leb(out: &mut Vec<u8>, mut value: u32) {
     }
 }
 
-fn write_client_js_loader(path: &Path) -> anyhow::Result<()> {
-    let script = r#"export const ORV_CLIENT_BOOTSTRAP = Object.freeze({
-  schemaVersion: 1,
-  runtimeFeatures: ["client_wasm"],
-  wasmUrl: "./app.wasm",
-  sourceBundleUrl: "../source-bundle.json",
-});
+fn write_client_js_loader(
+    path: &Path,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+    source_bundle_hash: &str,
+) -> anyhow::Result<()> {
+    let bootstrap = serde_json::to_string_pretty(&serde_json::json!({
+        "schemaVersion": 1,
+        "runtimeFeatures": ["client_wasm"],
+        "wasmUrl": "./app.wasm",
+        "sourceBundleUrl": "../source-bundle.json",
+        "sourceBundleHash": source_bundle_hash,
+        "entry": &source_bundle.entry,
+    }))?;
+    let script = r#"export const ORV_CLIENT_BOOTSTRAP = Object.freeze(__ORV_BOOTSTRAP__);
 
 const wasmUrl = new URL(ORV_CLIENT_BOOTSTRAP.wasmUrl, import.meta.url);
 const sourceBundleUrl = new URL(ORV_CLIENT_BOOTSTRAP.sourceBundleUrl, import.meta.url);
@@ -15203,6 +15271,7 @@ async function main() {
   if (root) {
     root.dataset.orvStatus = "ready";
     root.dataset.orvSourceBundle = sourceBundleUrl.href;
+    root.dataset.orvSourceBundleHash = ORV_CLIENT_BOOTSTRAP.sourceBundleHash;
   }
 }
 
@@ -15212,8 +15281,9 @@ main().catch((error) => {
     root.dataset.orvStatus = "error";
   }
 });
-"#;
-    write_text(path, script)
+"#
+    .replace("__ORV_BOOTSTRAP__", &bootstrap);
+    write_text(path, &script)
 }
 
 fn write_client_page_shell(path: &Path, entry: &Path, loader_src: &str) -> anyhow::Result<()> {
@@ -25038,11 +25108,26 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(wasm_text.contains("orv.client"));
         assert!(wasm_text.contains("source_bundle"));
         assert!(wasm_text.contains("orv_start"));
+        let source_bundle =
+            read_json_value(&build_out.join("source-bundle.json")).expect("source bundle");
+        let expected_source_bundle_hash =
+            stable_json_hash(&source_bundle).expect("source bundle hash");
+        let wasm_metadata = client_wasm_custom_section_payload(&wasm)
+            .expect("read wasm metadata")
+            .expect("orv metadata section");
+        let wasm_metadata: serde_json::Value =
+            serde_json::from_slice(wasm_metadata).expect("wasm metadata json");
+        assert_eq!(wasm_metadata["entry"], source_bundle["entry"]);
+        assert_eq!(
+            wasm_metadata["source_bundle_hash"],
+            expected_source_bundle_hash
+        );
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
         assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
         assert!(loader.contains("sourceBundleUrl"));
         assert!(loader.contains("../source-bundle.json"));
+        assert!(loader.contains("sourceBundleHash"));
         assert!(loader.contains("runtimeFeatures"));
         assert!(loader.contains("WebAssembly.instantiate"));
         assert!(loader.contains("orv_start"));
@@ -25300,11 +25385,17 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let build_out = out.join("dist");
 
         cmd_build(&entry, &build_out).expect("build artifacts");
+        let original_wasm =
+            std::fs::read(build_out.join("client").join("app.wasm")).expect("client wasm");
+        let original_metadata = client_wasm_custom_section_payload(&original_wasm)
+            .expect("read wasm metadata")
+            .expect("orv metadata section")
+            .to_vec();
         let mut wasm = WASM_MODULE_HEADER.to_vec();
         let mut custom_section = Vec::new();
         push_wasm_len(&mut custom_section, CLIENT_WASM_CUSTOM_SECTION_NAME.len());
         custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_NAME.as_bytes());
-        custom_section.extend_from_slice(CLIENT_WASM_CUSTOM_SECTION_PAYLOAD.as_bytes());
+        custom_section.extend_from_slice(&original_metadata);
         push_wasm_section(&mut wasm, 0, &custom_section);
         std::fs::write(build_out.join("client").join("app.wasm"), wasm).expect("rewrite wasm");
 

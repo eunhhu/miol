@@ -81,7 +81,7 @@ Runtime debug state comes from the reference runtime debug trace. Long-running `
 - `server/app.orv-runtime.json`
 - `server/launch.json`
 - `pages/index.html` for HTML-only zero-runtime entries
-- `client/app.js` and `client/app.wasm` placeholders for interactive client entries
+- `client/app.js` and a source-bound minimal `client/app.wasm` for interactive client entries
 
 `orv build --prod` adds deploy artifacts:
 
