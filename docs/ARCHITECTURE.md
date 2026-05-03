@@ -215,7 +215,7 @@ dist/
 - `orv editor snapshot/reveal/runtime/export/trace` — first-party editor bootstrap JSON, source-hash watch set, build-origin navigation payload, runtime inspection pane JSON, static editor shell artifact with ProjectGraph/panel-list/runtime-frame/trace-detail rendering and optional trace state, captured request trace navigation payload 출력
 - `orv build <file-or-orv.toml> --out <dir> [--prod]` — 초기 build manifest + bundle plan + origin map + project graph + server runtime/launch artifact, HTML-only static page, 또는 client page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/container/Dockerfile/Compose/runbook/entrypoint 추가
 - `orv add/remove` — `orv.toml` dependency section 편집과 lockfile 재생성
-- `orv lock [dir-or-orv.toml] [--check]` — `orv.toml` project/dependency metadata와 local/file/HTTP registry `index.json` 기반 prerelease/build-aware exact/wildcard/caret/tilde/comparator range 결과를 deterministic `orv.lock` JSON으로 고정하거나 최신성 검증
+- `orv lock [dir-or-orv.toml] [--check]` — `orv.toml` project/dependency metadata와 local/file/HTTP registry `index.json` 기반 prerelease/build-aware exact/wildcard/caret/tilde/comparator/disjunction range 결과를 deterministic `orv.lock` JSON으로 고정하거나 최신성 검증
 - `orv fetch [dir-or-orv.toml] --out <dir>` — 최신 lockfile에서 path/local registry 및 HTTP registry source-bundle dependency cache와 `deps-manifest.json` 출력
 - `orv workspace new <member> [--root <dir>] [--name <name>]` — workspace root manifest member 등록과 member project scaffold 생성
 - `orv workspace graph [root] [--out <dir>]` — workspace member graph/files/dependencies와 member 간 path dependency edge artifact 출력

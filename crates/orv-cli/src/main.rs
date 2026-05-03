@@ -2774,6 +2774,13 @@ fn read_json_from_http(url: &str) -> anyhow::Result<serde_json::Value> {
 }
 
 fn registry_version_matches(requested: &str, version: &SemverVersion) -> bool {
+    if requested.contains("||") {
+        return requested
+            .split("||")
+            .map(str::trim)
+            .filter(|clause| !clause.is_empty())
+            .any(|clause| registry_version_matches(clause, version));
+    }
     if is_wildcard_segment(requested) {
         return true;
     }
@@ -23086,6 +23093,47 @@ auth = { version = ">=1.2.0-alpha.1 <1.2.0", registry = "registry" }
         assert_eq!(
             lock["dependencies"][0]["requested_version"],
             ">=1.2.0-alpha.1 <1.2.0"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_disjunction_version_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-disjunction");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.4/src")).expect("create 1.2.4");
+        std::fs::create_dir_all(dir.join("registry/auth/1.3.0/src")).expect("create 1.3.0");
+        std::fs::create_dir_all(dir.join("registry/auth/2.1.0/src")).expect("create 2.1.0");
+        std::fs::create_dir_all(dir.join("registry/auth/3.0.0/src")).expect("create 3.0.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-disjunction\"\n")
+            .expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.4","1.3.0","2.1.0","3.0.0"]}"#,
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = ">=1.2.0 <1.3.0 || >=2.0.0 <3.0.0", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "2.1.0");
+        assert_eq!(
+            lock["dependencies"][0]["requested_version"],
+            ">=1.2.0 <1.3.0 || >=2.0.0 <3.0.0"
         );
 
         let _ = std::fs::remove_dir_all(dir);
