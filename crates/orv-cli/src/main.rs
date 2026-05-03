@@ -9483,6 +9483,7 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     verify_manifest_artifacts(dir, &manifest)?;
     verify_deploy_manifest_if_present(dir)?;
     verify_dev_hmr_session_if_present(dir, &plan)?;
+    verify_dev_hmr_transport_if_present(dir)?;
     verify_dev_watch_session_if_present(dir, &plan)?;
     verify_dev_watch_events_if_present(dir)
 }
@@ -9780,6 +9781,67 @@ fn verify_dev_hmr_session_if_present(dir: &Path, plan: &serde_json::Value) -> an
     }
     if json_str(reload, "fallback", "dev session reload")? != "full-reload" {
         anyhow::bail!("dev session reload fallback must be full-reload");
+    }
+    Ok(())
+}
+
+fn verify_dev_hmr_transport_if_present(dir: &Path) -> anyhow::Result<()> {
+    let transport_path = dir.join("dev").join("transport.json");
+    if !transport_path.is_file() {
+        return Ok(());
+    }
+    if !dir.join("dev").join("session.json").is_file() {
+        anyhow::bail!("dev hmr transport requires dev/session.json");
+    }
+    let transport = read_json_value(&transport_path)?;
+    if transport
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("dev hmr transport schema_version must be 1");
+    }
+    if json_str(&transport, "mode", "dev hmr transport")? != "hmr-transport" {
+        anyhow::bail!("dev hmr transport mode must be hmr-transport");
+    }
+    if json_str(&transport, "source_bundle", "dev hmr transport")? != "source-bundle.json" {
+        anyhow::bail!("dev hmr transport source_bundle must be source-bundle.json");
+    }
+    if json_str(&transport, "session", "dev hmr transport")? != "dev/session.json" {
+        anyhow::bail!("dev hmr transport session must be dev/session.json");
+    }
+    let browser = transport
+        .get("browser")
+        .ok_or_else(|| anyhow::anyhow!("dev hmr transport browser must be an object"))?;
+    if json_str(browser, "kind", "dev hmr transport browser")? != "event-source" {
+        anyhow::bail!("dev hmr transport browser kind must be event-source");
+    }
+    if json_str(browser, "client", "dev hmr transport browser")? != "dev/hmr-client.js" {
+        anyhow::bail!("dev hmr transport browser client must be dev/hmr-client.js");
+    }
+    if json_str(browser, "event_source", "dev hmr transport browser")? != "/__orv/hmr/events" {
+        anyhow::bail!("dev hmr transport browser event_source must be /__orv/hmr/events");
+    }
+    if json_str(browser, "session", "dev hmr transport browser")? != "/__orv/hmr/session" {
+        anyhow::bail!("dev hmr transport browser session must be /__orv/hmr/session");
+    }
+    let server = transport
+        .get("server")
+        .ok_or_else(|| anyhow::anyhow!("dev hmr transport server must be an object"))?;
+    if json_str(server, "kind", "dev hmr transport server")? != "reference-dev" {
+        anyhow::bail!("dev hmr transport server kind must be reference-dev");
+    }
+    if json_str(server, "events", "dev hmr transport server")? != "dev/events.json" {
+        anyhow::bail!("dev hmr transport server events must be dev/events.json");
+    }
+    let client_path = dir.join("dev").join("hmr-client.js");
+    let client = std::fs::read_to_string(&client_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", client_path.display()))?;
+    if !client.contains("EventSource('/__orv/hmr/events')") {
+        anyhow::bail!("dev hmr client must connect to /__orv/hmr/events");
+    }
+    if !client.contains("window.location.reload()") {
+        anyhow::bail!("dev hmr client must support full reload fallback");
     }
     Ok(())
 }
@@ -10973,6 +11035,7 @@ fn dev_with_writer_with_options<W: std::io::Write>(
     verify_build_dir(out)?;
     if hmr {
         write_dev_hmr_session(out)?;
+        write_dev_hmr_transport(out)?;
     }
     if watch {
         write_dev_watch_session(out, hmr)?;
@@ -10998,6 +11061,52 @@ fn write_dev_hmr_session(out: &Path) -> anyhow::Result<()> {
     });
     write_json(&out.join("dev").join("session.json"), &session)
 }
+
+fn write_dev_hmr_transport(out: &Path) -> anyhow::Result<()> {
+    let transport = serde_json::json!({
+        "schema_version": 1,
+        "mode": "hmr-transport",
+        "source_bundle": "source-bundle.json",
+        "session": "dev/session.json",
+        "browser": {
+            "kind": "event-source",
+            "client": "dev/hmr-client.js",
+            "event_source": "/__orv/hmr/events",
+            "session": "/__orv/hmr/session",
+            "reload_event": "orv:reload",
+        },
+        "server": {
+            "kind": "reference-dev",
+            "events": "dev/events.json",
+            "session": "dev/session.json",
+        },
+    });
+    write_json(&out.join("dev").join("transport.json"), &transport)?;
+    write_text(&out.join("dev").join("hmr-client.js"), DEV_HMR_CLIENT_JS)
+}
+
+const DEV_HMR_CLIENT_JS: &str = r"(function () {
+  if (!('EventSource' in window)) {
+    return;
+  }
+  var source = new EventSource('/__orv/hmr/events');
+  source.addEventListener('message', function (event) {
+    var payload = {};
+    try {
+      payload = JSON.parse(event.data || '{}');
+    } catch (_) {
+      payload = {};
+    }
+    window.dispatchEvent(new CustomEvent('orv:hmr', { detail: payload }));
+    if (payload.action === 'build-verify-run' || payload.action === 'reload') {
+      window.location.reload();
+    }
+  });
+  source.addEventListener('orv:reload', function () {
+    window.location.reload();
+  });
+}());
+";
 
 fn write_dev_watch_session(out: &Path, hmr: bool) -> anyhow::Result<()> {
     let (sources, targets, has_client_target) = dev_session_inputs(out)?;
@@ -20268,6 +20377,34 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn verify_build_rejects_invalid_dev_hmr_transport_manifest() {
+        let out = temp_output_dir("verify-build-dev-hmr-transport");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, true, false, &mut stdout)
+            .expect("dev hmr");
+        let transport_path = build_out.join("dev").join("transport.json");
+        let mut transport = read_json_value(&transport_path).expect("dev hmr transport");
+        transport["browser"]["client"] = serde_json::json!("tmp/hmr-client.js");
+        write_json(&transport_path, &transport).expect("write corrupt dev hmr transport");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid dev hmr transport");
+
+        assert!(err
+            .to_string()
+            .contains("dev hmr transport browser client must be dev/hmr-client.js"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_invalid_dev_watch_session_manifest() {
         let out = temp_output_dir("verify-build-dev-watch-session");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -21225,6 +21362,22 @@ define Auth() -> { @out "auth" }
                         .iter()
                         .any(|feature| feature == "client_wasm")
             }));
+        let transport =
+            read_json_value(&build_out.join("dev").join("transport.json")).expect("hmr transport");
+        assert_eq!(transport["schema_version"], 1);
+        assert_eq!(transport["mode"], "hmr-transport");
+        assert_eq!(transport["source_bundle"], "source-bundle.json");
+        assert_eq!(transport["session"], "dev/session.json");
+        assert_eq!(transport["browser"]["kind"], "event-source");
+        assert_eq!(transport["browser"]["client"], "dev/hmr-client.js");
+        assert_eq!(transport["browser"]["event_source"], "/__orv/hmr/events");
+        assert_eq!(transport["browser"]["session"], "/__orv/hmr/session");
+        assert_eq!(transport["server"]["kind"], "reference-dev");
+        assert_eq!(transport["server"]["events"], "dev/events.json");
+        let client = std::fs::read_to_string(build_out.join("dev").join("hmr-client.js"))
+            .expect("hmr client");
+        assert!(client.contains("EventSource('/__orv/hmr/events')"));
+        assert!(client.contains("window.location.reload()"));
         cmd_verify_build(&build_out).expect("verify dev hmr build");
         let _ = std::fs::remove_dir_all(&out);
     }
