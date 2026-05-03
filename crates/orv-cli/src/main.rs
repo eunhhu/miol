@@ -9,6 +9,7 @@
 //! `--prod`는 같은 artifact에 deploy manifest, route inventory, reference container
 //! contract, reference server entrypoint를 추가한다.
 //! `orv lock [dir-or-orv.toml]`은 프로젝트 의존성 metadata를 `orv.lock`으로 고정한다.
+//! `orv fetch [dir-or-orv.toml]`는 lockfile dependency source-bundle cache 를 생성한다.
 //! `orv add/remove`은 `orv.toml` dependency section 과 lockfile 을 함께 갱신한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
@@ -120,6 +121,15 @@ enum Command {
         /// 기존 orv.lock이 최신인지 확인하고 쓰지는 않는다.
         #[arg(long)]
         check: bool,
+    },
+    /// `orv.lock` dependency source들을 local dependency artifact로 가져온다.
+    Fetch {
+        /// orv.toml/orv.lock이 있는 프로젝트 디렉터리 또는 manifest 경로.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// dependency artifact 출력 디렉터리.
+        #[arg(long, short = 'o', default_value = "target/orv-deps")]
+        out: PathBuf,
     },
     /// `orv.toml`에 dependency를 추가하고 `orv.lock`을 갱신한다.
     Add {
@@ -564,6 +574,13 @@ fn main() -> ExitCode {
             }
         },
         Command::Lock { dir, check } => match cmd_lock(&dir, check) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Fetch { dir, out } => match cmd_fetch(&dir, &out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -11997,6 +12014,160 @@ fn cmd_lock(path: &Path, check: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_fetch(path: &Path, out: &Path) -> anyhow::Result<()> {
+    let manifest = project_manifest_path(path)?;
+    let root = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let lock_path = root.join("orv.lock");
+    let lock = read_json_value(&lock_path)?;
+    let expected = project_lock_json(&manifest)?;
+    if lock != expected {
+        anyhow::bail!("orv.lock is out of date; run `orv lock` before `orv fetch`");
+    }
+
+    let mut packages = Vec::new();
+    for key in ["dependencies", "dev_dependencies"] {
+        let entries = lock
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("orv.lock field `{key}` must be an array"))?;
+        for entry in entries {
+            packages.push(fetch_dependency_package(root, out, entry)?);
+        }
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.dependencies",
+        "root": root.display().to_string(),
+        "lockfile": "orv.lock",
+        "stats": {
+            "package_count": packages.len(),
+        },
+        "packages": packages,
+    });
+    write_json(&out.join("deps-manifest.json"), &manifest)?;
+    println!("fetch: wrote {}", out.display());
+    Ok(())
+}
+
+fn fetch_dependency_package(
+    root: &Path,
+    out: &Path,
+    dependency: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let name = json_str(dependency, "name", "lock dependency")?;
+    let section = json_str(dependency, "section", "lock dependency")?;
+    let source = json_str(dependency, "source", "lock dependency")?;
+    let version = json_str(dependency, "version", "lock dependency")?;
+    let checksum = json_str(dependency, "checksum", "lock dependency")?;
+    let package_root = match source {
+        "path" => path_dependency_project_root(root, dependency)?,
+        "registry" => registry_dependency_project_root(root, dependency)?,
+        other => anyhow::bail!("unsupported dependency source `{other}`"),
+    };
+    let entry = project_entry_path(&package_root)?;
+    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let source_bundle = orv_compiler::source_bundle_artifact(
+        entry.display().to_string(),
+        loaded
+            .files
+            .iter()
+            .map(|file| (file.path.display().to_string(), file.source.clone())),
+    );
+    orv_compiler::verify_source_bundle_artifact(&source_bundle)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    let package_dir = format!(
+        "packages/{}/{}",
+        dependency_cache_component(section),
+        dependency_cache_component(name)
+    );
+    let source_bundle_path = format!("{package_dir}/source-bundle.json");
+    write_json(
+        &out.join(&source_bundle_path),
+        &serde_json::to_value(&source_bundle)?,
+    )?;
+
+    let mut package = serde_json::json!({
+        "name": name,
+        "section": section,
+        "source": source,
+        "version": version,
+        "checksum": checksum,
+        "resolved_path": package_root.display().to_string(),
+        "entry": entry.display().to_string(),
+        "source_bundle": source_bundle_path,
+        "source_file_count": loaded.files.len(),
+        "verified": true,
+    });
+    if source == "path" {
+        package["path"] = serde_json::json!(json_str(dependency, "path", "path dependency")?);
+    } else {
+        package["registry"] =
+            serde_json::json!(json_str(dependency, "registry", "registry dependency")?);
+    }
+    Ok(package)
+}
+
+fn path_dependency_project_root(
+    root: &Path,
+    dependency: &serde_json::Value,
+) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(json_str(dependency, "path", "path dependency")?);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(root.join(path))
+    }
+}
+
+fn registry_dependency_project_root(
+    root: &Path,
+    dependency: &serde_json::Value,
+) -> anyhow::Result<PathBuf> {
+    let registry = json_str(dependency, "registry", "registry dependency")?;
+    if registry == "registry.orv.dev"
+        || registry.starts_with("http://")
+        || registry.starts_with("https://")
+    {
+        anyhow::bail!(
+            "remote registry download is not implemented yet; use a file:// or relative registry path"
+        );
+    }
+    let registry_root = registry.strip_prefix("file://").map_or_else(
+        || {
+            let path = PathBuf::from(registry);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        },
+        PathBuf::from,
+    );
+    Ok(registry_root
+        .join(json_str(dependency, "name", "registry dependency")?)
+        .join(json_str(dependency, "version", "registry dependency")?))
+}
+
+fn dependency_cache_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if component.is_empty() {
+        "package".to_string()
+    } else {
+        component
+    }
+}
+
 fn cmd_add_dependency(
     path: &Path,
     name: &str,
@@ -21033,6 +21204,17 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn fetch_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "fetch", "demo", "--out", "target/orv-deps"])
+            .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Fetch { dir, out } = parsed.command else {
+            panic!("expected fetch command");
+        };
+        assert_eq!(dir, PathBuf::from("demo"));
+        assert_eq!(out, PathBuf::from("target/orv-deps"));
+    }
+
+    #[test]
     fn add_and_remove_subcommands_are_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -21822,6 +22004,95 @@ mock-server = "0.2.0"
         write_json_atomic(&dir.join("orv.lock"), &stale).expect("write stale lock");
         let err = cmd_lock(&dir, true).expect_err("stale lock");
         assert!(err.to_string().contains("orv.lock is out of date"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fetch_writes_dependency_source_bundles_from_lockfile() {
+        let dir = temp_output_dir("project-fetch");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("libs/ui/src")).expect("create path dep src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.3/src"))
+            .expect("create registry dep src");
+        std::fs::write(dir.join("src/main.orv"), "@out \"fetch\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = "1.2.3", registry = "registry" }
+ui = { version = "0.1.0", path = "libs/ui" }
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(
+            dir.join("libs/ui/orv.toml"),
+            r#"[project]
+name = "ui"
+version = "0.1.0"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write path dep manifest");
+        std::fs::write(
+            dir.join("libs/ui/src/main.orv"),
+            r#"@out @html { @body { @p "UI" } }"#,
+        )
+        .expect("write path dep source");
+        std::fs::write(
+            dir.join("registry/auth/1.2.3/orv.toml"),
+            r#"[project]
+name = "auth"
+version = "1.2.3"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write registry dep manifest");
+        std::fs::write(
+            dir.join("registry/auth/1.2.3/src/main.orv"),
+            r#"@out @html { @body { @p "Auth" } }"#,
+        )
+        .expect("write registry dep source");
+        cmd_lock(&dir, false).expect("write lock");
+
+        let out = dir.join("target/orv-deps");
+        cmd_fetch(&dir, &out).expect("fetch dependencies");
+
+        assert!(out
+            .join("packages/dependencies/auth/source-bundle.json")
+            .is_file());
+        assert!(out
+            .join("packages/dependencies/ui/source-bundle.json")
+            .is_file());
+        let manifest = read_json_value(&out.join("deps-manifest.json")).expect("read manifest");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["kind"], "orv.dependencies");
+        assert_eq!(manifest["lockfile"], "orv.lock");
+        assert_eq!(manifest["stats"]["package_count"], 2);
+        assert!(manifest["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .any(|package| package["name"] == "auth"
+                && package["source"] == "registry"
+                && package["source_bundle"] == "packages/dependencies/auth/source-bundle.json"
+                && package["verified"] == true));
+        assert!(manifest["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .any(|package| package["name"] == "ui"
+                && package["source"] == "path"
+                && package["source_bundle"] == "packages/dependencies/ui/source-bundle.json"
+                && package["verified"] == true));
+        read_source_bundle_artifact(&out.join("packages/dependencies/auth/source-bundle.json"))
+            .expect("auth source bundle");
+        read_source_bundle_artifact(&out.join("packages/dependencies/ui/source-bundle.json"))
+            .expect("ui source bundle");
 
         let _ = std::fs::remove_dir_all(dir);
     }
