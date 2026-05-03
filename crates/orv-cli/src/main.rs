@@ -28,8 +28,8 @@ use codespan_reporting::term::termcolor::WriteColor;
 use orv_diagnostics::{ByteRange, FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
 use orv_syntax::ast::{
-    BinaryOp as AstBinaryOp, Block, ConstraintValue, Expr, ExprKind, FunctionBody, Program, Stmt,
-    StringSegment, TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
+    BinaryOp as AstBinaryOp, Block, ConstraintValue, Expr, ExprKind, FunctionBody, FunctionStmt,
+    Program, Stmt, StringSegment, TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
 };
 
 #[derive(Parser)]
@@ -2646,6 +2646,10 @@ impl LspSession {
                 Ok(result) => lsp_jsonrpc_result(&id, &result),
                 Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
             },
+            Some("textDocument/signatureHelp") => match self.signature_help_result(request) {
+                Ok(result) => lsp_jsonrpc_result(&id, &result),
+                Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
+            },
             Some("textDocument/completion") => match self.completion_result(request) {
                 Ok(result) => lsp_jsonrpc_result(&id, &result),
                 Err(err) => lsp_jsonrpc_error(&id, -32602, &err.to_string()),
@@ -2706,6 +2710,9 @@ impl LspSession {
                         "prepareProvider": true,
                     },
                     "hoverProvider": true,
+                    "signatureHelpProvider": {
+                        "triggerCharacters": ["(", ","],
+                    },
                     "completionProvider": {
                         "triggerCharacters": ["@", ".", ":"],
                     },
@@ -2953,6 +2960,27 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_hover_json(node, &loaded.files))
+    }
+
+    fn signature_help_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some((name, active_parameter)) = lsp_call_signature_context(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(function) = lsp_function_signature_stmt(&loaded.program, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(lsp_signature_help_json(function, active_parameter))
     }
 
     fn document_symbol_result(
@@ -7597,6 +7625,90 @@ fn lsp_hover_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serd
     })
 }
 
+fn lsp_signature_help_json(function: &FunctionStmt, active_parameter: usize) -> serde_json::Value {
+    let parameters = function
+        .params
+        .iter()
+        .map(lsp_signature_parameter_label)
+        .collect::<Vec<_>>();
+    let label = lsp_signature_label(function, &parameters);
+    let max_parameter = parameters.len().saturating_sub(1);
+    serde_json::json!({
+        "signatures": [
+            {
+                "label": label,
+                "parameters": parameters
+                    .iter()
+                    .map(|parameter| serde_json::json!({ "label": parameter }))
+                    .collect::<Vec<_>>(),
+            },
+        ],
+        "activeSignature": 0,
+        "activeParameter": active_parameter.min(max_parameter),
+    })
+}
+
+fn lsp_signature_label(function: &FunctionStmt, parameters: &[String]) -> String {
+    let mut label = format!("{}({})", function.name.name, parameters.join(", "));
+    if let Some(return_ty) = &function.return_ty {
+        label.push_str(": ");
+        label.push_str(&type_ref_string(return_ty));
+    }
+    label
+}
+
+fn lsp_signature_parameter_label(param: &orv_syntax::ast::Param) -> String {
+    param.ty.as_ref().map_or_else(
+        || param.name.name.clone(),
+        |ty| format!("{}: {}", param.name.name, type_ref_string(ty)),
+    )
+}
+
+fn lsp_function_signature_stmt<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionStmt> {
+    program.items.iter().find_map(|stmt| match stmt {
+        Stmt::Function(function) if function.name.name == name => Some(function.as_ref()),
+        _ => None,
+    })
+}
+
+fn lsp_call_signature_context(source: &str, byte: usize) -> Option<(&str, usize)> {
+    let open = lsp_call_open_paren(source, byte)?;
+    let name_end = source[..open].trim_end().len();
+    let name = identifier_span_at_byte(source, name_end.checked_sub(1)?)?.2;
+    let active_parameter = lsp_active_parameter_index(&source[open.saturating_add(1)..byte]);
+    Some((name, active_parameter))
+}
+
+fn lsp_call_open_paren(source: &str, byte: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut index = byte.min(bytes.len());
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b')' | b']' | b'}' => depth = depth.saturating_add(1),
+            b'(' if depth == 0 => return Some(index),
+            b'(' | b'[' | b'{' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn lsp_active_parameter_index(source: &str) -> usize {
+    let mut depth = 0usize;
+    let mut active = 0usize;
+    for byte in source.bytes() {
+        match byte {
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => active = active.saturating_add(1),
+            _ => {}
+        }
+    }
+    active
+}
+
 fn lsp_file_uri_for_path(path: &Path) -> String {
     format!("file://{}", path.display())
 }
@@ -11979,6 +12091,10 @@ function greet(user: User): string -> "hello"
         assert_eq!(
             response["result"]["capabilities"]["completionProvider"]["triggerCharacters"][0],
             "@"
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"][0],
+            "("
         );
         assert_eq!(
             response["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
@@ -16943,6 +17059,42 @@ let u: User = { id: 1 }
         assert_eq!(response["result"]["contents"]["value"], "**Struct** `User`");
         assert_eq!(response["result"]["range"]["start"]["line"], 0);
         assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_signature_help_returns_function_parameters() {
+        let dir = temp_output_dir("lsp-signature-help");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text =
+            "function add(left: int, right: int): int -> left + right\nlet total: int = add(1, 2)\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let call_line = source_text.lines().nth(1).expect("call line");
+        let character = call_line.find('2').expect("second argument");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 18,
+            "method": "textDocument/signatureHelp",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 18);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["activeSignature"], 0);
+        assert_eq!(response["result"]["activeParameter"], 1);
+        let signature = &response["result"]["signatures"][0];
+        assert_eq!(signature["label"], "add(left: int, right: int): int");
+        assert_eq!(signature["parameters"][0]["label"], "left: int");
+        assert_eq!(signature["parameters"][1]["label"], "right: int");
         let _ = std::fs::remove_dir_all(dir);
     }
 
