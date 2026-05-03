@@ -2921,13 +2921,11 @@ fn registry_index_versions(
     registry: &str,
     auth_token_env: Option<&str>,
 ) -> anyhow::Result<Vec<SemverVersion>> {
-    let index = if registry.starts_with("http://") {
-        read_json_from_http(
+    let index = if registry.starts_with("http://") || registry.starts_with("https://") {
+        read_json_from_registry_url(
             &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
             auth_token_env,
         )?
-    } else if registry.starts_with("https://") {
-        anyhow::bail!("https registry index resolution is not implemented yet")
     } else if registry == "registry.orv.dev" {
         anyhow::bail!("registry.orv.dev resolution is not implemented yet")
     } else {
@@ -2961,11 +2959,11 @@ fn registry_index_versions(
         .collect()
 }
 
-fn read_json_from_http(
+fn read_json_from_registry_url(
     url: &str,
     auth_token_env: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let source = http_get_string_with_auth(url, auth_token_env)?;
+    let source = registry_get_string_with_auth(url, auth_token_env)?;
     serde_json::from_str(&source).map_err(|e| anyhow::anyhow!("failed to parse {url}: {e}"))
 }
 
@@ -12983,25 +12981,22 @@ fn registry_dependency_source(
     dependency: &serde_json::Value,
 ) -> anyhow::Result<FetchedDependency> {
     let registry = json_str(dependency, "registry", "registry dependency")?;
-    if registry.starts_with("https://") {
-        anyhow::bail!(
-            "https registry download is not implemented yet; use http:// or file:// registry paths"
-        );
-    }
-    if registry.starts_with("http://") {
+    if registry.starts_with("http://") || registry.starts_with("https://") {
         let url = registry_source_bundle_url(
             registry,
             json_str(dependency, "name", "registry dependency")?,
             json_str(dependency, "version", "registry dependency")?,
         );
-        let artifact = download_http_source_bundle(
+        let artifact = download_registry_source_bundle(
             &url,
             json_optional_str(dependency, "auth_token_env", "registry dependency")?,
         )?;
         return Ok(FetchedDependency::SourceBundle { url, artifact });
     }
     if registry == "registry.orv.dev" {
-        anyhow::bail!("remote registry download requires an explicit http:// or file:// registry");
+        anyhow::bail!(
+            "remote registry download requires an explicit http://, https://, or file:// registry"
+        );
     }
     let registry_root = registry.strip_prefix("file://").map_or_else(
         || {
@@ -13030,16 +13025,40 @@ fn registry_source_bundle_url(registry: &str, name: &str, version: &str) -> Stri
     )
 }
 
-fn download_http_source_bundle(
+fn download_registry_source_bundle(
     url: &str,
     auth_token_env: Option<&str>,
 ) -> anyhow::Result<orv_compiler::SourceBundleArtifact> {
-    let body = http_get_string_with_auth(url, auth_token_env)?;
+    let body = registry_get_string_with_auth(url, auth_token_env)?;
     let artifact: orv_compiler::SourceBundleArtifact = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("failed to parse registry source bundle {url}: {e}"))?;
     orv_compiler::verify_source_bundle_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
     Ok(artifact)
+}
+
+fn registry_get_string_with_auth(
+    url: &str,
+    auth_token_env: Option<&str>,
+) -> anyhow::Result<String> {
+    if url.starts_with("https://") {
+        return https_get_string_with_auth(url, auth_token_env);
+    }
+    http_get_string_with_auth(url, auth_token_env)
+}
+
+fn https_get_string_with_auth(url: &str, auth_token_env: Option<&str>) -> anyhow::Result<String> {
+    let mut request = ureq::get(url);
+    if let Some(authorization) = registry_authorization_header(auth_token_env)? {
+        request = request.header("Authorization", &authorization);
+    }
+    let mut response = request
+        .call()
+        .map_err(|e| anyhow::anyhow!("registry request {url} failed: {e}"))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("failed to read registry response {url}: {e}"))
 }
 
 fn http_get_string_with_auth(url: &str, auth_token_env: Option<&str>) -> anyhow::Result<String> {
@@ -23391,6 +23410,31 @@ auth = { version = "^1.2.0", registry = "registry" }
         assert_eq!(lock["dependencies"][0]["requested_version"], "^1.2.0");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn registry_index_uses_https_transport_instead_of_roadmap_error() {
+        let error = registry_index_versions(Path::new("."), "auth", "https://127.0.0.1:9", None)
+            .expect_err("unreachable https registry");
+
+        assert!(!error.to_string().contains("not implemented"), "{error}");
+    }
+
+    #[test]
+    fn registry_fetch_uses_https_transport_instead_of_roadmap_error() {
+        let dependency = serde_json::json!({
+            "name": "auth",
+            "section": "dependencies",
+            "source": "registry",
+            "registry": "https://127.0.0.1:9",
+            "version": "1.2.3",
+            "checksum": "fnv1a64:test",
+        });
+        let Err(error) = registry_dependency_source(Path::new("."), &dependency) else {
+            panic!("unreachable https registry unexpectedly succeeded");
+        };
+
+        assert!(!error.to_string().contains("not implemented"), "{error}");
     }
 
     #[test]
