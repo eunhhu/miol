@@ -438,18 +438,21 @@ enum DbCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// local backup artifact 또는 WAL archive에서 @db.save JSON data snapshot을 복원한다.
+    /// local backup artifact, raw WAL, 또는 WAL archive에서 @db.save JSON data snapshot을 복원한다.
     Restore {
         /// 읽을 backup artifact JSON 경로.
         #[arg(long)]
         backup: Option<PathBuf>,
+        /// 읽을 @db.wal JSONL 경로.
+        #[arg(long)]
+        wal: Option<PathBuf>,
         /// 읽을 WAL archive manifest JSON 경로.
         #[arg(long)]
         archive: Option<PathBuf>,
         /// 복원할 @db.save JSON data snapshot 경로.
         #[arg(long)]
         data: PathBuf,
-        /// archive에서 복구할 RFC3339 point-in-time timestamp.
+        /// raw WAL/archive에서 복구할 RFC3339 point-in-time timestamp.
         #[arg(long)]
         at: Option<String>,
     },
@@ -837,11 +840,13 @@ fn main() -> ExitCode {
             },
             DbCommand::Restore {
                 backup,
+                wal,
                 archive,
                 data,
                 at,
             } => match cmd_db_restore_from_inputs(
                 backup.as_deref(),
+                wal.as_deref(),
                 archive.as_deref(),
                 at.as_deref(),
                 &data,
@@ -1976,6 +1981,12 @@ Archive the local WAL before deploy or backup rotation:\n\
 orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json\n\
 ```\n\
 \n\
+Restore the raw WAL into a snapshot for point-in-time recovery:\n\
+\n\
+```sh\n\
+orv db restore --wal data/shop.wal.jsonl --data data/shop.data.json --at 2026-05-02T12:00:00Z\n\
+```\n\
+\n\
 ## Deploy\n\
 \n\
 After `orv build . --prod --out dist`, use generated deploy runbook:\n\
@@ -2310,22 +2321,26 @@ fn cmd_db_restore(backup: &Path, data: &Path) -> anyhow::Result<()> {
 
 fn cmd_db_restore_from_inputs(
     backup: Option<&Path>,
+    wal: Option<&Path>,
     archive: Option<&Path>,
     at: Option<&str>,
     data: &Path,
 ) -> anyhow::Result<()> {
-    match (backup, archive) {
-        (Some(backup), None) => {
+    match (backup, wal, archive) {
+        (Some(backup), None, None) => {
             if at.is_some() {
-                anyhow::bail!("db restore --at requires --archive");
+                anyhow::bail!("db restore --at requires --wal or --archive");
             }
             cmd_db_restore(backup, data)
         }
-        (None, Some(archive)) => {
+        (None, Some(wal), None) => {
+            cmd_db_recover_from_inputs(Some(wal), None, data, None, None, at)
+        }
+        (None, None, Some(archive)) => {
             cmd_db_recover_from_inputs(None, Some(archive), data, None, None, at)
         }
-        (Some(_), Some(_)) => anyhow::bail!("db restore accepts only one of --backup or --archive"),
-        (None, None) => anyhow::bail!("db restore requires --backup or --archive"),
+        (None, None, None) => anyhow::bail!("db restore requires --backup, --wal, or --archive"),
+        _ => anyhow::bail!("db restore accepts only one of --backup, --wal, or --archive"),
     }
 }
 
@@ -22861,6 +22876,67 @@ entry = "src/main.orv"
         if let Err(err) = parsed {
             panic!("{}", err.render());
         }
+    }
+
+    #[test]
+    fn db_restore_wal_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "db",
+            "restore",
+            "--wal",
+            "target/db.wal.jsonl",
+            "--data",
+            "target/data.json",
+            "--at",
+            "2023-11-14T22:13:20Z",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
+    fn db_restore_raw_wal_replays_point_in_time_snapshot() {
+        let dir = temp_output_dir("db-restore-raw-wal");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let wal = dir.join("db.wal.jsonl");
+        let data = dir.join("data.json");
+        std::fs::write(
+            &wal,
+            concat!(
+                "{\"schema_version\":1,\"op\":\"create\",\"table\":\"users\",\"data\":{\"name\":\"Ada\"},\"ts_unix_ms\":1700000000000}\n",
+                "{\"schema_version\":1,\"op\":\"create\",\"table\":\"users\",\"data\":{\"name\":\"Grace\"},\"ts_unix_ms\":1700000001000}\n",
+            ),
+        )
+        .expect("write wal");
+        std::fs::write(
+            &data,
+            serde_json::json!({
+                "schema_version": 1,
+                "tables": {
+                    "users": {
+                        "next_id": 1,
+                        "rows": [{ "id": 1, "name": "stale" }]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write stale data");
+
+        cmd_db_restore_from_inputs(None, Some(&wal), None, Some("2023-11-14T22:13:20Z"), &data)
+            .expect("restore raw wal");
+
+        let snapshot = read_json_value(&data).expect("read restored data");
+        let rows = snapshot["tables"]["users"]["rows"]
+            .as_array()
+            .expect("users rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Ada");
+        let rollback = read_json_value(&rollback_schema_path(&data)).expect("read rollback");
+        assert_eq!(rollback["tables"]["users"]["rows"][0]["name"], "stale");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

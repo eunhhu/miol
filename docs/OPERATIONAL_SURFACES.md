@@ -101,4 +101,4 @@ When a server artifact contains static `@db.wal` paths such as `data/shop.wal.js
 
 Runtime `@db` currently uses an in-memory execution model with explicit JSON snapshot and WAL APIs: `@db.save/load`, `@db.wal(path)`, `@db.checkpoint()`, `@db.savepoint()`, and `@db.rollback(point)`. `@server` boot body DB setup is carried into route handlers, so a server-level `@db.wal("data/shop.wal.jsonl")` replays startup state and persists subsequent route mutations. `@db.connect` accepts the reference `memory://` adapter and rejects external adapter URLs until real PostgreSQL/MySQL/SQLite adapters exist.
 
-CLI DB commands provide schema/data dry-run, drift verification, apply/migrate with history, rollback, local backup/restore, hash-verified WAL recovery, archive manifest generation, manifest-relative source WAL resolution, archive point-in-time restore, and history squash.
+CLI DB commands provide schema/data dry-run, drift verification, apply/migrate with history, rollback, local backup/restore, hash-verified WAL recovery, archive manifest generation, manifest-relative source WAL resolution, raw-WAL/archive point-in-time restore, and history squash.
