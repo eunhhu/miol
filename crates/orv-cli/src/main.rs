@@ -415,9 +415,9 @@ enum EditorCommand {
     Debug {
         /// 대상 파일 경로.
         file: PathBuf,
-        /// 실행할 DAP control request.
-        #[arg(long, value_enum, default_value_t = EditorDebugControl::Next)]
-        control: EditorDebugControl,
+        /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
+        #[arg(long = "control", value_enum)]
+        controls: Vec<EditorDebugControl>,
     },
     /// first-party editor static UI artifact를 출력한다.
     Export {
@@ -983,7 +983,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            EditorCommand::Debug { file, control } => match cmd_editor_debug(&file, control) {
+            EditorCommand::Debug { file, controls } => match cmd_editor_debug(&file, &controls) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1289,9 +1289,9 @@ fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_editor_debug(path: &Path, control: EditorDebugControl) -> anyhow::Result<()> {
+fn cmd_editor_debug(path: &Path, controls: &[EditorDebugControl]) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
-    let value = editor_debug_session_json(&entry, control)?;
+    let value = editor_debug_session_json(&entry, controls)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4531,18 +4531,14 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
 
 fn editor_debug_session_json(
     path: &Path,
-    control: EditorDebugControl,
+    controls: &[EditorDebugControl],
 ) -> anyhow::Result<serde_json::Value> {
-    let control_request = control.request_json();
-    let control_command = control_request
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("next");
-    let control_arguments = control_request
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let requests = vec![
+    let controls = if controls.is_empty() {
+        vec![EditorDebugControl::Next]
+    } else {
+        controls.to_vec()
+    };
+    let mut requests = vec![
         serde_json::json!({
             "seq": 1,
             "type": "request",
@@ -4558,21 +4554,36 @@ fn editor_debug_session_json(
                 "live": true,
             },
         }),
-        serde_json::json!({
-            "seq": 3,
+    ];
+    let mut control_requests = Vec::new();
+    for (index, control) in controls.iter().copied().enumerate() {
+        let seq = u64::try_from(index + 3).unwrap_or(u64::MAX);
+        let control_request = control.request_json();
+        let control_command = control_request
+            .get("command")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("next"));
+        let control_arguments = control_request
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        requests.push(serde_json::json!({
+            "seq": seq,
             "type": "request",
             "command": control_command,
             "arguments": control_arguments,
-        }),
-        serde_json::json!({
-            "seq": 4,
-            "type": "request",
-            "command": "stackTrace",
-            "arguments": {
-                "threadId": 1,
-            },
-        }),
-    ];
+        }));
+        control_requests.push((seq, control, control_request));
+    }
+    let stack_seq = u64::try_from(requests.len() + 1).unwrap_or(u64::MAX);
+    requests.push(serde_json::json!({
+        "seq": stack_seq,
+        "type": "request",
+        "command": "stackTrace",
+        "arguments": {
+            "threadId": 1,
+        },
+    }));
     let input = dap_protocol_input_frames(&requests)?;
     let mut reader = std::io::Cursor::new(input.as_bytes());
     let mut writer = Vec::new();
@@ -4580,10 +4591,23 @@ fn editor_debug_session_json(
     let output =
         String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid DAP output: {e}"))?;
     let frames = dap_protocol_output_frames(&output)?;
-    let control_response =
-        dap_response_for_request_seq(&frames, 3).unwrap_or(serde_json::Value::Null);
-    let stack = dap_response_for_request_seq(&frames, 4)
+    let control_summaries: Vec<_> = control_requests
+        .into_iter()
+        .map(|(seq, control, control_request)| {
+            serde_json::json!({
+                "name": control.label(),
+                "request": control_request,
+                "response": dap_response_for_request_seq(&frames, seq)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    let stack = dap_response_for_request_seq(&frames, stack_seq)
         .and_then(|response| response.get("body").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let first_control = control_summaries
+        .first()
+        .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -4596,11 +4620,8 @@ fn editor_debug_session_json(
             "request_count": requests.len(),
             "frame_count": frames.len(),
         },
-        "control": {
-            "name": control.label(),
-            "request": control_request,
-            "response": control_response,
-        },
+        "control": first_control,
+        "controls": control_summaries,
         "stack": stack,
         "frames": frames,
     }))
@@ -23819,6 +23840,23 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_debug_subcommand_accepts_control_sequence() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "debug",
+            "fixtures/e2e/hello.orv",
+            "--control",
+            "next",
+            "--control",
+            "next",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn editor_trace_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -26450,7 +26488,7 @@ define Auth() -> { @out "auth" }
         let path = dir.join("app.orv");
         std::fs::write(&path, "let first: int = 1\nlet second: int = 2\n").expect("write source");
 
-        let debug = editor_debug_session_json(&path, EditorDebugControl::Next)
+        let debug = editor_debug_session_json(&path, &[EditorDebugControl::Next])
             .expect("editor debug session");
 
         assert_eq!(debug["kind"], "orv.editor.debug");
@@ -26468,6 +26506,42 @@ define Auth() -> { @out "auth" }
                     && frame["event"] == "stopped"
                     && frame["body"]["reason"] == "step"
             }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_debug_control_sequence_reuses_one_dap_session() {
+        let dir = temp_output_dir("editor-debug-control-sequence");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+
+        let debug =
+            editor_debug_session_json(&path, &[EditorDebugControl::Next, EditorDebugControl::Next])
+                .expect("editor debug session");
+
+        let controls = debug["controls"].as_array().expect("controls");
+        assert_eq!(controls.len(), 2);
+        assert!(controls
+            .iter()
+            .all(|control| control["response"]["success"] == true));
+        assert_eq!(debug["transport"]["request_count"], 5);
+        assert_eq!(debug["stack"]["stackFrames"][0]["line"], 3);
+        let step_stops = debug["frames"]
+            .as_array()
+            .expect("frames")
+            .iter()
+            .filter(|frame| {
+                frame["type"] == "event"
+                    && frame["event"] == "stopped"
+                    && frame["body"]["reason"] == "step"
+            })
+            .count();
+        assert!(step_stops >= 2, "{debug}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
