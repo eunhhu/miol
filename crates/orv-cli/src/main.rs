@@ -306,6 +306,9 @@ enum WorkspaceCommand {
         /// member build를 production profile로 생성한다.
         #[arg(long)]
         prod: bool,
+        /// 이전 workspace build manifest와 source hash가 같으면 member build를 건너뛴다.
+        #[arg(long)]
+        incremental: bool,
     },
 }
 
@@ -708,15 +711,23 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            WorkspaceCommand::Build { root, out, prod } => {
-                match cmd_workspace_build(&root, &out, BuildProfile::from_prod_flag(prod)) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        ExitCode::FAILURE
-                    }
+            WorkspaceCommand::Build {
+                root,
+                out,
+                prod,
+                incremental,
+            } => match cmd_workspace_build(
+                &root,
+                &out,
+                BuildProfile::from_prod_flag(prod),
+                incremental,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
                 }
-            }
+            },
         },
         Command::Test { path, filter, list } => match cmd_test(&path, filter.as_deref(), list) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1294,16 +1305,29 @@ fn cmd_workspace_graph(root: &Path, out: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow::Result<()> {
+fn cmd_workspace_build(
+    root: &Path,
+    out: &Path,
+    profile: BuildProfile,
+    incremental: bool,
+) -> anyhow::Result<()> {
+    let _ = incremental;
     let graph = workspace_graph_json(root)?;
     let graph_path = out.join("workspace-graph.json");
     write_json(&graph_path, &graph)?;
 
+    let build_order = workspace_build_order(&graph)?;
+    let dependency_edges = workspace_path_dependency_edges_from_graph(&graph)?;
+    let member_dependencies = workspace_member_dependency_map(&dependency_edges)?;
+    let previous_manifest = if incremental {
+        read_workspace_build_manifest(out)?
+    } else {
+        None
+    };
     let members = graph
         .get("members")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("workspace graph members must be an array"))?;
-    let build_order = workspace_build_order(&graph)?;
     let member_lookup = members
         .iter()
         .map(|member| {
@@ -1314,6 +1338,9 @@ fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow
         })
         .collect::<anyhow::Result<HashMap<_, _>>>()?;
     let mut member_builds = Vec::with_capacity(members.len());
+    let mut dirty_members = HashSet::new();
+    let mut built_count = 0usize;
+    let mut skipped_count = 0usize;
     for member_path in &build_order {
         let member = member_lookup
             .get(member_path)
@@ -1322,42 +1349,56 @@ fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow
             workspace_member_string(Path::new(json_str(member, "path", "workspace member")?))?;
         let name = json_str(member, "name", "workspace member")?;
         let entry = json_str(member, "entry", "workspace member")?;
+        let input_hash = workspace_member_input_hash(root, member)?;
         let build_dir = format!("members/{member_path}");
         let member_out = out.join(&build_dir);
-        cmd_build_with_profile(&root.join(entry), &member_out, profile)?;
-        cmd_verify_build(&member_out)?;
+        let dependency_dirty = member_dependencies
+            .get(&member_path)
+            .is_some_and(|dependencies| dependencies.iter().any(|dep| dirty_members.contains(dep)));
+        let skip = incremental
+            && !dependency_dirty
+            && workspace_previous_member_matches(
+                previous_manifest.as_ref(),
+                profile,
+                &member_path,
+                &build_dir,
+                &input_hash,
+            )
+            && cmd_verify_build(&member_out).is_ok();
+        let status = if skip {
+            skipped_count += 1;
+            "skipped"
+        } else {
+            cmd_build_with_profile(&root.join(entry), &member_out, profile)?;
+            cmd_verify_build(&member_out)?;
+            dirty_members.insert(member_path.clone());
+            built_count += 1;
+            "built"
+        };
         member_builds.push(serde_json::json!({
             "path": member_path,
             "name": name,
             "entry": entry,
             "build_dir": build_dir,
             "manifest": format!("{build_dir}/build-manifest.json"),
+            "input_hash": input_hash,
+            "status": status,
             "verified": true,
         }));
     }
 
-    let dependency_edges = graph
-        .get("edges")
-        .and_then(serde_json::Value::as_array)
-        .map(|edges| {
-            edges
-                .iter()
-                .filter(|edge| {
-                    edge.get("kind").and_then(serde_json::Value::as_str) == Some("path_dependency")
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let manifest = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.workspace.build",
         "profile": profile.as_str(),
+        "incremental": incremental,
         "root": root.display().to_string(),
         "workspace_graph": "workspace-graph.json",
         "stats": {
             "member_count": member_builds.len(),
             "dependency_edge_count": dependency_edges.len(),
+            "built_count": built_count,
+            "skipped_count": skipped_count,
         },
         "build_order": build_order,
         "members": member_builds,
@@ -1366,6 +1407,88 @@ fn cmd_workspace_build(root: &Path, out: &Path, profile: BuildProfile) -> anyhow
     write_json(&out.join("workspace-build.json"), &manifest)?;
     println!("workspace build: wrote {}", out.display());
     Ok(())
+}
+
+fn read_workspace_build_manifest(out: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let path = out.join("workspace-build.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    read_json_value(&path).map(Some)
+}
+
+fn workspace_path_dependency_edges_from_graph(
+    graph: &serde_json::Value,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let edges = graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace graph edges must be an array"))?;
+    Ok(edges
+        .iter()
+        .filter(|edge| {
+            edge.get("kind").and_then(serde_json::Value::as_str) == Some("path_dependency")
+        })
+        .cloned()
+        .collect())
+}
+
+fn workspace_member_dependency_map(
+    edges: &[serde_json::Value],
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges {
+        let dependent = json_str(edge, "from", "workspace edge")?.to_string();
+        let dependency = json_str(edge, "to", "workspace edge")?.to_string();
+        map.entry(dependent).or_default().push(dependency);
+    }
+    for dependencies in map.values_mut() {
+        dependencies.sort();
+        dependencies.dedup();
+    }
+    Ok(map)
+}
+
+fn workspace_member_input_hash(root: &Path, member: &serde_json::Value) -> anyhow::Result<String> {
+    let entry = root.join(json_str(member, "entry", "workspace member")?);
+    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let source_bundle = orv_compiler::source_bundle_artifact(
+        entry.display().to_string(),
+        loaded
+            .files
+            .iter()
+            .map(|file| (file.path.display().to_string(), file.source.clone())),
+    );
+    let hash = stable_json_hash(&serde_json::to_value(&source_bundle)?)?;
+    Ok(format!("fnv1a64:{hash}"))
+}
+
+fn workspace_previous_member_matches(
+    previous_manifest: Option<&serde_json::Value>,
+    profile: BuildProfile,
+    member_path: &str,
+    build_dir: &str,
+    input_hash: &str,
+) -> bool {
+    let Some(manifest) = previous_manifest else {
+        return false;
+    };
+    if manifest.get("profile").and_then(serde_json::Value::as_str) != Some(profile.as_str()) {
+        return false;
+    }
+    manifest
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|members| {
+            members.iter().find(|member| {
+                member.get("path").and_then(serde_json::Value::as_str) == Some(member_path)
+            })
+        })
+        .is_some_and(|member| {
+            member.get("build_dir").and_then(serde_json::Value::as_str) == Some(build_dir)
+                && member.get("input_hash").and_then(serde_json::Value::as_str) == Some(input_hash)
+        })
 }
 
 fn workspace_build_order(graph: &serde_json::Value) -> anyhow::Result<Vec<String>> {
@@ -14259,17 +14382,78 @@ mod tests {
         path
     }
 
+    fn workspace_build_fixture(name: &str) -> PathBuf {
+        let root = temp_output_dir(name);
+        std::fs::create_dir_all(root.join("apps/web/src")).expect("create web src");
+        std::fs::create_dir_all(root.join("shared/models/src")).expect("create models src");
+        std::fs::write(
+            root.join("orv.toml"),
+            r#"[workspace]
+resolver = "2"
+members = ["apps/web", "shared/models"]
+"#,
+        )
+        .expect("write root manifest");
+        std::fs::write(
+            root.join("apps/web/orv.toml"),
+            r#"[project]
+name = "web"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+models = { path = "../../shared/models", version = "0.1.0" }
+"#,
+        )
+        .expect("write web manifest");
+        std::fs::write(
+            root.join("shared/models/orv.toml"),
+            r#"[project]
+name = "models"
+version = "0.1.0"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write models manifest");
+        std::fs::write(
+            root.join("apps/web/src/main.orv"),
+            r#"@out @html { @body { @h1 "Web" } }"#,
+        )
+        .expect("write web source");
+        std::fs::write(
+            root.join("shared/models/src/main.orv"),
+            r#"@out @html { @body { @h1 "Models" } }"#,
+        )
+        .expect("write models source");
+        root
+    }
+
     fn send_raw_http(address: &str, path: &str) -> String {
-        let mut stream = std::net::TcpStream::connect(address).expect("connect attached server");
+        let mut last_error = None;
+        for _ in 0..20 {
+            match send_raw_http_once(address, path) {
+                Ok(response) if !response.is_empty() => return response,
+                Ok(_) => last_error = Some("empty response".to_string()),
+                Err(err) => last_error = Some(err.to_string()),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "read http response: {}",
+            last_error.unwrap_or_else(|| "no response".to_string())
+        );
+    }
+
+    fn send_raw_http_once(address: &str, path: &str) -> std::io::Result<String> {
+        let mut stream = std::net::TcpStream::connect(address)?;
         std::io::Write::write_all(
             &mut stream,
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
-        )
-        .expect("write http request");
+        )?;
         let mut response = String::new();
-        std::io::Read::read_to_string(&mut stream, &mut response).expect("read http response");
-        response
+        std::io::Read::read_to_string(&mut stream, &mut response)?;
+        Ok(response)
     }
 
     fn dap_test_request(
@@ -21396,17 +21580,25 @@ entry = "src/main.orv"
             "--out",
             "target/orv-workspace-build",
             "--prod",
+            "--incremental",
         ])
         .unwrap_or_else(|err| panic!("{}", err.render()));
         let Command::Workspace { command } = parsed.command else {
             panic!("expected workspace command");
         };
-        let WorkspaceCommand::Build { root, out, prod } = command else {
+        let WorkspaceCommand::Build {
+            root,
+            out,
+            prod,
+            incremental,
+        } = command
+        else {
             panic!("expected workspace build command");
         };
         assert_eq!(root, PathBuf::from("demo"));
         assert_eq!(out, PathBuf::from("target/orv-workspace-build"));
         assert!(prod);
+        assert!(incremental);
     }
 
     #[test]
@@ -22383,51 +22575,10 @@ entry = "src/main.orv"
 
     #[test]
     fn workspace_build_writes_member_builds_and_workspace_manifest() {
-        let root = temp_output_dir("workspace-build");
-        std::fs::create_dir_all(root.join("apps/web/src")).expect("create web src");
-        std::fs::create_dir_all(root.join("shared/models/src")).expect("create models src");
-        std::fs::write(
-            root.join("orv.toml"),
-            r#"[workspace]
-resolver = "2"
-members = ["apps/web", "shared/models"]
-"#,
-        )
-        .expect("write root manifest");
-        std::fs::write(
-            root.join("apps/web/orv.toml"),
-            r#"[project]
-name = "web"
-version = "0.1.0"
-entry = "src/main.orv"
-
-[dependencies]
-models = { path = "../../shared/models", version = "0.1.0" }
-"#,
-        )
-        .expect("write web manifest");
-        std::fs::write(
-            root.join("shared/models/orv.toml"),
-            r#"[project]
-name = "models"
-version = "0.1.0"
-entry = "src/main.orv"
-"#,
-        )
-        .expect("write models manifest");
-        std::fs::write(
-            root.join("apps/web/src/main.orv"),
-            r#"@out @html { @body { @h1 "Web" } }"#,
-        )
-        .expect("write web source");
-        std::fs::write(
-            root.join("shared/models/src/main.orv"),
-            r#"@out @html { @body { @h1 "Models" } }"#,
-        )
-        .expect("write models source");
-
+        let root = workspace_build_fixture("workspace-build");
         let out = root.join("target/orv-workspace-build");
-        cmd_workspace_build(&root, &out, BuildProfile::Development).expect("workspace build");
+        cmd_workspace_build(&root, &out, BuildProfile::Development, false)
+            .expect("workspace build");
 
         assert!(out.join("workspace-graph.json").is_file());
         assert!(out.join("members/apps/web/build-manifest.json").is_file());
@@ -22465,6 +22616,31 @@ entry = "src/main.orv"
             .any(|edge| edge["kind"] == "path_dependency"
                 && edge["from"] == "apps/web"
                 && edge["to"] == "shared/models"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_build_incremental_skips_unchanged_member_builds() {
+        let root = workspace_build_fixture("workspace-build-incremental");
+        let out = root.join("target/orv-workspace-build");
+        cmd_workspace_build(&root, &out, BuildProfile::Development, false)
+            .expect("initial workspace build");
+
+        cmd_workspace_build(&root, &out, BuildProfile::Development, true)
+            .expect("incremental workspace build");
+
+        let manifest = read_json_value(&out.join("workspace-build.json")).expect("read manifest");
+        assert_eq!(manifest["stats"]["built_count"], 0);
+        assert_eq!(manifest["stats"]["skipped_count"], 2);
+        assert!(manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .all(|member| member["status"] == "skipped"
+                && member["input_hash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.starts_with("fnv1a64:"))));
 
         let _ = std::fs::remove_dir_all(root);
     }
