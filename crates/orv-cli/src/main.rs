@@ -2558,6 +2558,47 @@ fn editor_export_state_json_with_trace(
     Ok(state)
 }
 
+struct EditorGraphPanel {
+    node_count: usize,
+    edge_count: usize,
+    source_depth: usize,
+    semantic_depth: usize,
+    svg: String,
+}
+
+fn editor_graph_panel_from_state(state: &serde_json::Value) -> EditorGraphPanel {
+    let graph_stats = state
+        .pointer("/snapshot/project_graph/stats")
+        .unwrap_or(&serde_json::Value::Null);
+    let graph_nodes = state
+        .pointer("/snapshot/project_graph/nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let graph_edges = state
+        .pointer("/snapshot/project_graph/edges")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    EditorGraphPanel {
+        node_count: json_usize_field(graph_stats, "node_count"),
+        edge_count: json_usize_field(graph_stats, "edge_count"),
+        source_depth: json_usize_field(graph_stats, "max_source_contains_depth"),
+        semantic_depth: json_usize_field(graph_stats, "max_semantic_contains_depth"),
+        svg: project_graph_view_svg(graph_nodes, graph_edges),
+    }
+}
+
+fn write_editor_graph_panel_html(
+    html: &mut String,
+    graph: &EditorGraphPanel,
+) -> anyhow::Result<()> {
+    write!(
+        html,
+        "<section class=\"panel graph-panel\"><h2>Project Graph</h2><div class=\"metric\">{}</div><p class=\"muted\">{} edges, source depth {}, semantic depth {}.</p><div id=\"editor-graph-view\" class=\"graph-view\">{}</div></section>",
+        graph.node_count, graph.edge_count, graph.source_depth, graph.semantic_depth, graph.svg
+    )?;
+    Ok(())
+}
+
 fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let entry = state
         .pointer("/snapshot/entry/path")
@@ -2568,6 +2609,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let schema_count = json_array_count(state.pointer("/snapshot/panels/schema"));
     let domain_count = json_array_count(state.pointer("/snapshot/panels/domains"));
     let diagnostic_count = json_array_count(state.pointer("/snapshot/diagnostics"));
+    let graph_panel = editor_graph_panel_from_state(state);
     let runtime_frame_count = json_array_count(state.pointer("/runtime/frames"));
     let trace_count = json_array_count(state.pointer("/trace/frames"));
     let trace_status_counts = editor_trace_status_counts_from_state(state);
@@ -2588,6 +2630,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("<style>\n");
     html.push_str(":root{color-scheme:light;--bg:#f7f8fb;--ink:#18202f;--muted:#687386;--line:#d7dce5;--panel:#ffffff;--accent:#0f766e;--warn:#b45309;}\n");
     html.push_str("*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}#orv-editor{min-height:100vh;display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr}.sidebar{grid-row:1/3;border-right:1px solid var(--line);background:#111827;color:#f8fafc;padding:20px 16px}.brand{font-weight:700;font-size:18px;margin-bottom:18px}.nav{display:grid;gap:8px}.nav span{display:flex;justify-content:space-between;border:1px solid #334155;padding:8px 10px}.topbar{border-bottom:1px solid var(--line);background:var(--panel);padding:14px 20px}.topbar h1{font-size:18px;margin:0}.topbar p{margin:4px 0 0;color:var(--muted)}.workspace{padding:18px 20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-height:132px}.panel h2{font-size:14px;margin:0 0 10px}.metric{font-size:28px;font-weight:700}.muted{color:var(--muted)}.list{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}.list li{border-top:1px solid var(--line);padding-top:6px;color:var(--muted);word-break:break-word;cursor:pointer}.list li:focus{outline:2px solid var(--accent);outline-offset:2px}.filterbar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}.filterbar button{border:1px solid var(--line);background:#f8fafc;color:var(--ink);padding:5px 8px;font:inherit;cursor:pointer}.filterbar button[aria-pressed=\"true\"]{border-color:var(--accent);color:var(--accent);font-weight:700}.detail{min-height:120px}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:240px;overflow:auto;background:#f1f5f9;border:1px solid var(--line);padding:10px}@media(max-width:760px){#orv-editor{display:block}.sidebar{border-right:0}.workspace{grid-template-columns:1fr}}\n");
+    html.push_str(".graph-panel{grid-column:1/-1}.graph-view{overflow:auto;border:1px solid var(--line);background:#fff}.graph-view svg{display:block;min-width:900px}\n");
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<main id=\"orv-editor\">\n");
     html.push_str(
@@ -2597,6 +2640,11 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(&mut html, "<span>Routes<b>{route_count}</b></span>")?;
     write!(&mut html, "<span>Schema<b>{schema_count}</b></span>")?;
     write!(&mut html, "<span>Domains<b>{domain_count}</b></span>")?;
+    write!(
+        &mut html,
+        "<span>Graph<b>{}</b></span>",
+        graph_panel.node_count
+    )?;
     write!(
         &mut html,
         "<span>Runtime Frames<b>{runtime_frame_count}</b></span>"
@@ -2626,6 +2674,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<section class=\"panel\"><h2>Diagnostics</h2><div class=\"metric\">{diagnostic_count}</div><p class=\"muted\">Project loader, resolver, and analyzer diagnostics.</p></section>"
     )?;
+    write_editor_graph_panel_html(&mut html, &graph_panel)?;
     write_trace_panel_html(&mut html, trace_count, &trace_status_counts)?;
     html.push_str("<section class=\"panel\"><h2>Selected Trace</h2><pre id=\"trace-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Runtime</h2>");
@@ -21247,8 +21296,11 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("renderEditorState"));
         assert!(html.contains("Routes"));
         assert!(html.contains("Runtime"));
+        assert!(html.contains("Project Graph"));
+        assert!(html.contains("id=\"editor-graph-view\""));
         assert_eq!(state["schema_version"], 1);
         assert_eq!(state["snapshot"]["schema_version"], 1);
+        assert_eq!(state["snapshot"]["project_graph"]["schema_version"], 1);
         assert_eq!(state["runtime"]["runtime"]["status"], "ok");
         assert_eq!(
             state["runtime"]["runtime"]["stdout"],
