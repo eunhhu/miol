@@ -2616,18 +2616,14 @@ impl LspSession {
             Some("textDocument/typeDefinition") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.type_definition_result(request))
             }
-            Some("textDocument/prepareCallHierarchy") => lsp_jsonrpc_result_or_invalid_params(
-                &id,
-                self.prepare_call_hierarchy_result(request),
-            ),
-            Some("callHierarchy/outgoingCalls") => lsp_jsonrpc_result_or_invalid_params(
-                &id,
-                self.call_hierarchy_outgoing_result(request),
-            ),
-            Some("callHierarchy/incomingCalls") => lsp_jsonrpc_result_or_invalid_params(
-                &id,
-                self.call_hierarchy_incoming_result(request),
-            ),
+            Some(
+                method @ ("textDocument/prepareCallHierarchy"
+                | "textDocument/prepareTypeHierarchy"
+                | "callHierarchy/outgoingCalls"
+                | "callHierarchy/incomingCalls"
+                | "typeHierarchy/supertypes"
+                | "typeHierarchy/subtypes"),
+            ) => lsp_jsonrpc_result_or_invalid_params(&id, self.hierarchy_result(method, request)),
             Some("textDocument/references") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.references_result(request))
             }
@@ -2657,6 +2653,23 @@ impl LspSession {
             }
             Some(method) => lsp_jsonrpc_method_not_found(&id, method),
             None => lsp_jsonrpc_error(&id, -32600, "invalid request"),
+        }
+    }
+
+    fn hierarchy_result(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        match method {
+            "textDocument/prepareCallHierarchy" => self.prepare_call_hierarchy_result(request),
+            "textDocument/prepareTypeHierarchy" => self.prepare_type_hierarchy_result(request),
+            "callHierarchy/outgoingCalls" => self.call_hierarchy_outgoing_result(request),
+            "callHierarchy/incomingCalls" => self.call_hierarchy_incoming_result(request),
+            "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => {
+                Self::empty_type_hierarchy_result(request)
+            }
+            _ => unreachable!("hierarchy method dispatch is filtered by jsonrpc_response"),
         }
     }
 
@@ -2705,6 +2718,7 @@ impl LspSession {
                     "typeDefinitionProvider": true,
                     "implementationProvider": true,
                     "callHierarchyProvider": true,
+                    "typeHierarchyProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
                     "renameProvider": {
@@ -2869,6 +2883,39 @@ impl LspSession {
         Ok(serde_json::Value::Array(vec![
             lsp_call_hierarchy_item_json(function, &loaded.files),
         ]))
+    }
+
+    fn prepare_type_hierarchy_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(node) = lsp_type_definition_node(&loaded.graph, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(serde_json::Value::Array(vec![
+            lsp_type_hierarchy_item_json(node, &loaded.files),
+        ]))
+    }
+
+    fn empty_type_hierarchy_result(
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        request
+            .pointer("/params/item/name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("typeHierarchy item.name must be a string"))?;
+        Ok(serde_json::Value::Array(Vec::new()))
     }
 
     fn call_hierarchy_outgoing_result(
@@ -7851,6 +7898,35 @@ fn lsp_call_hierarchy_item_json(
     })
 }
 
+fn lsp_type_hierarchy_item_json(
+    node: &orv_project::ProjectNode,
+    files: &[SourceFile],
+) -> serde_json::Value {
+    let uri = files.iter().find(|file| file.id == node.file).map_or_else(
+        || "file://<unknown>".to_string(),
+        |file| lsp_file_uri_for_path(&file.path),
+    );
+    let selection_range = files
+        .iter()
+        .find(|file| file.id == node.file)
+        .and_then(|file| {
+            lsp_node_name_span(&file.source, node)
+                .map(|(start, end)| lsp_range_for_source(&file.source, start, end))
+        })
+        .unwrap_or_else(|| lsp_range_json(node.span, files));
+    serde_json::json!({
+        "name": node.name,
+        "kind": lsp_symbol_kind_code(node.kind).unwrap_or(23),
+        "detail": lsp_symbol_kind(node.kind).unwrap_or("Type"),
+        "uri": uri,
+        "range": lsp_range_json(node.span, files),
+        "selectionRange": selection_range,
+        "data": {
+            "source_node": node.id,
+        },
+    })
+}
+
 fn lsp_call_hierarchy_outgoing_calls(
     caller: &FunctionStmt,
     program: &Program,
@@ -12478,94 +12554,55 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 7);
         assert_eq!(response["result"]["serverInfo"]["name"], "orv-lsp");
-        assert_eq!(response["result"]["capabilities"]["textDocumentSync"], 1);
+        let capabilities = &response["result"]["capabilities"];
+        assert_eq!(capabilities["textDocumentSync"], 1);
+        for provider in [
+            "documentSymbolProvider",
+            "foldingRangeProvider",
+            "selectionRangeProvider",
+            "definitionProvider",
+            "declarationProvider",
+            "typeDefinitionProvider",
+            "implementationProvider",
+            "typeHierarchyProvider",
+            "callHierarchyProvider",
+            "referencesProvider",
+            "documentHighlightProvider",
+            "workspaceSymbolProvider",
+            "hoverProvider",
+            "inlayHintProvider",
+        ] {
+            assert_eq!(capabilities[provider], true, "{provider}");
+        }
         assert_eq!(
-            response["result"]["capabilities"]["documentSymbolProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["documentLinkProvider"]["resolveProvider"],
+            capabilities["documentLinkProvider"]["resolveProvider"],
             false
         );
+        assert_eq!(capabilities["semanticTokensProvider"]["full"], true);
         assert_eq!(
-            response["result"]["capabilities"]["foldingRangeProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["selectionRangeProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["definitionProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["declarationProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["typeDefinitionProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["implementationProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["callHierarchyProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["referencesProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["documentHighlightProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["semanticTokensProvider"]["full"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"][1],
+            capabilities["semanticTokensProvider"]["legend"]["tokenTypes"][1],
             "type"
         );
+        assert_eq!(capabilities["codeLensProvider"]["resolveProvider"], false);
         assert_eq!(
-            response["result"]["capabilities"]["codeLensProvider"]["resolveProvider"],
-            false
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["codeActionProvider"]["codeActionKinds"][0],
+            capabilities["codeActionProvider"]["codeActionKinds"][0],
             "quickfix"
         );
         assert_eq!(
-            response["result"]["capabilities"]["executeCommandProvider"]["commands"][0],
+            capabilities["executeCommandProvider"]["commands"][0],
             "orv.revealSourceNode"
         );
+        assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
         assert_eq!(
-            response["result"]["capabilities"]["renameProvider"]["prepareProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["workspaceSymbolProvider"],
-            true
-        );
-        assert_eq!(response["result"]["capabilities"]["hoverProvider"], true);
-        assert_eq!(
-            response["result"]["capabilities"]["completionProvider"]["triggerCharacters"][0],
+            capabilities["completionProvider"]["triggerCharacters"][0],
             "@"
         );
         assert_eq!(
-            response["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"][0],
+            capabilities["signatureHelpProvider"]["triggerCharacters"][0],
             "("
         );
         assert_eq!(
-            response["result"]["capabilities"]["inlayHintProvider"],
-            true
-        );
-        assert_eq!(
-            response["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
+            capabilities["diagnosticProvider"]["workspaceDiagnostics"],
             true
         );
     }
@@ -17645,6 +17682,91 @@ let u: User = { id: 1 }
         );
         assert_eq!(response["result"]["range"]["start"]["line"], 0);
         assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_prepare_type_hierarchy_returns_type_item() {
+        let dir = temp_output_dir("lsp-type-hierarchy-prepare");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "struct User {\n  id: int\n}\n\nlet u: User = { id: 1 }\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let binding_line = source_text.lines().nth(4).expect("binding line");
+        let type_character = binding_line.find("User").expect("type name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 28,
+            "method": "textDocument/prepareTypeHierarchy",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 4,
+                    "character": type_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 28);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"].as_array().expect("type hierarchy items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "User");
+        assert_eq!(items[0]["kind"], 23);
+        assert_eq!(items[0]["selectionRange"]["start"]["line"], 0);
+        assert_eq!(items[0]["selectionRange"]["start"]["character"], 7);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_type_hierarchy_supertypes_and_subtypes_are_empty_without_inheritance() {
+        let dir = temp_output_dir("lsp-type-hierarchy-empty");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "struct User {\n  id: int\n}\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let item = serde_json::json!({
+            "name": "User",
+            "kind": 23,
+            "uri": format!("file://{}", canonical_source.display()),
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 2, "character": 1 },
+            },
+            "selectionRange": {
+                "start": { "line": 0, "character": 7 },
+                "end": { "line": 0, "character": 11 },
+            },
+        });
+        let supertypes = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 29,
+            "method": "typeHierarchy/supertypes",
+            "params": {
+                "item": item,
+            },
+        }));
+        let subtypes = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "typeHierarchy/subtypes",
+            "params": {
+                "item": item,
+            },
+        }));
+
+        assert_eq!(supertypes["id"], 29);
+        assert!(supertypes.get("error").is_none(), "{supertypes}");
+        assert_eq!(
+            supertypes["result"].as_array().expect("supertypes").len(),
+            0
+        );
+        assert_eq!(subtypes["id"], 30);
+        assert!(subtypes.get("error").is_none(), "{subtypes}");
+        assert_eq!(subtypes["result"].as_array().expect("subtypes").len(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
