@@ -218,7 +218,7 @@ dist/
 - `orv lock [dir-or-orv.toml] [--check]` — `orv.toml` project/dependency metadata와 local/file/HTTP/HTTPS registry `index.json` 기반 prerelease/build-aware exact/wildcard/caret/tilde/comparator/disjunction range 결과, optional `auth_token_env` 이름을 deterministic `orv.lock` JSON으로 고정하거나 최신성 검증
 - `orv fetch [dir-or-orv.toml] --out <dir>` — 최신 lockfile에서 path/local registry 및 optional Bearer auth HTTP/HTTPS registry source-bundle dependency cache와 `deps-manifest.json` 출력
 - `orv workspace new <member> [--root <dir>] [--name <name>]` — workspace root manifest member 등록과 member project scaffold 생성
-- `orv workspace graph [root] [--out <dir>]` — workspace member graph/files/dependencies와 member 간 path dependency edge artifact 출력
+- `orv workspace graph [root] [--view] [--out <dir>]` — workspace member graph/files/dependencies와 member 간 path dependency edge artifact 또는 정적 workspace graph HTML view 출력
 - `orv workspace lock [root] --out <dir>` — dependency-first member lockfile artifact들과 `workspace-lock.json` 출력
 - `orv workspace fetch [root] --out <dir>` — dependency-first member dependency cache artifacts와 `workspace-fetch.json` 출력
 - `orv workspace build [root] --out <dir> [--prod] [--incremental]` — path dependency edge 기반 dependency-first 순서로 각 workspace member를 기존 build pipeline으로 빌드/검증하고 unchanged source hash member는 skip 하는 top-level workspace build manifest 출력

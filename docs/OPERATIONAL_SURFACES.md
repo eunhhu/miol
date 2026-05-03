@@ -18,7 +18,7 @@
 - `orv lock [dir-or-orv.toml] [--check]`
 - `orv fetch [dir-or-orv.toml] [--out <dir>]`
 - `orv workspace new <member> [--root <dir>] [--name <name>]`
-- `orv workspace graph [root] [--out <dir>]`
+- `orv workspace graph [root] [--view] [--out <dir>]`
 - `orv workspace lock [root] [--out <dir>]`
 - `orv workspace fetch [root] [--out <dir>]`
 - `orv workspace build [root] [--out <dir>] [--prod] [--incremental]`
@@ -40,7 +40,7 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 
 `orv workspace new <member> [--root <dir>] [--name <name>]` creates a basic member project and records the relative member path in root `orv.toml` `[workspace].members` with resolver `2`.
 
-`orv workspace graph [root] [--out <dir>]` reads root `[workspace].members`, loads each member entry through the shared ProjectGraph pipeline, records member graphs/files/dependencies, and emits path dependency edges between workspace members. Workspace path dependency edges include dependency package/section, target member name/version, requested version when present, and reject requested versions that do not match the target member version. With `--out`, it writes `workspace-graph.json`.
+`orv workspace graph [root] [--view] [--out <dir>]` reads root `[workspace].members`, loads each member entry through the shared ProjectGraph pipeline, records member graphs/files/dependencies, and emits path dependency edges between workspace members. Workspace path dependency edges include dependency package/section, target member name/version, requested version when present, and reject requested versions that do not match the target member version. With `--out`, it writes `workspace-graph.json`; with `--view`, it writes `workspace-graph.json` plus a static `index.html` workspace member/dependency graph view.
 
 `orv workspace lock [root] --out <dir>` reads the same workspace graph, orders members dependency-first from path dependency edges, writes per-member lockfiles under `members/<member>/orv.lock`, and emits `workspace-lock.json` with member project metadata, dependency lists, path dependency edges, lock order, and package counts without mutating member source directories.
 

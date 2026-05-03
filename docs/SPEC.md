@@ -3060,7 +3060,7 @@ mock-server = "0.2.0"
 | `orv lock [dir-or-orv.toml] [--check]` | `orv.toml` project/dependency metadata와 local/file/HTTP/HTTPS registry `index.json` 기반 prerelease/build-aware exact/wildcard/caret/tilde/comparator/disjunction range 결과에서 deterministic `orv.lock` 생성 또는 최신성 검증 |
 | `orv fetch [dir-or-orv.toml] --out <dir>` | 최신 `orv.lock` 기준 path/local registry 및 HTTP/HTTPS registry dependency source-bundle cache와 `deps-manifest.json` 출력 |
 | `orv workspace new <member> [--root <dir>] [--name <name>]` | workspace root manifest member 등록과 member project scaffold 생성 |
-| `orv workspace graph [root] [--out <dir>]` | workspace member ProjectGraph/files/dependencies 및 target member name/version/requested version을 포함한 member 간 path dependency edge artifact 출력; target version mismatch 거부 |
+| `orv workspace graph [root] [--view] [--out <dir>]` | workspace member ProjectGraph/files/dependencies 및 target member name/version/requested version을 포함한 member 간 path dependency edge artifact 출력, static workspace graph HTML view 생성, target version mismatch 거부 |
 | `orv workspace lock [root] --out <dir>` | dependency-first member lockfile artifacts 및 `workspace-lock.json` 출력 |
 | `orv workspace fetch [root] --out <dir>` | dependency-first member dependency cache artifacts 및 `workspace-fetch.json` 출력 |
 | `orv workspace build [root] --out <dir> [--prod] [--incremental]` | path dependency edge 기반 dependency-first 순서로 workspace member별 build/verify 실행 후 `members/<member>` artifacts, `workspace-graph.json`, `workspace-build.json` 출력; `--incremental`은 input hash가 같은 verified member를 skip |
