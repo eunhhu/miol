@@ -461,6 +461,14 @@ enum EditorCommand {
         #[arg(long)]
         trace: PathBuf,
     },
+    /// `EventSource` trace snapshot을 first-party editor trace JSON으로 변환한다.
+    TraceStream {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// `EventSource` snapshot body 경로.
+        #[arg(long)]
+        events: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1042,6 +1050,15 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::TraceStream { dir, events } => {
+                match cmd_editor_trace_stream(&dir, &events) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Command::Lsp { command } => match command {
             LspCommand::Snapshot { file } => match cmd_lsp_snapshot(&file) {
@@ -1360,6 +1377,12 @@ fn cmd_editor_export_with_options(
 
 fn cmd_editor_trace(dir: &Path, trace: &Path) -> anyhow::Result<()> {
     let value = editor_trace_json(dir, trace)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_trace_stream(dir: &Path, events: &Path) -> anyhow::Result<()> {
+    let value = editor_trace_stream_json(dir, events)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4261,6 +4284,17 @@ fn editor_reveal_focus_json(
 
 fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Value> {
     let trace_value = read_json_value(trace)?;
+    let trace_path = trace.display().to_string();
+    let live_refresh = editor_trace_live_refresh_json(dir, trace)?;
+    editor_trace_payload_json(dir, &trace_path, &trace_value, &live_refresh)
+}
+
+fn editor_trace_payload_json(
+    dir: &Path,
+    trace_path: &str,
+    trace_value: &serde_json::Value,
+    live_refresh: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
     let frames = trace_value
         .get("frames")
         .and_then(serde_json::Value::as_array)
@@ -4289,14 +4323,125 @@ fn editor_trace_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Val
         "kind": "orv.editor.trace",
         "build_dir": dir.display().to_string(),
         "trace": {
-            "path": trace.display().to_string(),
+            "path": trace_path,
             "kind": trace_value.get("kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
             "frame_count": editor_frames.len(),
             "status_counts": editor_trace_status_counts_json(&status_counts),
         },
-        "live_refresh": editor_trace_live_refresh_json(dir, trace)?,
+        "live_refresh": live_refresh,
         "frames": editor_frames,
     }))
+}
+
+fn editor_trace_stream_json(dir: &Path, events: &Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(events)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", events.display()))?;
+    let content_hash = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
+    let body = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("event stream {} must be UTF-8: {e}", events.display()))?;
+    let parsed_events = parse_editor_event_source_events(&body);
+    let mut trace_events = Vec::new();
+    for (index, event) in parsed_events.iter().enumerate() {
+        if event.event != "orv:trace" {
+            continue;
+        }
+        let trace_value: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
+            anyhow::anyhow!("failed to parse trace event {index} data as JSON: {e}")
+        })?;
+        let trace_path = format!("{}#event:{index}", events.display());
+        let live_refresh = editor_trace_stream_live_refresh_json(dir, events, &content_hash)?;
+        let trace = editor_trace_payload_json(dir, &trace_path, &trace_value, &live_refresh)?;
+        trace_events.push(serde_json::json!({
+            "index": index,
+            "event": event.event,
+            "data_bytes": event.data.len(),
+            "trace": trace,
+        }));
+    }
+    let latest = trace_events
+        .last()
+        .and_then(|event| event.get("trace"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.trace.stream",
+        "build_dir": dir.display().to_string(),
+        "event_stream": {
+            "path": events.display().to_string(),
+            "content_type": "text/event-stream",
+            "content_hash": content_hash,
+            "event_count": parsed_events.len(),
+            "trace_event_count": trace_events.len(),
+        },
+        "latest": latest,
+        "events": trace_events,
+    }))
+}
+
+fn editor_trace_stream_live_refresh_json(
+    dir: &Path,
+    events: &Path,
+    content_hash: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut refresh = serde_json::json!({
+        "strategy": "event-source-snapshot",
+        "watch": {
+            "event_stream": {
+                "path": events.display().to_string(),
+                "content_hash": content_hash,
+            },
+        },
+    });
+    if let Some(transport) = editor_trace_live_transport_json(dir)? {
+        refresh["transport"] = transport;
+    }
+    Ok(refresh)
+}
+
+struct EditorEventSourceEvent {
+    event: String,
+    data: String,
+}
+
+fn parse_editor_event_source_events(body: &str) -> Vec<EditorEventSourceEvent> {
+    let mut events = Vec::new();
+    let mut event = String::from("message");
+    let mut data_lines = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            flush_editor_event_source_event(&mut events, &mut event, &mut data_lines);
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
+            (field, value.strip_prefix(' ').unwrap_or(value))
+        });
+        match field {
+            "event" => event = value.to_string(),
+            "data" => data_lines.push(value.to_string()),
+            _ => {}
+        }
+    }
+    flush_editor_event_source_event(&mut events, &mut event, &mut data_lines);
+    events
+}
+
+fn flush_editor_event_source_event(
+    events: &mut Vec<EditorEventSourceEvent>,
+    event: &mut String,
+    data_lines: &mut Vec<String>,
+) {
+    if !data_lines.is_empty() {
+        events.push(EditorEventSourceEvent {
+            event: event.clone(),
+            data: data_lines.join("\n"),
+        });
+        data_lines.clear();
+    }
+    *event = String::from("message");
 }
 
 fn editor_trace_live_refresh_json(dir: &Path, trace: &Path) -> anyhow::Result<serde_json::Value> {
@@ -24378,6 +24523,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_trace_stream_subcommand_accepts_event_stream_snapshot() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "trace-stream",
+            "target/orv-build",
+            "--events",
+            "target/orv-build/trace-events.sse",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn verify_build_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from(["orv", "verify-build", "target/orv-build-test"]);
         if let Err(err) = parsed {
@@ -26916,6 +27076,67 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             trace["live_refresh"]["transport"]["url"],
             "http://127.0.0.1:8080/__orv/trace/events"
+        );
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn editor_trace_stream_consumes_eventsource_trace_snapshot() {
+        let (src_dir, path) = prod_server_source("editor-trace-stream-source");
+        let out = temp_output_dir("editor-trace-stream");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "orv.production.trace",
+            "frame_count": 1,
+            "frames": [{
+                "method": "GET",
+                "path": "/ping",
+                "status": 200,
+                "route_origin_id": route.id,
+            }],
+        });
+        let events_path = src_dir.join("trace-events.sse");
+        std::fs::write(
+            &events_path,
+            format!(
+                "event: message\ndata: {{\"kind\":\"heartbeat\"}}\n\nevent: orv:trace\ndata: {}\n\n",
+                serde_json::to_string(&payload).expect("payload json")
+            ),
+        )
+        .expect("write trace events");
+
+        let stream = editor_trace_stream_json(&out, &events_path).expect("editor trace stream");
+
+        assert_eq!(stream["kind"], "orv.editor.trace.stream");
+        assert_eq!(stream["event_stream"]["content_type"], "text/event-stream");
+        assert_eq!(stream["event_stream"]["event_count"], 2);
+        assert_eq!(stream["event_stream"]["trace_event_count"], 1);
+        assert_eq!(stream["events"][0]["event"], "orv:trace");
+        assert_eq!(stream["latest"]["kind"], "orv.editor.trace");
+        assert_eq!(
+            stream["latest"]["live_refresh"]["strategy"],
+            "event-source-snapshot"
+        );
+        assert_eq!(
+            stream["latest"]["live_refresh"]["transport"]["url"],
+            "http://127.0.0.1:8080/__orv/trace/events"
+        );
+        assert_eq!(stream["latest"]["frames"][0]["origin_id"], route.id);
+        assert_eq!(
+            stream["latest"]["frames"][0]["navigation"]["focus"]["panel"],
+            "routes"
         );
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
