@@ -20,6 +20,7 @@
 //! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -2641,11 +2642,67 @@ fn registry_lock_dependency_with_source(
     Ok(entry)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SemverVersion {
     major: u64,
     minor: u64,
     patch: u64,
+    pre_release: Vec<SemverPreReleaseId>,
+    build: Option<String>,
+    raw: String,
+}
+
+impl Ord for SemverVersion {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.major
+            .cmp(&other.major)
+            .then_with(|| self.minor.cmp(&other.minor))
+            .then_with(|| self.patch.cmp(&other.patch))
+            .then_with(|| compare_pre_release(&self.pre_release, &other.pre_release))
+            .then_with(|| self.build.cmp(&other.build))
+            .then_with(|| self.raw.cmp(&other.raw))
+    }
+}
+
+impl PartialOrd for SemverVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SemverPreReleaseId {
+    Numeric(u64),
+    AlphaNumeric(String),
+}
+
+fn compare_pre_release(left: &[SemverPreReleaseId], right: &[SemverPreReleaseId]) -> CmpOrdering {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => return CmpOrdering::Equal,
+        (true, false) => return CmpOrdering::Greater,
+        (false, true) => return CmpOrdering::Less,
+        (false, false) => {}
+    }
+    for (left, right) in left.iter().zip(right) {
+        let ordering = match (left, right) {
+            (SemverPreReleaseId::Numeric(left), SemverPreReleaseId::Numeric(right)) => {
+                left.cmp(right)
+            }
+            (SemverPreReleaseId::Numeric(_), SemverPreReleaseId::AlphaNumeric(_)) => {
+                CmpOrdering::Less
+            }
+            (SemverPreReleaseId::AlphaNumeric(_), SemverPreReleaseId::Numeric(_)) => {
+                CmpOrdering::Greater
+            }
+            (SemverPreReleaseId::AlphaNumeric(left), SemverPreReleaseId::AlphaNumeric(right)) => {
+                left.cmp(right)
+            }
+        };
+        if ordering != CmpOrdering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn resolve_registry_version(
@@ -2663,10 +2720,7 @@ fn resolve_registry_version(
         .filter(|version| registry_version_matches(requested, version))
         .max()
         .ok_or_else(|| anyhow::anyhow!("no registry version for {name} matches `{requested}`"))?;
-    Ok(format!(
-        "{}.{}.{}",
-        resolved.major, resolved.minor, resolved.patch
-    ))
+    Ok(resolved.raw)
 }
 
 fn registry_index_versions(
@@ -2707,8 +2761,9 @@ fn registry_index_versions(
             let raw = version
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("registry index versions must be strings"))?;
-            parse_semver_version(raw)
-                .ok_or_else(|| anyhow::anyhow!("registry version `{raw}` is not semver x.y.z"))
+            parse_semver_version(raw).ok_or_else(|| {
+                anyhow::anyhow!("registry version `{raw}` is not semver x.y.z[-pre][+build]")
+            })
         })
         .collect()
 }
@@ -2818,15 +2873,66 @@ fn is_wildcard_segment(segment: &str) -> bool {
 }
 
 fn parse_semver_version(version: &str) -> Option<SemverVersion> {
-    let mut parts = version.split('.');
+    let (without_build, build) = version
+        .split_once('+')
+        .map_or((version, None), |(without_build, build)| {
+            (without_build, Some(build))
+        });
+    if build.is_some_and(|build| !is_valid_semver_identifier_list(build)) {
+        return None;
+    }
+    let (core, pre_release) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, pre_release)| {
+            (core, Some(pre_release))
+        });
+    let pre_release = match pre_release {
+        Some(pre_release) => parse_pre_release_identifiers(pre_release)?,
+        None => Vec::new(),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next()?.parse::<u64>().ok()?;
     let patch = parts.next()?.parse::<u64>().ok()?;
-    parts.next().is_none().then_some(SemverVersion {
+    parts.next().is_none().then(|| SemverVersion {
         major,
         minor,
         patch,
+        pre_release,
+        build: build.map(str::to_string),
+        raw: version.to_string(),
     })
+}
+
+fn parse_pre_release_identifiers(raw: &str) -> Option<Vec<SemverPreReleaseId>> {
+    if raw.is_empty() {
+        return None;
+    }
+    raw.split('.')
+        .map(|identifier| {
+            if identifier.is_empty()
+                || !identifier
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                return None;
+            }
+            identifier.parse::<u64>().map_or_else(
+                |_| Some(SemverPreReleaseId::AlphaNumeric(identifier.to_string())),
+                |number| Some(SemverPreReleaseId::Numeric(number)),
+            )
+        })
+        .collect()
+}
+
+fn is_valid_semver_identifier_list(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
 }
 
 fn path_lock_dependency(
@@ -22910,6 +23016,76 @@ auth = { version = ">=1.2.0 <2.0.0", registry = "registry" }
         assert_eq!(
             lock["dependencies"][0]["requested_version"],
             ">=1.2.0 <2.0.0"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_preserves_exact_version_with_build_metadata() {
+        let dir = temp_output_dir("project-lock-registry-build-metadata");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-build\"\n").expect("write entry");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = "1.2.3+build.7"
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.2.3+build.7");
+        assert!(lock["dependencies"][0].get("requested_version").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_resolves_prerelease_comparator_version_from_local_registry_index() {
+        let dir = temp_output_dir("project-lock-registry-prerelease");
+        std::fs::create_dir_all(dir.join("src")).expect("create project src");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0-alpha.1/src"))
+            .expect("create alpha.1");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0-alpha.2/src"))
+            .expect("create alpha.2");
+        std::fs::create_dir_all(dir.join("registry/auth/1.2.0/src")).expect("create 1.2.0");
+        std::fs::write(dir.join("src/main.orv"), "@out \"lock-prerelease\"\n")
+            .expect("write entry");
+        std::fs::write(
+            dir.join("registry/auth/index.json"),
+            r#"{"versions":["1.2.0-alpha.1","1.2.0-alpha.2","1.2.0"]}"#,
+        )
+        .expect("write index");
+        std::fs::write(
+            dir.join("orv.toml"),
+            r#"[project]
+name = "shop"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+auth = { version = ">=1.2.0-alpha.1 <1.2.0", registry = "registry" }
+"#,
+        )
+        .expect("write manifest");
+
+        cmd_lock(&dir, false).expect("write lock");
+
+        let lock = read_json_value(&dir.join("orv.lock")).expect("read lock");
+        assert_eq!(lock["dependencies"][0]["name"], "auth");
+        assert_eq!(lock["dependencies"][0]["version"], "1.2.0-alpha.2");
+        assert_eq!(
+            lock["dependencies"][0]["requested_version"],
+            ">=1.2.0-alpha.1 <1.2.0"
         );
 
         let _ = std::fs::remove_dir_all(dir);
