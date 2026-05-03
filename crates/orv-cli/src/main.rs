@@ -12684,6 +12684,10 @@ fn verify_dev_watch_set(
 }
 
 fn client_wasm_exports_function(bytes: &[u8], name: &str) -> anyhow::Result<bool> {
+    Ok(client_wasm_export_function_index(bytes, name)?.is_some())
+}
+
+fn client_wasm_export_function_index(bytes: &[u8], name: &str) -> anyhow::Result<Option<u32>> {
     let mut offset = WASM_MODULE_HEADER.len();
     while offset < bytes.len() {
         let section_id = bytes[offset];
@@ -12695,20 +12699,20 @@ fn client_wasm_exports_function(bytes: &[u8], name: &str) -> anyhow::Result<bool
         if section_end > bytes.len() {
             anyhow::bail!("client_wasm bundle has invalid WASM section length");
         }
-        if section_id == 7 && wasm_export_section_has_function(bytes, offset, section_end, name)? {
-            return Ok(true);
+        if section_id == 7 {
+            return wasm_export_section_function_index(bytes, offset, section_end, name);
         }
         offset = section_end;
     }
-    Ok(false)
+    Ok(None)
 }
 
-fn wasm_export_section_has_function(
+fn wasm_export_section_function_index(
     bytes: &[u8],
     mut offset: usize,
     section_end: usize,
     name: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<u32>> {
     let export_count = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
     for _ in 0..export_count {
         let name_len = read_wasm_u32_leb(bytes, &mut offset, section_end)? as usize;
@@ -12725,12 +12729,12 @@ fn wasm_export_section_has_function(
         }
         let kind = bytes[offset];
         offset += 1;
-        let _index = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+        let index = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
         if export_name_matches && kind == 0 {
-            return Ok(true);
+            return Ok(Some(index));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn client_wasm_custom_section_payload(bytes: &[u8]) -> anyhow::Result<Option<&[u8]>> {
@@ -12784,6 +12788,18 @@ fn verify_client_wasm_initial_render_data(
     let actual_hash = format!("{:016x}", fnv1a64(data));
     if actual_hash != expected_hash {
         anyhow::bail!("client_wasm initial_render html_hash mismatch");
+    }
+    let expected_len_i32 = i32::try_from(expected_len)
+        .map_err(|_| anyhow::anyhow!("client_wasm initial_render byte_length exceeds wasm i32"))?;
+    let ptr = client_wasm_exported_i32_const(bytes, CLIENT_WASM_RENDER_PTR_EXPORT)?
+        .ok_or_else(|| anyhow::anyhow!("client_wasm orv_render_ptr export body is missing"))?;
+    if ptr != 0 {
+        anyhow::bail!("client_wasm orv_render_ptr export must return initial render pointer");
+    }
+    let len = client_wasm_exported_i32_const(bytes, CLIENT_WASM_RENDER_LEN_EXPORT)?
+        .ok_or_else(|| anyhow::anyhow!("client_wasm orv_render_len export body is missing"))?;
+    if len != expected_len_i32 {
+        anyhow::bail!("client_wasm orv_render_len export must return initial render byte_length");
     }
     Ok(())
 }
@@ -12841,6 +12857,104 @@ fn wasm_initial_render_data_section(
         offset = data_end;
     }
     Ok(None)
+}
+
+fn client_wasm_exported_i32_const(bytes: &[u8], name: &str) -> anyhow::Result<Option<i32>> {
+    let Some(function_index) = client_wasm_export_function_index(bytes, name)? else {
+        return Ok(None);
+    };
+    let imported_function_count = client_wasm_imported_function_count(bytes)?;
+    if function_index < imported_function_count {
+        anyhow::bail!("client_wasm {name} export must not point at an imported function");
+    }
+    let code_index = function_index - imported_function_count;
+    client_wasm_code_function_i32_const(bytes, code_index)
+}
+
+fn client_wasm_imported_function_count(bytes: &[u8]) -> anyhow::Result<u32> {
+    let mut offset = WASM_MODULE_HEADER.len();
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(bytes, &mut offset, bytes.len())? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid WASM section length"))?;
+        if section_end > bytes.len() {
+            anyhow::bail!("client_wasm bundle has invalid WASM section length");
+        }
+        if section_id == 2 {
+            anyhow::bail!("client_wasm render exports must not depend on imported functions");
+        }
+        offset = section_end;
+    }
+    Ok(0)
+}
+
+fn client_wasm_code_function_i32_const(
+    bytes: &[u8],
+    target_index: u32,
+) -> anyhow::Result<Option<i32>> {
+    let mut offset = WASM_MODULE_HEADER.len();
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(bytes, &mut offset, bytes.len())? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid WASM section length"))?;
+        if section_end > bytes.len() {
+            anyhow::bail!("client_wasm bundle has invalid WASM section length");
+        }
+        if section_id == 10 {
+            return wasm_code_section_i32_const(bytes, offset, section_end, target_index);
+        }
+        offset = section_end;
+    }
+    Ok(None)
+}
+
+fn wasm_code_section_i32_const(
+    bytes: &[u8],
+    mut offset: usize,
+    section_end: usize,
+    target_index: u32,
+) -> anyhow::Result<Option<i32>> {
+    let function_count = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+    for index in 0..function_count {
+        let body_len = read_wasm_u32_leb(bytes, &mut offset, section_end)? as usize;
+        let body_end = offset
+            .checked_add(body_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm function body length is invalid"))?;
+        if body_end > section_end {
+            anyhow::bail!("client_wasm function body is truncated");
+        }
+        if index == target_index {
+            return wasm_i32_const_body(bytes, offset, body_end).map(Some);
+        }
+        offset = body_end;
+    }
+    Ok(None)
+}
+
+fn wasm_i32_const_body(bytes: &[u8], mut offset: usize, body_end: usize) -> anyhow::Result<i32> {
+    let local_decl_count = read_wasm_u32_leb(bytes, &mut offset, body_end)?;
+    if local_decl_count != 0 {
+        anyhow::bail!("client_wasm render export body must not declare locals");
+    }
+    if offset >= body_end || bytes[offset] != 0x41 {
+        anyhow::bail!("client_wasm render export body must return i32.const");
+    }
+    offset += 1;
+    let value = read_wasm_i32_leb(bytes, &mut offset, body_end)?;
+    if offset >= body_end || bytes[offset] != 0x0b {
+        anyhow::bail!("client_wasm render export body must end after i32.const");
+    }
+    offset += 1;
+    if offset != body_end {
+        anyhow::bail!("client_wasm render export body has trailing instructions");
+    }
+    Ok(value)
 }
 
 fn read_wasm_u32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::Result<u32> {
@@ -26102,6 +26216,66 @@ models = { path = "../../shared/models", version = "2.0.0" }
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_wasm_render_len_export_mismatch() {
+        let out = temp_output_dir("verify-build-client-wasm-render-len");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let wasm_path = build_out.join("client").join("app.wasm");
+        let mut wasm = std::fs::read(&wasm_path).expect("client wasm");
+        corrupt_generated_render_len_const(&mut wasm, 0);
+        std::fs::write(&wasm_path, wasm).expect("rewrite wasm");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client wasm render len");
+
+        assert!(
+            err.to_string().contains("orv_render_len"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    fn corrupt_generated_render_len_const(wasm: &mut [u8], replacement: u8) {
+        let mut offset = WASM_MODULE_HEADER.len();
+        while offset < wasm.len() {
+            let section_id = wasm[offset];
+            offset += 1;
+            let section_len =
+                read_wasm_u32_leb(wasm, &mut offset, wasm.len()).expect("section length") as usize;
+            let section_end = offset + section_len;
+            if section_id == 10 {
+                let mut body_offset = offset;
+                let function_count =
+                    read_wasm_u32_leb(wasm, &mut body_offset, section_end).expect("function count");
+                assert_eq!(function_count, 3);
+                for ordinal in 0..function_count {
+                    let body_len = read_wasm_u32_leb(wasm, &mut body_offset, section_end)
+                        .expect("body len") as usize;
+                    let body_start = body_offset;
+                    let body_end = body_start + body_len;
+                    if ordinal == 2 {
+                        assert_eq!(wasm[body_start], 0x00);
+                        assert_eq!(wasm[body_start + 1], 0x41);
+                        assert_eq!(wasm[body_end - 1], 0x0b);
+                        wasm[body_start + 2] = replacement;
+                        return;
+                    }
+                    body_offset = body_end;
+                }
+            }
+            offset = section_end;
+        }
+        panic!("render_len function body not found");
     }
 
     #[test]
