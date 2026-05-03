@@ -13,7 +13,6 @@ orv-macros = { workspace = true }
 orv-diagnostics = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-wgpu = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
