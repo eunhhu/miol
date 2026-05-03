@@ -271,6 +271,64 @@ enum InitTemplate {
     Shop,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EditorDebugControl {
+    Continue,
+    Pause,
+    Next,
+    StepIn,
+    StepOut,
+    Restart,
+    Disconnect,
+}
+
+impl EditorDebugControl {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "Continue",
+            Self::Pause => "Pause",
+            Self::Next => "Next",
+            Self::StepIn => "Step In",
+            Self::StepOut => "Step Out",
+            Self::Restart => "Restart",
+            Self::Disconnect => "Disconnect",
+        }
+    }
+
+    fn request_json(self) -> serde_json::Value {
+        match self {
+            Self::Continue => serde_json::json!({
+                "command": "continue",
+                "arguments": {"threadId": 1},
+            }),
+            Self::Pause => serde_json::json!({
+                "command": "pause",
+                "arguments": {"threadId": 1},
+            }),
+            Self::Next => serde_json::json!({
+                "command": "next",
+                "arguments": {"threadId": 1},
+            }),
+            Self::StepIn => serde_json::json!({
+                "command": "stepIn",
+                "arguments": {"threadId": 1},
+            }),
+            Self::StepOut => serde_json::json!({
+                "command": "stepOut",
+                "arguments": {"threadId": 1},
+            }),
+            Self::Restart => serde_json::json!({
+                "command": "restart",
+                "arguments": {},
+            }),
+            Self::Disconnect => serde_json::json!({
+                "command": "disconnect",
+                "arguments": {"terminateDebuggee": true},
+            }),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum WorkspaceCommand {
     /// 워크스페이스 member 프로젝트를 생성하고 root manifest에 등록한다.
@@ -352,6 +410,14 @@ enum EditorCommand {
     Runtime {
         /// 대상 파일 경로.
         file: PathBuf,
+    },
+    /// first-party editor DAP control transport smoke JSON을 출력한다.
+    Debug {
+        /// 대상 파일 경로.
+        file: PathBuf,
+        /// 실행할 DAP control request.
+        #[arg(long, value_enum, default_value_t = EditorDebugControl::Next)]
+        control: EditorDebugControl,
     },
     /// first-party editor static UI artifact를 출력한다.
     Export {
@@ -917,6 +983,13 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            EditorCommand::Debug { file, control } => match cmd_editor_debug(&file, control) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
             EditorCommand::Export {
                 file,
                 out,
@@ -1212,6 +1285,13 @@ fn cmd_editor_reveal(dir: &Path, origin_id: &str) -> anyhow::Result<()> {
 fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
     let value = editor_runtime_json(&entry)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn cmd_editor_debug(path: &Path, control: EditorDebugControl) -> anyhow::Result<()> {
+    let entry = project_entry_path(path)?;
+    let value = editor_debug_session_json(&entry, control)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4446,6 +4526,83 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
         "configurations": editor_debug_configurations_json(path),
         "controls": editor_debug_controls_json(),
         "breakpoint_sources": editor_debug_breakpoint_sources_json(&loaded.files),
+    }))
+}
+
+fn editor_debug_session_json(
+    path: &Path,
+    control: EditorDebugControl,
+) -> anyhow::Result<serde_json::Value> {
+    let control_request = control.request_json();
+    let control_command = control_request
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("next");
+    let control_arguments = control_request
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let requests = vec![
+        serde_json::json!({
+            "seq": 1,
+            "type": "request",
+            "command": "initialize",
+            "arguments": {},
+        }),
+        serde_json::json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": format!("file://{}", path.display()),
+                "live": true,
+            },
+        }),
+        serde_json::json!({
+            "seq": 3,
+            "type": "request",
+            "command": control_command,
+            "arguments": control_arguments,
+        }),
+        serde_json::json!({
+            "seq": 4,
+            "type": "request",
+            "command": "stackTrace",
+            "arguments": {
+                "threadId": 1,
+            },
+        }),
+    ];
+    let input = dap_protocol_input_frames(&requests)?;
+    let mut reader = std::io::Cursor::new(input.as_bytes());
+    let mut writer = Vec::new();
+    dap_serve_stdio_stream(&mut reader, &mut writer)?;
+    let output =
+        String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid DAP output: {e}"))?;
+    let frames = dap_protocol_output_frames(&output)?;
+    let control_response =
+        dap_response_for_request_seq(&frames, 3).unwrap_or(serde_json::Value::Null);
+    let stack = dap_response_for_request_seq(&frames, 4)
+        .and_then(|response| response.get("body").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.debug",
+        "program": path.display().to_string(),
+        "adapter": editor_debug_adapter_json(),
+        "transport": {
+            "protocol": "dap",
+            "framing": "content-length",
+            "request_count": requests.len(),
+            "frame_count": frames.len(),
+        },
+        "control": {
+            "name": control.label(),
+            "request": control_request,
+            "response": control_response,
+        },
+        "stack": stack,
+        "frames": frames,
     }))
 }
 
@@ -14403,6 +14560,41 @@ fn dap_stdio_response(input: &str) -> anyhow::Result<String> {
     String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid utf-8 DAP response: {e}"))
 }
 
+fn dap_protocol_input_frames(requests: &[serde_json::Value]) -> anyhow::Result<String> {
+    let mut input = String::new();
+    for request in requests {
+        let body = serde_json::to_string(request)?;
+        write!(&mut input, "Content-Length: {}\r\n\r\n{body}", body.len())?;
+    }
+    Ok(input)
+}
+
+fn dap_protocol_output_frames(output: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut reader = std::io::Cursor::new(output.as_bytes());
+    let mut frames = Vec::new();
+    loop {
+        let Some(content_length) = read_lsp_content_length(&mut reader)? else {
+            return Ok(frames);
+        };
+        let mut body = vec![0_u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut body)?;
+        frames.push(serde_json::from_slice(&body)?);
+    }
+}
+
+fn dap_response_for_request_seq(
+    frames: &[serde_json::Value],
+    request_seq: u64,
+) -> Option<serde_json::Value> {
+    frames
+        .iter()
+        .find(|frame| {
+            frame.get("type").and_then(serde_json::Value::as_str) == Some("response")
+                && frame.get("request_seq").and_then(serde_json::Value::as_u64) == Some(request_seq)
+        })
+        .cloned()
+}
+
 fn read_lsp_content_length<R: std::io::BufRead>(reader: &mut R) -> anyhow::Result<Option<usize>> {
     let mut content_length = None;
     let mut saw_header = false;
@@ -23612,6 +23804,21 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_debug_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "debug",
+            "fixtures/e2e/hello.orv",
+            "--control",
+            "next",
+        ]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn editor_trace_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -26233,6 +26440,34 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("Debug Controls"));
         assert!(html.contains("id=\"debug-breakpoint-list\""));
         assert!(html.contains("renderDebugDetail"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_debug_control_uses_dap_stdio_transport() {
+        let dir = temp_output_dir("editor-debug-control");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(&path, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+
+        let debug = editor_debug_session_json(&path, EditorDebugControl::Next)
+            .expect("editor debug session");
+
+        assert_eq!(debug["kind"], "orv.editor.debug");
+        assert_eq!(debug["adapter"]["protocol"], "dap");
+        assert_eq!(debug["transport"]["framing"], "content-length");
+        assert_eq!(debug["control"]["request"]["command"], "next");
+        assert_eq!(debug["control"]["response"]["success"], true);
+        assert_eq!(debug["stack"]["stackFrames"][0]["line"], 2);
+        assert!(debug["frames"]
+            .as_array()
+            .expect("frames")
+            .iter()
+            .any(|frame| {
+                frame["type"] == "event"
+                    && frame["event"] == "stopped"
+                    && frame["body"]["reason"] == "step"
+            }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
