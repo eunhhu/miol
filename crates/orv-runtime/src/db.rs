@@ -12,10 +12,12 @@
 //! - 마이그레이션/스키마 diff, 외부 DB 어댑터.
 //! - async/await — 호출 측이 `await` 를 쓰더라도 현재 인터프리터는 sync.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::interp::Value;
 
@@ -115,6 +117,13 @@ impl DbQuery {
 pub struct InMemoryDb {
     tables: HashMap<String, Table>,
     wal_path: Option<PathBuf>,
+}
+
+/// Single-threaded runtime DB handle.
+pub(crate) type DbHandle = Rc<RefCell<InMemoryDb>>;
+
+pub(crate) fn new_db_handle() -> DbHandle {
+    Rc::new(RefCell::new(InMemoryDb::new()))
 }
 
 /// DB snapshot load/save error.

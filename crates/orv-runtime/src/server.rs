@@ -1,9 +1,3 @@
-// Clippy: `Arc<HashMap<NameId, Value>>` / `Arc<Vec<RouteEntry>>` 는 내부에 !Send
-// 타입(`Rc` 기반 Value)을 담는다. 이 파일의 서버는 tokio `current_thread` +
-// `spawn_local` 로만 쓰이므로 cross-thread 공유가 발생하지 않지만 타입
-// 시스템은 그 사실을 모른다. 구조적 allow 를 파일 레벨로 준다.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! `@server` HTTP 런타임 (C5b, MVP).
 //!
 //! tokio 의 `current_thread` 런타임 위에서 hyper 1.x HTTP/1.1 서버를 기동한다.
@@ -26,6 +20,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,6 +35,7 @@ use hyper_util::rt::TokioIo;
 use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, HirStmt, NameId};
 use tokio::net::TcpListener;
 
+use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
     eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env, RequestCtx,
     ResponseCtx, RuntimeError, Value,
@@ -68,6 +64,44 @@ struct RouteEntry {
     path: String,
     handler: HirExpr,
     origin_id: String,
+}
+
+/// Route table shared only inside a tokio current-thread server loop.
+///
+/// `RouteEntry` contains HIR values backed by non-thread-safe runtime data, so
+/// this type deliberately uses `Rc` instead of `Arc`. If the server execution
+/// model moves to multi-threaded request handling, the compiler will force this
+/// boundary to be redesigned instead of silently cloning non-Send state across
+/// tasks.
+#[derive(Clone)]
+struct LocalRoutes(Rc<Vec<RouteEntry>>);
+
+impl LocalRoutes {
+    fn new(routes: Vec<RouteEntry>) -> Self {
+        Self(Rc::new(routes))
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, RouteEntry> {
+        self.0.iter()
+    }
+}
+
+/// Captured server environment shared only by local request evaluation.
+///
+/// The values can contain `Rc`-backed runtime data. Keeping the state behind an
+/// explicit local wrapper makes the current-thread invariant visible at the
+/// function boundary.
+#[derive(Clone)]
+struct LocalCapturedEnv(Rc<HashMap<NameId, Value>>);
+
+impl LocalCapturedEnv {
+    fn new(captured_env: HashMap<NameId, Value>) -> Self {
+        Self(Rc::new(captured_env))
+    }
+
+    fn snapshot(&self) -> HashMap<NameId, Value> {
+        self.0.as_ref().clone()
+    }
 }
 
 /// Captured metadata for one HTTP request handled by an attached runtime.
@@ -142,8 +176,8 @@ pub(crate) fn run_server_with_request_trace_path(
         // 개념이 없으므로 `#[cfg(unix)]` 로 갈라친다.
         serve_loop_with_request_trace_file(
             listener,
-            Arc::new(entries),
-            Arc::new(captured_env),
+            LocalRoutes::new(entries),
+            LocalCapturedEnv::new(captured_env),
             None,
             request_trace_path,
             shutdown_signal(),
@@ -282,8 +316,8 @@ fn run_attached_server_thread(
             .map_err(|_| "attached server startup receiver dropped".to_string())?;
         serve_loop(
             listener,
-            Arc::new(entries),
-            Arc::new(captured_env),
+            LocalRoutes::new(entries),
+            LocalCapturedEnv::new(captured_env),
             Some(request_frames),
             async move {
                 let _ = shutdown_rx.await;
@@ -399,8 +433,8 @@ where
     let addr = listener
         .local_addr()
         .map_err(|e| RuntimeError::native(format!("local_addr failed: {e}")))?;
-    let table = Arc::new(entries);
-    let captured_env = Arc::new(captured_env);
+    let table = LocalRoutes::new(entries);
+    let captured_env = LocalCapturedEnv::new(captured_env);
     let handle = tokio::task::spawn_local(async move {
         let _ = serve_loop(listener, table, captured_env, None, shutdown).await;
     });
@@ -436,8 +470,8 @@ where
     let addr = listener
         .local_addr()
         .map_err(|e| RuntimeError::native(format!("local_addr failed: {e}")))?;
-    let table = Arc::new(entries);
-    let captured_env = Arc::new(captured_env);
+    let table = LocalRoutes::new(entries);
+    let captured_env = LocalCapturedEnv::new(captured_env);
     let handle = tokio::task::spawn_local(async move {
         let _ = serve_loop_with_request_trace_file(
             listener,
@@ -561,8 +595,8 @@ fn collect_routes(routes: &[HirExpr]) -> Result<Vec<RouteEntry>, RuntimeError> {
 
 async fn serve_loop<S>(
     listener: TcpListener,
-    routes: Arc<Vec<RouteEntry>>,
-    captured_env: Arc<HashMap<NameId, Value>>,
+    routes: LocalRoutes,
+    captured_env: LocalCapturedEnv,
     request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
     shutdown: S,
 ) -> Result<(), RuntimeError>
@@ -572,7 +606,7 @@ where
     // C_db: 서버 수명 동안 공유하는 in-memory DB. 각 요청 handler 는 이 단일
     // 인스턴스를 받아 `@db.create`/`@db.find` 등을 호출하며, 요청 간 상태가
     // 유지된다.
-    let db = Arc::new(Mutex::new(crate::db::InMemoryDb::new()));
+    let db = new_db_handle();
     // shutdown 은 단일 해상도 이벤트라 `tokio::pin!` 로 고정해 `select!` 에서
     // `&mut` 참조로 폴링한다. 이렇게 해야 매 반복에서 future 를 소비하지 않고
     // 재진입이 가능하다.
@@ -591,9 +625,9 @@ where
             }
         };
         let io = TokioIo::new(stream);
-        let routes = Arc::clone(&routes);
-        let captured_env = Arc::clone(&captured_env);
-        let db = Arc::clone(&db);
+        let routes = routes.clone();
+        let captured_env = captured_env.clone();
+        let db = db.clone();
         let request_frames = request_frames.clone();
         let client_ip = peer.ip().to_string();
         // MVP: 커넥션 직렬 처리. tokio::task::spawn 은 `!Send` Future 를 못
@@ -601,9 +635,9 @@ where
         // 필요한 순간(C6 이후)에 LocalSet 경로를 도입한다. 현재는 요청당 지연
         // 이 짧고 통합 테스트도 순차라 직렬이 더 단순하다.
         let service = service_fn(move |req| {
-            let routes = Arc::clone(&routes);
-            let captured_env = Arc::clone(&captured_env);
-            let db = Arc::clone(&db);
+            let routes = routes.clone();
+            let captured_env = captured_env.clone();
+            let db = db.clone();
             let request_frames = request_frames.clone();
             let client_ip = client_ip.clone();
             async move {
@@ -629,8 +663,8 @@ where
 #[allow(clippy::future_not_send)]
 async fn serve_loop_with_request_trace_file<S>(
     listener: TcpListener,
-    routes: Arc<Vec<RouteEntry>>,
-    captured_env: Arc<HashMap<NameId, Value>>,
+    routes: LocalRoutes,
+    captured_env: LocalCapturedEnv,
     request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
     request_trace_path: Option<std::path::PathBuf>,
     shutdown: S,
@@ -668,9 +702,9 @@ fn runtime_request_trace_path_from_env() -> Option<std::path::PathBuf> {
 
 async fn handle_request(
     req: Request<Incoming>,
-    routes: Arc<Vec<RouteEntry>>,
-    captured_env: Arc<HashMap<NameId, Value>>,
-    db: Arc<Mutex<crate::db::InMemoryDb>>,
+    routes: LocalRoutes,
+    captured_env: LocalCapturedEnv,
+    db: DbHandle,
     client_ip: String,
     request_frames: Option<Arc<Mutex<Vec<ServerRequestFrame>>>>,
 ) -> Response<Full<Bytes>> {
@@ -746,8 +780,8 @@ async fn handle_request(
     let outcome = match run_handler_with_request_in_env(
         &entry.handler,
         ctx,
-        captured_env.as_ref().clone(),
-        Arc::clone(&db),
+        captured_env.snapshot(),
+        db.clone(),
         &mut sink,
     ) {
         Ok(o) => o,

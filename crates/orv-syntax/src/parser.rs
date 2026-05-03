@@ -1,8 +1,9 @@
 //! Parser — 토큰 스트림을 AST로 변환.
 //!
-//! 1차 구현은 `let`/`let mut`/`let sig`, `const`, 리터럴 표현식, 식별자
-//! 참조, void scope 자동 출력 대상인 표현식 스테이트먼트까지를 다룬다.
-//! 함수/제어 흐름/도메인/struct는 다음 커밋에서 추가된다.
+//! 현재 구현은 top-level 선언(`import`, `struct`, `enum`, `type`, `let`,
+//! `const`, `function`, `define`, `domain`)과 표현식/문장 문법을 AST로 만든다.
+//! `parse_with_newlines` 는 개행 오프셋을 받아 paren-less 도메인 호출의 인자
+//! 흡수 범위를 줄 단위로 제한한다.
 
 use crate::ast::{
     BinaryOp, Block, CatchClause, ConstStmt, ConstraintValue, EnumStmt, EnumVariant, Expr,

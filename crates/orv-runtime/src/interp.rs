@@ -1,8 +1,3 @@
-// The current runtime is single-threaded, but DB handles are cloned through the
-// same `Arc<Mutex<_>>` shape used by the HTTP layer. Values can contain `Rc`
-// function/lambda handles, so the DB is intentionally not `Send + Sync` yet.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! tree-walking 인터프리터 — HIR 버전.
 //!
 //! SPEC §0 에서 채택한 V8 Ignition 모델의 "영구 dev-loop 실행 경로" 다.
@@ -20,7 +15,9 @@
 //! 본문에서 생긴 로컬은 호출자에 새지 않는다. 정밀한 capture 분석은 이후
 //! 최적화로 미룬다.
 
-use crate::db::{DbFilter, DbFilterOp, DbNear, DbOrder, DbQuery, InMemoryDb};
+use crate::db::{
+    new_db_handle, DbFilter, DbFilterOp, DbHandle, DbNear, DbOrder, DbQuery, InMemoryDb,
+};
 use orv_hir::{
     BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt,
     HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
@@ -31,7 +28,6 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 /// B4 `@env` 테스트 override.
 ///
@@ -362,7 +358,7 @@ pub enum Value {
     Object(Vec<(String, Value)>),
     /// C_db: in-memory DB handle. `@db` 평가 결과이며 `.create` 같은 field
     /// 접근으로 bound method 를 얻어 호출한다.
-    Db(Arc<Mutex<crate::db::InMemoryDb>>),
+    Db(DbHandle),
     /// SPEC §4.9: 원시 타입 namespace 핸들. `int` / `string` / `float` / `bool`
     /// 같은 이름이 값 맥락에서 평가되면 이 variant. field access `.from` 이
     /// BoundMethod 를 만들어 호출하면 타입별 파싱/포맷을 수행한다.
@@ -563,7 +559,7 @@ pub fn run_handler_with_request<W: Write>(
     request: RequestCtx,
     writer: &mut W,
 ) -> Result<HandlerOutcome, RuntimeError> {
-    let db = Arc::new(Mutex::new(crate::db::InMemoryDb::new()));
+    let db = new_db_handle();
     run_handler_with_request_in_env(handler, request, HashMap::new(), db, writer)
 }
 
@@ -576,7 +572,7 @@ pub(crate) fn run_handler_with_request_in_env<W: Write>(
     handler: &HirExpr,
     request: RequestCtx,
     env: HashMap<NameId, Value>,
-    db: Arc<Mutex<crate::db::InMemoryDb>>,
+    db: DbHandle,
     writer: &mut W,
 ) -> Result<HandlerOutcome, RuntimeError> {
     let mut interp = Interp::new_with_env(writer, env);
@@ -675,7 +671,7 @@ struct Interp<W: Write> {
     content_slot: Option<HirBlock>,
     /// C_db: 프로세스 내 in-memory DB. handler 호출 간 공유되어 이전 요청이
     /// 쓴 데이터를 다음 요청이 읽을 수 있다. 서버 재시작 시 소실.
-    db: Arc<Mutex<crate::db::InMemoryDb>>,
+    db: DbHandle,
     /// SPEC §4 runtime validator: struct 이름 -> 필드 타입.
     type_structs: HashMap<String, Vec<(String, HirTypeRef)>>,
     /// SPEC §4 runtime validator: type alias 이름 -> 실제 타입.
@@ -736,7 +732,7 @@ impl<W: Write> Interp<W> {
             context: Vec::new(),
             after_queue: Vec::new(),
             content_slot: None,
-            db: Arc::new(Mutex::new(crate::db::InMemoryDb::new())),
+            db: new_db_handle(),
             type_structs: HashMap::new(),
             type_aliases: HashMap::new(),
             storage_chunks: HashMap::new(),
@@ -1785,17 +1781,17 @@ impl<W: Write> Interp<W> {
 
     fn eval_db_transaction(
         &mut self,
-        db: Arc<Mutex<InMemoryDb>>,
+        db: DbHandle,
         args: &[HirExpr],
     ) -> Result<Value, RuntimeError> {
-        let snapshot = db.lock().unwrap().clone();
+        let snapshot = db.borrow().clone();
         let mut last = Value::Void;
         for arg in args {
             match self.eval_call_arg(arg) {
                 Ok(value) => last = value,
                 Err(err) => {
                     let rollback = {
-                        let mut guard = db.lock().unwrap();
+                        let mut guard = db.borrow_mut();
                         *guard = snapshot;
                         guard.checkpoint_wal_if_enabled()
                     };
@@ -2405,7 +2401,7 @@ impl<W: Write> Interp<W> {
                 if let Some(error) = error {
                     fields.push(("error".to_string(), Value::Str(error)));
                 }
-                Ok(self.db.lock().unwrap().create("Job", fields))
+                Ok(self.db.borrow_mut().create("Job", fields))
             }
             _ => Err(RuntimeError::native(format!(
                 "no method `{method}` on <type {ns}>"
@@ -2463,7 +2459,7 @@ impl<W: Write> Interp<W> {
                 body,
             });
         }
-        Ok(self.db.lock().unwrap().create(
+        Ok(self.db.borrow_mut().create(
             "Cron",
             vec![
                 ("schedule".to_string(), Value::Str(schedule)),
@@ -2478,7 +2474,7 @@ impl<W: Write> Interp<W> {
         for handler in handlers {
             match self.eval_block(&handler.body) {
                 Ok(_) => {
-                    self.db.lock().unwrap().create(
+                    self.db.borrow_mut().create(
                         "CronRun",
                         vec![
                             ("schedule".to_string(), Value::Str(handler.schedule)),
@@ -2488,7 +2484,7 @@ impl<W: Write> Interp<W> {
                     ran += 1;
                 }
                 Err(err) => {
-                    self.db.lock().unwrap().create(
+                    self.db.borrow_mut().create(
                         "CronRun",
                         vec![
                             ("schedule".to_string(), Value::Str(handler.schedule)),
@@ -4774,11 +4770,7 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 /// - `wal(path)` — JSONL WAL 을 replay 하고 이후 mutation 을 append+fsync.
 /// - `checkpoint()` — 현재 DB 상태를 WAL snapshot record 한 줄로 압축.
 /// - `savepoint()` / `rollback(savepoint)` — in-memory savepoint capture/restore.
-fn call_db_method(
-    db: &Arc<Mutex<crate::db::InMemoryDb>>,
-    method: &str,
-    args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
     let require_str = |v: &Value, what: &str| -> Result<String, RuntimeError> {
         match v {
             Value::Str(s) => Ok(s.clone()),
@@ -4795,8 +4787,7 @@ fn call_db_method(
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
             let data = parsed.data.unwrap_or_default();
-            db.lock()
-                .unwrap()
+            db.borrow_mut()
                 .create_logged(&table, data)
                 .map_err(|e| RuntimeError::native(format!("db.create failed: {e}")))
         }
@@ -4806,7 +4797,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            let db = db.lock().unwrap();
+            let db = db.borrow();
             if db_find_returns_many(&parsed.query) {
                 Ok(Value::Array(db.find_query(&table, &parsed.query)))
             } else {
@@ -4821,9 +4812,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            Ok(Value::Array(
-                db.lock().unwrap().find_query(&table, &parsed.query),
-            ))
+            Ok(Value::Array(db.borrow().find_query(&table, &parsed.query)))
         }
         "update" => {
             if args.len() < 2 {
@@ -4833,8 +4822,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            db.lock()
-                .unwrap()
+            db.borrow_mut()
                 .update_logged(
                     &table,
                     &parsed.query,
@@ -4850,8 +4838,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            db.lock()
-                .unwrap()
+            db.borrow_mut()
                 .delete_logged(&table, &parsed.query)
                 .map(Value::Int)
                 .map_err(|e| RuntimeError::native(format!("db.delete failed: {e}")))
@@ -4865,7 +4852,7 @@ fn call_db_method(
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
             let data = parsed.data.unwrap_or_default();
-            let mut db = db.lock().unwrap();
+            let mut db = db.borrow_mut();
             if matches!(db.find_one_query(&table, &parsed.query), Value::Void) {
                 db.create_logged(
                     &table,
@@ -4886,9 +4873,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            Ok(Value::Array(
-                db.lock().unwrap().find_query(&table, &parsed.query),
-            ))
+            Ok(Value::Array(db.borrow().find_query(&table, &parsed.query)))
         }
         "count" => {
             if args.is_empty() {
@@ -4896,9 +4881,7 @@ fn call_db_method(
             }
             let table = require_str(&args[0], "table name")?;
             let parsed = parse_db_runtime_args(method, &args[1..])?;
-            Ok(Value::Int(
-                db.lock().unwrap().count_query(&table, &parsed.query),
-            ))
+            Ok(Value::Int(db.borrow().count_query(&table, &parsed.query)))
         }
         "sum" => {
             if args.is_empty() {
@@ -4911,7 +4894,7 @@ fn call_db_method(
             let [field] = parsed.query.fields.as_slice() else {
                 return Err(RuntimeError::native("`db.sum` expects exactly one @field"));
             };
-            Ok(db.lock().unwrap().sum_query(&table, &parsed.query, field))
+            Ok(db.borrow().sum_query(&table, &parsed.query, field))
         }
         "transaction" => Ok(args.last().cloned().unwrap_or(Value::Void)),
         "schema" => Ok(Value::Void),
@@ -4922,8 +4905,7 @@ fn call_db_method(
                 .first()
                 .ok_or_else(|| RuntimeError::native("`db.save` expects path"))?;
             let path = require_str(path, "path")?;
-            db.lock()
-                .unwrap()
+            db.borrow()
                 .save_snapshot(Path::new(&path))
                 .map_err(|e| RuntimeError::native(format!("db.save failed: {e}")))?;
             Ok(Value::Void)
@@ -4935,7 +4917,7 @@ fn call_db_method(
             let path = require_str(path, "path")?;
             let restored = InMemoryDb::load_snapshot(Path::new(&path))
                 .map_err(|e| RuntimeError::native(format!("db.load failed: {e}")))?;
-            *db.lock().unwrap() = restored;
+            *db.borrow_mut() = restored;
             Ok(Value::Void)
         }
         "wal" => {
@@ -4945,19 +4927,18 @@ fn call_db_method(
             let path = require_str(path, "path")?;
             let restored = InMemoryDb::load_wal(Path::new(&path))
                 .map_err(|e| RuntimeError::native(format!("db.wal failed: {e}")))?;
-            *db.lock().unwrap() = restored;
+            *db.borrow_mut() = restored;
             Ok(Value::Void)
         }
         "checkpoint" => {
-            db.lock()
-                .unwrap()
+            db.borrow_mut()
                 .checkpoint_wal()
                 .map_err(|e| RuntimeError::native(format!("db.checkpoint failed: {e}")))?;
             Ok(Value::Void)
         }
         "savepoint" => {
-            let savepoint = db.lock().unwrap().savepoint();
-            Ok(Value::Db(Arc::new(Mutex::new(savepoint))))
+            let savepoint = db.borrow().savepoint();
+            Ok(Value::Db(Rc::new(std::cell::RefCell::new(savepoint))))
         }
         "rollback" => {
             let savepoint = args
@@ -4968,9 +4949,8 @@ fn call_db_method(
                     "`db.rollback` expects savepoint, got {savepoint}"
                 )));
             };
-            let savepoint = savepoint.lock().unwrap().clone();
-            db.lock()
-                .unwrap()
+            let savepoint = savepoint.borrow().clone();
+            db.borrow_mut()
                 .restore_savepoint(&savepoint)
                 .map_err(|e| RuntimeError::native(format!("db.rollback failed: {e}")))?;
             Ok(Value::Void)
