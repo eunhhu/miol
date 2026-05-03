@@ -93,6 +93,8 @@ Runtime debug state comes from the reference runtime debug trace. Long-running `
 - `deploy/README.md`
 - `deploy/server.sh`
 
+When a server artifact contains static `@db.wal` paths such as `data/shop.wal.jsonl`, the deploy manifest and container contract record those WAL paths and the generated Compose file mounts the parent directory, for example `../data:/app/data`.
+
 `source-bundle.json` records source path/content/hash snapshots so reveal, LSP reveal, artifact verification, artifact reanalysis, and reference artifact execution do not depend on the original source files.
 
 ## DB Operations

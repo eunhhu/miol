@@ -1968,6 +1968,8 @@ Browser home: http://localhost:8080/ provides product, member, order, payment, a
 \n\
 Persistent data: `data/shop.wal.jsonl`. The runtime replays this WAL on startup and appends product, member, order, payment, and shipment mutations before applying them.\n\
 \n\
+Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop WAL outside the container layer.\n\
+\n\
 Archive the local WAL before deploy or backup rotation:\n\
 \n\
 ```sh\n\
@@ -12511,6 +12513,7 @@ fn verify_deploy_server_target(
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
     validate_prod_server_listen(Some(&artifact))?;
+    let persistence = server_artifact_deploy_persistence(&artifact)?;
     verify_deploy_routes_artifact(
         dir,
         routes_artifact,
@@ -12530,6 +12533,7 @@ fn verify_deploy_server_target(
             runtime_image,
             listen: artifact.listen.as_ref(),
         },
+        &persistence,
     )?;
     verify_deploy_compose_artifact(
         dir,
@@ -12537,6 +12541,7 @@ fn verify_deploy_server_target(
         dockerfile,
         runtime_image,
         artifact.listen.as_ref(),
+        &persistence,
     )?;
     verify_deploy_runbook_artifact(
         dir,
@@ -12545,6 +12550,7 @@ fn verify_deploy_server_target(
         routes_artifact,
         artifact.listen.as_ref(),
         &artifact.routes,
+        &persistence,
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
@@ -12561,6 +12567,9 @@ fn verify_deploy_server_target(
             anyhow::bail!("deploy server routes do not match runtime artifact");
         }
     }
+    if server.get("persistence") != Some(&deploy_persistence_value(&persistence)) {
+        anyhow::bail!("deploy server persistence does not match runtime artifact");
+    }
     Ok(())
 }
 
@@ -12569,6 +12578,7 @@ fn verify_deploy_container_artifact(
     path: &str,
     dockerfile_path: &str,
     contract: &DeployServerContract<'_>,
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let container_path = dir.join(path);
     if !container_path.is_file() {
@@ -12624,6 +12634,9 @@ fn verify_deploy_container_artifact(
     if command.first().and_then(serde_json::Value::as_str) != Some("./deploy/server.sh") {
         anyhow::bail!("deploy container command must start with ./deploy/server.sh");
     }
+    if container.get("persistence") != Some(&deploy_persistence_value(persistence)) {
+        anyhow::bail!("deploy container persistence does not match runtime artifact");
+    }
     verify_deploy_dockerfile(
         dir,
         dockerfile_path,
@@ -12638,6 +12651,7 @@ fn verify_deploy_compose_artifact(
     dockerfile_path: &str,
     runtime_image: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let compose_path = dir.join(path);
     if !compose_path.is_file() {
@@ -12662,6 +12676,12 @@ fn verify_deploy_compose_artifact(
             anyhow::bail!("deploy compose must configure PORT");
         }
     }
+    for volume in &persistence.volumes {
+        if !compose.contains(&volume.compose_mount) {
+            let mount = &volume.compose_mount;
+            anyhow::bail!("deploy compose must mount persistent volume {mount}");
+        }
+    }
     Ok(())
 }
 
@@ -12672,6 +12692,7 @@ fn verify_deploy_runbook_artifact(
     routes_artifact: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
     routes: &[orv_compiler::ServerRouteArtifact],
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let runbook_path = dir.join(path);
     if !runbook_path.is_file() {
@@ -12694,6 +12715,17 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("/__orv/trace/events") {
         anyhow::bail!("deploy runbook must document live trace event stream endpoint");
+    }
+    for path in &persistence.wal_paths {
+        if !runbook.contains(path) {
+            anyhow::bail!("deploy runbook must document persistent WAL path {path}");
+        }
+    }
+    for volume in &persistence.volumes {
+        if !runbook.contains(&volume.compose_mount) {
+            let mount = &volume.compose_mount;
+            anyhow::bail!("deploy runbook must document persistent volume {mount}");
+        }
     }
     if let Some(port) = deploy_runbook_port_assignment(listen) {
         if !runbook.contains(&port) {
@@ -14582,6 +14614,366 @@ fn validate_prod_server_listen(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployPersistence {
+    wal_paths: Vec<String>,
+    volumes: Vec<DeployPersistenceVolume>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployPersistenceVolume {
+    host: String,
+    container: String,
+    compose_mount: String,
+}
+
+fn server_artifact_deploy_persistence(
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<DeployPersistence> {
+    let entry_path = artifact
+        .source_bundle
+        .files
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("server artifact source bundle is empty"))?
+        .path
+        .clone();
+    let loaded = orv_project::load_project_from_sources(
+        Path::new(&entry_path),
+        artifact
+            .source_bundle
+            .files
+            .iter()
+            .map(|file| (PathBuf::from(&file.path), file.source.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to rehydrate deploy persistence sources: {e}"))?;
+    if !loaded.diagnostics.is_empty() {
+        anyhow::bail!("deploy persistence source reanalysis produced diagnostics");
+    }
+    let resolved = orv_resolve::resolve(&loaded.program);
+    if !resolved.diagnostics.is_empty() {
+        anyhow::bail!("deploy persistence resolve reanalysis produced diagnostics");
+    }
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    if !lowered.diagnostics.is_empty() {
+        anyhow::bail!("deploy persistence lowering reanalysis produced diagnostics");
+    }
+    let mut wal_paths = Vec::new();
+    collect_program_db_wal_paths(&lowered.program, &mut wal_paths);
+    wal_paths.sort();
+    wal_paths.dedup();
+    Ok(DeployPersistence {
+        volumes: deploy_persistence_volumes(&wal_paths),
+        wal_paths,
+    })
+}
+
+fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Value {
+    serde_json::json!({
+        "wal_paths": persistence.wal_paths,
+        "volumes": persistence.volumes.iter().map(|volume| {
+            serde_json::json!({
+                "host": volume.host,
+                "container": volume.container,
+                "compose_mount": volume.compose_mount,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn deploy_persistence_volumes(wal_paths: &[String]) -> Vec<DeployPersistenceVolume> {
+    let mut dirs = BTreeSet::new();
+    for wal_path in wal_paths {
+        if let Some(dir) = deploy_persistent_parent_dir(wal_path) {
+            dirs.insert(dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|host| {
+            let container = format!("/app/{host}");
+            DeployPersistenceVolume {
+                compose_mount: format!("../{host}:{container}"),
+                host,
+                container,
+            }
+        })
+        .collect()
+}
+
+fn deploy_persistent_parent_dir(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty()
+        || parent
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(parent.to_string_lossy().replace('\\', "/"))
+}
+
+fn deploy_compose_volumes(persistence: &DeployPersistence) -> String {
+    if persistence.volumes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("    volumes:\n");
+    for volume in &persistence.volumes {
+        let _ = writeln!(out, "      - {}", volume.compose_mount);
+    }
+    out
+}
+
+fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String {
+    if persistence.wal_paths.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Persistent Data\n\n");
+    for path in &persistence.wal_paths {
+        let _ = writeln!(out, "- WAL: {path}");
+    }
+    for volume in &persistence.volumes {
+        let _ = writeln!(out, "- Compose volume: {}", volume.compose_mount);
+    }
+    out.push('\n');
+    out
+}
+
+fn collect_program_db_wal_paths(program: &orv_hir::HirProgram, out: &mut Vec<String>) {
+    for stmt in &program.items {
+        collect_stmt_db_wal_paths(stmt, out);
+    }
+}
+
+fn collect_stmt_db_wal_paths(stmt: &orv_hir::HirStmt, out: &mut Vec<String>) {
+    match stmt {
+        orv_hir::HirStmt::Let(stmt) => collect_expr_db_wal_paths(&stmt.init, out),
+        orv_hir::HirStmt::Const(stmt) => collect_expr_db_wal_paths(&stmt.init, out),
+        orv_hir::HirStmt::Function(stmt) => collect_function_body_db_wal_paths(&stmt.body, out),
+        orv_hir::HirStmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                collect_expr_db_wal_paths(value, out);
+            }
+        }
+        orv_hir::HirStmt::Expr(expr) => collect_expr_db_wal_paths(expr, out),
+        orv_hir::HirStmt::Struct(_)
+        | orv_hir::HirStmt::Enum(_)
+        | orv_hir::HirStmt::TypeAlias(_)
+        | orv_hir::HirStmt::Import(_) => {}
+    }
+}
+
+fn collect_block_db_wal_paths(block: &orv_hir::HirBlock, out: &mut Vec<String>) {
+    for stmt in &block.stmts {
+        collect_stmt_db_wal_paths(stmt, out);
+    }
+}
+
+fn collect_function_body_db_wal_paths(body: &orv_hir::HirFunctionBody, out: &mut Vec<String>) {
+    match body {
+        orv_hir::HirFunctionBody::Block(block) => collect_block_db_wal_paths(block, out),
+        orv_hir::HirFunctionBody::Expr(expr) => collect_expr_db_wal_paths(expr, out),
+    }
+}
+
+fn collect_expr_db_wal_paths(expr: &orv_hir::HirExpr, out: &mut Vec<String>) {
+    use orv_hir::HirExprKind;
+
+    if let HirExprKind::Call { callee, args } = &expr.kind {
+        if hir_call_name(callee) == "@db.wal" {
+            if let Some(path) = args.first().and_then(hir_static_string) {
+                out.push(path);
+            }
+        }
+    }
+
+    match &expr.kind {
+        HirExprKind::Integer(_)
+        | HirExprKind::Float(_)
+        | HirExprKind::Regex { .. }
+        | HirExprKind::True
+        | HirExprKind::False
+        | HirExprKind::Void
+        | HirExprKind::TypeName(_)
+        | HirExprKind::Ident(_)
+        | HirExprKind::Break
+        | HirExprKind::Continue => {}
+        HirExprKind::String(segments) => {
+            for segment in segments {
+                if let orv_hir::HirStringSegment::Interp(expr) = segment {
+                    collect_expr_db_wal_paths(expr, out);
+                }
+            }
+        }
+        HirExprKind::Unary { expr, .. }
+        | HirExprKind::Paren(expr)
+        | HirExprKind::Out(expr)
+        | HirExprKind::Throw(expr)
+        | HirExprKind::Await(expr)
+        | HirExprKind::Cast { expr, .. } => collect_expr_db_wal_paths(expr, out),
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_expr_db_wal_paths(lhs, out);
+            collect_expr_db_wal_paths(rhs, out);
+        }
+        HirExprKind::Html(block) | HirExprKind::Block(block) => {
+            collect_block_db_wal_paths(block, out);
+        }
+        HirExprKind::Route { handler, .. } => collect_block_db_wal_paths(handler, out),
+        HirExprKind::Respond { status, payload } => {
+            collect_expr_db_wal_paths(status, out);
+            collect_expr_db_wal_paths(payload, out);
+        }
+        HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        } => {
+            if let Some(listen) = listen {
+                collect_expr_db_wal_paths(listen, out);
+            }
+            for route in routes {
+                collect_expr_db_wal_paths(route, out);
+            }
+            for stmt in body_stmts {
+                collect_stmt_db_wal_paths(stmt, out);
+            }
+        }
+        HirExprKind::Domain { args, .. } => {
+            for arg in args {
+                collect_expr_db_wal_paths(arg, out);
+            }
+        }
+        HirExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => {
+            collect_expr_db_wal_paths(cond, out);
+            collect_block_db_wal_paths(then, out);
+            if let Some(else_branch) = else_branch {
+                collect_expr_db_wal_paths(else_branch, out);
+            }
+        }
+        HirExprKind::When { scrutinee, arms } => {
+            collect_expr_db_wal_paths(scrutinee, out);
+            for arm in arms {
+                collect_pattern_db_wal_paths(&arm.pattern, out);
+                collect_expr_db_wal_paths(&arm.body, out);
+            }
+        }
+        HirExprKind::Assign { value, .. } => collect_expr_db_wal_paths(value, out),
+        HirExprKind::AssignField { object, value, .. } => {
+            collect_expr_db_wal_paths(object, out);
+            collect_expr_db_wal_paths(value, out);
+        }
+        HirExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => {
+            collect_expr_db_wal_paths(object, out);
+            collect_expr_db_wal_paths(index, out);
+            collect_expr_db_wal_paths(value, out);
+        }
+        HirExprKind::Call { callee, args } => {
+            collect_expr_db_wal_paths(callee, out);
+            for arg in args {
+                collect_expr_db_wal_paths(arg, out);
+            }
+        }
+        HirExprKind::For { iter, body, .. } => {
+            collect_expr_db_wal_paths(iter, out);
+            collect_block_db_wal_paths(body, out);
+        }
+        HirExprKind::While { cond, body } => {
+            collect_expr_db_wal_paths(cond, out);
+            collect_block_db_wal_paths(body, out);
+        }
+        HirExprKind::Range { start, end, .. } => {
+            collect_expr_db_wal_paths(start, out);
+            collect_expr_db_wal_paths(end, out);
+        }
+        HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
+            for item in items {
+                collect_expr_db_wal_paths(item, out);
+            }
+        }
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                collect_expr_db_wal_paths(&field.value, out);
+            }
+        }
+        HirExprKind::Index { target, index } => {
+            collect_expr_db_wal_paths(target, out);
+            collect_expr_db_wal_paths(index, out);
+        }
+        HirExprKind::Slice { target, start, end } => {
+            collect_expr_db_wal_paths(target, out);
+            if let Some(start) = start {
+                collect_expr_db_wal_paths(start, out);
+            }
+            if let Some(end) = end {
+                collect_expr_db_wal_paths(end, out);
+            }
+        }
+        HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
+            collect_expr_db_wal_paths(target, out);
+        }
+        HirExprKind::Lambda { body, .. } => collect_function_body_db_wal_paths(body, out),
+        HirExprKind::Try { try_block, catch } => {
+            collect_block_db_wal_paths(try_block, out);
+            if let Some(catch) = catch {
+                collect_block_db_wal_paths(&catch.body, out);
+            }
+        }
+    }
+}
+
+fn collect_pattern_db_wal_paths(pattern: &orv_hir::HirPattern, out: &mut Vec<String>) {
+    match pattern {
+        orv_hir::HirPattern::Literal(expr)
+        | orv_hir::HirPattern::Guard(expr)
+        | orv_hir::HirPattern::Not(expr)
+        | orv_hir::HirPattern::Contains(expr) => collect_expr_db_wal_paths(expr, out),
+        orv_hir::HirPattern::Range { start, end, .. } => {
+            collect_expr_db_wal_paths(start, out);
+            collect_expr_db_wal_paths(end, out);
+        }
+        orv_hir::HirPattern::Wildcard => {}
+    }
+}
+
+fn hir_static_string(expr: &orv_hir::HirExpr) -> Option<String> {
+    let orv_hir::HirExprKind::String(segments) = &expr.kind else {
+        return None;
+    };
+    let mut out = String::new();
+    for segment in segments {
+        match segment {
+            orv_hir::HirStringSegment::Str(value) => out.push_str(value),
+            orv_hir::HirStringSegment::Interp(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+fn hir_call_name(expr: &orv_hir::HirExpr) -> String {
+    match &expr.kind {
+        orv_hir::HirExprKind::Ident(ident) => ident.name.clone(),
+        orv_hir::HirExprKind::Field { target, field, .. } => {
+            format!("{}.{}", hir_call_name(target), field)
+        }
+        orv_hir::HirExprKind::OptionalField { target, field, .. } => {
+            format!("{}?.{}", hir_call_name(target), field)
+        }
+        orv_hir::HirExprKind::Domain { name, .. } => format!("@{name}"),
+        orv_hir::HirExprKind::TypeName(name) => name.clone(),
+        _ => "<expr>".to_string(),
+    }
+}
+
 fn deploy_ports_value(listen: Option<&orv_compiler::ServerListenArtifact>) -> serde_json::Value {
     let Some(listen) = listen else {
         return serde_json::json!([]);
@@ -14864,6 +15256,7 @@ fn write_prod_deploy_artifacts(
         let dockerfile = "deploy/Dockerfile";
         let compose = "deploy/compose.yaml";
         let runbook = "deploy/README.md";
+        let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact_path)?;
         write_prod_routes_artifact(out, targets.server_artifact_path, server_artifact)?;
         write_prod_container_artifacts(
@@ -14873,9 +15266,10 @@ fn write_prod_deploy_artifacts(
             routes_artifact,
             dockerfile,
             server_artifact,
+            &persistence,
         )?;
-        write_prod_compose_artifact(out, dockerfile, server_artifact)?;
-        write_prod_deploy_runbook(out, compose, routes_artifact, server_artifact)?;
+        write_prod_compose_artifact(out, dockerfile, server_artifact, &persistence)?;
+        write_prod_deploy_runbook(out, compose, routes_artifact, server_artifact, &persistence)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "artifact": targets.server_artifact_path,
@@ -14889,6 +15283,7 @@ fn write_prod_deploy_artifacts(
             "protocol": "http1",
             "listen": server_artifact.listen.clone(),
             "routes": server_artifact.routes.clone(),
+            "persistence": deploy_persistence_value(&persistence),
         })
     } else {
         serde_json::Value::Null
@@ -14947,6 +15342,7 @@ fn write_prod_container_artifacts(
     routes_artifact: &str,
     dockerfile_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let container = serde_json::json!({
         "schema_version": 1,
@@ -14961,6 +15357,7 @@ fn write_prod_container_artifacts(
         "listen": server_artifact.listen.clone(),
         "ports": deploy_ports_value(server_artifact.listen.as_ref()),
         "command": ["./deploy/server.sh"],
+        "persistence": deploy_persistence_value(persistence),
     });
     write_json(&out.join("deploy").join("container.json"), &container)?;
     let expose = deploy_exposed_port(server_artifact.listen.as_ref())
@@ -14981,6 +15378,7 @@ fn write_prod_compose_artifact(
     out: &Path,
     dockerfile_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let port = deploy_compose_port(server_artifact.listen.as_ref())
         .map(|port| {
@@ -14990,6 +15388,7 @@ fn write_prod_compose_artifact(
             )
         })
         .unwrap_or_default();
+    let volumes = deploy_compose_volumes(persistence);
     let compose = format!(
         r#"services:
   orv-app:
@@ -14999,7 +15398,7 @@ fn write_prod_compose_artifact(
       args:
         ORV_RUNTIME_IMAGE: {ORV_REFERENCE_RUNTIME_IMAGE}
     image: orv-reference-app:latest
-{port}"#
+{port}{volumes}"#
     );
     write_text(&out.join("deploy").join("compose.yaml"), &compose)
 }
@@ -15009,6 +15408,7 @@ fn write_prod_deploy_runbook(
     compose_path: &str,
     routes_artifact: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
@@ -15019,6 +15419,7 @@ fn write_prod_deploy_runbook(
         .iter()
         .map(|route| format!("- {} {}\n", route.method, route.path))
         .collect::<String>();
+    let persistence_section = deploy_runbook_persistence_section(persistence);
     let runbook = format!(
         r#"# orv deploy
 
@@ -15041,6 +15442,7 @@ curl -N {trace_events_url}
 orv editor trace . --trace deploy/request-trace.json
 ```
 
+{persistence_section}
 ## Routes
 
 {routes}"#
@@ -15990,6 +16392,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
         assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
+        assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(
             guide.contains("orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json")
         );
@@ -16013,6 +16416,10 @@ test "checkout failing runtime body" {
         let runtime =
             read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
         let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         for (method, path) in [
             ("GET", "/"),
             ("POST", "/members"),
@@ -16026,6 +16433,19 @@ test "checkout failing runtime body" {
                 path
             ));
         }
+        assert_eq!(
+            deploy["server"]["persistence"]["wal_paths"][0],
+            serde_json::json!("data/shop.wal.jsonl")
+        );
+        assert_eq!(
+            container["persistence"]["volumes"][0]["host"],
+            serde_json::json!("data")
+        );
+        assert_eq!(
+            container["persistence"]["volumes"][0]["container"],
+            serde_json::json!("/app/data")
+        );
+        assert!(compose.contains("../data:/app/data"));
         cmd_verify_build(&out).expect("verify shop prod build");
         let _ = std::fs::remove_dir_all(dir);
     }
