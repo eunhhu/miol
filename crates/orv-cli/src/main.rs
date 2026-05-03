@@ -2623,6 +2623,9 @@ impl LspSession {
                 | "typeHierarchy/supertypes"
                 | "typeHierarchy/subtypes"),
             ) => lsp_jsonrpc_result_or_invalid_params(&id, self.hierarchy_result(method, request)),
+            Some(method @ ("textDocument/documentColor" | "textDocument/colorPresentation")) => {
+                lsp_jsonrpc_result_or_invalid_params(&id, self.color_result(method, request))
+            }
             Some("textDocument/references") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.references_result(request))
             }
@@ -2652,6 +2655,18 @@ impl LspSession {
             }
             Some(method) => lsp_jsonrpc_method_not_found(&id, method),
             None => lsp_jsonrpc_error(&id, -32600, "invalid request"),
+        }
+    }
+
+    fn color_result(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        match method {
+            "textDocument/documentColor" => self.document_color_result(request),
+            "textDocument/colorPresentation" => Self::color_presentation_result(request),
+            _ => unreachable!("color method dispatch is filtered by jsonrpc_response"),
         }
     }
 
@@ -2734,6 +2749,7 @@ impl LspSession {
                     "monikerProvider": true,
                     "callHierarchyProvider": true,
                     "typeHierarchyProvider": true,
+                    "colorProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
                     "renameProvider": {
@@ -2875,6 +2891,38 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_location_json(node, &loaded.files))
+    }
+
+    fn document_color_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_document_colors_json(
+            &file.source,
+        )))
+    }
+
+    fn color_presentation_result(request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let _uri = lsp_text_document_uri(request)?;
+        let range = request
+            .pointer("/params/range")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("range must be an object"))?;
+        let (red, green, blue, alpha) = lsp_color_param(request)?;
+        let label = lsp_hex_color_label(red, green, blue, alpha);
+        Ok(serde_json::Value::Array(vec![serde_json::json!({
+            "label": label,
+            "textEdit": {
+                "range": range,
+                "newText": label,
+            },
+        })]))
     }
 
     fn moniker_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -7983,6 +8031,115 @@ const fn lsp_moniker_symbol_kind(kind: ProjectNodeKind) -> &'static str {
     }
 }
 
+fn lsp_document_colors_json(source: &str) -> Vec<serde_json::Value> {
+    let bytes = source.as_bytes();
+    let mut colors = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'#' {
+            if let Some((length, red, green, blue)) = lsp_hex_color_at(bytes, index) {
+                let start = u32::try_from(index).unwrap_or(u32::MAX);
+                let end = u32::try_from(index.saturating_add(length)).unwrap_or(u32::MAX);
+                colors.push(serde_json::json!({
+                    "range": lsp_range_for_source(source, start, end),
+                    "color": {
+                        "red": f64::from(red) / 255.0,
+                        "green": f64::from(green) / 255.0,
+                        "blue": f64::from(blue) / 255.0,
+                        "alpha": 1.0,
+                    },
+                }));
+                index = index.saturating_add(length);
+                continue;
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    colors
+}
+
+fn lsp_hex_color_at(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, u8)> {
+    let start = index.checked_add(1)?;
+    lsp_hex_color_with_digits(bytes, start, 6)
+        .map(|(red, green, blue)| (7, red, green, blue))
+        .or_else(|| {
+            lsp_hex_color_with_digits(bytes, start, 3)
+                .map(|(red, green, blue)| (4, red, green, blue))
+        })
+}
+
+fn lsp_hex_color_with_digits(bytes: &[u8], start: usize, digits: usize) -> Option<(u8, u8, u8)> {
+    let end = start.checked_add(digits)?;
+    if end > bytes.len()
+        || bytes
+            .get(end)
+            .and_then(|byte| lsp_hex_value(*byte))
+            .is_some()
+    {
+        return None;
+    }
+    match digits {
+        6 => Some((
+            lsp_hex_pair(bytes[start], bytes[start + 1])?,
+            lsp_hex_pair(bytes[start + 2], bytes[start + 3])?,
+            lsp_hex_pair(bytes[start + 4], bytes[start + 5])?,
+        )),
+        3 => {
+            let red = lsp_hex_value(bytes[start])?;
+            let green = lsp_hex_value(bytes[start + 1])?;
+            let blue = lsp_hex_value(bytes[start + 2])?;
+            Some((red * 17, green * 17, blue * 17))
+        }
+        _ => None,
+    }
+}
+
+fn lsp_hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(lsp_hex_value(high)? * 16 + lsp_hex_value(low)?)
+}
+
+const fn lsp_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn lsp_color_param(request: &serde_json::Value) -> anyhow::Result<(u8, u8, u8, u8)> {
+    let color = request
+        .pointer("/params/color")
+        .ok_or_else(|| anyhow::anyhow!("color must be an object"))?;
+    Ok((
+        lsp_color_channel_param(color, "red")?,
+        lsp_color_channel_param(color, "green")?,
+        lsp_color_channel_param(color, "blue")?,
+        lsp_color_channel_param(color, "alpha")?,
+    ))
+}
+
+fn lsp_color_channel_param(color: &serde_json::Value, field: &str) -> anyhow::Result<u8> {
+    let value = color
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("color.{field} must be a number"))?;
+    Ok(lsp_color_channel(value))
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn lsp_color_channel(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn lsp_hex_color_label(red: u8, green: u8, blue: u8, alpha: u8) -> String {
+    if alpha == u8::MAX {
+        format!("#{red:02x}{green:02x}{blue:02x}")
+    } else {
+        format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}")
+    }
+}
+
 fn lsp_call_hierarchy_outgoing_calls(
     caller: &FunctionStmt,
     program: &Program,
@@ -12623,6 +12780,7 @@ function greet(user: User): string -> "hello"
             "typeHierarchyProvider",
             "callHierarchyProvider",
             "monikerProvider",
+            "colorProvider",
             "referencesProvider",
             "documentHighlightProvider",
             "workspaceSymbolProvider",
@@ -17861,6 +18019,68 @@ let u: User = { id: 1 }
         assert_eq!(monikers[0]["unique"], "project");
         assert_eq!(monikers[0]["kind"], "export");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_document_color_returns_hex_literal_ranges() {
+        let dir = temp_output_dir("lsp-document-color");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "let accent = \"#336699\"\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let color_character = source_text.find("#336699").expect("color literal");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "textDocument/documentColor",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 32);
+        assert!(response.get("error").is_none(), "{response}");
+        let colors = response["result"].as_array().expect("document colors");
+        assert_eq!(colors.len(), 1);
+        assert_eq!(colors[0]["range"]["start"]["character"], color_character);
+        assert_eq!(colors[0]["color"]["red"], 0.2);
+        assert_eq!(colors[0]["color"]["green"], 0.4);
+        assert_eq!(colors[0]["color"]["blue"], 0.6);
+        assert_eq!(colors[0]["color"]["alpha"], 1.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_color_presentation_returns_hex_text_edit() {
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "textDocument/colorPresentation",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///tmp/app.orv",
+                },
+                "color": {
+                    "red": 0.2,
+                    "green": 0.4,
+                    "blue": 0.6,
+                    "alpha": 1.0,
+                },
+                "range": {
+                    "start": { "line": 0, "character": 14 },
+                    "end": { "line": 0, "character": 21 },
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 33);
+        assert!(response.get("error").is_none(), "{response}");
+        let presentations = response["result"].as_array().expect("color presentations");
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(presentations[0]["label"], "#336699");
+        assert_eq!(presentations[0]["textEdit"]["newText"], "#336699");
     }
 
     #[test]
