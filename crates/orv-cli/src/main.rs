@@ -12235,6 +12235,13 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
         anyhow::bail!("client_wasm initial_render html_hash is required");
     }
     if initial_render
+        .get("byte_length")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        anyhow::bail!("client_wasm initial_render byte_length is required");
+    }
+    if initial_render
         .get("ptr_export")
         .and_then(serde_json::Value::as_str)
         != Some(CLIENT_WASM_RENDER_PTR_EXPORT)
@@ -12257,6 +12264,7 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_wasm bundle must export initial render pointer and length");
     }
+    verify_client_wasm_initial_render_data(&bytes, initial_render)?;
     Ok(())
 }
 
@@ -12755,6 +12763,86 @@ fn client_wasm_custom_section_payload(bytes: &[u8]) -> anyhow::Result<Option<&[u
     Ok(None)
 }
 
+fn verify_client_wasm_initial_render_data(
+    bytes: &[u8],
+    initial_render: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let expected_len = initial_render
+        .get("byte_length")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("client_wasm initial_render byte_length is required"))?;
+    let expected_hash = initial_render
+        .get("html_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("client_wasm initial_render html_hash is required"))?;
+    let data = client_wasm_initial_render_data(bytes)?.unwrap_or(&[]);
+    let actual_len = u64::try_from(data.len())
+        .map_err(|_| anyhow::anyhow!("client_wasm initial_render byte_length is invalid"))?;
+    if actual_len != expected_len {
+        anyhow::bail!("client_wasm initial_render byte_length mismatch");
+    }
+    let actual_hash = format!("{:016x}", fnv1a64(data));
+    if actual_hash != expected_hash {
+        anyhow::bail!("client_wasm initial_render html_hash mismatch");
+    }
+    Ok(())
+}
+
+fn client_wasm_initial_render_data(bytes: &[u8]) -> anyhow::Result<Option<&[u8]>> {
+    let mut offset = WASM_MODULE_HEADER.len();
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(bytes, &mut offset, bytes.len())? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm bundle has invalid WASM section length"))?;
+        if section_end > bytes.len() {
+            anyhow::bail!("client_wasm bundle has invalid WASM section length");
+        }
+        if section_id == 11 {
+            return wasm_initial_render_data_section(bytes, offset, section_end);
+        }
+        offset = section_end;
+    }
+    Ok(None)
+}
+
+fn wasm_initial_render_data_section(
+    bytes: &[u8],
+    mut offset: usize,
+    section_end: usize,
+) -> anyhow::Result<Option<&[u8]>> {
+    let data_count = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+    for _ in 0..data_count {
+        let flags = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
+        if flags != 0 {
+            anyhow::bail!("client_wasm initial_render data segment must target memory 0");
+        }
+        if offset >= section_end || bytes[offset] != 0x41 {
+            anyhow::bail!("client_wasm initial_render data segment must use i32.const offset");
+        }
+        offset += 1;
+        let memory_offset = read_wasm_i32_leb(bytes, &mut offset, section_end)?;
+        if offset >= section_end || bytes[offset] != 0x0b {
+            anyhow::bail!("client_wasm initial_render data segment offset is invalid");
+        }
+        offset += 1;
+        let data_len = read_wasm_u32_leb(bytes, &mut offset, section_end)? as usize;
+        let data_end = offset
+            .checked_add(data_len)
+            .ok_or_else(|| anyhow::anyhow!("client_wasm initial_render data segment is invalid"))?;
+        if data_end > section_end {
+            anyhow::bail!("client_wasm initial_render data segment is truncated");
+        }
+        if memory_offset == 0 {
+            return Ok(Some(&bytes[offset..data_end]));
+        }
+        offset = data_end;
+    }
+    Ok(None)
+}
+
 fn read_wasm_u32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::Result<u32> {
     let mut value = 0u32;
     let mut shift = 0;
@@ -12774,6 +12862,27 @@ fn read_wasm_u32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::
         shift += 7;
     }
     anyhow::bail!("client_wasm bundle has invalid u32 LEB128 length")
+}
+
+fn read_wasm_i32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::Result<i32> {
+    let mut value = 0i32;
+    let mut shift = 0;
+    for _ in 0..5 {
+        if *offset >= limit {
+            anyhow::bail!("client_wasm bundle has truncated i32 LEB128");
+        }
+        let byte = bytes[*offset];
+        *offset += 1;
+        value |= i32::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < 32 && (byte & 0x40) != 0 {
+                value |= !0 << shift;
+            }
+            return Ok(value);
+        }
+    }
+    anyhow::bail!("client_wasm bundle has invalid i32 LEB128")
 }
 
 fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
@@ -25956,6 +26065,40 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         assert!(
             err.to_string().contains("orv_start"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_wasm_initial_render_data_mismatch() {
+        let out = temp_output_dir("verify-build-client-wasm-render-data");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let wasm_path = build_out.join("client").join("app.wasm");
+        let mut wasm = std::fs::read(&wasm_path).expect("client wasm");
+        let initial_html = b"<html><body><p>0</p></body></html>";
+        let html_offset = wasm
+            .windows(initial_html.len())
+            .position(|window| window == initial_html)
+            .expect("initial render data segment");
+        let count_offset = html_offset + b"<html><body><p>".len();
+        assert_eq!(wasm[count_offset], b'0');
+        wasm[count_offset] = b'1';
+        std::fs::write(&wasm_path, wasm).expect("rewrite wasm");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client wasm render data");
+
+        assert!(
+            err.to_string().contains("initial_render html_hash"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
