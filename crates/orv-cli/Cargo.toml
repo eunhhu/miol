@@ -13,7 +13,6 @@ name = "orv"
 path = "src/main.rs"
 
 [dependencies]
-orv-core = { workspace = true }
 orv-diagnostics = { workspace = true }
 orv-syntax = { workspace = true }
 orv-resolve = { workspace = true }

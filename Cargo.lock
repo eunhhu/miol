@@ -892,7 +892,6 @@ dependencies = [
  "codespan-reporting 0.11.1",
  "orv-analyzer",
  "orv-compiler",
- "orv-core",
  "orv-diagnostics",
  "orv-hir",
  "orv-project",
