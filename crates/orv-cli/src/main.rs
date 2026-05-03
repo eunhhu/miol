@@ -19,8 +19,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -137,6 +143,12 @@ enum Command {
         /// persistent watch loop를 실행한다.
         #[arg(long)]
         watch_loop: bool,
+        /// reference HMR `EventSource` dev endpoint를 실행한다.
+        #[arg(long)]
+        serve: bool,
+        /// HMR dev endpoint port. 0이면 OS가 빈 port를 고른다.
+        #[arg(long, default_value_t = 0)]
+        serve_port: u16,
         /// watch loop 반복 횟수. 생략하면 계속 실행한다.
         #[arg(long)]
         watch_iterations: Option<u64>,
@@ -486,16 +498,30 @@ fn main() -> ExitCode {
             hmr,
             watch,
             watch_loop,
+            serve,
+            serve_port,
             watch_iterations,
             watch_interval_ms,
         } => match cmd_dev(
             &file,
             &out,
-            hmr,
-            watch,
-            watch_loop,
-            watch_iterations,
-            watch_interval_ms,
+            DevOptions {
+                hmr,
+                watch,
+                loop_mode: if watch_loop {
+                    DevLoopMode::WatchLoop {
+                        iterations: watch_iterations,
+                        interval_ms: watch_interval_ms,
+                    }
+                } else {
+                    DevLoopMode::Once
+                },
+                serve: serve.then_some(DevServeOptions {
+                    port: serve_port,
+                    iterations: watch_iterations,
+                    interval_ms: watch_interval_ms,
+                }),
+            },
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -9744,6 +9770,7 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     verify_deploy_manifest_if_present(dir)?;
     verify_dev_hmr_session_if_present(dir, &plan)?;
     verify_dev_hmr_transport_if_present(dir)?;
+    verify_dev_hmr_server_if_present(dir)?;
     verify_dev_watch_session_if_present(dir, &plan)?;
     verify_dev_watch_events_if_present(dir)
 }
@@ -10102,6 +10129,53 @@ fn verify_dev_hmr_transport_if_present(dir: &Path) -> anyhow::Result<()> {
     }
     if !client.contains("window.location.reload()") {
         anyhow::bail!("dev hmr client must support full reload fallback");
+    }
+    Ok(())
+}
+
+fn verify_dev_hmr_server_if_present(dir: &Path) -> anyhow::Result<()> {
+    let server_path = dir.join("dev").join("server.json");
+    if !server_path.is_file() {
+        return Ok(());
+    }
+    if !dir.join("dev").join("session.json").is_file() {
+        anyhow::bail!("dev hmr server requires dev/session.json");
+    }
+    if !dir.join("dev").join("events.json").is_file() {
+        anyhow::bail!("dev hmr server requires dev/events.json");
+    }
+    let server = read_json_value(&server_path)?;
+    if server
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("dev hmr server schema_version must be 1");
+    }
+    if json_str(&server, "mode", "dev hmr server")? != "hmr-server" {
+        anyhow::bail!("dev hmr server mode must be hmr-server");
+    }
+    if json_str(&server, "protocol", "dev hmr server")? != "http1" {
+        anyhow::bail!("dev hmr server protocol must be http1");
+    }
+    if json_str(&server, "session", "dev hmr server")? != "dev/session.json" {
+        anyhow::bail!("dev hmr server session must be dev/session.json");
+    }
+    if json_str(&server, "events", "dev hmr server")? != "dev/events.json" {
+        anyhow::bail!("dev hmr server events must be dev/events.json");
+    }
+    let address = json_str(&server, "address", "dev hmr server")?;
+    address
+        .parse::<SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("dev hmr server address must be a socket address: {e}"))?;
+    let endpoints = server
+        .get("endpoints")
+        .ok_or_else(|| anyhow::anyhow!("dev hmr server endpoints must be an object"))?;
+    if json_str(endpoints, "session", "dev hmr server endpoints")? != "/__orv/hmr/session" {
+        anyhow::bail!("dev hmr server session endpoint must be /__orv/hmr/session");
+    }
+    if json_str(endpoints, "events", "dev hmr server endpoints")? != "/__orv/hmr/events" {
+        anyhow::bail!("dev hmr server events endpoint must be /__orv/hmr/events");
     }
     Ok(())
 }
@@ -11128,33 +11202,263 @@ fn cmd_run_build(dir: &Path, trace: Option<&Path>) -> anyhow::Result<()> {
     run_build_with_writer_with_trace(dir, trace, &mut stdout)
 }
 
-fn cmd_dev(
-    path: &Path,
-    out: &Path,
+#[derive(Clone, Copy)]
+struct DevOptions {
     hmr: bool,
     watch: bool,
-    watch_loop: bool,
-    watch_iterations: Option<u64>,
-    watch_interval_ms: u64,
-) -> anyhow::Result<()> {
+    loop_mode: DevLoopMode,
+    serve: Option<DevServeOptions>,
+}
+
+#[derive(Clone, Copy)]
+struct DevServeOptions {
+    port: u16,
+    iterations: Option<u64>,
+    interval_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DevLoopMode {
+    Once,
+    WatchLoop {
+        iterations: Option<u64>,
+        interval_ms: u64,
+    },
+}
+
+fn cmd_dev(path: &Path, out: &Path, options: DevOptions) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    if watch_loop {
-        return dev_watch_loop_with_writer(
+    if let Some(serve) = options.serve {
+        return dev_hmr_serve_with_writer(
             path,
             out,
-            hmr,
-            watch_iterations,
-            watch_interval_ms,
+            serve.port,
+            serve.iterations,
+            serve.interval_ms,
             &mut stdout,
         );
     }
-    if hmr {
-        dev_with_writer_with_options(path, out, true, watch, &mut stdout)
-    } else if watch {
+    if let DevLoopMode::WatchLoop {
+        iterations,
+        interval_ms,
+    } = options.loop_mode
+    {
+        return dev_watch_loop_with_writer(
+            path,
+            out,
+            options.hmr,
+            iterations,
+            interval_ms,
+            &mut stdout,
+        );
+    }
+    if options.hmr {
+        dev_with_writer_with_options(path, out, true, options.watch, &mut stdout)
+    } else if options.watch {
         dev_with_writer_with_options(path, out, false, true, &mut stdout)
     } else {
         dev_with_writer(path, out, &mut stdout)
     }
+}
+
+struct DevHmrServer {
+    addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DevHmrServer {
+    const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for DevHmrServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn dev_hmr_serve_with_writer<W: std::io::Write>(
+    path: &Path,
+    out: &Path,
+    port: u16,
+    iterations: Option<u64>,
+    interval_ms: u64,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    validate_dev_loop_options(iterations, interval_ms)?;
+    let mut events = Vec::new();
+    let mut previous_signature: Option<String> = None;
+    let mut server: Option<DevHmrServer> = None;
+    let mut iteration = 0_u64;
+
+    loop {
+        iteration = iteration.saturating_add(1);
+        let reason = dev_watch_loop_reason(out, previous_signature.as_deref())?;
+        if reason == "unchanged" {
+            events.push(dev_watch_loop_event(iteration, reason, "skip", "ok", None));
+        } else {
+            dev_with_writer_with_options(path, out, true, true, writer)?;
+            let signature = dev_watch_current_source_signature(out)?;
+            events.push(dev_watch_loop_event(
+                iteration,
+                reason,
+                "build-verify-run",
+                "ok",
+                Some(&signature),
+            ));
+            previous_signature = Some(signature);
+        }
+        write_dev_watch_events(out, true, interval_ms, &events)?;
+
+        if server.is_none() {
+            let spawned = spawn_dev_hmr_server(out, port)?;
+            writeln!(writer, "\n[orv dev] hmr server http://{}", spawned.addr())?;
+            server = Some(spawned);
+        }
+        if iterations.is_some_and(|limit| iteration >= limit) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+    drop(server);
+    Ok(())
+}
+
+fn spawn_dev_hmr_server(out: &Path, port: u16) -> anyhow::Result<DevHmrServer> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("failed to bind HMR dev server: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| anyhow::anyhow!("failed to configure HMR dev server: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("failed to read HMR dev server address: {e}"))?;
+    write_dev_hmr_server_manifest(out, addr)?;
+
+    let root = out.to_path_buf();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
+    let handle =
+        std::thread::spawn(move || dev_hmr_server_loop(&listener, &root, &worker_shutdown));
+    Ok(DevHmrServer {
+        addr,
+        shutdown,
+        handle: Some(handle),
+    })
+}
+
+fn write_dev_hmr_server_manifest(out: &Path, addr: SocketAddr) -> anyhow::Result<()> {
+    let server = serde_json::json!({
+        "schema_version": 1,
+        "mode": "hmr-server",
+        "protocol": "http1",
+        "address": addr.to_string(),
+        "source_bundle": "source-bundle.json",
+        "session": "dev/session.json",
+        "events": "dev/events.json",
+        "endpoints": {
+            "session": "/__orv/hmr/session",
+            "events": "/__orv/hmr/events",
+        },
+    });
+    write_json(&out.join("dev").join("server.json"), &server)
+}
+
+fn dev_hmr_server_loop(listener: &std::net::TcpListener, out: &Path, shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = handle_dev_hmr_connection(stream, out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_dev_hmr_connection(mut stream: std::net::TcpStream, out: &Path) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") && request.len() < 8192 {
+        let read = std::io::Read::read(&mut stream, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    let path = dev_hmr_request_path(&request).unwrap_or("/");
+    let response = dev_hmr_http_response(out, path)
+        .unwrap_or_else(|err| dev_hmr_text_response("500 Internal Server Error", &err.to_string()));
+    std::io::Write::write_all(&mut stream, &response)
+}
+
+fn dev_hmr_request_path(request: &[u8]) -> Option<&str> {
+    let request = std::str::from_utf8(request).ok()?;
+    let line = request.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    (method == "GET").then_some(path)
+}
+
+fn dev_hmr_http_response(out: &Path, path: &str) -> anyhow::Result<Vec<u8>> {
+    match path {
+        "/__orv/hmr/session" => {
+            let body = std::fs::read_to_string(out.join("dev").join("session.json"))?;
+            Ok(dev_hmr_response(
+                "200 OK",
+                "application/json",
+                "no-cache",
+                &body,
+            ))
+        }
+        "/__orv/hmr/events" => {
+            let events = read_json_value(&out.join("dev").join("events.json"))?;
+            let body = dev_hmr_sse_body(&events);
+            Ok(dev_hmr_response(
+                "200 OK",
+                "text/event-stream",
+                "no-cache",
+                &body,
+            ))
+        }
+        _ => Ok(dev_hmr_text_response("404 Not Found", "not found")),
+    }
+}
+
+fn dev_hmr_sse_body(events: &serde_json::Value) -> String {
+    let mut body = String::new();
+    if let Some(items) = events.get("events").and_then(serde_json::Value::as_array) {
+        for event in items {
+            let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+            let _ = write!(body, "event: message\ndata: {data}\n\n");
+            if event.get("action").and_then(serde_json::Value::as_str) == Some("build-verify-run") {
+                let _ = write!(body, "event: orv:reload\ndata: {data}\n\n");
+            }
+        }
+    }
+    body
+}
+
+fn dev_hmr_text_response(status: &str, body: &str) -> Vec<u8> {
+    dev_hmr_response(status, "text/plain; charset=utf-8", "no-cache", body)
+}
+
+fn dev_hmr_response(status: &str, content_type: &str, cache_control: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: {cache_control}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 fn dev_watch_loop_with_writer<W: std::io::Write>(
@@ -11165,29 +11469,14 @@ fn dev_watch_loop_with_writer<W: std::io::Write>(
     interval_ms: u64,
     writer: &mut W,
 ) -> anyhow::Result<()> {
-    if interval_ms == 0 {
-        anyhow::bail!("watch loop interval_ms must be positive");
-    }
-    if iterations == Some(0) {
-        anyhow::bail!("watch loop iterations must be positive");
-    }
+    validate_dev_loop_options(iterations, interval_ms)?;
 
     let mut events = Vec::new();
     let mut previous_signature: Option<String> = None;
     let mut iteration = 0_u64;
     loop {
         iteration = iteration.saturating_add(1);
-        let reason = match &previous_signature {
-            None => "initial",
-            Some(signature) => {
-                let current = dev_watch_current_source_signature(out)?;
-                if &current == signature {
-                    "unchanged"
-                } else {
-                    "changed"
-                }
-            }
-        };
+        let reason = dev_watch_loop_reason(out, previous_signature.as_deref())?;
         if reason == "unchanged" {
             events.push(dev_watch_loop_event(iteration, reason, "skip", "ok", None));
         } else {
@@ -11210,6 +11499,31 @@ fn dev_watch_loop_with_writer<W: std::io::Write>(
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
     Ok(())
+}
+
+fn validate_dev_loop_options(iterations: Option<u64>, interval_ms: u64) -> anyhow::Result<()> {
+    if interval_ms == 0 {
+        anyhow::bail!("watch loop interval_ms must be positive");
+    }
+    if iterations == Some(0) {
+        anyhow::bail!("watch loop iterations must be positive");
+    }
+    Ok(())
+}
+
+fn dev_watch_loop_reason(
+    out: &Path,
+    previous_signature: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    let Some(signature) = previous_signature else {
+        return Ok("initial");
+    };
+    let current = dev_watch_current_source_signature(out)?;
+    if current == signature {
+        Ok("unchanged")
+    } else {
+        Ok("changed")
+    }
 }
 
 fn dev_watch_loop_event(
@@ -19841,6 +20155,30 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn dev_hmr_serve_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "dev",
+            "src/main.orv",
+            "--hmr",
+            "--serve",
+            "--serve-port",
+            "0",
+            "--watch-iterations",
+            "1",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Dev {
+            serve, serve_port, ..
+        } = parsed.command
+        else {
+            panic!("expected dev command");
+        };
+        assert!(serve);
+        assert_eq!(serve_port, 0);
+    }
+
+    #[test]
     fn reveal_subcommand_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -20676,6 +21014,49 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("dev hmr transport browser client must be dev/hmr-client.js"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_invalid_dev_hmr_server_manifest() {
+        let out = temp_output_dir("verify-build-dev-hmr-server");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, true, true, &mut stdout)
+            .expect("dev hmr watch");
+        write_dev_watch_events(
+            &build_out,
+            true,
+            1,
+            &[dev_watch_loop_event(
+                1,
+                "initial",
+                "build-verify-run",
+                "ok",
+                Some("sig"),
+            )],
+        )
+        .expect("write events");
+        write_dev_hmr_server_manifest(&build_out, "127.0.0.1:1234".parse().expect("addr"))
+            .expect("server manifest");
+        let server_path = build_out.join("dev").join("server.json");
+        let mut server = read_json_value(&server_path).expect("dev hmr server");
+        server["endpoints"]["events"] = serde_json::json!("/wrong");
+        write_json(&server_path, &server).expect("write corrupt dev hmr server");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid dev hmr server");
+
+        assert!(err
+            .to_string()
+            .contains("dev hmr server events endpoint must be /__orv/hmr/events"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -21657,6 +22038,65 @@ define Auth() -> { @out "auth" }
         assert!(client.contains("EventSource('/__orv/hmr/events')"));
         assert!(client.contains("window.location.reload()"));
         cmd_verify_build(&build_out).expect("verify dev hmr build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn dev_hmr_reference_server_serves_session_and_event_stream() {
+        let out = temp_output_dir("dev-hmr-server");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+        let mut stdout = Vec::new();
+
+        dev_with_writer_with_options(&entry, &build_out, true, true, &mut stdout)
+            .expect("dev hmr watch");
+        write_dev_watch_events(
+            &build_out,
+            true,
+            1,
+            &[dev_watch_loop_event(
+                1,
+                "initial",
+                "build-verify-run",
+                "ok",
+                Some("sig"),
+            )],
+        )
+        .expect("write hmr events");
+        let server = spawn_dev_hmr_server(&build_out, 0).expect("spawn hmr server");
+        let address = server.addr().to_string();
+
+        let manifest =
+            read_json_value(&build_out.join("dev").join("server.json")).expect("server manifest");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["mode"], "hmr-server");
+        assert_eq!(manifest["address"], address);
+        assert_eq!(manifest["endpoints"]["session"], "/__orv/hmr/session");
+        assert_eq!(manifest["endpoints"]["events"], "/__orv/hmr/events");
+
+        let session_response = send_raw_http(&address, "/__orv/hmr/session");
+        assert!(session_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(session_response.contains("Content-Type: application/json"));
+        assert!(session_response.contains("\"mode\": \"hmr\""));
+
+        let events_response = send_raw_http(&address, "/__orv/hmr/events");
+        assert!(events_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(events_response.contains("Content-Type: text/event-stream"));
+        assert!(events_response.contains("event: message"));
+        assert!(events_response.contains("event: orv:reload"));
+        assert!(events_response.contains("\"action\":\"build-verify-run\""));
+
+        let missing_response = send_raw_http(&address, "/missing");
+        assert!(missing_response.starts_with("HTTP/1.1 404 Not Found"));
+
+        cmd_verify_build(&build_out).expect("verify dev hmr server build");
+        drop(server);
         let _ = std::fs::remove_dir_all(&out);
     }
 
