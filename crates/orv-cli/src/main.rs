@@ -2608,9 +2608,11 @@ impl LspSession {
             Some("workspace/executeCommand") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.execute_command_result(request))
             }
-            Some("textDocument/definition" | "textDocument/declaration") => {
-                lsp_jsonrpc_result_or_invalid_params(&id, self.definition_result(request))
-            }
+            Some(
+                "textDocument/definition"
+                | "textDocument/declaration"
+                | "textDocument/implementation",
+            ) => lsp_jsonrpc_result_or_invalid_params(&id, self.definition_result(request)),
             Some("textDocument/typeDefinition") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.type_definition_result(request))
             }
@@ -2701,6 +2703,7 @@ impl LspSession {
                     "definitionProvider": true,
                     "declarationProvider": true,
                     "typeDefinitionProvider": true,
+                    "implementationProvider": true,
                     "callHierarchyProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
@@ -12505,6 +12508,10 @@ function greet(user: User): string -> "hello"
             true
         );
         assert_eq!(
+            response["result"]["capabilities"]["implementationProvider"],
+            true
+        );
+        assert_eq!(
             response["result"]["capabilities"]["callHierarchyProvider"],
             true
         );
@@ -17593,6 +17600,43 @@ let u: User = { id: 1 }
         }));
 
         assert_eq!(response["id"], 21);
+        assert!(response.get("error").is_none(), "{response}");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        assert_eq!(
+            response["result"]["uri"],
+            format!("file://{}", canonical_source.display())
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
+        assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_implementation_returns_concrete_symbol_location() {
+        let dir = temp_output_dir("lsp-implementation");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text =
+            "function greet(name: string): string -> name\nlet message: string = greet(\"Ada\")\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let call_line = source_text.lines().nth(1).expect("call line");
+        let call_character = call_line.find("greet").expect("call name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 27,
+            "method": "textDocument/implementation",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": call_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 27);
         assert!(response.get("error").is_none(), "{response}");
         let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
         assert_eq!(
