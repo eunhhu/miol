@@ -3661,6 +3661,7 @@ impl DapSession {
                     "supportsRestartFrame": true,
                     "supportsPauseRequest": true,
                     "supportsCancelRequest": true,
+                    "supportsInstructionBreakpoints": true,
                     "supportsOrvRuntimeAttach": true,
                     "supportsOrvRuntimeTracePath": true,
                     "exceptionBreakpointFilters": [
@@ -3684,6 +3685,7 @@ impl DapSession {
             "setExceptionBreakpoints" => self.set_exception_breakpoints_result(request),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
+            "setInstructionBreakpoints" => Ok(dap_instruction_breakpoints_response(request)),
             "dataBreakpointInfo" => self.data_breakpoint_info_result(request),
             "setDataBreakpoints" => self.set_data_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
@@ -6375,6 +6377,38 @@ fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_js
                     breakpoint
                 })
                 .collect()
+        });
+    serde_json::json!({
+        "breakpoints": breakpoints,
+    })
+}
+
+fn dap_instruction_breakpoints_response(request: &serde_json::Value) -> serde_json::Value {
+    let breakpoints = request
+        .pointer("/arguments/breakpoints")
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(Vec::new, |items| {
+            items
+            .iter()
+            .enumerate()
+            .map(|(index, breakpoint)| {
+                let instruction_reference = breakpoint
+                    .get("instructionReference")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or("", str::trim);
+                let offset = breakpoint
+                    .get("offset")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "id": u64::try_from(index + 1).unwrap_or(u64::MAX),
+                    "verified": false,
+                    "instructionReference": instruction_reference,
+                    "offset": offset,
+                    "message": "ORV runtime has source frames, not stable instruction addresses",
+                })
+            })
+            .collect::<Vec<_>>()
         });
     serde_json::json!({
         "breakpoints": breakpoints,
@@ -11901,6 +11935,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsRestartFrame"], true);
         assert_eq!(response["body"]["supportsPauseRequest"], true);
         assert_eq!(response["body"]["supportsCancelRequest"], true);
+        assert_eq!(response["body"]["supportsInstructionBreakpoints"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
     }
@@ -11921,6 +11956,36 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["request_seq"], 66);
         assert_eq!(response["command"], "cancel");
         assert_eq!(response["success"], true);
+    }
+
+    #[test]
+    fn dap_set_instruction_breakpoints_returns_unverified_entries() {
+        let response = dap_protocol_response(&serde_json::json!({
+            "seq": 77,
+            "type": "request",
+            "command": "setInstructionBreakpoints",
+            "arguments": {
+                "breakpoints": [
+                    {
+                        "instructionReference": "orv:entry:0",
+                        "offset": 4,
+                    }
+                ],
+            },
+        }));
+
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 77);
+        assert_eq!(response["command"], "setInstructionBreakpoints");
+        assert_eq!(response["success"], true);
+        let breakpoint = &response["body"]["breakpoints"][0];
+        assert_eq!(breakpoint["verified"], false);
+        assert_eq!(breakpoint["instructionReference"], "orv:entry:0");
+        assert_eq!(breakpoint["offset"], 4);
+        assert_eq!(
+            breakpoint["message"],
+            "ORV runtime has source frames, not stable instruction addresses"
+        );
     }
 
     #[test]
