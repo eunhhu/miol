@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -275,6 +275,15 @@ enum WorkspaceCommand {
         /// 생성할 starter template.
         #[arg(long, value_enum, default_value_t = InitTemplate::Basic)]
         template: InitTemplate,
+    },
+    /// Workspace member project graph들을 하나의 artifact로 출력한다.
+    Graph {
+        /// workspace root 디렉터리.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// workspace graph artifact 출력 디렉터리.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -661,6 +670,15 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            WorkspaceCommand::Graph { root, out } => {
+                match cmd_workspace_graph(&root, out.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Command::Test { path, filter, list } => match cmd_test(&path, filter.as_deref(), list) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1223,6 +1241,18 @@ fn cmd_workspace_new(
     cmd_init(&root.join(&member_path), Some(&project_name), template)?;
     write_toml_manifest_atomic(&root_manifest, &manifest)?;
     println!("workspace: added {member_path}");
+    Ok(())
+}
+
+fn cmd_workspace_graph(root: &Path, out: Option<&Path>) -> anyhow::Result<()> {
+    let graph = workspace_graph_json(root)?;
+    if let Some(out) = out {
+        let path = out.join("workspace-graph.json");
+        write_json(&path, &graph)?;
+        println!("workspace graph: wrote {}", path.display());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&graph)?);
+    }
     Ok(())
 }
 
@@ -2511,6 +2541,218 @@ fn workspace_member_project_name(member: &Path) -> String {
 
 fn toml_value_str_or_empty(value: &toml::Value) -> &str {
     value.as_str().unwrap_or("")
+}
+
+fn workspace_graph_json(root: &Path) -> anyhow::Result<serde_json::Value> {
+    let root_manifest = root.join("orv.toml");
+    let manifest = read_toml_manifest(&root_manifest)?;
+    let workspace = manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("{} must define [workspace]", root_manifest.display()))?;
+    let resolver = workspace
+        .get("resolver")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("1");
+    let members = workspace_members(workspace)?;
+    let mut member_values = Vec::new();
+    let mut member_paths = HashSet::new();
+    for member in &members {
+        member_paths.insert(member.clone());
+        member_values.push(workspace_member_graph_json(root, member)?);
+    }
+    let edges = workspace_graph_edges(root, &members, &member_paths)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.workspace.graph",
+        "root": root.display().to_string(),
+        "resolver": resolver,
+        "stats": {
+            "member_count": members.len(),
+            "edge_count": edges.len(),
+        },
+        "members": member_values,
+        "edges": edges,
+    }))
+}
+
+fn workspace_members(
+    workspace: &toml::map::Map<String, toml::Value>,
+) -> anyhow::Result<Vec<String>> {
+    let members = workspace
+        .get("members")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspace.members must be an array"))?;
+    let mut paths = members
+        .iter()
+        .map(|member| {
+            let member = member
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("workspace.members entries must be strings"))?;
+            workspace_member_string(Path::new(member))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn workspace_member_graph_json(root: &Path, member: &str) -> anyhow::Result<serde_json::Value> {
+    let member_root = root.join(member);
+    let manifest_path = member_root.join("orv.toml");
+    let manifest = read_toml_manifest(&manifest_path)?;
+    let project = manifest
+        .get("project")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("{} must define [project]", manifest_path.display()))?;
+    let entry = project_manifest_entry_path(&manifest_path)?;
+    let loaded = orv_project::load_project(&entry).map_err(|e| anyhow::anyhow!("{e}"))?;
+    report_diagnostics(&loaded.diagnostics, &loaded.files)?;
+    let resolved = orv_resolve::resolve(&loaded.program);
+    report_diagnostics(&resolved.diagnostics, &loaded.files)?;
+    let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+    report_diagnostics(&lowered.diagnostics, &loaded.files)?;
+    let origin_map = orv_compiler::origin_map(&lowered.program);
+    Ok(serde_json::json!({
+        "name": toml_string(project, "name", "[project].name")?,
+        "version": project.get("version").and_then(toml::Value::as_str).unwrap_or("0.0.0"),
+        "path": member,
+        "manifest": format!("{member}/orv.toml"),
+        "entry": workspace_relative_path(root, &entry),
+        "files": loaded.files.iter().map(|file| workspace_relative_path(root, &file.path)).collect::<Vec<_>>(),
+        "graph": project_graph_json(&loaded.graph, &origin_map),
+        "dependencies": workspace_member_dependencies(&manifest),
+    }))
+}
+
+fn workspace_member_dependencies(manifest: &toml::Value) -> Vec<serde_json::Value> {
+    ["dependencies", "dev-dependencies"]
+        .into_iter()
+        .flat_map(|section| workspace_dependency_values(manifest, section))
+        .collect()
+}
+
+fn workspace_dependency_values(manifest: &toml::Value, section: &str) -> Vec<serde_json::Value> {
+    let Some(table) = manifest.get(section).and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    let mut dependencies = table
+        .iter()
+        .map(|(name, value)| {
+            let mut dependency = serde_json::json!({
+                "name": name,
+                "section": section,
+            });
+            if let Some(path) = value
+                .as_table()
+                .and_then(|table| table.get("path"))
+                .and_then(toml::Value::as_str)
+            {
+                dependency["source"] = serde_json::json!("path");
+                dependency["path"] = serde_json::json!(path);
+            } else {
+                dependency["source"] = serde_json::json!("registry");
+            }
+            dependency
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| {
+        json_str_or_empty(left, "name").cmp(json_str_or_empty(right, "name"))
+    });
+    dependencies
+}
+
+fn workspace_graph_edges(
+    root: &Path,
+    members: &[String],
+    member_paths: &HashSet<String>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut edges = members
+        .iter()
+        .map(|member| {
+            serde_json::json!({
+                "kind": "member",
+                "from": "workspace",
+                "to": member,
+            })
+        })
+        .collect::<Vec<_>>();
+    for member in members {
+        let manifest = read_toml_manifest(&root.join(member).join("orv.toml"))?;
+        edges.extend(workspace_path_dependency_edges(
+            root,
+            member,
+            &manifest,
+            member_paths,
+        ));
+    }
+    Ok(edges)
+}
+
+fn workspace_path_dependency_edges(
+    root: &Path,
+    member: &str,
+    manifest: &toml::Value,
+    member_paths: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    ["dependencies", "dev-dependencies"]
+        .into_iter()
+        .flat_map(|section| {
+            manifest
+                .get(section)
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flat_map(move |dependencies| {
+                    dependencies.iter().filter_map(move |(name, value)| {
+                        let path = value
+                            .as_table()
+                            .and_then(|table| table.get("path"))
+                            .and_then(toml::Value::as_str)?;
+                        let target = workspace_dependency_target(root, member, path)?;
+                        member_paths.contains(&target).then(|| {
+                            serde_json::json!({
+                                "kind": "path_dependency",
+                                "from": member,
+                                "to": target,
+                                "package": name,
+                                "section": section,
+                            })
+                        })
+                    })
+                })
+        })
+        .collect()
+}
+
+fn workspace_dependency_target(root: &Path, member: &str, dependency: &str) -> Option<String> {
+    let target = normalize_workspace_fs_path(&root.join(member).join(dependency));
+    target
+        .strip_prefix(normalize_workspace_fs_path(root))
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn workspace_relative_path(root: &Path, path: &Path) -> String {
+    normalize_workspace_fs_path(path)
+        .strip_prefix(normalize_workspace_fs_path(root))
+        .map_or_else(
+            |_| path.display().to_string(),
+            |relative| relative.to_string_lossy().replace('\\', "/"),
+        )
+}
+
+fn normalize_workspace_fs_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn write_new_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -20765,11 +21007,35 @@ entry = "src/main.orv"
             root,
             name,
             template,
-        } = command;
+        } = command
+        else {
+            panic!("expected workspace new command");
+        };
         assert_eq!(member, PathBuf::from("apps/web"));
         assert_eq!(root, PathBuf::from("demo"));
         assert_eq!(name.as_deref(), Some("web"));
         assert_eq!(template, InitTemplate::Basic);
+    }
+
+    #[test]
+    fn workspace_graph_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "workspace",
+            "graph",
+            "demo",
+            "--out",
+            "target/orv-workspace",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Workspace { command } = parsed.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Graph { root, out } = command else {
+            panic!("expected workspace graph command");
+        };
+        assert_eq!(root, PathBuf::from("demo"));
+        assert_eq!(out, Some(PathBuf::from("target/orv-workspace")));
     }
 
     #[test]
@@ -21570,6 +21836,87 @@ mock-server = "0.2.0"
         assert!(members
             .iter()
             .any(|member| member.as_str() == Some("shared/models")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_graph_merges_member_graphs_and_path_dependency_edges() {
+        let root = temp_output_dir("workspace-graph");
+        std::fs::create_dir_all(root.join("apps/web/src")).expect("create web src");
+        std::fs::create_dir_all(root.join("shared/models/src")).expect("create models src");
+        std::fs::write(
+            root.join("orv.toml"),
+            r#"[workspace]
+resolver = "2"
+members = ["apps/web", "shared/models"]
+"#,
+        )
+        .expect("write root manifest");
+        std::fs::write(
+            root.join("apps/web/orv.toml"),
+            r#"[project]
+name = "web"
+version = "0.1.0"
+entry = "src/main.orv"
+
+[dependencies]
+models = { path = "../../shared/models", version = "0.1.0" }
+"#,
+        )
+        .expect("write web manifest");
+        std::fs::write(
+            root.join("shared/models/orv.toml"),
+            r#"[project]
+name = "models"
+version = "0.1.0"
+entry = "src/main.orv"
+"#,
+        )
+        .expect("write models manifest");
+        std::fs::write(
+            root.join("apps/web/src/main.orv"),
+            "@server { @route GET / { @respond 200 { ok: true } } }\n",
+        )
+        .expect("write web source");
+        std::fs::write(
+            root.join("shared/models/src/main.orv"),
+            "pub struct User { id: int, name: string }\n",
+        )
+        .expect("write models source");
+
+        let graph = workspace_graph_json(&root).expect("workspace graph");
+
+        assert_eq!(graph["schema_version"], 1);
+        assert_eq!(graph["kind"], "orv.workspace.graph");
+        assert_eq!(graph["resolver"], "2");
+        assert_eq!(graph["stats"]["member_count"], 2);
+        let members = graph["members"].as_array().expect("members");
+        assert!(members
+            .iter()
+            .any(|member| member["path"] == "apps/web" && member["name"] == "web"));
+        assert!(members
+            .iter()
+            .any(|member| member["path"] == "shared/models"
+                && member["graph"]["nodes"]
+                    .as_array()
+                    .expect("nodes")
+                    .iter()
+                    .any(|node| node["kind"] == "struct" && node["name"] == "User")));
+        assert!(graph["edges"]
+            .as_array()
+            .expect("workspace edges")
+            .iter()
+            .any(|edge| edge["kind"] == "path_dependency"
+                && edge["from"] == "apps/web"
+                && edge["to"] == "shared/models"
+                && edge["package"] == "models"));
+
+        let out = root.join("target/orv-workspace");
+        cmd_workspace_graph(&root, Some(&out)).expect("write workspace graph");
+        assert!(out.join("workspace-graph.json").is_file());
+        let written = read_json_value(&out.join("workspace-graph.json")).expect("read written");
+        assert_eq!(written["stats"]["member_count"], 2);
 
         let _ = std::fs::remove_dir_all(root);
     }
