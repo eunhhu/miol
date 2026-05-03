@@ -2614,6 +2614,18 @@ impl LspSession {
             Some("textDocument/typeDefinition") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.type_definition_result(request))
             }
+            Some("textDocument/prepareCallHierarchy") => lsp_jsonrpc_result_or_invalid_params(
+                &id,
+                self.prepare_call_hierarchy_result(request),
+            ),
+            Some("callHierarchy/outgoingCalls") => lsp_jsonrpc_result_or_invalid_params(
+                &id,
+                self.call_hierarchy_outgoing_result(request),
+            ),
+            Some("callHierarchy/incomingCalls") => lsp_jsonrpc_result_or_invalid_params(
+                &id,
+                self.call_hierarchy_incoming_result(request),
+            ),
             Some("textDocument/references") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.references_result(request))
             }
@@ -2689,6 +2701,7 @@ impl LspSession {
                     "definitionProvider": true,
                     "declarationProvider": true,
                     "typeDefinitionProvider": true,
+                    "callHierarchyProvider": true,
                     "referencesProvider": true,
                     "documentHighlightProvider": true,
                     "renameProvider": {
@@ -2830,6 +2843,72 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_location_json(node, &loaded.files))
+    }
+
+    fn prepare_call_hierarchy_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let byte = lsp_position_to_byte(&file.source, position);
+        let Some(name) = identifier_at_byte(&file.source, byte) else {
+            return Ok(serde_json::Value::Null);
+        };
+        let Some(function) = lsp_function_stmt_by_name(&loaded.program, name) else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(serde_json::Value::Array(vec![
+            lsp_call_hierarchy_item_json(function, &loaded.files),
+        ]))
+    }
+
+    fn call_hierarchy_outgoing_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let (loaded, caller_name) = self.loaded_project_for_call_hierarchy_item(request)?;
+        let Some(caller) = lsp_function_stmt_by_name(&loaded.program, caller_name) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        Ok(serde_json::Value::Array(lsp_call_hierarchy_outgoing_calls(
+            caller,
+            &loaded.program,
+            &loaded.files,
+        )))
+    }
+
+    fn call_hierarchy_incoming_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let (loaded, callee_name) = self.loaded_project_for_call_hierarchy_item(request)?;
+        Ok(serde_json::Value::Array(lsp_call_hierarchy_incoming_calls(
+            callee_name,
+            &loaded.program,
+            &loaded.files,
+        )))
+    }
+
+    fn loaded_project_for_call_hierarchy_item<'a>(
+        &self,
+        request: &'a serde_json::Value,
+    ) -> anyhow::Result<(orv_project::LoadedProject, &'a str)> {
+        let name = request
+            .pointer("/params/item/name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("callHierarchy item.name must be a string"))?;
+        let uri = request
+            .pointer("/params/item/uri")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("callHierarchy item.uri must be a string"))?;
+        let path = lsp_file_uri_path(uri)?;
+        Ok((self.loaded_project_for_path(&path)?, name))
     }
 
     fn references_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -2984,7 +3063,7 @@ impl LspSession {
         let Some((name, active_parameter)) = lsp_call_signature_context(&file.source, byte) else {
             return Ok(serde_json::Value::Null);
         };
-        let Some(function) = lsp_function_signature_stmt(&loaded.program, name) else {
+        let Some(function) = lsp_function_stmt_by_name(&loaded.program, name) else {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_signature_help_json(function, active_parameter))
@@ -7730,6 +7809,125 @@ fn lsp_type_definition_node<'a>(
     })
 }
 
+fn lsp_function_stmt_by_name<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionStmt> {
+    program.items.iter().find_map(|stmt| match stmt {
+        Stmt::Function(function) if function.name.name == name => Some(function.as_ref()),
+        _ => None,
+    })
+}
+
+fn lsp_function_stmts(program: &Program) -> Vec<&FunctionStmt> {
+    program
+        .items
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Function(function) => Some(function.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lsp_call_hierarchy_item_json(
+    function: &FunctionStmt,
+    files: &[SourceFile],
+) -> serde_json::Value {
+    let uri = files
+        .iter()
+        .find(|file| file.id == function.span.file)
+        .map_or_else(
+            || "file://<unknown>".to_string(),
+            |file| lsp_file_uri_for_path(&file.path),
+        );
+    serde_json::json!({
+        "name": function.name.name,
+        "kind": 12,
+        "detail": "function",
+        "uri": uri,
+        "range": lsp_range_json(function.span, files),
+        "selectionRange": lsp_range_json(function.name.span, files),
+    })
+}
+
+fn lsp_call_hierarchy_outgoing_calls(
+    caller: &FunctionStmt,
+    program: &Program,
+    files: &[SourceFile],
+) -> Vec<serde_json::Value> {
+    let Some(source) = lsp_source_file_for_span(files, caller.span) else {
+        return Vec::new();
+    };
+    lsp_function_stmts(program)
+        .into_iter()
+        .filter_map(|callee| {
+            let ranges = lsp_function_call_ranges(&source.source, caller, &callee.name.name);
+            if ranges.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "to": lsp_call_hierarchy_item_json(callee, files),
+                "fromRanges": ranges,
+            }))
+        })
+        .collect()
+}
+
+fn lsp_call_hierarchy_incoming_calls(
+    callee_name: &str,
+    program: &Program,
+    files: &[SourceFile],
+) -> Vec<serde_json::Value> {
+    lsp_function_stmts(program)
+        .into_iter()
+        .filter_map(|caller| {
+            let source = lsp_source_file_for_span(files, caller.span)?;
+            let ranges = lsp_function_call_ranges(&source.source, caller, callee_name);
+            if ranges.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "from": lsp_call_hierarchy_item_json(caller, files),
+                "fromRanges": ranges,
+            }))
+        })
+        .collect()
+}
+
+fn lsp_function_call_ranges(
+    source: &str,
+    caller: &FunctionStmt,
+    callee_name: &str,
+) -> Vec<serde_json::Value> {
+    let mut ranges = Vec::new();
+    let mut search_from = usize::try_from(caller.span.range.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(caller.span.range.end)
+        .unwrap_or(usize::MAX)
+        .min(source.len());
+    search_from = search_from.min(end);
+    while let Some(relative) = source[search_from..end].find(callee_name) {
+        let name_start = search_from + relative;
+        let Some(open) = lsp_call_open_after_name(source, name_start, callee_name) else {
+            search_from = name_start.saturating_add(callee_name.len());
+            continue;
+        };
+        if lsp_call_is_function_declaration(source, name_start) {
+            search_from = open.saturating_add(1);
+            continue;
+        }
+        let name_end = name_start.saturating_add(callee_name.len());
+        ranges.push(lsp_range_for_source(
+            source,
+            u32::try_from(name_start).unwrap_or(u32::MAX),
+            u32::try_from(name_end).unwrap_or(u32::MAX),
+        ));
+        search_from = open.saturating_add(1);
+    }
+    ranges
+}
+
+fn lsp_source_file_for_span(files: &[SourceFile], span: Span) -> Option<&SourceFile> {
+    files.iter().find(|file| file.id == span.file)
+}
+
 fn lsp_location_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serde_json::Value {
     let uri = files.iter().find(|file| file.id == node.file).map_or_else(
         || "file://<unknown>".to_string(),
@@ -7906,13 +8104,6 @@ fn lsp_call_argument_starts(source: &str, open: usize, end: usize) -> Vec<usize>
         index += 1;
     }
     starts
-}
-
-fn lsp_function_signature_stmt<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionStmt> {
-    program.items.iter().find_map(|stmt| match stmt {
-        Stmt::Function(function) if function.name.name == name => Some(function.as_ref()),
-        _ => None,
-    })
 }
 
 fn lsp_call_signature_context(source: &str, byte: usize) -> Option<(&str, usize)> {
@@ -12311,6 +12502,10 @@ function greet(user: User): string -> "hello"
         );
         assert_eq!(
             response["result"]["capabilities"]["typeDefinitionProvider"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["callHierarchyProvider"],
             true
         );
         assert_eq!(
@@ -17406,6 +17601,144 @@ let u: User = { id: 1 }
         );
         assert_eq!(response["result"]["range"]["start"]["line"], 0);
         assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_prepare_call_hierarchy_returns_function_item() {
+        let dir = temp_output_dir("lsp-call-hierarchy-prepare");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "function discount(price: int): int -> price\nfunction total(price: int): int -> discount(price)\nlet value: int = total(10)\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let total_line = source_text.lines().nth(1).expect("total line");
+        let total_character = total_line.find("total").expect("total name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "textDocument/prepareCallHierarchy",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": total_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 24);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"].as_array().expect("call hierarchy items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "total");
+        assert_eq!(items[0]["kind"], 12);
+        assert_eq!(
+            items[0]["uri"],
+            format!(
+                "file://{}",
+                std::fs::canonicalize(&source)
+                    .expect("canonical source")
+                    .display()
+            )
+        );
+        assert_eq!(items[0]["selectionRange"]["start"]["line"], 1);
+        assert_eq!(
+            items[0]["selectionRange"]["start"]["character"],
+            total_character
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_call_hierarchy_outgoing_returns_direct_calls() {
+        let dir = temp_output_dir("lsp-call-hierarchy-outgoing");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "function discount(price: int): int -> price\nfunction total(price: int): int -> discount(price)\nlet value: int = total(10)\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let total_line = source_text.lines().nth(1).expect("total line");
+        let call_character = total_line.find("discount").expect("discount call");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "callHierarchy/outgoingCalls",
+            "params": {
+                "item": {
+                    "name": "total",
+                    "kind": 12,
+                    "uri": format!("file://{}", canonical_source.display()),
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 1, "character": total_line.len() },
+                    },
+                    "selectionRange": {
+                        "start": { "line": 1, "character": total_line.find("total").expect("total name") },
+                        "end": { "line": 1, "character": total_line.find("total").expect("total name") + "total".len() },
+                    },
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 25);
+        assert!(response.get("error").is_none(), "{response}");
+        let calls = response["result"].as_array().expect("outgoing calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["to"]["name"], "discount");
+        assert_eq!(calls[0]["to"]["kind"], 12);
+        assert_eq!(calls[0]["fromRanges"][0]["start"]["line"], 1);
+        assert_eq!(
+            calls[0]["fromRanges"][0]["start"]["character"],
+            call_character
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_call_hierarchy_incoming_returns_direct_callers() {
+        let dir = temp_output_dir("lsp-call-hierarchy-incoming");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "function discount(price: int): int -> price\nfunction total(price: int): int -> discount(price)\nlet value: int = total(10)\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
+        let discount_line = source_text.lines().next().expect("discount line");
+        let total_line = source_text.lines().nth(1).expect("total line");
+        let call_character = total_line.find("discount").expect("discount call");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "callHierarchy/incomingCalls",
+            "params": {
+                "item": {
+                    "name": "discount",
+                    "kind": 12,
+                    "uri": format!("file://{}", canonical_source.display()),
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": discount_line.len() },
+                    },
+                    "selectionRange": {
+                        "start": { "line": 0, "character": discount_line.find("discount").expect("discount name") },
+                        "end": { "line": 0, "character": discount_line.find("discount").expect("discount name") + "discount".len() },
+                    },
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 26);
+        assert!(response.get("error").is_none(), "{response}");
+        let calls = response["result"].as_array().expect("incoming calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["from"]["name"], "total");
+        assert_eq!(calls[0]["from"]["kind"], 12);
+        assert_eq!(calls[0]["fromRanges"][0]["start"]["line"], 1);
+        assert_eq!(
+            calls[0]["fromRanges"][0]["start"]["character"],
+            call_character
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
