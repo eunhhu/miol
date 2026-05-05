@@ -27530,6 +27530,9 @@ entry = "src/main.orv"
   @route POST /orders/share {
     @respond 201 { share: (@body.total as int) / (@body.parts as int) }
   }
+  @route POST /orders/remainder {
+    @respond 201 { remainder: (@body.total as int) % (@body.parts as int) }
+  }
 }
 "#,
         )
@@ -27594,6 +27597,11 @@ entry = "src/main.orv"
         );
         let share_response =
             send_raw_http_json_post(address, "/orders/share", r#"{"total":"875","parts":"7"}"#);
+        let remainder_response = send_raw_http_json_post(
+            address,
+            "/orders/remainder",
+            r#"{"total":"875","parts":"6"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -27607,6 +27615,8 @@ entry = "src/main.orv"
         assert!(due_response.contains(r#"{"due":750}"#));
         assert!(share_response.starts_with("HTTP/1.1 201"));
         assert!(share_response.contains(r#"{"share":125}"#));
+        assert!(remainder_response.starts_with("HTTP/1.1 201"));
+        assert!(remainder_response.contains(r#"{"remainder":5}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -27798,7 +27808,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) % (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) ** (@body.extra as int) }
   }
 }
 ",
