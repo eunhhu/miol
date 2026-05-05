@@ -162,11 +162,19 @@
         actual: amount
       }
     }
-    let payment = await @db.create("Payment", {
+    let payments = @payment.connect("test://local")
+    let capture = payments.capture({
       orderId: orderId,
       amount: amount,
-      method: @body.method,
-      status: "captured"
+      method: @body.method
+    })
+    let payment = await @db.create("Payment", {
+      orderId: capture.orderId,
+      amount: capture.amount,
+      method: capture.method,
+      provider: capture.provider,
+      reference: capture.id,
+      status: capture.status
     })
     await @db.update("Order", { id: orderId }, { status: "paid" })
     let paidOrder = await @db.find("Order", { id: orderId })
@@ -179,12 +187,20 @@
     if payment == void {
       @respond 402 { err: "payment_required", orderId: orderId }
     }
-    let shipment = await @db.create("Shipment", {
+    let shipping = @shipping.connect("test://local")
+    let booking = shipping.book({
       orderId: orderId,
       carrier: @body.carrier,
-      address: @body.address,
-      status: "ready",
-      tracking: "TRK-LOCAL"
+      address: @body.address
+    })
+    let shipment = await @db.create("Shipment", {
+      orderId: booking.orderId,
+      carrier: booking.carrier,
+      address: booking.address,
+      provider: booking.provider,
+      reference: booking.id,
+      status: booking.status,
+      tracking: booking.tracking
     })
     await @db.update("Order", { id: orderId }, { status: "shipped" })
     let shippedOrder = await @db.find("Order", { id: orderId })

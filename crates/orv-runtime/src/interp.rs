@@ -2282,6 +2282,12 @@ impl<W: Write> Interp<W> {
             {
                 self.call_stateful_object_method(&fields, method, &args)
             }
+            (Value::Object(fields), "capture" | "book")
+                if object_kind(&fields)
+                    .is_some_and(|kind| matches!(kind, "payment.adapter" | "shipping.adapter")) =>
+            {
+                call_commerce_adapter_method(&fields, method, &args)
+            }
             // ── C_db 메서드 ──
             //
             // 시그니처 (MVP):
@@ -2377,6 +2383,8 @@ impl<W: Write> Interp<W> {
             "mail" | "mail.verify" => call_mail_method(ns, method, args),
             "media" => call_media_method(method, args),
             "push" => call_push_method(method, args),
+            "payment" => call_payment_method(method, args),
+            "shipping" => call_shipping_method(method, args),
             "offline" => call_offline_method(method, args),
             "cache" => call_cache_method(method, args),
             "net" | "net.tcp" | "net.udp" | "net.tun" => {
@@ -3822,6 +3830,120 @@ fn call_push_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError>
     }
 }
 
+fn call_payment_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "connect" => {
+            let url = string_arg(args, 0, "`@payment.connect` expects adapter url")?;
+            let provider = reference_adapter_provider(&url, "payment")?;
+            Ok(Value::Object(vec![
+                (
+                    "kind".to_string(),
+                    Value::Str("payment.adapter".to_string()),
+                ),
+                ("provider".to_string(), Value::Str(provider)),
+                ("url".to_string(), Value::Str(url)),
+            ]))
+        }
+        "capture" => payment_capture_value("test", args),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type payment>"
+        ))),
+    }
+}
+
+fn call_shipping_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "connect" => {
+            let url = string_arg(args, 0, "`@shipping.connect` expects adapter url")?;
+            let provider = reference_adapter_provider(&url, "shipping")?;
+            Ok(Value::Object(vec![
+                (
+                    "kind".to_string(),
+                    Value::Str("shipping.adapter".to_string()),
+                ),
+                ("provider".to_string(), Value::Str(provider)),
+                ("url".to_string(), Value::Str(url)),
+            ]))
+        }
+        "book" => shipping_booking_value("test", args),
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type shipping>"
+        ))),
+    }
+}
+
+fn call_commerce_adapter_method(
+    fields: &[(String, Value)],
+    method: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let provider = object_field(fields, "provider")
+        .map(value_to_display)
+        .unwrap_or_else(|| "test".to_string());
+    match (object_kind(fields).unwrap_or_default(), method) {
+        ("payment.adapter", "capture") => payment_capture_value(&provider, args),
+        ("shipping.adapter", "book") => shipping_booking_value(&provider, args),
+        (kind, _) => Err(RuntimeError::native(format!(
+            "no method `{method}` on {kind}"
+        ))),
+    }
+}
+
+fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeError> {
+    let Some((scheme, _target)) = url.split_once("://") else {
+        return Err(RuntimeError::native(format!(
+            "`@{kind}.connect` expects adapter url"
+        )));
+    };
+    if matches!(scheme, "test" | "local") {
+        Ok(scheme.to_string())
+    } else {
+        Err(RuntimeError::native(format!(
+            "external {kind} adapters are not implemented for `{url}`; supported schemes are test:// and local://"
+        )))
+    }
+}
+
+fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    let order_id = payload_field(args, "orderId")
+        .ok_or_else(|| RuntimeError::native("`payment.capture` expects orderId"))?;
+    let amount = payload_field(args, "amount")
+        .ok_or_else(|| RuntimeError::native("`payment.capture` expects amount"))?;
+    let method = payload_field(args, "method").unwrap_or_else(|| Value::Str("card".to_string()));
+    Ok(Value::Object(vec![
+        (
+            "kind".to_string(),
+            Value::Str("payment.capture".to_string()),
+        ),
+        ("provider".to_string(), Value::Str(provider.to_string())),
+        ("status".to_string(), Value::Str("captured".to_string())),
+        ("id".to_string(), Value::Str("PAY-LOCAL".to_string())),
+        ("orderId".to_string(), order_id),
+        ("amount".to_string(), amount),
+        ("method".to_string(), method),
+    ]))
+}
+
+fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    let order_id = payload_field(args, "orderId")
+        .ok_or_else(|| RuntimeError::native("`shipping.book` expects orderId"))?;
+    let carrier = payload_field(args, "carrier").unwrap_or_else(|| Value::Str("post".to_string()));
+    let address = payload_field(args, "address").unwrap_or_else(|| Value::Str(String::new()));
+    Ok(Value::Object(vec![
+        (
+            "kind".to_string(),
+            Value::Str("shipping.booking".to_string()),
+        ),
+        ("provider".to_string(), Value::Str(provider.to_string())),
+        ("status".to_string(), Value::Str("ready".to_string())),
+        ("id".to_string(), Value::Str("SHIP-LOCAL".to_string())),
+        ("orderId".to_string(), order_id),
+        ("carrier".to_string(), carrier),
+        ("address".to_string(), address),
+        ("tracking".to_string(), Value::Str("TRK-LOCAL".to_string())),
+    ]))
+}
+
 fn call_offline_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
     match method {
         "store" => {
@@ -4094,8 +4216,8 @@ fn eval_reference_domain(name: &str, args: &[HirExpr]) -> Option<Value> {
                 Some(Value::TypeName(format!("job.{job_name}")))
             }
         }
-        "sync" | "mail" | "media" | "push" | "offline" | "cache" | "net" | "plugin" | "gpu"
-        | "observability" | "ffi"
+        "sync" | "mail" | "media" | "push" | "payment" | "shipping" | "offline" | "cache"
+        | "net" | "plugin" | "gpu" | "observability" | "ffi"
             if args.is_empty() =>
         {
             Some(Value::TypeName(name.to_string()))
@@ -4173,6 +4295,8 @@ fn is_reference_namespace(ns: &str) -> bool {
             | "mail"
             | "media"
             | "push"
+            | "payment"
+            | "shipping"
             | "offline"
             | "cache"
             | "net"
@@ -4195,6 +4319,8 @@ fn is_reference_namespace_method(ns: &str, method: &str) -> bool {
         "mail.verify" => matches!(method, "dkim" | "spf" | "dmarc"),
         "media" => matches!(method, "camera" | "screen" | "pipeline" | "player"),
         "push" => matches!(method, "request" | "subscribe" | "send"),
+        "payment" => matches!(method, "connect" | "capture"),
+        "shipping" => matches!(method, "connect" | "book"),
         "offline" => method == "store",
         "cache" => method == "open",
         "net" => matches!(method, "tcp" | "udp"),
@@ -4290,6 +4416,15 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
                     method: field.to_string(),
                 });
             }
+            if object_kind(fields).is_some_and(|kind| {
+                matches!(kind, "payment.adapter") && field == "capture"
+                    || matches!(kind, "shipping.adapter") && field == "book"
+            }) {
+                return Ok(Value::BoundMethod {
+                    receiver: Box::new(t),
+                    method: field.to_string(),
+                });
+            }
             if missing_object_is_void {
                 Ok(Value::Void)
             } else {
@@ -4322,6 +4457,15 @@ fn named_string_arg(args: &[Value], name: &str) -> Option<String> {
     named_arg(args, name).and_then(|value| match value {
         Value::Str(s) => Some(s),
         _ => None,
+    })
+}
+
+fn payload_field(args: &[Value], name: &str) -> Option<Value> {
+    named_arg(args, name).or_else(|| {
+        args.first().and_then(|value| match value {
+            Value::Object(fields) => object_field(fields, name).cloned(),
+            _ => None,
+        })
     })
 }
 
@@ -8713,6 +8857,47 @@ let local = store.put("logo", "blob")
         )
         .unwrap();
         assert_eq!(out, "assets-v1\nstored\ncode\nlogo\n");
+    }
+
+    #[test]
+    fn payment_and_shipping_reference_adapters_support_shop_flow() {
+        let out = run_str(
+            r#"let payments = @payment.connect("test://local")
+let captured = payments.capture({ orderId: 7, amount: 25000, method: "card" })
+let shipping = @shipping.connect("test://local")
+let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
+@out payments.provider
+@out captured.status
+@out captured.amount
+@out shipping.provider
+@out booking.status
+@out booking.tracking"#,
+        )
+        .unwrap();
+        assert_eq!(out, "test\ncaptured\n25000\ntest\nready\nTRK-LOCAL\n");
+    }
+
+    #[test]
+    fn payment_and_shipping_external_adapters_fail_until_implemented() {
+        let payment_err = run_str(r#"let payments = @payment.connect("stripe://live")"#)
+            .expect_err("external payment adapter must fail until implemented");
+        assert!(
+            payment_err
+                .message
+                .contains("external payment adapters are not implemented"),
+            "{}",
+            payment_err.message
+        );
+
+        let shipping_err = run_str(r#"let shipping = @shipping.connect("carrier://live")"#)
+            .expect_err("external shipping adapter must fail until implemented");
+        assert!(
+            shipping_err
+                .message
+                .contains("external shipping adapters are not implemented"),
+            "{}",
+            shipping_err.message
+        );
     }
 
     #[test]

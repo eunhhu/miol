@@ -2916,6 +2916,7 @@ mod tests {
             let payment: serde_json::Value =
                 serde_json::from_slice(&payment_body).expect("payment json");
             assert_eq!(payment["payment"]["status"], serde_json::json!("captured"));
+            assert_eq!(payment["payment"]["provider"], serde_json::json!("test"));
             assert_eq!(payment["order"]["status"], serde_json::json!("paid"));
 
             let shipment_payload = serde_json::json!({
@@ -2930,6 +2931,7 @@ mod tests {
             let shipment: serde_json::Value =
                 serde_json::from_slice(&shipment_body).expect("shipment json");
             assert_eq!(shipment["shipment"]["status"], serde_json::json!("ready"));
+            assert_eq!(shipment["shipment"]["provider"], serde_json::json!("test"));
             assert_eq!(shipment["order"]["status"], serde_json::json!("shipped"));
 
             let shipment_path = format!("/shipments/{order_id}");
