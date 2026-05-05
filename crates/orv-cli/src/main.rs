@@ -14520,6 +14520,16 @@ fn verify_deploy_runbook_artifact(
             anyhow::bail!("deploy runbook must document persistent DB path {path}");
         }
     }
+    for path in &persistence.record_paths {
+        if !runbook.contains(path) {
+            anyhow::bail!("deploy runbook must document commerce record path {path}");
+        }
+    }
+    for endpoint in &persistence.commerce_endpoints {
+        if !runbook.contains(endpoint) {
+            anyhow::bail!("deploy runbook must document commerce endpoint {endpoint}");
+        }
+    }
     for volume in &persistence.volumes {
         if !runbook.contains(&volume.compose_mount) {
             let mount = &volume.compose_mount;
@@ -16942,6 +16952,7 @@ struct DeployPersistence {
     wal_paths: Vec<String>,
     db_paths: Vec<String>,
     record_paths: Vec<String>,
+    commerce_endpoints: Vec<String>,
     volumes: Vec<DeployPersistenceVolume>,
 }
 
@@ -16985,11 +16996,13 @@ fn server_artifact_deploy_persistence(
     let mut wal_paths = Vec::new();
     let mut db_paths = Vec::new();
     let mut record_paths = Vec::new();
+    let mut commerce_endpoints = Vec::new();
     collect_program_persistence_paths(
         &lowered.program,
         &mut wal_paths,
         &mut db_paths,
         &mut record_paths,
+        &mut commerce_endpoints,
     );
     wal_paths.sort();
     wal_paths.dedup();
@@ -16997,6 +17010,8 @@ fn server_artifact_deploy_persistence(
     db_paths.dedup();
     record_paths.sort();
     record_paths.dedup();
+    commerce_endpoints.sort();
+    commerce_endpoints.dedup();
     let mut persistent_paths = wal_paths.clone();
     persistent_paths.extend(db_paths.clone());
     persistent_paths.extend(record_paths.clone());
@@ -17007,6 +17022,7 @@ fn server_artifact_deploy_persistence(
         wal_paths,
         db_paths,
         record_paths,
+        commerce_endpoints,
     })
 }
 
@@ -17015,6 +17031,7 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
         "wal_paths": persistence.wal_paths,
         "db_paths": persistence.db_paths,
         "record_paths": persistence.record_paths,
+        "commerce_endpoints": persistence.commerce_endpoints,
         "volumes": persistence.volumes.iter().map(|volume| {
             serde_json::json!({
                 "host": volume.host,
@@ -17075,6 +17092,7 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     if persistence.wal_paths.is_empty()
         && persistence.db_paths.is_empty()
         && persistence.record_paths.is_empty()
+        && persistence.commerce_endpoints.is_empty()
     {
         return String::new();
     }
@@ -17088,6 +17106,9 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     for path in &persistence.record_paths {
         let _ = writeln!(out, "- Record log: {path}");
     }
+    for endpoint in &persistence.commerce_endpoints {
+        let _ = writeln!(out, "- Commerce endpoint: {endpoint}");
+    }
     for volume in &persistence.volumes {
         let _ = writeln!(out, "- Compose volume: {}", volume.compose_mount);
     }
@@ -17100,9 +17121,10 @@ fn collect_program_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     for stmt in &program.items {
-        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out);
+        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
     }
 }
 
@@ -17111,24 +17133,31 @@ fn collect_stmt_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     match stmt {
         orv_hir::HirStmt::Let(stmt) => {
-            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirStmt::Const(stmt) => {
-            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirStmt::Function(stmt) => {
-            collect_function_body_persistence_paths(&stmt.body, wal_out, db_out, record_out);
+            collect_function_body_persistence_paths(
+                &stmt.body,
+                wal_out,
+                db_out,
+                record_out,
+                endpoint_out,
+            );
         }
         orv_hir::HirStmt::Return(stmt) => {
             if let Some(value) = &stmt.value {
-                collect_expr_persistence_paths(value, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
             }
         }
         orv_hir::HirStmt::Expr(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirStmt::Struct(_)
         | orv_hir::HirStmt::Enum(_)
@@ -17142,9 +17171,10 @@ fn collect_block_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     for stmt in &block.stmts {
-        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out);
+        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
     }
 }
 
@@ -17153,13 +17183,14 @@ fn collect_function_body_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     match body {
         orv_hir::HirFunctionBody::Block(block) => {
-            collect_block_persistence_paths(block, wal_out, db_out, record_out);
+            collect_block_persistence_paths(block, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirFunctionBody::Expr(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
         }
     }
 }
@@ -17169,6 +17200,7 @@ fn collect_expr_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     use orv_hir::HirExprKind;
 
@@ -17201,6 +17233,13 @@ fn collect_expr_persistence_paths(
             {
                 record_out.push(path);
             }
+            if let Some(endpoint) = args
+                .first()
+                .and_then(hir_static_string)
+                .and_then(|url| http_adapter_endpoint(&url))
+            {
+                endpoint_out.push(endpoint);
+            }
         }
     }
 
@@ -17218,7 +17257,7 @@ fn collect_expr_persistence_paths(
         HirExprKind::String(segments) => {
             for segment in segments {
                 if let orv_hir::HirStringSegment::Interp(expr) = segment {
-                    collect_expr_persistence_paths(expr, wal_out, db_out, record_out);
+                    collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
                 }
             }
         }
@@ -17228,21 +17267,21 @@ fn collect_expr_persistence_paths(
         | HirExprKind::Throw(expr)
         | HirExprKind::Await(expr)
         | HirExprKind::Cast { expr, .. } => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Binary { lhs, rhs, .. } => {
-            collect_expr_persistence_paths(lhs, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(rhs, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(lhs, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(rhs, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Html(block) | HirExprKind::Block(block) => {
-            collect_block_persistence_paths(block, wal_out, db_out, record_out);
+            collect_block_persistence_paths(block, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Route { handler, .. } => {
-            collect_block_persistence_paths(handler, wal_out, db_out, record_out);
+            collect_block_persistence_paths(handler, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Respond { status, payload } => {
-            collect_expr_persistence_paths(status, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(payload, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(status, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(payload, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Server {
             listen,
@@ -17250,18 +17289,18 @@ fn collect_expr_persistence_paths(
             body_stmts,
         } => {
             if let Some(listen) = listen {
-                collect_expr_persistence_paths(listen, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(listen, wal_out, db_out, record_out, endpoint_out);
             }
             for route in routes {
-                collect_expr_persistence_paths(route, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(route, wal_out, db_out, record_out, endpoint_out);
             }
             for stmt in body_stmts {
-                collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out);
+                collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
             }
         }
         HirExprKind::Domain { args, .. } => {
             for arg in args {
-                collect_expr_persistence_paths(arg, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(arg, wal_out, db_out, record_out, endpoint_out);
             }
         }
         HirExprKind::If {
@@ -17269,86 +17308,122 @@ fn collect_expr_persistence_paths(
             then,
             else_branch,
         } => {
-            collect_expr_persistence_paths(cond, wal_out, db_out, record_out);
-            collect_block_persistence_paths(then, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(cond, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(then, wal_out, db_out, record_out, endpoint_out);
             if let Some(else_branch) = else_branch {
-                collect_expr_persistence_paths(else_branch, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(
+                    else_branch,
+                    wal_out,
+                    db_out,
+                    record_out,
+                    endpoint_out,
+                );
             }
         }
         HirExprKind::When { scrutinee, arms } => {
-            collect_expr_persistence_paths(scrutinee, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(scrutinee, wal_out, db_out, record_out, endpoint_out);
             for arm in arms {
-                collect_pattern_persistence_paths(&arm.pattern, wal_out, db_out, record_out);
-                collect_expr_persistence_paths(&arm.body, wal_out, db_out, record_out);
+                collect_pattern_persistence_paths(
+                    &arm.pattern,
+                    wal_out,
+                    db_out,
+                    record_out,
+                    endpoint_out,
+                );
+                collect_expr_persistence_paths(
+                    &arm.body,
+                    wal_out,
+                    db_out,
+                    record_out,
+                    endpoint_out,
+                );
             }
         }
         HirExprKind::Assign { value, .. } => {
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::AssignField { object, value, .. } => {
-            collect_expr_persistence_paths(object, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(object, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::AssignIndex {
             object,
             index,
             value,
         } => {
-            collect_expr_persistence_paths(object, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(index, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(object, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(index, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Call { callee, args } => {
-            collect_expr_persistence_paths(callee, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(callee, wal_out, db_out, record_out, endpoint_out);
             for arg in args {
-                collect_expr_persistence_paths(arg, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(arg, wal_out, db_out, record_out, endpoint_out);
             }
         }
         HirExprKind::For { iter, body, .. } => {
-            collect_expr_persistence_paths(iter, wal_out, db_out, record_out);
-            collect_block_persistence_paths(body, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(iter, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(body, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::While { cond, body } => {
-            collect_expr_persistence_paths(cond, wal_out, db_out, record_out);
-            collect_block_persistence_paths(body, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(cond, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(body, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Range { start, end, .. } => {
-            collect_expr_persistence_paths(start, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(end, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
             for item in items {
-                collect_expr_persistence_paths(item, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(item, wal_out, db_out, record_out, endpoint_out);
             }
         }
         HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
             for field in fields {
-                collect_expr_persistence_paths(&field.value, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(
+                    &field.value,
+                    wal_out,
+                    db_out,
+                    record_out,
+                    endpoint_out,
+                );
             }
         }
         HirExprKind::Index { target, index } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(index, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(index, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Slice { target, start, end } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
             if let Some(start) = start {
-                collect_expr_persistence_paths(start, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
             }
             if let Some(end) = end {
-                collect_expr_persistence_paths(end, wal_out, db_out, record_out);
+                collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
             }
         }
         HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
         }
         HirExprKind::Lambda { body, .. } => {
-            collect_function_body_persistence_paths(body, wal_out, db_out, record_out);
+            collect_function_body_persistence_paths(
+                body,
+                wal_out,
+                db_out,
+                record_out,
+                endpoint_out,
+            );
         }
         HirExprKind::Try { try_block, catch } => {
-            collect_block_persistence_paths(try_block, wal_out, db_out, record_out);
+            collect_block_persistence_paths(try_block, wal_out, db_out, record_out, endpoint_out);
             if let Some(catch) = catch {
-                collect_block_persistence_paths(&catch.body, wal_out, db_out, record_out);
+                collect_block_persistence_paths(
+                    &catch.body,
+                    wal_out,
+                    db_out,
+                    record_out,
+                    endpoint_out,
+                );
             }
         }
     }
@@ -17359,17 +17434,18 @@ fn collect_pattern_persistence_paths(
     wal_out: &mut Vec<String>,
     db_out: &mut Vec<String>,
     record_out: &mut Vec<String>,
+    endpoint_out: &mut Vec<String>,
 ) {
     match pattern {
         orv_hir::HirPattern::Literal(expr)
         | orv_hir::HirPattern::Guard(expr)
         | orv_hir::HirPattern::Not(expr)
         | orv_hir::HirPattern::Contains(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirPattern::Range { start, end, .. } => {
-            collect_expr_persistence_paths(start, wal_out, db_out, record_out);
-            collect_expr_persistence_paths(end, wal_out, db_out, record_out);
+            collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
         }
         orv_hir::HirPattern::Wildcard => {}
     }
@@ -17389,6 +17465,12 @@ fn sqlite_adapter_path(url: &str) -> Option<String> {
         return None;
     }
     Some(path.to_string())
+}
+
+fn http_adapter_endpoint(url: &str) -> Option<String> {
+    url.strip_prefix("http://")
+        .filter(|target| !target.is_empty())
+        .map(|_| url.to_string())
 }
 
 fn hir_static_string(expr: &orv_hir::HirExpr) -> Option<String> {
@@ -28372,6 +28454,61 @@ entry = "src/main.orv"
         assert!(compose.contains("../records:/app/records"));
         assert!(runbook.contains("- Record log: records/payments.jsonl"));
         assert!(runbook.contains("- Record log: records/shipments.jsonl"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_records_http_commerce_adapter_endpoints() {
+        let dir = temp_output_dir("build-prod-http-commerce-source");
+        std::fs::create_dir_all(&dir).expect("create http commerce source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect("http://payments.internal/capture")
+  let shipping = @shipping.connect("http://shipping.internal/book")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "post", address: "Seoul" })
+    @respond 200 { payment: captured.status, shipment: booked.status }
+  }
+}
+"#,
+        )
+        .expect("write http commerce source");
+        let out = temp_output_dir("build-prod-http-commerce");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["commerce_endpoints"],
+            serde_json::json!([
+                "http://payments.internal/capture",
+                "http://shipping.internal/book"
+            ])
+        );
+        assert_eq!(
+            container["persistence"]["commerce_endpoints"],
+            deploy["server"]["persistence"]["commerce_endpoints"]
+        );
+        assert!(container["persistence"]["volumes"]
+            .as_array()
+            .expect("volumes")
+            .is_empty());
+        assert!(!compose.contains("../records:/app/records"));
+        assert!(runbook.contains("- Commerce endpoint: http://payments.internal/capture"));
+        assert!(runbook.contains("- Commerce endpoint: http://shipping.internal/book"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
