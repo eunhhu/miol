@@ -21,7 +21,7 @@
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -344,6 +344,31 @@ impl EditorDebugControl {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorDebugBreakpoint {
+    path: PathBuf,
+    line: u64,
+}
+
+fn parse_editor_debug_breakpoint(value: &str) -> Result<EditorDebugBreakpoint, String> {
+    let (path, line) = value
+        .rsplit_once(':')
+        .ok_or_else(|| "breakpoint must be formatted as <path>:<line>".to_string())?;
+    if path.is_empty() {
+        return Err("breakpoint path must not be empty".to_string());
+    }
+    let line = line
+        .parse::<u64>()
+        .map_err(|_| "breakpoint line must be a positive integer".to_string())?;
+    if line == 0 {
+        return Err("breakpoint line must be greater than zero".to_string());
+    }
+    Ok(EditorDebugBreakpoint {
+        path: PathBuf::from(path),
+        line,
+    })
+}
+
 #[derive(Subcommand)]
 enum WorkspaceCommand {
     /// 워크스페이스 member 프로젝트를 생성하고 root manifest에 등록한다.
@@ -430,6 +455,9 @@ enum EditorCommand {
     Debug {
         /// 대상 파일 경로.
         file: PathBuf,
+        /// Apply a DAP source breakpoint before controls, formatted as `<path>:<line>`.
+        #[arg(long = "breakpoint", value_parser = parse_editor_debug_breakpoint)]
+        breakpoints: Vec<EditorDebugBreakpoint>,
         /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
         #[arg(long = "control", value_enum)]
         controls: Vec<EditorDebugControl>,
@@ -438,6 +466,9 @@ enum EditorCommand {
     RunDebug {
         /// `orv editor export`가 쓴 state.json 또는 debug/session-runner.json 경로.
         state: PathBuf,
+        /// Apply a DAP source breakpoint before controls, formatted as `<path>:<line>`.
+        #[arg(long = "breakpoint", value_parser = parse_editor_debug_breakpoint)]
+        breakpoints: Vec<EditorDebugBreakpoint>,
         /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
         #[arg(long = "control", value_enum)]
         controls: Vec<EditorDebugControl>,
@@ -1014,22 +1045,28 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            EditorCommand::Debug { file, controls } => match cmd_editor_debug(&file, &controls) {
+            EditorCommand::Debug {
+                file,
+                breakpoints,
+                controls,
+            } => match cmd_editor_debug(&file, &controls, &breakpoints) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
                     ExitCode::FAILURE
                 }
             },
-            EditorCommand::RunDebug { state, controls } => {
-                match cmd_editor_run_debug(&state, &controls) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        ExitCode::FAILURE
-                    }
+            EditorCommand::RunDebug {
+                state,
+                breakpoints,
+                controls,
+            } => match cmd_editor_run_debug(&state, &controls, &breakpoints) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
                 }
-            }
+            },
             EditorCommand::Export {
                 file,
                 out,
@@ -1357,15 +1394,23 @@ fn cmd_editor_runtime(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_editor_debug(path: &Path, controls: &[EditorDebugControl]) -> anyhow::Result<()> {
+fn cmd_editor_debug(
+    path: &Path,
+    controls: &[EditorDebugControl],
+    breakpoints: &[EditorDebugBreakpoint],
+) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
-    let value = editor_debug_session_json(&entry, controls)?;
+    let value = editor_debug_session_json(&entry, controls, breakpoints)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-fn cmd_editor_run_debug(state: &Path, controls: &[EditorDebugControl]) -> anyhow::Result<()> {
-    let value = editor_debug_runner_session_json(state, controls)?;
+fn cmd_editor_run_debug(
+    state: &Path,
+    controls: &[EditorDebugControl],
+    breakpoints: &[EditorDebugBreakpoint],
+) -> anyhow::Result<()> {
+    let value = editor_debug_runner_session_json(state, controls, breakpoints)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4800,6 +4845,7 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
 fn editor_debug_session_json(
     path: &Path,
     controls: &[EditorDebugControl],
+    breakpoints: &[EditorDebugBreakpoint],
 ) -> anyhow::Result<serde_json::Value> {
     let controls = if controls.is_empty() {
         vec![EditorDebugControl::Next]
@@ -4823,27 +4869,12 @@ fn editor_debug_session_json(
             },
         }),
     ];
-    let mut control_requests = Vec::new();
-    for (index, control) in controls.iter().copied().enumerate() {
-        let seq = u64::try_from(index + 3).unwrap_or(u64::MAX);
-        let control_request = control.request_json();
-        let control_command = control_request
-            .get("command")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("next"));
-        let control_arguments = control_request
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        requests.push(serde_json::json!({
-            "seq": seq,
-            "type": "request",
-            "command": control_command,
-            "arguments": control_arguments,
-        }));
-        control_requests.push((seq, control, control_request));
-    }
-    let stack_seq = u64::try_from(requests.len() + 1).unwrap_or(u64::MAX);
+    let mut next_seq = 3_u64;
+    let breakpoint_requests =
+        editor_debug_push_breakpoint_requests(&mut requests, &mut next_seq, breakpoints);
+    let control_requests =
+        editor_debug_push_control_requests(&mut requests, &mut next_seq, &controls);
+    let stack_seq = next_seq;
     requests.push(serde_json::json!({
         "seq": stack_seq,
         "type": "request",
@@ -4859,17 +4890,8 @@ fn editor_debug_session_json(
     let output =
         String::from_utf8(writer).map_err(|e| anyhow::anyhow!("invalid DAP output: {e}"))?;
     let frames = dap_protocol_output_frames(&output)?;
-    let control_summaries: Vec<_> = control_requests
-        .into_iter()
-        .map(|(seq, control, control_request)| {
-            serde_json::json!({
-                "name": control.label(),
-                "request": control_request,
-                "response": dap_response_for_request_seq(&frames, seq)
-                    .unwrap_or(serde_json::Value::Null),
-            })
-        })
-        .collect();
+    let breakpoint_summaries = editor_debug_breakpoint_summaries(&frames, breakpoint_requests);
+    let control_summaries = editor_debug_control_summaries(&frames, control_requests);
     let stack = dap_response_for_request_seq(&frames, stack_seq)
         .and_then(|response| response.get("body").cloned())
         .unwrap_or_else(|| serde_json::json!({}));
@@ -4888,6 +4910,7 @@ fn editor_debug_session_json(
             "request_count": requests.len(),
             "frame_count": frames.len(),
         },
+        "breakpoints": breakpoint_summaries,
         "control": first_control,
         "controls": control_summaries,
         "stack": stack,
@@ -4898,6 +4921,7 @@ fn editor_debug_session_json(
 fn editor_debug_runner_session_json(
     state_path: &Path,
     controls: &[EditorDebugControl],
+    breakpoints: &[EditorDebugBreakpoint],
 ) -> anyhow::Result<serde_json::Value> {
     let state = read_json_value(state_path)?;
     let runner = match state.get("kind").and_then(serde_json::Value::as_str) {
@@ -4914,7 +4938,7 @@ fn editor_debug_runner_session_json(
         anyhow::bail!("editor debug runner kind is invalid");
     }
     let program = json_str(&runner, "program", "editor debug runner")?;
-    let debug = editor_debug_session_json(Path::new(program), controls)?;
+    let debug = editor_debug_session_json(Path::new(program), controls, breakpoints)?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.debug.runner.result",
@@ -4922,6 +4946,88 @@ fn editor_debug_runner_session_json(
         "runner": runner,
         "debug": debug,
     }))
+}
+
+fn editor_debug_push_breakpoint_requests(
+    requests: &mut Vec<serde_json::Value>,
+    next_seq: &mut u64,
+    breakpoints: &[EditorDebugBreakpoint],
+) -> Vec<(u64, PathBuf, Vec<u64>, serde_json::Value)> {
+    let mut breakpoint_requests = Vec::new();
+    for (source_path, lines) in editor_debug_breakpoint_request_groups(breakpoints) {
+        let seq = *next_seq;
+        *next_seq += 1;
+        let request = editor_debug_set_breakpoints_request_json(seq, &source_path, &lines);
+        requests.push(request.clone());
+        breakpoint_requests.push((seq, source_path, lines, request));
+    }
+    breakpoint_requests
+}
+
+fn editor_debug_push_control_requests(
+    requests: &mut Vec<serde_json::Value>,
+    next_seq: &mut u64,
+    controls: &[EditorDebugControl],
+) -> Vec<(u64, EditorDebugControl, serde_json::Value)> {
+    let mut control_requests = Vec::new();
+    for control in controls.iter().copied() {
+        let seq = *next_seq;
+        *next_seq += 1;
+        let control_request = control.request_json();
+        let control_command = control_request
+            .get("command")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("next"));
+        let control_arguments = control_request
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        requests.push(serde_json::json!({
+            "seq": seq,
+            "type": "request",
+            "command": control_command,
+            "arguments": control_arguments,
+        }));
+        control_requests.push((seq, control, control_request));
+    }
+    control_requests
+}
+
+fn editor_debug_breakpoint_summaries(
+    frames: &[serde_json::Value],
+    breakpoint_requests: Vec<(u64, PathBuf, Vec<u64>, serde_json::Value)>,
+) -> Vec<serde_json::Value> {
+    breakpoint_requests
+        .into_iter()
+        .map(|(seq, source_path, lines, request)| {
+            serde_json::json!({
+                "source": {
+                    "path": source_path.display().to_string(),
+                },
+                "lines": lines,
+                "request": request,
+                "response": dap_response_for_request_seq(frames, seq)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn editor_debug_control_summaries(
+    frames: &[serde_json::Value],
+    control_requests: Vec<(u64, EditorDebugControl, serde_json::Value)>,
+) -> Vec<serde_json::Value> {
+    control_requests
+        .into_iter()
+        .map(|(seq, control, control_request)| {
+            serde_json::json!({
+                "name": control.label(),
+                "request": control_request,
+                "response": dap_response_for_request_seq(frames, seq)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
 }
 
 fn editor_debug_adapter_json() -> serde_json::Value {
@@ -4946,6 +5052,8 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
                 "live": true,
             },
             "thread_id": 1,
+            "breakpoint_argument": "--breakpoint",
+            "breakpoint_format": "<path>:<line>",
             "reuse_session": true,
         },
         "controls": editor_debug_session_runner_controls_json(),
@@ -4973,6 +5081,60 @@ fn editor_debug_control_runner_command(control: EditorDebugControl) -> serde_jso
         "--control",
         control.cli_value()
     ])
+}
+
+fn editor_debug_breakpoint_runner_command(
+    path: &Path,
+    line: u64,
+    control: EditorDebugControl,
+) -> serde_json::Value {
+    serde_json::json!([
+        "orv",
+        "editor",
+        "run-debug",
+        EDITOR_DEBUG_SESSION_RUNNER_PATH,
+        "--breakpoint",
+        format!("{}:{line}", path.display()),
+        "--control",
+        control.cli_value()
+    ])
+}
+
+fn editor_debug_breakpoint_request_groups(
+    breakpoints: &[EditorDebugBreakpoint],
+) -> Vec<(PathBuf, Vec<u64>)> {
+    let mut grouped = BTreeMap::<PathBuf, BTreeSet<u64>>::new();
+    for breakpoint in breakpoints {
+        grouped
+            .entry(breakpoint.path.clone())
+            .or_default()
+            .insert(breakpoint.line);
+    }
+    grouped
+        .into_iter()
+        .map(|(path, lines)| (path, lines.into_iter().collect()))
+        .collect()
+}
+
+fn editor_debug_set_breakpoints_request_json(
+    seq: u64,
+    path: &Path,
+    lines: &[u64],
+) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "request",
+        "command": "setBreakpoints",
+        "arguments": {
+            "source": {
+                "path": path.display().to_string(),
+            },
+            "breakpoints": lines
+                .iter()
+                .map(|line| serde_json::json!({"line": line}))
+                .collect::<Vec<_>>(),
+        },
+    })
 }
 
 fn editor_debug_session_runner_controls_json() -> Vec<serde_json::Value> {
@@ -5035,10 +5197,25 @@ fn editor_debug_breakpoint_sources_json(files: &[SourceFile]) -> Vec<serde_json:
         .map(|(index, file)| {
             let source = dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX));
             let lines = dap_verified_breakpoint_lines(&file.path).unwrap_or_default();
+            let breakpoints = lines
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "line": line,
+                        "request": editor_debug_set_breakpoints_request_json(0, &file.path, &[*line]),
+                        "runner_command": editor_debug_breakpoint_runner_command(
+                            &file.path,
+                            *line,
+                            EditorDebugControl::Continue,
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "source": dap_source_json(&source),
                 "line_count": lines.len(),
                 "lines": lines,
+                "breakpoints": breakpoints,
             })
         })
         .collect()
@@ -5080,6 +5257,15 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .get("controls")
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
+    let breakpoint_count = debug
+        .get("breakpoint_sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |sources| {
+            sources
+                .iter()
+                .map(|source| json_usize_field(source, "line_count"))
+                .sum::<usize>()
+        });
     let control_commands = debug
         .get("controls")
         .and_then(serde_json::Value::as_array)
@@ -5112,6 +5298,15 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "runner_command": runner.get("command").cloned().unwrap_or_else(|| editor_debug_control_runner_command(EditorDebugControl::Next)),
             "control_commands": control_commands,
             "control_count": controls,
+            "breakpoint_argument": runner
+                .pointer("/session/breakpoint_argument")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("--breakpoint")),
+            "breakpoint_format": runner
+                .pointer("/session/breakpoint_format")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("<path>:<line>")),
+            "breakpoint_count": breakpoint_count,
             "reuse_session": runner
                 .pointer("/session/reuse_session")
                 .cloned()
@@ -5305,7 +5500,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str(&state_json);
     html.push_str("</script>\n");
     html.push_str(
-        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderDebugDetail(value){\n  const target = document.getElementById('debug-detail');\n  if (!target) return;\n  if (!value) {\n    target.textContent = 'No debug item selected.';\n    return;\n  }\n  target.textContent = JSON.stringify(value, null, 2);\n}\nfunction renderDebugRunner(runner){\n  const target = document.getElementById('debug-runner-detail');\n  if (!target) return;\n  target.textContent = runner ? JSON.stringify(runner, null, 2) : 'No debug runner.';\n}\nfunction debugBreakpointRows(state){\n  const rows = [];\n  for (const group of state.debug?.breakpoint_sources || []) {\n    for (const line of group.lines || []) {\n      rows.push({source: group.source || {}, line});\n    }\n  }\n  return rows;\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderTraceTransport(state){\n  const target = document.getElementById('trace-transport-detail');\n  if (!target) return;\n  const transport = state.trace?.live_refresh?.transport;\n  if (!transport) {\n    target.textContent = 'No trace transport.';\n    return;\n  }\n  target.textContent = [transport.kind, transport.event, transport.url].filter(Boolean).join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const debugConfigs = state.debug?.configurations || [];\n  put('debug-config-list', debugConfigs, item => item.name || item.request || 'debug', renderDebugDetail);\n  const debugBreakpoints = debugBreakpointRows(state);\n  put('debug-breakpoint-list', debugBreakpoints, breakpoint => {\n    const source = breakpoint.source || {};\n    return `${source.name || source.path || 'source'}:${breakpoint.line}`;\n  }, breakpoint => renderDebugDetail({\n    command: 'setBreakpoints',\n    arguments: {\n      source: breakpoint.source,\n      breakpoints: [{line: breakpoint.line}]\n    }\n  }));\n  renderDebugRunner(state.debug?.session_runner);\n  renderDebugDetail(debugConfigs[0]);\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n  renderTraceTransport(state);\n}\nrenderEditorState();\n</script>\n",
+        "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderDebugDetail(value){\n  const target = document.getElementById('debug-detail');\n  if (!target) return;\n  if (!value) {\n    target.textContent = 'No debug item selected.';\n    return;\n  }\n  target.textContent = JSON.stringify(value, null, 2);\n}\nfunction renderDebugRunner(runner){\n  const target = document.getElementById('debug-runner-detail');\n  if (!target) return;\n  target.textContent = runner ? JSON.stringify(runner, null, 2) : 'No debug runner.';\n}\nfunction debugBreakpointRows(state){\n  const rows = [];\n  for (const group of state.debug?.breakpoint_sources || []) {\n    const breakpoints = group.breakpoints || (group.lines || []).map(line => ({line}));\n    for (const breakpoint of breakpoints) {\n      rows.push({...breakpoint, source: group.source || {}, line: breakpoint.line});\n    }\n  }\n  return rows;\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderTraceTransport(state){\n  const target = document.getElementById('trace-transport-detail');\n  if (!target) return;\n  const transport = state.trace?.live_refresh?.transport;\n  if (!transport) {\n    target.textContent = 'No trace transport.';\n    return;\n  }\n  target.textContent = [transport.kind, transport.event, transport.url].filter(Boolean).join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const debugConfigs = state.debug?.configurations || [];\n  put('debug-config-list', debugConfigs, item => item.name || item.request || 'debug', renderDebugDetail);\n  const debugBreakpoints = debugBreakpointRows(state);\n  put('debug-breakpoint-list', debugBreakpoints, breakpoint => {\n    const source = breakpoint.source || {};\n    return `${source.name || source.path || 'source'}:${breakpoint.line}`;\n  }, breakpoint => {\n    const request = breakpoint.request || {\n      command: 'setBreakpoints',\n      arguments: {source: breakpoint.source, breakpoints: [{line: breakpoint.line}]}\n    };\n    renderDebugControlCommand({runner_command: breakpoint.runner_command || []});\n    renderDebugDetail({request, runner_command: breakpoint.runner_command || []});\n  });\n  renderDebugRunner(state.debug?.session_runner);\n  renderDebugDetail(debugConfigs[0]);\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n  renderTraceTransport(state);\n}\nrenderEditorState();\n</script>\n",
     );
     html.push_str(
         "<script>\nfunction renderDebugControlCommand(control){\n  const target = document.getElementById('debug-control-command');\n  if (!target) return;\n  const command = control?.runner_command || control?.command || [];\n  target.textContent = Array.isArray(command) ? command.join(' ') : JSON.stringify(command, null, 2);\n}\nfunction renderDebugControls(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-control-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  const controls = state.debug?.controls || [];\n  for (const control of controls) {\n    const row = document.createElement('li');\n    row.textContent = control.name || control.request?.command || 'control';\n    row.tabIndex = 0;\n    const show = () => {\n      renderDebugControlCommand(control);\n      renderDebugDetail(control.request || control);\n    };\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n  if (controls.length) renderDebugControlCommand(controls[0]);\n}\nrenderDebugControls();\n</script>\n</body>\n</html>\n",
@@ -29568,6 +29763,10 @@ define Auth() -> { @out "auth" }
             state["debug"]["session_runner"]["session"]["reuse_session"],
             true
         );
+        assert_eq!(
+            state["debug"]["session_runner"]["session"]["breakpoint_argument"],
+            "--breakpoint"
+        );
         assert_editor_debug_runner_artifact(&out, &state);
         assert_editor_native_host_manifest(&out, &state);
         assert_editor_debug_configurations(&state);
@@ -29584,6 +29783,7 @@ define Auth() -> { @out "auth" }
         let run = editor_debug_runner_session_json(
             &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
             &[EditorDebugControl::Next],
+            &[],
         )
         .expect("run standalone debug runner");
         assert_eq!(run["kind"], "orv.editor.debug.runner.result");
@@ -29608,6 +29808,11 @@ define Auth() -> { @out "auth" }
             native_host["debug"]["runner_command"],
             state["debug"]["session_runner"]["command"]
         );
+        assert_eq!(native_host["debug"]["breakpoint_argument"], "--breakpoint");
+        assert_eq!(native_host["debug"]["breakpoint_format"], "<path>:<line>");
+        assert!(native_host["debug"]["breakpoint_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
         let control_commands = native_host["debug"]["control_commands"]
             .as_array()
             .expect("native host control commands");
@@ -29644,6 +29849,23 @@ define Auth() -> { @out "auth" }
                 && source["lines"]
                     .as_array()
                     .is_some_and(|lines| lines.iter().any(|line| line == 1))
+        }));
+        assert!(breakpoint_sources.iter().any(|source| {
+            source["source"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("app.orv"))
+                && source["breakpoints"].as_array().is_some_and(|breakpoints| {
+                    breakpoints.iter().any(|breakpoint| {
+                        breakpoint["line"] == 1
+                            && breakpoint["request"]["command"] == "setBreakpoints"
+                            && breakpoint["runner_command"]
+                                .as_array()
+                                .is_some_and(|command| {
+                                    command.iter().any(|part| part == "--breakpoint")
+                                        && command.iter().any(|part| part == "continue")
+                                })
+                    })
+                })
         }));
     }
 
@@ -29743,7 +29965,7 @@ define Auth() -> { @out "auth" }
         let path = dir.join("app.orv");
         std::fs::write(&path, "let first: int = 1\nlet second: int = 2\n").expect("write source");
 
-        let debug = editor_debug_session_json(&path, &[EditorDebugControl::Next])
+        let debug = editor_debug_session_json(&path, &[EditorDebugControl::Next], &[])
             .expect("editor debug session");
 
         assert_eq!(debug["kind"], "orv.editor.debug");
@@ -29775,9 +29997,12 @@ define Auth() -> { @out "auth" }
         )
         .expect("write source");
 
-        let debug =
-            editor_debug_session_json(&path, &[EditorDebugControl::Next, EditorDebugControl::Next])
-                .expect("editor debug session");
+        let debug = editor_debug_session_json(
+            &path,
+            &[EditorDebugControl::Next, EditorDebugControl::Next],
+            &[],
+        )
+        .expect("editor debug session");
 
         let controls = debug["controls"].as_array().expect("controls");
         assert_eq!(controls.len(), 2);
@@ -29801,6 +30026,43 @@ define Auth() -> { @out "auth" }
     }
 
     #[test]
+    fn editor_debug_breakpoint_argument_stops_continue_at_line() {
+        let dir = temp_output_dir("editor-debug-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let breakpoint = EditorDebugBreakpoint {
+            path: path.clone(),
+            line: 3,
+        };
+
+        let debug =
+            editor_debug_session_json(&path, &[EditorDebugControl::Continue], &[breakpoint])
+                .expect("editor debug session");
+
+        assert_eq!(debug["transport"]["request_count"], 5);
+        assert_eq!(
+            debug["breakpoints"][0]["source"]["path"],
+            path.display().to_string()
+        );
+        assert_eq!(debug["breakpoints"][0]["lines"], serde_json::json!([3]));
+        assert_eq!(debug["breakpoints"][0]["response"]["success"], true);
+        assert!(debug["breakpoints"][0]["response"]["body"]["breakpoints"]
+            .as_array()
+            .expect("breakpoints")
+            .iter()
+            .any(|breakpoint| breakpoint["verified"] == true && breakpoint["line"] == 3));
+        assert_eq!(debug["control"]["request"]["command"], "continue");
+        assert_eq!(debug["control"]["response"]["success"], true);
+        assert_eq!(debug["stack"]["stackFrames"][0]["line"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn editor_run_debug_executes_exported_session_runner() {
         let dir = temp_output_dir("editor-run-debug");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -29816,6 +30078,7 @@ define Auth() -> { @out "auth" }
         let run = editor_debug_runner_session_json(
             &out.join("state.json"),
             &[EditorDebugControl::Next, EditorDebugControl::Next],
+            &[],
         )
         .expect("run exported debug runner");
 
@@ -29823,6 +30086,33 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
         assert_eq!(run["debug"]["transport"]["framing"], "content-length");
         assert_eq!(run["debug"]["transport"]["request_count"], 5);
+        assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_executes_exported_runner_with_breakpoint() {
+        let dir = temp_output_dir("editor-run-debug-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+        cmd_editor_export(&path, &out).expect("editor export");
+        let breakpoint = EditorDebugBreakpoint { path, line: 3 };
+
+        let run = editor_debug_runner_session_json(
+            &out.join("debug").join("session-runner.json"),
+            &[EditorDebugControl::Continue],
+            &[breakpoint],
+        )
+        .expect("run exported debug runner");
+
+        assert_eq!(run["kind"], "orv.editor.debug.runner.result");
+        assert_eq!(run["debug"]["breakpoints"][0]["response"]["success"], true);
         assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
         let _ = std::fs::remove_dir_all(dir);
     }
