@@ -26027,6 +26027,13 @@ entry = "src/main.orv"
             .expect("routes array")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        assert!(server_artifact["routes"][0]["response_origin_ids"]
+            .as_array()
+            .expect("route response origins")
+            .iter()
+            .any(|origin| origin
+                .as_str()
+                .is_some_and(|origin| origin.starts_with("ori_"))));
         assert!(server_artifact["source_bundle"]["files"]
             .as_array()
             .expect("source bundle files")
@@ -26123,7 +26130,13 @@ entry = "src/main.orv"
         let route_origin = server_artifact["routes"][0]["origin_id"]
             .as_str()
             .expect("route origin id");
+        let response_origin = server_artifact["routes"][0]["response_origin_ids"][0]
+            .as_str()
+            .expect("response origin id");
         assert!(native_route_table_source.contains("pub struct OrvNativeRoute"));
+        assert!(
+            native_route_table_source.contains("pub response_origin_ids: &'static [&'static str]")
+        );
         assert!(native_route_table_source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(native_route_table_source.contains("method: \"GET\""));
         assert!(native_route_table_source.contains("path: \"/ping\""));
@@ -26132,6 +26145,8 @@ entry = "src/main.orv"
             native_route_table_source.contains("orv_native_route_path_params(route.path, path)")
         );
         assert!(native_route_table_source.contains(&format!("origin_id: \"{route_origin}\"")));
+        assert!(native_route_table_source
+            .contains(&format!("response_origin_ids: &[\"{response_origin}\"]")));
         assert!(native_route_table_source
             .contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();"));
         let native_router_source_text =
@@ -26234,9 +26249,13 @@ entry = "src/main.orv"
         let route_origin = server_artifact["routes"][0]["origin_id"]
             .as_str()
             .expect("route origin id");
+        let response_origin = server_artifact["routes"][0]["response_origin_ids"][0]
+            .as_str()
+            .expect("response origin id");
 
         assert_eq!(native_plan["routes_source"], "server/native/routes.rs");
         assert!(source.contains("pub struct OrvNativeRoute"));
+        assert!(source.contains("pub response_origin_ids: &'static [&'static str]"));
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute {"));
         assert!(source.contains("method: \"GET\""));
@@ -26244,6 +26263,7 @@ entry = "src/main.orv"
         assert!(source.contains("pub fn orv_native_match_route("));
         assert!(source.contains("orv_native_route_path_params(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
+        assert!(source.contains(&format!("response_origin_ids: &[\"{response_origin}\"]")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );

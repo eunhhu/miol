@@ -305,6 +305,9 @@ pub struct ServerRouteArtifact {
     pub path: String,
     /// Origin id for production-to-code tracing.
     pub origin_id: String,
+    /// `@respond` origin ids contained in this route handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_origin_ids: Vec<String>,
 }
 
 /// One compiled server listen descriptor.
@@ -658,7 +661,7 @@ pub fn server_runtime_artifact(
         .entries
         .iter()
         .filter(|entry| entry.kind == "route")
-        .filter_map(route_artifact)
+        .filter_map(|entry| route_artifact(entry, origin_map))
         .collect();
     let listen = origin_map
         .entries
@@ -825,6 +828,7 @@ pub struct OrvNativeRoute {
     pub method: &'static str,
     pub path: &'static str,
     pub origin_id: &'static str,
+    pub response_origin_ids: &'static [&'static str],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -845,10 +849,16 @@ pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
     for route in &artifact.routes {
         let _ = writeln!(
             source,
-            "    OrvNativeRoute {{ method: {}, path: {}, origin_id: {} }},",
+            "    OrvNativeRoute {{ method: {}, path: {}, origin_id: {}, response_origin_ids: &[{}] }},",
             rust_string_literal(&route.method),
             rust_string_literal(&route.path),
-            rust_string_literal(&route.origin_id)
+            rust_string_literal(&route.origin_id),
+            route
+                .response_origin_ids
+                .iter()
+                .map(|id| rust_string_literal(id))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     source.push_str(
@@ -1101,13 +1111,35 @@ pub fn verify_source_bundle_artifact(artifact: &SourceBundleArtifact) -> Result<
     }
 }
 
-fn route_artifact(entry: &OriginEntry) -> Option<ServerRouteArtifact> {
+fn route_artifact(entry: &OriginEntry, origin_map: &OriginMap) -> Option<ServerRouteArtifact> {
     let (method, path) = entry.name.split_once(' ')?;
     Some(ServerRouteArtifact {
         method: method.to_string(),
         path: path.to_string(),
         origin_id: entry.id.clone(),
+        response_origin_ids: route_response_origin_ids(&entry.id, origin_map),
     })
+}
+
+fn route_response_origin_ids(route_origin_id: &str, origin_map: &OriginMap) -> Vec<String> {
+    let mut response_origin_ids = Vec::new();
+    for edge in origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.from == route_origin_id && edge.kind == "contains")
+    {
+        let Some(entry) = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.id == edge.to && entry.kind == "domain" && entry.name == "respond")
+        else {
+            continue;
+        };
+        if !response_origin_ids.contains(&entry.id) {
+            response_origin_ids.push(entry.id.clone());
+        }
+    }
+    response_origin_ids
 }
 
 fn listen_artifact(entry: &OriginEntry) -> ServerListenArtifact {
@@ -2191,6 +2223,8 @@ function greet(name: string): string -> "hi {name}""#,
         assert_eq!(artifact.routes[0].method, "GET");
         assert_eq!(artifact.routes[0].path, "/ping");
         assert!(artifact.routes[0].origin_id.starts_with("ori_"));
+        assert_eq!(artifact.routes[0].response_origin_ids.len(), 1);
+        assert!(artifact.routes[0].response_origin_ids[0].starts_with("ori_"));
         let listen = artifact.listen.as_ref().expect("listen descriptor");
         assert_eq!(listen.port, Some(8080));
         assert!(listen.origin_id.starts_with("ori_"));
@@ -2221,11 +2255,16 @@ function greet(name: string): string -> "hi {name}""#,
         let route_origin = &artifact.routes[0].origin_id;
 
         assert!(source.contains("pub struct OrvNativeRoute"));
+        assert!(source.contains("pub response_origin_ids: &'static [&'static str]"));
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute { method: \"GET\", path: \"/ping\", origin_id:"));
         assert!(source.contains("pub fn orv_native_match_route("));
         assert!(source.contains("orv_native_route_path_params(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
+        assert!(source.contains(&format!(
+            "response_origin_ids: &[{}]",
+            rust_string_literal(&artifact.routes[0].response_origin_ids[0])
+        )));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );
