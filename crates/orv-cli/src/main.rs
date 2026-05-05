@@ -18695,6 +18695,41 @@ entry = "src/main.orv"
         Ok(response)
     }
 
+    fn send_raw_http_json_post(address: &str, path: &str, body: &str) -> String {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match send_raw_http_json_post_once(address, path, body) {
+                Ok(response) if !response.is_empty() => return response,
+                Ok(_) => last_error = Some("empty response".to_string()),
+                Err(err) => last_error = Some(err.to_string()),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "read http response: {}",
+            last_error.unwrap_or_else(|| "no response".to_string())
+        );
+    }
+
+    fn send_raw_http_json_post_once(
+        address: &str,
+        path: &str,
+        body: &str,
+    ) -> std::io::Result<String> {
+        let mut stream = std::net::TcpStream::connect(address)?;
+        std::io::Write::write_all(
+            &mut stream,
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response)?;
+        Ok(response)
+    }
+
     fn spawn_one_shot_http_json(path: &'static str, body: Vec<u8>) -> (String, JoinHandle<()>) {
         spawn_one_shot_http_json_with_optional_auth(path, body, None)
     }
@@ -27257,6 +27292,86 @@ entry = "src/main.orv"
             "mixed native launcher cargo check should be warning-free:\n{stderr}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn generated_native_server_serves_mixed_static_and_request_body_field_response() {
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = temp_output_dir("native-mixed-body-field-server-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 404 { err: "product_not_found", sku: @body.sku }
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let out = temp_output_dir("native-mixed-body-field-server-build");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        cmd_verify_build(&out).expect("verify mixed native server build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--release")
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo build mixed native server");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "mixed native server cargo build failed:\n{stderr}"
+        );
+
+        let binary = out
+            .join("server")
+            .join("native")
+            .join("target")
+            .join("release")
+            .join("orv-native-server");
+        let mut child = std::process::Command::new(&binary)
+            .env("ORV_BUILD_DIR", &out)
+            .env("ORV_HOST", "127.0.0.1")
+            .env("ORV_PORT", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn generated native server");
+        let stderr = child.stderr.take().expect("native server stderr");
+        let child = ChildGuard(child);
+        let mut stderr = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut stderr, &mut line).expect("native server listen line");
+        let address = line
+            .trim()
+            .strip_prefix("orv native server listening on ")
+            .expect("native listen address");
+
+        let response = send_raw_http_json_post(address, "/orders", r#"{"sku":"sku-1"}"#);
+
+        assert!(response.starts_with("HTTP/1.1 404"));
+        assert!(response.contains("content-type: application/json"));
+        assert!(response.contains(r#"{"err":"product_not_found","sku":"sku-1"}"#));
+
+        drop(child);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&out);
     }
