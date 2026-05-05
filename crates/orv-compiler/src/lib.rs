@@ -1805,38 +1805,30 @@ pub fn orv_native_handle_route(
             native_route_count += 1;
             let _ = writeln!(
                 source,
-                r#"    if route_match.route.origin_id == {} {{
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body: {}.to_string(),
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&route.origin_id),
-                rust_string_literal(body_json),
-                rust_string_literal(&response.origin_id)
+                "    if route_match.route.origin_id == {} {{",
+                rust_string_literal(&route.origin_id)
+            );
+            let body_expr = format!("{}.to_string()", rust_string_literal(body_json));
+            push_native_handler_response_return(
+                &mut source,
+                status,
+                &body_expr,
+                &response.origin_id,
             );
             continue;
         }
         if response.body_kind == "empty" {
             native_route_count += 1;
             let _ = writeln!(
-                source,
-                r#"    if route_match.route.origin_id == {} {{
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body: String::new(),
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&route.origin_id),
-                rust_string_literal(&response.origin_id)
+                &mut source,
+                "    if route_match.route.origin_id == {} {{",
+                rust_string_literal(&route.origin_id)
+            );
+            push_native_handler_response_return(
+                &mut source,
+                status,
+                "String::new()",
+                &response.origin_id,
             );
             continue;
         }
@@ -1852,12 +1844,7 @@ pub fn orv_native_handle_route(
                 if index > 0 {
                     source.push_str("        body.push(',');\n");
                 }
-                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
-                let _ = writeln!(
-                    source,
-                    "        body.push_str({});",
-                    rust_string_literal(&field_prefix)
-                );
+                push_native_json_field_prefix(&mut source, &field.field);
                 match field.value_kind.as_str() {
                     "static_json" => {
                         let value_json = field.value_json.as_deref().unwrap_or("null");
@@ -1902,20 +1889,8 @@ pub fn orv_native_handle_route(
                     _ => source.push_str("        body.push_str(\"null\");\n"),
                 }
             }
-            let _ = writeln!(
-                source,
-                r#"        body.push('}}');
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body,
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&response.origin_id)
-            );
+            source.push_str("        body.push('}');\n");
+            push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
             continue;
         }
         if !response.body_query_params.is_empty() {
@@ -1931,32 +1906,15 @@ pub fn orv_native_handle_route(
                 if index > 0 {
                     source.push_str("        body.push(',');\n");
                 }
-                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
-                let _ = writeln!(
-                    source,
-                    "        body.push_str({});",
-                    rust_string_literal(&field_prefix)
-                );
+                push_native_json_field_prefix(&mut source, &field.field);
                 let _ = writeln!(
                     source,
                     "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
                     rust_string_literal(&field.param)
                 );
             }
-            let _ = writeln!(
-                source,
-                r#"        body.push('}}');
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body,
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&response.origin_id)
-            );
+            source.push_str("        body.push('}');\n");
+            push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
             continue;
         }
         if !response.body_request_json.is_empty() {
@@ -1971,30 +1929,13 @@ pub fn orv_native_handle_route(
                 if index > 0 {
                     source.push_str("        body.push(',');\n");
                 }
-                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
-                let _ = writeln!(
-                    source,
-                    "        body.push_str({});",
-                    rust_string_literal(&field_prefix)
-                );
+                push_native_json_field_prefix(&mut source, &field.field);
                 source.push_str(
                     "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
                 );
             }
-            let _ = writeln!(
-                source,
-                r#"        body.push('}}');
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body,
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&response.origin_id)
-            );
+            source.push_str("        body.push('}');\n");
+            push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
             continue;
         }
         if !response.body_request_fields.is_empty() {
@@ -2010,32 +1951,15 @@ pub fn orv_native_handle_route(
                 if index > 0 {
                     source.push_str("        body.push(',');\n");
                 }
-                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
-                let _ = writeln!(
-                    source,
-                    "        body.push_str({});",
-                    rust_string_literal(&field_prefix)
-                );
+                push_native_json_field_prefix(&mut source, &field.field);
                 let _ = writeln!(
                     source,
                     "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
                     rust_string_literal(&field.name)
                 );
             }
-            let _ = writeln!(
-                source,
-                r#"        body.push('}}');
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body,
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&response.origin_id)
-            );
+            source.push_str("        body.push('}');\n");
+            push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
             continue;
         }
         if !response.body_route_params.is_empty() {
@@ -2051,32 +1975,15 @@ pub fn orv_native_handle_route(
                 if index > 0 {
                     source.push_str("        body.push(',');\n");
                 }
-                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
-                let _ = writeln!(
-                    source,
-                    "        body.push_str({});",
-                    rust_string_literal(&field_prefix)
-                );
+                push_native_json_field_prefix(&mut source, &field.field);
                 let _ = writeln!(
                     source,
                     "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
                     rust_string_literal(&field.param)
                 );
             }
-            let _ = writeln!(
-                source,
-                r#"        body.push('}}');
-        return OrvNativeHandlerResponse {{
-            status: {status},
-            content_type: "application/json",
-            body,
-            origin_id: Some(route_match.route.origin_id),
-            response_origin_id: Some({}),
-            params: route_match.params.clone(),
-        }};
-    }}"#,
-                rust_string_literal(&response.origin_id)
-            );
+            source.push_str("        body.push('}');\n");
+            push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
         }
     }
     if native_route_count == artifact.routes.len() {
@@ -2125,6 +2032,36 @@ fn orv_native_push_json_string(value: &str, out: &mut String) {
         );
     }
     source
+}
+
+fn push_native_json_field_prefix(source: &mut String, field: &str) {
+    let field_prefix = format!("\"{}\":", json_escaped(field));
+    let _ = writeln!(
+        source,
+        "        body.push_str({});",
+        rust_string_literal(&field_prefix)
+    );
+}
+
+fn push_native_handler_response_return(
+    source: &mut String,
+    status: i64,
+    body_expr: &str,
+    response_origin_id: &str,
+) {
+    let _ = writeln!(
+        source,
+        r#"        return OrvNativeHandlerResponse {{
+            status: {status},
+            content_type: "application/json",
+            body: {body_expr},
+            origin_id: Some(route_match.route.origin_id),
+            response_origin_id: Some({}),
+            params: route_match.params.clone(),
+        }};
+    }}"#,
+        rust_string_literal(response_origin_id)
+    );
 }
 
 fn rust_string_literal(value: &str) -> String {
