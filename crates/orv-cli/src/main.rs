@@ -12443,6 +12443,24 @@ fn verify_native_server_plan_value(
     )?;
     let package_path = json_str(plan, "package", "native server plan")?;
     verify_native_server_launcher_package(&dir.join(package_path))?;
+    let expected_build = serde_json::json!([
+        "cargo",
+        "build",
+        "--manifest-path",
+        package_path,
+        "--release"
+    ]);
+    if plan.pointer("/commands/build") != Some(&expected_build) {
+        anyhow::bail!("native server plan build command must match generated launcher package");
+    }
+    let expected_run_env = serde_json::json!({ "ORV_BUILD_DIR": "." });
+    if plan.pointer("/commands/run/env") != Some(&expected_run_env) {
+        anyhow::bail!("native server plan run env must set ORV_BUILD_DIR to build directory");
+    }
+    let expected_run_command = serde_json::json!([NATIVE_SERVER_LAUNCHER_BINARY_PATH]);
+    if plan.pointer("/commands/run/command") != Some(&expected_run_command) {
+        anyhow::bail!("native server plan run command must match generated launcher binary");
+    }
     let launch = read_server_launch_artifact(&dir.join(launcher_path))?;
     if launch.artifact != artifact_path {
         anyhow::bail!("native server plan launcher artifact does not match server artifact");
@@ -16335,6 +16353,7 @@ const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
 const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
 const NATIVE_SERVER_PACKAGE_PATH: &str = "server/native/Cargo.toml";
 const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
+const NATIVE_SERVER_LAUNCHER_BINARY_PATH: &str = "./server/native/target/release/orv-native-server";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
 const CLIENT_WASM_RENDER_LEN_EXPORT: &str = "orv_render_len";
@@ -16654,6 +16673,23 @@ fn write_native_server_plan_artifact(
             "kind": "server_binary",
             "path": NATIVE_SERVER_BINARY_PATH,
             "protocol": "http1",
+        },
+        "commands": {
+            "build": [
+                "cargo",
+                "build",
+                "--manifest-path",
+                native_server_package_path,
+                "--release",
+            ],
+            "run": {
+                "env": {
+                    "ORV_BUILD_DIR": ".",
+                },
+                "command": [
+                    NATIVE_SERVER_LAUNCHER_BINARY_PATH,
+                ],
+            },
         },
         "blocked_by": ["native-codegen", "native-runtime-image"],
         "listen": server_artifact.listen.clone(),
@@ -25275,6 +25311,21 @@ entry = "src/main.orv"
         assert_eq!(native_plan["target"]["kind"], "server_binary");
         assert_eq!(native_plan["target"]["path"], "server/app");
         assert_eq!(native_plan["target"]["protocol"], "http1");
+        assert_eq!(
+            native_plan["commands"]["build"],
+            serde_json::json!([
+                "cargo",
+                "build",
+                "--manifest-path",
+                "server/native/Cargo.toml",
+                "--release"
+            ])
+        );
+        assert_eq!(native_plan["commands"]["run"]["env"]["ORV_BUILD_DIR"], ".");
+        assert_eq!(
+            native_plan["commands"]["run"]["command"],
+            serde_json::json!(["./server/native/target/release/orv-native-server"])
+        );
         assert_eq!(native_plan["listen"], server_artifact["listen"]);
         assert!(json_routes_include(&native_plan["routes"], "GET", "/ping"));
         assert!(native_plan["blocked_by"]
@@ -25554,6 +25605,42 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("native server plan artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_native_server_plan_command_mismatch() {
+        let (src_dir, path) = prod_server_source("native-server-plan-command-source");
+        let out = temp_output_dir("native-server-plan-command-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let native_plan_path = out.join("server").join("native-server.json");
+        let mut native_plan = read_json_value(&native_plan_path).expect("native server plan");
+        native_plan["commands"] = serde_json::json!({
+            "build": [
+                "wrong-cargo",
+                "build",
+                "--manifest-path",
+                "server/native/Cargo.toml",
+                "--release"
+            ],
+            "run": {
+                "env": {
+                    "ORV_BUILD_DIR": "."
+                },
+                "command": [
+                    "./server/native/target/release/orv-native-server"
+                ]
+            }
+        });
+        write_json(&native_plan_path, &native_plan).expect("write corrupt native server plan");
+
+        let err = cmd_verify_build(&out).expect_err("native server plan command mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("native server plan build command must match generated launcher package"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
