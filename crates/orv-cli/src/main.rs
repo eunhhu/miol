@@ -1559,9 +1559,10 @@ fn workspace_graph_view_html(graph: &serde_json::Value) -> String {
     let mut html = workspace_graph_view_head(member_count, edge_count);
     html.push_str(&workspace_graph_view_svg(members, edges));
     html.push_str("</section>");
+    html.push_str("<section class=\"filters\"><label>Search<input id=\"workspace-search\" type=\"search\" autocomplete=\"off\"></label></section>");
     html.push_str(&workspace_graph_member_rows(members));
     html.push_str(&workspace_graph_edge_rows(edges));
-    html.push_str("</main></body></html>");
+    html.push_str("<script>function filterWorkspaceGraphRows(){const query=(document.getElementById('workspace-search')?.value||'').toLowerCase();for(const row of document.querySelectorAll('[data-workspace-member-row],[data-workspace-edge-row]')){row.hidden=!!query&&!row.textContent.toLowerCase().includes(query);}}document.getElementById('workspace-search')?.addEventListener('input',filterWorkspaceGraphRows);filterWorkspaceGraphRows();</script></main></body></html>");
     html
 }
 
@@ -1570,7 +1571,7 @@ fn workspace_graph_view_head(member_count: usize, edge_count: usize) -> String {
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     html.push_str("<title>ORV Workspace Graph</title><style>");
-    html.push_str("body{margin:0;background:#f7f7f3;color:#242424;font:14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:1160px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;border-bottom:1px solid #d7d7cf;padding-bottom:14px}h1{font-size:24px;margin:0}p{margin:6px 0 0;color:#555}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:18px 0}.stat{border:1px solid #d7d7cf;background:#fff;padding:10px;border-radius:6px}.stat b{display:block;font-size:20px}.graph{overflow:auto;border:1px solid #d7d7cf;background:#fff;border-radius:6px}svg{display:block;min-width:900px}.edge{stroke:#b8b8ad;stroke-width:1.5}.dep{stroke:#c2410c}.node-label{font-size:12px;fill:#242424}.node-kind{font-size:10px;fill:#555}table{width:100%;border-collapse:collapse;margin-top:18px;background:#fff;border:1px solid #d7d7cf}th,td{padding:8px;border-bottom:1px solid #e5e5df;text-align:left}th{font-size:12px;text-transform:uppercase;color:#555}</style>");
+    html.push_str("body{margin:0;background:#f7f7f3;color:#242424;font:14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:1160px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;border-bottom:1px solid #d7d7cf;padding-bottom:14px}h1{font-size:24px;margin:0}p{margin:6px 0 0;color:#555}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:18px 0}.stat{border:1px solid #d7d7cf;background:#fff;padding:10px;border-radius:6px}.stat b{display:block;font-size:20px}.graph{overflow:auto;border:1px solid #d7d7cf;background:#fff;border-radius:6px}.filters{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}.filters label{display:grid;gap:4px;color:#555}.filters input{min-width:220px;border:1px solid #d7d7cf;background:#fff;padding:7px;font:inherit}svg{display:block;min-width:900px}.edge{stroke:#b8b8ad;stroke-width:1.5}.dep{stroke:#c2410c}.node-label{font-size:12px;fill:#242424}.node-kind{font-size:10px;fill:#555}table{width:100%;border-collapse:collapse;margin-top:18px;background:#fff;border:1px solid #d7d7cf}th,td{padding:8px;border-bottom:1px solid #e5e5df;text-align:left}th{font-size:12px;text-transform:uppercase;color:#555}</style>");
     html.push_str("</head><body data-member-count=\"");
     html.push_str(&member_count.to_string());
     html.push_str("\" data-edge-count=\"");
@@ -1588,7 +1589,7 @@ fn workspace_graph_member_rows(members: &[serde_json::Value]) -> String {
         "<table><thead><tr><th>Member</th><th>Name</th><th>Version</th><th>Entry</th></tr></thead><tbody>",
     );
     for member in members {
-        html.push_str("<tr><td>");
+        html.push_str("<tr data-workspace-member-row><td>");
         html.push_str(&html_escape_text(json_str_or_empty(member, "path")));
         html.push_str("</td><td>");
         html.push_str(&html_escape_text(json_str_or_empty(member, "name")));
@@ -1607,7 +1608,7 @@ fn workspace_graph_edge_rows(edges: &[serde_json::Value]) -> String {
         "<table><thead><tr><th>Kind</th><th>From</th><th>To</th><th>Package</th></tr></thead><tbody>",
     );
     for edge in edges {
-        html.push_str("<tr><td>");
+        html.push_str("<tr data-workspace-edge-row><td>");
         html.push_str(&html_escape_text(json_str_or_empty(edge, "kind")));
         html.push_str("</td><td>");
         html.push_str(&html_escape_text(json_str_or_empty(edge, "from")));
@@ -27342,6 +27343,10 @@ entry = "src/main.orv"
         assert!(html.contains("apps/web"));
         assert!(html.contains("shared/models"));
         assert!(html.contains("path_dependency"));
+        assert!(html.contains("id=\"workspace-search\""));
+        assert!(html.contains("data-workspace-member-row"));
+        assert!(html.contains("data-workspace-edge-row"));
+        assert!(html.contains("filterWorkspaceGraphRows"));
 
         let _ = std::fs::remove_dir_all(root);
     }
