@@ -35,6 +35,9 @@ pub const SERVER_LAUNCH_ARTIFACT_VERSION: u32 = 1;
 /// Current native server plan artifact schema version.
 pub const NATIVE_SERVER_PLAN_ARTIFACT_VERSION: u32 = 1;
 
+/// Current native runtime image plan artifact schema version.
+pub const NATIVE_RUNTIME_IMAGE_PLAN_ARTIFACT_VERSION: u32 = 1;
+
 /// Current build source bundle artifact schema version.
 pub const SOURCE_BUNDLE_ARTIFACT_VERSION: u32 = 1;
 
@@ -160,6 +163,8 @@ pub struct NativeServerPlanArtifact {
     pub source: String,
     /// Relative generated Rust launcher package path.
     pub package: String,
+    /// Relative native runtime image plan artifact path.
+    pub runtime_image_plan: String,
     /// Planned final native target.
     pub target: NativeServerTargetArtifact,
     /// Generated reference launcher commands.
@@ -199,6 +204,51 @@ pub struct NativeServerRunCommand {
     pub env: HashMap<String, String>,
     /// Run command argv.
     pub command: Vec<String>,
+}
+
+/// Planned native runtime image output descriptor.
+///
+/// This records the current reference runtime image and the future native OCI
+/// image target without claiming that the final image exists yet.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeRuntimeImagePlanArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Artifact kind.
+    pub kind: String,
+    /// Planning status, currently `planned`.
+    pub status: String,
+    /// Runtime model used before native codegen exists.
+    pub runtime: String,
+    /// Runtime layers required by this server artifact.
+    pub runtime_features: Vec<String>,
+    /// Relative server runtime artifact path.
+    pub artifact: String,
+    /// Relative native server plan artifact path.
+    pub native_plan: String,
+    /// Current reference container image used by deploy artifacts.
+    pub reference_image: String,
+    /// Planned final native runtime image target.
+    pub target: NativeRuntimeImageTargetArtifact,
+    /// Blockers before this can become a final native runtime image.
+    pub blocked_by: Vec<String>,
+    /// Source-backed listen descriptor used by the reference server.
+    pub listen: Option<ServerListenArtifact>,
+    /// HTTP route descriptors reachable through this image.
+    pub routes: Vec<ServerRouteArtifact>,
+}
+
+/// Planned final native runtime image target descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeRuntimeImageTargetArtifact {
+    /// Target kind, currently `oci_image`.
+    pub kind: String,
+    /// Planned image tag.
+    pub image: String,
+    /// Native server binary expected inside the image.
+    pub binary: String,
+    /// Transport protocol used by the image.
+    pub protocol: String,
 }
 
 /// Source snapshot embedded in the reference runtime artifact.
@@ -413,6 +463,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "server/native-server.json".to_string(),
         });
         artifacts.push(BuildArtifact {
+            kind: "native_runtime_image_plan".to_string(),
+            path: "server/runtime-image.json".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "native_server_launcher_source".to_string(),
             path: "server/native/main.rs".to_string(),
         });
@@ -473,6 +527,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "native_server_plan".to_string(),
             path: "server/native-server.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_runtime_image_plan".to_string(),
+            path: "server/runtime-image.json".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
         bundles.push(BundleTarget {

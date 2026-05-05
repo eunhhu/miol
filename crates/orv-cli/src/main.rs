@@ -12388,6 +12388,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
+            "native_runtime_image_plan" => verify_native_runtime_image_plan_target(dir, &target)?,
             "native_server_launcher_source" => verify_native_server_launcher_source(
                 &target,
                 SERVER_ARTIFACT_PATH,
@@ -12444,6 +12445,17 @@ fn verify_native_server_plan_target(dir: &Path, target: &Path) -> anyhow::Result
     )
 }
 
+fn verify_native_runtime_image_plan_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
+    let plan = read_json_value(target)?;
+    let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
+    verify_native_runtime_image_plan_value(
+        &plan,
+        SERVER_ARTIFACT_PATH,
+        NATIVE_SERVER_PLAN_PATH,
+        &artifact,
+    )
+}
+
 fn verify_native_server_plan_artifact(
     dir: &Path,
     path: &str,
@@ -12460,6 +12472,24 @@ fn verify_native_server_plan_artifact(
     }
     let plan = read_json_value(&native_plan_path)?;
     verify_native_server_plan_value(dir, &plan, artifact_path, launcher_path, artifact)
+}
+
+fn verify_native_runtime_image_plan_artifact(
+    dir: &Path,
+    path: &str,
+    artifact_path: &str,
+    native_plan_path: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let image_plan_path = dir.join(path);
+    if !image_plan_path.is_file() {
+        anyhow::bail!(
+            "missing native runtime image plan artifact: {}",
+            image_plan_path.display()
+        );
+    }
+    let plan = read_json_value(&image_plan_path)?;
+    verify_native_runtime_image_plan_value(&plan, artifact_path, native_plan_path, artifact)
 }
 
 fn verify_native_server_plan_value(
@@ -12499,6 +12529,7 @@ fn verify_native_server_plan_value(
     )?;
     let package_path = json_str(plan, "package", "native server plan")?;
     verify_native_server_launcher_package(&dir.join(package_path))?;
+    verify_native_server_plan_runtime_image(plan)?;
     let expected_build = serde_json::json!([
         "cargo",
         "build",
@@ -12563,6 +12594,105 @@ fn verify_native_server_plan_value(
     let artifact_routes = serde_json::to_value(&artifact.routes)?;
     if plan.get("routes") != Some(&artifact_routes) {
         anyhow::bail!("native server plan routes do not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_server_plan_runtime_image(plan: &serde_json::Value) -> anyhow::Result<()> {
+    if json_str(plan, "runtime_image_plan", "native server plan")? != NATIVE_RUNTIME_IMAGE_PLAN_PATH
+    {
+        anyhow::bail!(
+            "native server plan runtime_image_plan must be {NATIVE_RUNTIME_IMAGE_PLAN_PATH}"
+        );
+    }
+    Ok(())
+}
+
+fn verify_native_runtime_image_plan_value(
+    plan: &serde_json::Value,
+    artifact_path: &str,
+    native_plan_path: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    if plan
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(
+            orv_compiler::NATIVE_RUNTIME_IMAGE_PLAN_ARTIFACT_VERSION,
+        ))
+    {
+        anyhow::bail!(
+            "native runtime image plan schema_version must be {}",
+            orv_compiler::NATIVE_RUNTIME_IMAGE_PLAN_ARTIFACT_VERSION
+        );
+    }
+    if json_str(plan, "kind", "native runtime image plan")? != "native_runtime_image_plan" {
+        anyhow::bail!("native runtime image plan kind must be native_runtime_image_plan");
+    }
+    if json_str(plan, "status", "native runtime image plan")? != "planned" {
+        anyhow::bail!("native runtime image plan status must be planned");
+    }
+    if json_str(plan, "artifact", "native runtime image plan")? != artifact_path {
+        anyhow::bail!("native runtime image plan artifact must be {artifact_path}");
+    }
+    if json_str(plan, "native_plan", "native runtime image plan")? != native_plan_path {
+        anyhow::bail!("native runtime image plan native_plan must be {native_plan_path}");
+    }
+    if json_str(plan, "runtime", "native runtime image plan")? != artifact.runtime {
+        anyhow::bail!("native runtime image plan runtime does not match runtime artifact");
+    }
+    if plan.get("runtime_features") != Some(&serde_json::to_value(&artifact.runtime_features)?) {
+        anyhow::bail!("native runtime image plan runtime_features do not match runtime artifact");
+    }
+    if json_str(plan, "reference_image", "native runtime image plan")?
+        != ORV_REFERENCE_RUNTIME_IMAGE
+    {
+        anyhow::bail!(
+            "native runtime image plan reference_image must be {ORV_REFERENCE_RUNTIME_IMAGE}"
+        );
+    }
+    let target = plan
+        .get("target")
+        .ok_or_else(|| anyhow::anyhow!("native runtime image plan target must be an object"))?;
+    if json_str(target, "kind", "native runtime image plan target")? != "oci_image" {
+        anyhow::bail!("native runtime image plan target kind must be oci_image");
+    }
+    if json_str(target, "image", "native runtime image plan target")? != NATIVE_RUNTIME_IMAGE_NAME {
+        anyhow::bail!("native runtime image plan target image must be {NATIVE_RUNTIME_IMAGE_NAME}");
+    }
+    if json_str(target, "binary", "native runtime image plan target")? != NATIVE_SERVER_BINARY_PATH
+    {
+        anyhow::bail!(
+            "native runtime image plan target binary must be {NATIVE_SERVER_BINARY_PATH}"
+        );
+    }
+    if json_str(target, "protocol", "native runtime image plan target")? != "http1" {
+        anyhow::bail!("native runtime image plan target protocol must be http1");
+    }
+    let blocked_by = plan
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("native runtime image plan blocked_by must be an array"))?;
+    if !blocked_by
+        .iter()
+        .any(|item| item.as_str() == Some("native-codegen"))
+    {
+        anyhow::bail!("native runtime image plan blocked_by must include native-codegen");
+    }
+    if !blocked_by
+        .iter()
+        .any(|item| item.as_str() == Some("native-runtime-image"))
+    {
+        anyhow::bail!("native runtime image plan blocked_by must include native-runtime-image");
+    }
+    verify_deploy_listen_value(
+        plan.get("listen"),
+        artifact.listen.as_ref(),
+        "native runtime image plan",
+    )?;
+    let artifact_routes = serde_json::to_value(&artifact.routes)?;
+    if plan.get("routes") != Some(&artifact_routes) {
+        anyhow::bail!("native runtime image plan routes do not match runtime artifact");
     }
     Ok(())
 }
@@ -13638,6 +13768,7 @@ fn verify_deploy_server_target(
     let entrypoint = json_str(server, "entrypoint", "deploy server")?;
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
     let native_plan = json_str(server, "native_plan", "deploy server")?;
+    let native_runtime_image_plan = json_str(server, "native_runtime_image_plan", "deploy server")?;
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
@@ -13646,18 +13777,7 @@ fn verify_deploy_server_target(
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
         anyhow::bail!("deploy server runtime_image must be {ORV_REFERENCE_RUNTIME_IMAGE}");
     }
-    let entrypoint_path = dir.join(entrypoint);
-    if !entrypoint_path.is_file() {
-        anyhow::bail!(
-            "missing deploy server entrypoint: {}",
-            entrypoint_path.display()
-        );
-    }
-    let script = std::fs::read_to_string(&entrypoint_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", entrypoint_path.display()))?;
-    if !script.contains("orv run-artifact") {
-        anyhow::bail!("deploy server entrypoint must run `orv run-artifact`");
-    }
+    verify_deploy_server_entrypoint(dir, entrypoint)?;
     let artifact = read_server_artifact(&dir.join(artifact_path))?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
@@ -13675,6 +13795,13 @@ fn verify_deploy_server_target(
         native_plan,
         artifact_path,
         SERVER_LAUNCH_PATH,
+        &artifact,
+    )?;
+    verify_native_runtime_image_plan_artifact(
+        dir,
+        native_runtime_image_plan,
+        artifact_path,
+        native_plan,
         &artifact,
     )?;
     verify_deploy_container_artifact(
@@ -13725,6 +13852,22 @@ fn verify_deploy_server_target(
     }
     if server.get("persistence") != Some(&deploy_persistence_value(&persistence)) {
         anyhow::bail!("deploy server persistence does not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_deploy_server_entrypoint(dir: &Path, entrypoint: &str) -> anyhow::Result<()> {
+    let entrypoint_path = dir.join(entrypoint);
+    if !entrypoint_path.is_file() {
+        anyhow::bail!(
+            "missing deploy server entrypoint: {}",
+            entrypoint_path.display()
+        );
+    }
+    let script = std::fs::read_to_string(&entrypoint_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", entrypoint_path.display()))?;
+    if !script.contains("orv run-artifact") {
+        anyhow::bail!("deploy server entrypoint must run `orv run-artifact`");
     }
     Ok(())
 }
@@ -15766,6 +15909,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let server_artifact_path = SERVER_ARTIFACT_PATH;
     let server_launch_path = SERVER_LAUNCH_PATH;
     let native_server_plan_path = NATIVE_SERVER_PLAN_PATH;
+    let native_runtime_image_plan_path = NATIVE_RUNTIME_IMAGE_PLAN_PATH;
     let native_server_source_path = NATIVE_SERVER_SOURCE_PATH;
     let native_server_package_path = NATIVE_SERVER_PACKAGE_PATH;
     let source_bundle = orv_compiler::source_bundle_artifact(
@@ -15822,13 +15966,20 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             &out.join(server_launch_path),
             &serde_json::to_value(launch)?,
         )?;
-        write_native_server_plan_artifact(
+        let native_server_paths = NativeServerPlanPaths {
+            plan: native_server_plan_path,
+            artifact: server_artifact_path,
+            launcher: server_launch_path,
+            source: native_server_source_path,
+            package: native_server_package_path,
+            runtime_image_plan: native_runtime_image_plan_path,
+        };
+        write_native_server_plan_artifact(out, &native_server_paths, server_artifact)?;
+        write_native_runtime_image_plan_artifact(
             out,
-            native_server_plan_path,
+            native_runtime_image_plan_path,
             server_artifact_path,
-            server_launch_path,
-            native_server_source_path,
-            native_server_package_path,
+            native_server_plan_path,
             server_artifact,
         )?;
         write_native_server_launcher_source(
@@ -15872,6 +16023,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
                 client_wasm_path: client_wasm_path.as_deref(),
                 server_artifact_path,
                 native_server_plan_path,
+                native_runtime_image_plan_path,
             },
         )?;
     }
@@ -16420,10 +16572,12 @@ const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
+const NATIVE_RUNTIME_IMAGE_PLAN_PATH: &str = "server/runtime-image.json";
 const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
 const NATIVE_SERVER_PACKAGE_PATH: &str = "server/native/Cargo.toml";
 const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
 const NATIVE_SERVER_LAUNCHER_BINARY_PATH: &str = "./server/native/target/release/orv-native-server";
+const NATIVE_RUNTIME_IMAGE_NAME: &str = "orv-native-server:latest";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
 const CLIENT_WASM_RENDER_LEN_EXPORT: &str = "orv_render_len";
@@ -16720,13 +16874,18 @@ fn write_client_page_shell(path: &Path, entry: &Path, loader_src: &str) -> anyho
     write_text(path, &html)
 }
 
+struct NativeServerPlanPaths<'a> {
+    plan: &'a str,
+    artifact: &'a str,
+    launcher: &'a str,
+    source: &'a str,
+    package: &'a str,
+    runtime_image_plan: &'a str,
+}
+
 fn write_native_server_plan_artifact(
     out: &Path,
-    path: &str,
-    server_artifact_path: &str,
-    server_launch_path: &str,
-    native_server_source_path: &str,
-    native_server_package_path: &str,
+    paths: &NativeServerPlanPaths<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
     let plan = orv_compiler::NativeServerPlanArtifact {
@@ -16735,10 +16894,11 @@ fn write_native_server_plan_artifact(
         status: "planned".to_string(),
         runtime: server_artifact.runtime.clone(),
         runtime_features: server_artifact.runtime_features.clone(),
-        artifact: server_artifact_path.to_string(),
-        launcher: server_launch_path.to_string(),
-        source: native_server_source_path.to_string(),
-        package: native_server_package_path.to_string(),
+        artifact: paths.artifact.to_string(),
+        launcher: paths.launcher.to_string(),
+        source: paths.source.to_string(),
+        package: paths.package.to_string(),
+        runtime_image_plan: paths.runtime_image_plan.to_string(),
         target: orv_compiler::NativeServerTargetArtifact {
             kind: "server_binary".to_string(),
             path: NATIVE_SERVER_BINARY_PATH.to_string(),
@@ -16749,13 +16909,45 @@ fn write_native_server_plan_artifact(
                 "cargo".to_string(),
                 "build".to_string(),
                 "--manifest-path".to_string(),
-                native_server_package_path.to_string(),
+                paths.package.to_string(),
                 "--release".to_string(),
             ],
             run: orv_compiler::NativeServerRunCommand {
                 env: HashMap::from([("ORV_BUILD_DIR".to_string(), ".".to_string())]),
                 command: vec![NATIVE_SERVER_LAUNCHER_BINARY_PATH.to_string()],
             },
+        },
+        blocked_by: vec![
+            "native-codegen".to_string(),
+            "native-runtime-image".to_string(),
+        ],
+        listen: server_artifact.listen.clone(),
+        routes: server_artifact.routes.clone(),
+    };
+    write_json(&out.join(paths.plan), &serde_json::to_value(plan)?)
+}
+
+fn write_native_runtime_image_plan_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact_path: &str,
+    native_server_plan_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let plan = orv_compiler::NativeRuntimeImagePlanArtifact {
+        schema_version: orv_compiler::NATIVE_RUNTIME_IMAGE_PLAN_ARTIFACT_VERSION,
+        kind: "native_runtime_image_plan".to_string(),
+        status: "planned".to_string(),
+        runtime: server_artifact.runtime.clone(),
+        runtime_features: server_artifact.runtime_features.clone(),
+        artifact: server_artifact_path.to_string(),
+        native_plan: native_server_plan_path.to_string(),
+        reference_image: ORV_REFERENCE_RUNTIME_IMAGE.to_string(),
+        target: orv_compiler::NativeRuntimeImageTargetArtifact {
+            kind: "oci_image".to_string(),
+            image: NATIVE_RUNTIME_IMAGE_NAME.to_string(),
+            binary: NATIVE_SERVER_BINARY_PATH.to_string(),
+            protocol: "http1".to_string(),
         },
         blocked_by: vec![
             "native-codegen".to_string(),
@@ -16864,6 +17056,7 @@ struct ProdBuildTargets<'a> {
     client_wasm_path: Option<&'a str>,
     server_artifact_path: &'a str,
     native_server_plan_path: &'a str,
+    native_runtime_image_plan_path: &'a str,
 }
 
 fn write_prod_deploy_artifacts(
@@ -16900,6 +17093,7 @@ fn write_prod_deploy_artifacts(
             "entrypoint": entrypoint,
             "routes_artifact": routes_artifact,
             "native_plan": targets.native_server_plan_path,
+            "native_runtime_image_plan": targets.native_runtime_image_plan_path,
             "container": container,
             "dockerfile": dockerfile,
             "compose": compose,
@@ -25443,6 +25637,79 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_writes_native_runtime_image_plan_contract() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("native-runtime-image-plan");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let image_plan_path = out.join("server").join("runtime-image.json");
+        assert!(
+            image_plan_path.is_file(),
+            "missing {}",
+            image_plan_path.display()
+        );
+        let image_plan = read_json_value(&image_plan_path).expect("runtime image plan");
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let native_plan =
+            read_json_value(&out.join(NATIVE_SERVER_PLAN_PATH)).expect("native server plan");
+        assert_manifest_artifact(
+            &out.join("build-manifest.json"),
+            "native_runtime_image_plan",
+            "server/runtime-image.json",
+        );
+        assert_bundle_target(
+            &out.join("bundle-plan.json"),
+            "native_runtime_image_plan",
+            "server/runtime-image.json",
+        );
+        assert_eq!(
+            native_plan["runtime_image_plan"],
+            "server/runtime-image.json"
+        );
+        assert_eq!(image_plan["kind"], "native_runtime_image_plan");
+        assert_eq!(image_plan["status"], "planned");
+        assert_eq!(image_plan["artifact"], SERVER_ARTIFACT_PATH);
+        assert_eq!(image_plan["native_plan"], NATIVE_SERVER_PLAN_PATH);
+        assert_eq!(image_plan["runtime"], server_artifact["runtime"]);
+        assert_eq!(
+            image_plan["reference_image"],
+            "ghcr.io/orv-lang/orv-reference:latest"
+        );
+        assert_eq!(image_plan["target"]["kind"], "oci_image");
+        assert_eq!(image_plan["target"]["binary"], NATIVE_SERVER_BINARY_PATH);
+        assert_eq!(image_plan["routes"], server_artifact["routes"]);
+
+        cmd_verify_build(&out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    fn assert_manifest_artifact(path: &Path, kind: &str, artifact_path: &str) {
+        let manifest = read_json_value(path).expect("build manifest");
+        assert!(
+            manifest["artifacts"]
+                .as_array()
+                .expect("manifest artifacts")
+                .iter()
+                .any(|artifact| artifact["kind"] == kind && artifact["path"] == artifact_path),
+            "missing manifest artifact {kind}"
+        );
+    }
+
+    fn assert_bundle_target(path: &Path, kind: &str, target_path: &str) {
+        let plan = read_json_value(path).expect("bundle plan");
+        assert!(
+            plan["bundles"]
+                .as_array()
+                .expect("bundle targets")
+                .iter()
+                .any(|bundle| bundle["kind"] == kind && bundle["path"] == target_path),
+            "missing bundle target {kind}"
+        );
+    }
+
+    #[test]
     fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
         let (src_dir, path) = prod_server_source("build-prod-source");
         let out = temp_output_dir("build-prod-artifacts");
@@ -25509,6 +25776,10 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
+        assert_eq!(
+            deploy["server"]["native_runtime_image_plan"],
+            "server/runtime-image.json"
+        );
         assert_eq!(
             deploy["server"]["runtime_image"],
             "ghcr.io/orv-lang/orv-reference:latest"
