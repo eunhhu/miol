@@ -105,6 +105,21 @@ function readInitialRender(instance) {
   return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
 }
 
+function validateInitialRender(manifest, html) {
+  const expected = manifest.initial_render || {};
+  if (expected.content_type !== "text/html" || expected.encoding !== "utf-8") {
+    throw new Error("orv client initial render metadata mismatch");
+  }
+  const bytes = new TextEncoder().encode(html);
+  const actualHash = fnv1a64(bytes);
+  if (actualHash !== expected.html_hash) {
+    throw new Error(`orv client initial render hash mismatch: expected ${expected.html_hash}, got ${actualHash}`);
+  }
+  if (bytes.length !== expected.byte_length) {
+    throw new Error(`orv client initial render byte length mismatch: expected ${expected.byte_length}, got ${bytes.length}`);
+  }
+}
+
 async function main() {
   const manifest = await loadClientManifest();
   const reactivePlan = await loadReactivePlan(manifest);
@@ -113,6 +128,7 @@ async function main() {
   const bytes = await response.arrayBuffer();
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const initialRender = readInitialRender(instance);
+  validateInitialRender(manifest, initialRender);
   if (root && initialRender) {
     root.innerHTML = initialRender;
   }

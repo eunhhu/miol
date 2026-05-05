@@ -180,7 +180,7 @@ HIR + 프로젝트 그래프 → 최적화된 출력 코드
 최적화된 코드 → 실행 가능 번들
 ```
 
-완전한 서버 네이티브 바이너리와 동적/최적화 클라이언트 WASM/JS 코드젠은 아직 로드맵이다. 현재는 서버 entry에서 `server/native-server.json` planned binary contract와 static-lowered route를 직접 HTTP dispatch하고 dynamic route는 reference bridge로 유지하는 `server/native/Cargo.toml`/`server/native/main.rs` incremental native launcher package를, `let sig` 또는 client-side HTML await가 필요한 entry에서 page shell, client manifest URL, reactive plan, source bundle entry/hash를 담고 런타임 manifest/reactive-plan/source hash check를 수행하는 `ORV_CLIENT_BOOTSTRAP` metadata JS bootstrap, `orv.client` custom section, `orv_start`, initial-render memory, `orv_render_ptr`, `orv_render_len` exports를 담은 유효 WASM module인 `client/app.wasm`, 그리고 page/reactive-plan/loader/WASM/source hash/export/initial-render 계약을 묶는 `client/manifest.json`을 출력해 bundle/verify/deploy/reveal 계약을 먼저 고정한다.
+완전한 서버 네이티브 바이너리와 동적/최적화 클라이언트 WASM/JS 코드젠은 아직 로드맵이다. 현재는 서버 entry에서 `server/native-server.json` planned binary contract와 static-lowered route를 직접 HTTP dispatch하고 dynamic route는 reference bridge로 유지하는 `server/native/Cargo.toml`/`server/native/main.rs` incremental native launcher package를, `let sig` 또는 client-side HTML await가 필요한 entry에서 page shell, client manifest URL, reactive plan, source bundle entry/hash를 담고 런타임 manifest/reactive-plan/source hash/initial-render check를 수행하는 `ORV_CLIENT_BOOTSTRAP` metadata JS bootstrap, `orv.client` custom section, `orv_start`, initial-render memory, `orv_render_ptr`, `orv_render_len` exports를 담은 유효 WASM module인 `client/app.wasm`, 그리고 page/reactive-plan/loader/WASM/source hash/export/initial-render 계약을 묶는 `client/manifest.json`을 출력해 bundle/verify/deploy/reveal 계약을 먼저 고정한다.
 
 ## 로드맵 번들 출력 구조
 

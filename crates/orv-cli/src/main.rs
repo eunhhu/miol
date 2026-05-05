@@ -13376,6 +13376,14 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("instance.exports.orv_start()") {
         anyhow::bail!("client_js bundle does not call {CLIENT_WASM_START_EXPORT}");
     }
+    if !source.contains("validateInitialRender")
+        || !source.contains("initial_render")
+        || !source.contains("html_hash")
+        || !source.contains("client initial render hash mismatch")
+        || !source.contains("client initial render byte length mismatch")
+    {
+        anyhow::bail!("client_js bundle does not verify initial render contract");
+    }
     Ok(())
 }
 
@@ -28706,6 +28714,9 @@ entry = "src/main.orv"
             "source bundle hash mismatch",
             "runtimeFeatures",
             "WebAssembly.instantiate",
+            "validateInitialRender",
+            "initial_render",
+            "client initial render hash mismatch",
             "orv_start",
             "orv_render_ptr",
             "orv_render_len",
@@ -31288,6 +31299,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         assert!(
             err.to_string().contains("client reactive plan"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_js_without_initial_render_hash_check() {
+        let out = temp_output_dir("verify-build-client-js-initial-render");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let loader_path = build_out.join("client").join("app.js");
+        let loader = std::fs::read_to_string(&loader_path)
+            .expect("client loader")
+            .replace("validateInitialRender", "skipInitialRenderValidation");
+        std::fs::write(&loader_path, loader).expect("rewrite loader");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
+
+        assert!(
+            err.to_string().contains("initial render"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
