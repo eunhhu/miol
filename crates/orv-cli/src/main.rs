@@ -27720,7 +27720,7 @@ entry = "src/main.orv"
         let path = dir.join("app.orv");
         std::fs::write(
             &path,
-            r"@server {
+            r#"@server {
   @listen 8080
   @route GET /products/:id {
     @respond 200 { id: @param.id as int }
@@ -27731,6 +27731,13 @@ entry = "src/main.orv"
       doubled: (@param.id as int) * 2,
       half: (@param.id as int) / 2,
       parity: (@param.id as int) % 2
+    }
+  }
+  @route GET /products/:id/mixed {
+    @respond 200 {
+      kind: "calc",
+      next_id: (@param.id as int) + 1,
+      prev_page: (@query.page as int) - 1
     }
   }
   @route GET /search {
@@ -27748,7 +27755,7 @@ entry = "src/main.orv"
     }
   }
 }
-",
+"#,
         )
         .expect("write source");
         let out = temp_output_dir("native-param-query-cast-server-build");
@@ -27797,6 +27804,7 @@ entry = "src/main.orv"
 
         let route_response = send_raw_http(address, "/products/42");
         let route_math_response = send_raw_http(address, "/products/13/math");
+        let route_mixed_response = send_raw_http(address, "/products/41/mixed?page=13");
         let query_response = send_raw_http(address, "/search?page=12.5");
         let next_response = send_raw_http(address, "/search/next?page=12");
         let math_response = send_raw_http(address, "/search/math?page=13");
@@ -27805,6 +27813,8 @@ entry = "src/main.orv"
         assert!(route_response.contains(r#"{"id":42}"#));
         assert!(route_math_response.starts_with("HTTP/1.1 200"));
         assert!(route_math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
+        assert!(route_mixed_response.starts_with("HTTP/1.1 200"));
+        assert!(route_mixed_response.contains(r#"{"kind":"calc","next_id":42,"prev_page":12}"#));
         assert!(query_response.starts_with("HTTP/1.1 200"));
         assert!(query_response.contains(r#"{"page":12.5}"#));
         assert!(next_response.starts_with("HTTP/1.1 200"));

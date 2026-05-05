@@ -58,7 +58,7 @@
 
 **Native empty response delta (2026-05-06):** Static `@respond` payloads with 1xx/204/304 statuses and explicit `void` payloads now lower into `empty` metadata and generated native handlers. The direct HTTP response writer suppresses body bytes and body `content-type` for those statuses to match reference runtime HTTP semantics.
 
-**Native mixed object response delta (2026-05-06):** Single-response `@respond` object bodies that mix static literal fields with direct request-domain fields, such as `{ err: "product_not_found", sku: @body.sku }`, now lower into ordered `mixed_json` metadata and generated native handlers.
+**Native mixed object response delta (2026-05-06):** Single-response `@respond` object bodies that mix static literal fields with direct request-domain fields, such as `{ err: "product_not_found", sku: @body.sku }`, now lower into ordered `mixed_json` metadata and generated native handlers. Mixed objects also preserve supported captured numeric operations, so shapes such as `{ kind: "calc", next_id: (@param.id as int) + 1, prev_page: (@query.page as int) - 1 }` stay on the direct native path instead of falling back to the reference bridge.
 
 **Native guarded response flow delta (2026-05-06):** Simple route handlers shaped as one or more `if @body.field == "literal" { @respond ... }` or `if @body.left != @body.right { @respond ... }` guards followed by an unconditional `@respond` now lower response guard metadata into `server/app.orv-runtime.json` and generated native handlers. The direct launcher serves these guarded multi-response routes without the reference bridge; dynamic guarded routes with casts, DB calls, or unsupported branch shapes still fall back.
 
