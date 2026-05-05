@@ -2400,13 +2400,18 @@ fn push_native_int_success_arm(
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
             true
         }
-        (Some("add"), Some(operand_json)) => {
+        (Some("add" | "mul"), Some(operand_json)) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
             };
+            let method = if op == Some("mul") {
+                "checked_mul"
+            } else {
+                "checked_add"
+            };
             let _ = writeln!(
                 source,
-                "            Ok(value) => match value.checked_add({operand}) {{"
+                "            Ok(value) => match value.{method}({operand}) {{"
             );
             source.push_str(
                 "                Some(value) => body.push_str(&value.to_string()),\n                None => {\n",
@@ -3091,16 +3096,19 @@ fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseVa
 
 fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
-        HirExprKind::Binary {
-            op: BinaryOp::Add,
-            lhs,
-            rhs,
-        } => {
+        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Add | BinaryOp::Mul) => {
             let mut value = request_body_field_value(lhs)?;
             if value.value_kind != "request_body_field_int" || value.op.is_some() {
                 return None;
             }
-            value.op = Some("add".to_string());
+            value.op = Some(
+                match op {
+                    BinaryOp::Add => "add",
+                    BinaryOp::Mul => "mul",
+                    _ => return None,
+                }
+                .to_string(),
+            );
             value.operand_json = Some(static_integer(rhs)?.to_string());
             Some(value)
         }
@@ -5150,6 +5158,47 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(handlers.contains(".trim().parse::<i64>()"));
         assert!(handlers.contains("value.checked_add(1)"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_mul_literal_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { cents: (@body.quantity as int) * 100 }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "cents");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("100")
+        );
+        assert!(handlers.contains(".trim().parse::<i64>()"));
+        assert!(handlers.contains("value.checked_mul(100)"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
