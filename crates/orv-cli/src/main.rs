@@ -5310,6 +5310,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let breakpoint_commands = editor_native_host_breakpoint_commands_json(debug);
     let trace_enabled = state.get("trace").is_some();
     serde_json::json!({
         "schema_version": 1,
@@ -5325,6 +5326,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "adapter_command": adapter.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "dap", "serve", "--stdio"])),
             "runner_command": runner.get("command").cloned().unwrap_or_else(|| editor_debug_control_runner_command(EditorDebugControl::Next)),
             "control_commands": control_commands,
+            "breakpoint_commands": breakpoint_commands,
             "control_count": controls,
             "breakpoint_argument": runner
                 .pointer("/session/breakpoint_argument")
@@ -5348,6 +5350,45 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "trace_navigation": trace_enabled,
         },
     })
+}
+
+fn editor_native_host_breakpoint_commands_json(
+    debug: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut commands = Vec::new();
+    let Some(sources) = debug
+        .get("breakpoint_sources")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return commands;
+    };
+    for source_group in sources {
+        let source = source_group
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(breakpoints) = source_group
+            .get("breakpoints")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for breakpoint in breakpoints {
+            commands.push(serde_json::json!({
+                "source": source,
+                "line": breakpoint.get("line").cloned().unwrap_or(serde_json::Value::Null),
+                "request": breakpoint
+                    .get("request")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                "command": breakpoint
+                    .get("runner_command")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            }));
+        }
+    }
+    commands
 }
 
 fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value {
@@ -29871,6 +29912,20 @@ define Auth() -> { @out "auth" }
                         "--control",
                         "next"
                     ])
+        }));
+        let breakpoint_commands = native_host["debug"]["breakpoint_commands"]
+            .as_array()
+            .expect("native host breakpoint commands");
+        assert!(breakpoint_commands.iter().any(|breakpoint| {
+            breakpoint["line"] == 1
+                && breakpoint["source"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("app.orv"))
+                && breakpoint["request"]["command"] == "setBreakpoints"
+                && breakpoint["command"].as_array().is_some_and(|command| {
+                    command.iter().any(|part| part == "--breakpoint")
+                        && command.iter().any(|part| part == "continue")
+                })
         }));
     }
 
