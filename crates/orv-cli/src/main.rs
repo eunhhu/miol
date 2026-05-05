@@ -13887,6 +13887,7 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
         "project_graph": reveal_project_graph_node(&graph, origin_id),
         "production": {
             "routes": reveal_routes(origin_id, &server_artifacts),
+            "native_server": reveal_native_server_targets(dir, origin_id)?,
             "client": reveal_client_targets(dir, entry)?,
         },
     }))
@@ -14051,6 +14052,76 @@ fn reveal_routes(
         }
     }
     routes
+}
+
+fn reveal_native_server_targets(
+    dir: &Path,
+    origin_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for bundle in bundles {
+        if bundle.get("kind").and_then(serde_json::Value::as_str) != Some("native_server_plan") {
+            continue;
+        }
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target_path = dir.join(path);
+        if !target_path.is_file() {
+            continue;
+        }
+        let native_plan = read_json_value(&target_path)?;
+        let matching_routes = native_plan
+            .get("routes")
+            .and_then(serde_json::Value::as_array)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter(|route| {
+                        route.get("origin_id").and_then(serde_json::Value::as_str)
+                            == Some(origin_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if matching_routes.is_empty() {
+            continue;
+        }
+        targets.push(serde_json::json!({
+            "kind": "native_server_plan",
+            "path": path,
+            "exists": true,
+            "status": native_plan
+                .get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "artifact": native_plan
+                .get("artifact")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "launcher": native_plan
+                .get("launcher")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "target": native_plan
+                .get("target")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "runtime_features": native_plan
+                .get("runtime_features")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "blocked_by": native_plan
+                .get("blocked_by")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "routes": matching_routes,
+        }));
+    }
+    Ok(targets)
 }
 
 fn reveal_client_targets(
@@ -26967,6 +27038,25 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let native_server = reveal["production"]["native_server"]
+            .as_array()
+            .expect("native server targets");
+        assert!(native_server.iter().any(|target| {
+            target["kind"] == "native_server_plan"
+                && target["path"] == "server/native-server.json"
+                && target["artifact"] == "server/app.orv-runtime.json"
+                && target["target"]["path"] == "server/app"
+                && target["routes"]
+                    .as_array()
+                    .expect("native routes")
+                    .iter()
+                    .any(|route| route["method"] == "GET" && route["path"] == "/ping")
+                && target["blocked_by"]
+                    .as_array()
+                    .expect("blocked_by")
+                    .iter()
+                    .any(|item| item == "native-codegen")
+        }));
         let _ = std::fs::remove_dir_all(&out);
     }
 
