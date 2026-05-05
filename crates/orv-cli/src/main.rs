@@ -26126,6 +26126,8 @@ entry = "src/main.orv"
         assert!(native_routes.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(native_routes.contains("method: \"GET\""));
         assert!(native_routes.contains("path: \"/ping\""));
+        assert!(native_routes.contains("pub fn orv_native_match_route("));
+        assert!(native_routes.contains("route.method == method && route.path == path"));
         assert!(native_routes.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(native_routes
             .contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();"));
@@ -26226,6 +26228,8 @@ entry = "src/main.orv"
         assert!(source.contains("OrvNativeRoute {"));
         assert!(source.contains("method: \"GET\""));
         assert!(source.contains("path: \"/ping\""));
+        assert!(source.contains("pub fn orv_native_match_route("));
+        assert!(source.contains("route.method == method && route.path == path"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")

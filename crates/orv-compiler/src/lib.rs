@@ -752,6 +752,12 @@ pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
         r#"];
 
 pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();
+
+pub fn orv_native_match_route(method: &str, path: &str) -> Option<&'static OrvNativeRoute> {
+    ORV_NATIVE_ROUTES
+        .iter()
+        .find(|route| route.method == method && route.path == path)
+}
 "#,
     );
     source
@@ -1926,6 +1932,8 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("pub struct OrvNativeRoute"));
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute { method: \"GET\", path: \"/ping\", origin_id:"));
+        assert!(source.contains("pub fn orv_native_match_route("));
+        assert!(source.contains("route.method == method && route.path == path"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
