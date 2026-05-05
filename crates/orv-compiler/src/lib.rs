@@ -2865,7 +2865,26 @@ fn push_native_float_response_condition(
         return false;
     };
     if condition.operand_name.is_some() {
-        return false;
+        let Some(operand_lookup) = condition
+            .operand_kind
+            .as_deref()
+            .and_then(native_response_condition_float_operand_lookup)
+        else {
+            return false;
+        };
+        let operand_name = condition.operand_name.as_deref().unwrap_or_default();
+        let _ = writeln!(
+            source,
+            "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
+            rust_string_literal(&condition.name),
+            rust_string_literal(operand_name)
+        );
+        let _ = writeln!(
+            source,
+            "            (Ok(value), Ok(operand)) if value.is_finite() && operand.is_finite() => value {operator} operand,"
+        );
+        source.push_str("            _ => false,\n        } {\n");
+        return true;
     }
     let Ok(value) = condition.value.parse::<f64>() else {
         return false;
@@ -2919,6 +2938,15 @@ fn native_response_condition_float_lookup(kind: &str) -> Option<(&'static str, &
         _ => return None,
     };
     Some((lookup, operator))
+}
+
+fn native_response_condition_float_operand_lookup(operand_kind: &str) -> Option<&'static str> {
+    match operand_kind {
+        "request_body_field_float" => Some("routes::orv_native_body_field_value"),
+        "route_param_float" => Some("routes::orv_native_param_value"),
+        "query_param_float" => Some("routes::orv_native_query_value"),
+        _ => None,
+    }
 }
 
 fn push_native_int_response_condition(
@@ -4017,12 +4045,22 @@ fn native_captured_float_response_condition(
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
     if let Some(left) = captured_condition_float_operand(lhs) {
+        if let Some(value) = static_float(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_float_operand(op, left.kind)?,
+                name: left.name,
+                value,
+                operand_name: None,
+                operand_kind: None,
+            });
+        }
+        let right = captured_condition_float_operand(rhs)?;
         return Some(ServerResponseConditionArtifact {
             kind: condition_kind_for_float_operand(op, left.kind)?,
             name: left.name,
-            value: static_float(rhs)?,
-            operand_name: None,
-            operand_kind: None,
+            value: String::new(),
+            operand_name: Some(right.name),
+            operand_kind: Some(right.kind.to_string()),
         });
     }
     let right = captured_condition_float_operand(rhs)?;
@@ -7066,6 +7104,52 @@ function greet(name: string): string -> "hi {name}""#,
             "routes::orv_native_body_field_value(route_match, \"amount\").unwrap_or(\"\").trim().parse::<f64>()"
         ));
         assert!(handlers.contains("Ok(value) if value.is_finite() => value > 0.0"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_captured_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    if (@body.amount as float) <= (@query.limit as float) {
+      @respond 201 { accepted: true, amount: @body.amount as float }
+    }
+    @respond 409 { err: "amount_over_limit" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_float_le");
+        assert_eq!(condition.name, "amount");
+        assert_eq!(condition.operand_name.as_deref(), Some("limit"));
+        assert_eq!(condition.operand_kind.as_deref(), Some("query_param_float"));
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"amount\").unwrap_or(\"\").trim().parse::<f64>()"
+        ));
+        assert!(handlers.contains(
+            "routes::orv_native_query_value(route_match, \"limit\").unwrap_or(\"\").trim().parse::<f64>()"
+        ));
+        assert!(handlers.contains(
+            "(Ok(value), Ok(operand)) if value.is_finite() && operand.is_finite() => value <= operand"
+        ));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
