@@ -31627,4 +31627,33 @@ define Auth() -> { @out "auth" }
             "{rendered}"
         );
     }
+
+    #[test]
+    fn project_diagnostics_render_imported_file_source() {
+        let dir = temp_output_dir("imported-diagnostic-source");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let entry = dir.join("main.orv");
+        let imported = models.join("user.orv");
+        std::fs::write(&entry, "import models.user.User\nlet ok: int = 1\n").expect("write entry");
+        std::fs::write(
+            &imported,
+            "pub struct User { id: int }\nlet bad: int = \"wrong\"\n",
+        )
+        .expect("write imported");
+        let loaded = orv_project::load_project(&entry).expect("load project");
+        let resolved = orv_resolve::resolve(&loaded.program);
+        let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+        let mut diagnostics = Vec::new();
+        diagnostics.extend(loaded.diagnostics.clone());
+        diagnostics.extend(resolved.diagnostics);
+        diagnostics.extend(lowered.diagnostics);
+
+        let rendered = render_diagnostics_for_test(&diagnostics, &loaded.files);
+
+        assert!(rendered.contains("models/user.orv"), "{rendered}");
+        assert!(rendered.contains("let bad: int = \"wrong\""), "{rendered}");
+        assert!(!rendered.contains("let ok: int = 1"), "{rendered}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
