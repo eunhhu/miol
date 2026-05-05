@@ -842,6 +842,25 @@ fn orv_native_route_path_matches(pattern: &str, path: &str) -> bool {
     }
     let pattern_segments: Vec<&str> = pattern.split('/').collect();
     let path_segments: Vec<&str> = path.split('/').collect();
+    if let Some(rest_segment) = pattern_segments.last() {
+        if rest_segment
+            .strip_prefix(':')
+            .and_then(|segment| segment.strip_suffix('*'))
+            .is_some()
+        {
+            let prefix_len = pattern_segments.len() - 1;
+            if path_segments.len() <= prefix_len {
+                return false;
+            }
+            return pattern_segments
+                .iter()
+                .take(prefix_len)
+                .zip(path_segments.iter())
+                .all(|(pattern_segment, path_segment)| {
+                    pattern_segment.starts_with(':') || pattern_segment == path_segment
+                });
+        }
+    }
     if pattern_segments.len() != path_segments.len() {
         return false;
     }
@@ -2111,6 +2130,27 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("fn orv_native_route_path_matches(pattern: &str, path: &str)"));
         assert!(source.contains("pattern_segment.starts_with(':')"));
         assert!(source.contains("pattern_segments.len() != path_segments.len()"));
+    }
+
+    #[test]
+    fn native_server_routes_source_generates_named_wildcard_matcher() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /assets/:rest* {
+    @respond 200 { ok: true }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(&manifest, &map, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("path: \"/assets/:rest*\""));
+        assert!(source.contains("strip_prefix(':')"));
+        assert!(source.contains("segment.strip_suffix('*')"));
+        assert!(source.contains("path_segments.len() <= prefix_len"));
+        assert!(source.contains("take(prefix_len)"));
     }
 
     #[test]
