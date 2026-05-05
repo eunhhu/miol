@@ -102,6 +102,7 @@
           @h2 "Read models"
           @ul {
             @li { @a href="/products" "Catalog API" }
+            @li { @a href="/admin/summary" "Operations summary" }
             @li { @a href="/orders/demo" "Orders by customer" }
             @li { @a href="/shipments/1" "Shipment lookup" }
           }
@@ -116,6 +117,21 @@
           }
         }
       }
+    }
+  }
+
+  @route GET /admin/summary {
+    let products = await shopdb.count("Product", {})
+    let members = await shopdb.count("Member", {})
+    let orders = await shopdb.count("Order", {})
+    let payments = await shopdb.count("Payment", {})
+    let shipments = await shopdb.count("Shipment", {})
+    @respond 200 {
+      products: products,
+      members: members,
+      orders: orders,
+      payments: payments,
+      shipments: shipments
     }
   }
 

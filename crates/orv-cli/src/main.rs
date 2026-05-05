@@ -2188,7 +2188,7 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
 \n\
-Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links and persistent storage paths.\n\
+Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links, operations summary, and persistent storage paths.\n\
 \n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
@@ -2242,6 +2242,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 \n\
 - `GET /`\n\
 - `GET /admin`\n\
+- `GET /admin/summary`\n\
 - `GET /health`\n\
 - `POST /products`\n\
 - `GET /products`\n\
@@ -21218,6 +21219,9 @@ test "checkout failing runtime body" {
         assert!(source.contains("@a href=\"/admin\" \"Admin dashboard\""));
         assert!(source.contains("@route GET /admin"));
         assert!(source.contains("Operations dashboard"));
+        assert!(source.contains("@a href=\"/admin/summary\" \"Operations summary\""));
+        assert!(source.contains("@route GET /admin/summary"));
+        assert!(source.contains(r#"shopdb.count("Product", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@route POST /members"));
@@ -21278,6 +21282,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /admin"));
+        assert!(guide.contains("GET /admin/summary"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
@@ -21310,6 +21315,7 @@ test "checkout failing runtime body" {
         for (method, path) in [
             ("GET", "/"),
             ("GET", "/admin"),
+            ("GET", "/admin/summary"),
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),

@@ -2799,6 +2799,7 @@ mod tests {
             let admin_html = String::from_utf8(admin_body).expect("admin html");
             assert!(admin_html.contains("<h1>Miol Shop Admin</h1>"));
             assert!(admin_html.contains("Operations dashboard"));
+            assert!(admin_html.contains("<a href=\"/admin/summary\">Operations summary</a>"));
             assert!(admin_html.contains("data/shop.sqlite"));
 
             let (health_status, _, health_body) = send_request(addr, "GET", "/health", None).await;
@@ -2973,6 +2974,17 @@ mod tests {
                 found_shipment["shipment"]["tracking"],
                 serde_json::json!("TRK-LOCAL")
             );
+
+            let (summary_status, _, summary_body) =
+                send_request(addr, "GET", "/admin/summary", None).await;
+            assert_eq!(summary_status, 200);
+            let summary: serde_json::Value =
+                serde_json::from_slice(&summary_body).expect("admin summary json");
+            assert_eq!(summary["products"], serde_json::json!(2));
+            assert_eq!(summary["members"], serde_json::json!(1));
+            assert_eq!(summary["orders"], serde_json::json!(2));
+            assert_eq!(summary["payments"], serde_json::json!(1));
+            assert_eq!(summary["shipments"], serde_json::json!(1));
 
             handle.abort();
 
