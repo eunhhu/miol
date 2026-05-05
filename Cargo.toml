@@ -18,6 +18,7 @@ orv-core = { path = "crates/orv-core" }
 orv-macros = { path = "crates/orv-macros" }
 orv-cli = { path = "crates/orv-cli" }
 orv-diagnostics = { path = "crates/orv-diagnostics" }
+orv-ids = { path = "crates/orv-ids" }
 orv-syntax = { path = "crates/orv-syntax" }
 orv-resolve = { path = "crates/orv-resolve" }
 orv-hir = { path = "crates/orv-hir" }

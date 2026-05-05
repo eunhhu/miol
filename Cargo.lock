@@ -482,9 +482,13 @@ name = "orv-hir"
 version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
- "orv-resolve",
+ "orv-ids",
  "pretty_assertions",
 ]
+
+[[package]]
+name = "orv-ids"
+version = "0.1.0"
 
 [[package]]
 name = "orv-macros"
@@ -512,6 +516,7 @@ name = "orv-resolve"
 version = "0.1.0"
 dependencies = [
  "orv-diagnostics",
+ "orv-ids",
  "orv-syntax",
  "pretty_assertions",
 ]

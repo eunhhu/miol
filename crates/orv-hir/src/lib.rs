@@ -23,7 +23,7 @@
 #![warn(missing_docs)]
 
 use orv_diagnostics::Span;
-pub use orv_resolve::NameId;
+pub use orv_ids::NameId;
 
 /// Build the compact deterministic fingerprint used by origin maps.
 ///
@@ -314,7 +314,7 @@ pub struct HirStructField {
 
 /// 스코프 바인딩/참조에 붙는 식별자.
 ///
-/// - `id` 는 [`orv_resolve`] 가 부여한 유일한 바인딩 ID.
+/// - `id` 는 이름 해석 단계가 부여한 유일한 바인딩 ID.
 /// - `name` 은 진단 포맷용. 런타임 조회에는 사용하지 않는다.
 /// - 참조 사이트에서도 `id` 가 같은 선언을 가리킨다.
 #[derive(Clone, Debug)]

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use orv_diagnostics::{Diagnostic, FileId, Span};
+pub use orv_ids::NameId;
 use orv_syntax::ast::{
     Block, CatchClause, ConstStmt, Expr, ExprKind, FunctionBody, FunctionStmt, Ident, LetStmt,
     ObjectField, Param, Pattern, Program, ReturnStmt, Stmt, StringSegment, StructStmt, WhenArm,
@@ -33,10 +34,6 @@ pub struct ResolveResult {
     /// 진단 메시지 (주로 미정의 변수).
     pub diagnostics: Vec<Diagnostic>,
 }
-
-/// 유일한 바인딩 식별자. HIR 이 이를 참조한다.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct NameId(pub u32);
 
 /// 선언 메타데이터.
 #[derive(Clone, Debug)]

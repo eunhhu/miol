@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 orv-diagnostics = { workspace = true }
+orv-ids = { workspace = true }
 orv-syntax = { workspace = true }
 
 [dev-dependencies]
