@@ -14491,8 +14491,10 @@ fn verify_deploy_compose_artifact(
             let display = port.display;
             anyhow::bail!("deploy compose must publish {display}");
         }
-        if !compose.contains(&port.environment) {
-            anyhow::bail!("deploy compose must configure PORT");
+    }
+    for environment in deploy_compose_environment_lines(listen, persistence) {
+        if !compose.contains(&environment) {
+            anyhow::bail!("deploy compose must configure {environment}");
         }
     }
     for volume in &persistence.volumes {
@@ -14562,6 +14564,19 @@ fn verify_deploy_runbook_artifact(
     for endpoint in &persistence.commerce_endpoints {
         if !runbook.contains(endpoint) {
             anyhow::bail!("deploy runbook must document commerce endpoint {endpoint}");
+        }
+    }
+    for env in &persistence.commerce_env {
+        if !runbook.contains(&env.env) {
+            let variable = &env.env;
+            anyhow::bail!("deploy runbook must document commerce endpoint env {variable}");
+        }
+        if let Some(default) = &env.default {
+            if !runbook.contains(default) {
+                anyhow::bail!(
+                    "deploy runbook must document commerce endpoint env default {default}"
+                );
+            }
         }
     }
     for volume in &persistence.volumes {
@@ -16987,7 +17002,51 @@ struct DeployPersistence {
     db_paths: Vec<String>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
+    commerce_env: Vec<DeployCommerceEnv>,
     volumes: Vec<DeployPersistenceVolume>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DeployCommerceEnv {
+    env: String,
+    default: Option<String>,
+}
+
+#[derive(Default)]
+struct DeployPersistenceAccumulator {
+    wal_paths: Vec<String>,
+    db_paths: Vec<String>,
+    record_paths: Vec<String>,
+    commerce_endpoints: Vec<String>,
+    commerce_env: Vec<DeployCommerceEnv>,
+}
+
+impl DeployPersistenceAccumulator {
+    fn into_persistence(mut self) -> DeployPersistence {
+        self.wal_paths.sort();
+        self.wal_paths.dedup();
+        self.db_paths.sort();
+        self.db_paths.dedup();
+        self.record_paths.sort();
+        self.record_paths.dedup();
+        self.commerce_endpoints.sort();
+        self.commerce_endpoints.dedup();
+        self.commerce_env.sort();
+        self.commerce_env.dedup();
+        let mut persistent_paths = self.wal_paths.clone();
+        persistent_paths.extend(self.db_paths.clone());
+        persistent_paths.extend(self.record_paths.clone());
+        persistent_paths.sort();
+        persistent_paths.dedup();
+        DeployPersistence {
+            volumes: deploy_persistence_volumes(&persistent_paths),
+            wal_paths: self.wal_paths,
+            db_paths: self.db_paths,
+            record_paths: self.record_paths,
+            commerce_endpoints: self.commerce_endpoints,
+            commerce_env: self.commerce_env,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17027,37 +17086,9 @@ fn server_artifact_deploy_persistence(
     if !lowered.diagnostics.is_empty() {
         anyhow::bail!("deploy persistence lowering reanalysis produced diagnostics");
     }
-    let mut wal_paths = Vec::new();
-    let mut db_paths = Vec::new();
-    let mut record_paths = Vec::new();
-    let mut commerce_endpoints = Vec::new();
-    collect_program_persistence_paths(
-        &lowered.program,
-        &mut wal_paths,
-        &mut db_paths,
-        &mut record_paths,
-        &mut commerce_endpoints,
-    );
-    wal_paths.sort();
-    wal_paths.dedup();
-    db_paths.sort();
-    db_paths.dedup();
-    record_paths.sort();
-    record_paths.dedup();
-    commerce_endpoints.sort();
-    commerce_endpoints.dedup();
-    let mut persistent_paths = wal_paths.clone();
-    persistent_paths.extend(db_paths.clone());
-    persistent_paths.extend(record_paths.clone());
-    persistent_paths.sort();
-    persistent_paths.dedup();
-    Ok(DeployPersistence {
-        volumes: deploy_persistence_volumes(&persistent_paths),
-        wal_paths,
-        db_paths,
-        record_paths,
-        commerce_endpoints,
-    })
+    let mut persistence = DeployPersistenceAccumulator::default();
+    collect_program_persistence_paths(&lowered.program, &mut persistence);
+    Ok(persistence.into_persistence())
 }
 
 fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Value {
@@ -17066,6 +17097,12 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
         "db_paths": persistence.db_paths,
         "record_paths": persistence.record_paths,
         "commerce_endpoints": persistence.commerce_endpoints,
+        "commerce_env": persistence.commerce_env.iter().map(|env| {
+            serde_json::json!({
+                "env": env.env,
+                "default": env.default.as_deref(),
+            })
+        }).collect::<Vec<_>>(),
         "volumes": persistence.volumes.iter().map(|volume| {
             serde_json::json!({
                 "host": volume.host,
@@ -17127,6 +17164,7 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
         && persistence.db_paths.is_empty()
         && persistence.record_paths.is_empty()
         && persistence.commerce_endpoints.is_empty()
+        && persistence.commerce_env.is_empty()
     {
         return String::new();
     }
@@ -17143,6 +17181,20 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     for endpoint in &persistence.commerce_endpoints {
         let _ = writeln!(out, "- Commerce endpoint: {endpoint}");
     }
+    for env in &persistence.commerce_env {
+        match &env.default {
+            Some(default) => {
+                let _ = writeln!(
+                    out,
+                    "- Commerce endpoint env: {} default {default}",
+                    env.env
+                );
+            }
+            None => {
+                let _ = writeln!(out, "- Commerce endpoint env: {}", env.env);
+            }
+        }
+    }
     for volume in &persistence.volumes {
         let _ = writeln!(out, "- Compose volume: {}", volume.compose_mount);
     }
@@ -17152,46 +17204,31 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
 
 fn collect_program_persistence_paths(
     program: &orv_hir::HirProgram,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
+    out: &mut DeployPersistenceAccumulator,
 ) {
     for stmt in &program.items {
-        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
+        collect_stmt_persistence_paths(stmt, out);
     }
 }
 
-fn collect_stmt_persistence_paths(
-    stmt: &orv_hir::HirStmt,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
-) {
+fn collect_stmt_persistence_paths(stmt: &orv_hir::HirStmt, out: &mut DeployPersistenceAccumulator) {
     match stmt {
         orv_hir::HirStmt::Let(stmt) => {
-            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(&stmt.init, out);
         }
         orv_hir::HirStmt::Const(stmt) => {
-            collect_expr_persistence_paths(&stmt.init, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(&stmt.init, out);
         }
         orv_hir::HirStmt::Function(stmt) => {
-            collect_function_body_persistence_paths(
-                &stmt.body,
-                wal_out,
-                db_out,
-                record_out,
-                endpoint_out,
-            );
+            collect_function_body_persistence_paths(&stmt.body, out);
         }
         orv_hir::HirStmt::Return(stmt) => {
             if let Some(value) = &stmt.value {
-                collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(value, out);
             }
         }
         orv_hir::HirStmt::Expr(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(expr, out);
         }
         orv_hir::HirStmt::Struct(_)
         | orv_hir::HirStmt::Enum(_)
@@ -17202,47 +17239,35 @@ fn collect_stmt_persistence_paths(
 
 fn collect_block_persistence_paths(
     block: &orv_hir::HirBlock,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
+    out: &mut DeployPersistenceAccumulator,
 ) {
     for stmt in &block.stmts {
-        collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
+        collect_stmt_persistence_paths(stmt, out);
     }
 }
 
 fn collect_function_body_persistence_paths(
     body: &orv_hir::HirFunctionBody,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
+    out: &mut DeployPersistenceAccumulator,
 ) {
     match body {
         orv_hir::HirFunctionBody::Block(block) => {
-            collect_block_persistence_paths(block, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(block, out);
         }
         orv_hir::HirFunctionBody::Expr(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(expr, out);
         }
     }
 }
 
-fn collect_expr_persistence_paths(
-    expr: &orv_hir::HirExpr,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
-) {
+fn collect_expr_persistence_paths(expr: &orv_hir::HirExpr, out: &mut DeployPersistenceAccumulator) {
     use orv_hir::HirExprKind;
 
     if let HirExprKind::Call { callee, args } = &expr.kind {
         let call_name = hir_call_name(callee);
         if call_name == "@db.wal" {
             if let Some(path) = args.first().and_then(hir_static_string) {
-                wal_out.push(path);
+                out.wal_paths.push(path);
             }
         } else if call_name == "@db.connect" {
             if let Some(path) = args
@@ -17250,29 +17275,18 @@ fn collect_expr_persistence_paths(
                 .and_then(hir_static_string)
                 .and_then(|url| file_adapter_path(&url))
             {
-                wal_out.push(path);
+                out.wal_paths.push(path);
             }
             if let Some(path) = args
                 .first()
                 .and_then(hir_static_string)
                 .and_then(|url| sqlite_adapter_path(&url))
             {
-                db_out.push(path);
+                out.db_paths.push(path);
             }
         } else if matches!(call_name.as_str(), "@payment.connect" | "@shipping.connect") {
-            if let Some(path) = args
-                .first()
-                .and_then(hir_static_string)
-                .and_then(|url| file_adapter_path(&url))
-            {
-                record_out.push(path);
-            }
-            if let Some(endpoint) = args
-                .first()
-                .and_then(hir_static_string)
-                .and_then(|url| http_adapter_endpoint(&url))
-            {
-                endpoint_out.push(endpoint);
+            if let Some(arg) = args.first() {
+                collect_commerce_adapter_persistence_arg(arg, out);
             }
         }
     }
@@ -17291,7 +17305,7 @@ fn collect_expr_persistence_paths(
         HirExprKind::String(segments) => {
             for segment in segments {
                 if let orv_hir::HirStringSegment::Interp(expr) = segment {
-                    collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
+                    collect_expr_persistence_paths(expr, out);
                 }
             }
         }
@@ -17301,21 +17315,21 @@ fn collect_expr_persistence_paths(
         | HirExprKind::Throw(expr)
         | HirExprKind::Await(expr)
         | HirExprKind::Cast { expr, .. } => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(expr, out);
         }
         HirExprKind::Binary { lhs, rhs, .. } => {
-            collect_expr_persistence_paths(lhs, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(rhs, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(lhs, out);
+            collect_expr_persistence_paths(rhs, out);
         }
         HirExprKind::Html(block) | HirExprKind::Block(block) => {
-            collect_block_persistence_paths(block, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(block, out);
         }
         HirExprKind::Route { handler, .. } => {
-            collect_block_persistence_paths(handler, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(handler, out);
         }
         HirExprKind::Respond { status, payload } => {
-            collect_expr_persistence_paths(status, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(payload, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(status, out);
+            collect_expr_persistence_paths(payload, out);
         }
         HirExprKind::Server {
             listen,
@@ -17323,18 +17337,18 @@ fn collect_expr_persistence_paths(
             body_stmts,
         } => {
             if let Some(listen) = listen {
-                collect_expr_persistence_paths(listen, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(listen, out);
             }
             for route in routes {
-                collect_expr_persistence_paths(route, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(route, out);
             }
             for stmt in body_stmts {
-                collect_stmt_persistence_paths(stmt, wal_out, db_out, record_out, endpoint_out);
+                collect_stmt_persistence_paths(stmt, out);
             }
         }
         HirExprKind::Domain { args, .. } => {
             for arg in args {
-                collect_expr_persistence_paths(arg, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(arg, out);
             }
         }
         HirExprKind::If {
@@ -17342,122 +17356,86 @@ fn collect_expr_persistence_paths(
             then,
             else_branch,
         } => {
-            collect_expr_persistence_paths(cond, wal_out, db_out, record_out, endpoint_out);
-            collect_block_persistence_paths(then, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(cond, out);
+            collect_block_persistence_paths(then, out);
             if let Some(else_branch) = else_branch {
-                collect_expr_persistence_paths(
-                    else_branch,
-                    wal_out,
-                    db_out,
-                    record_out,
-                    endpoint_out,
-                );
+                collect_expr_persistence_paths(else_branch, out);
             }
         }
         HirExprKind::When { scrutinee, arms } => {
-            collect_expr_persistence_paths(scrutinee, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(scrutinee, out);
             for arm in arms {
-                collect_pattern_persistence_paths(
-                    &arm.pattern,
-                    wal_out,
-                    db_out,
-                    record_out,
-                    endpoint_out,
-                );
-                collect_expr_persistence_paths(
-                    &arm.body,
-                    wal_out,
-                    db_out,
-                    record_out,
-                    endpoint_out,
-                );
+                collect_pattern_persistence_paths(&arm.pattern, out);
+                collect_expr_persistence_paths(&arm.body, out);
             }
         }
         HirExprKind::Assign { value, .. } => {
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(value, out);
         }
         HirExprKind::AssignField { object, value, .. } => {
-            collect_expr_persistence_paths(object, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(object, out);
+            collect_expr_persistence_paths(value, out);
         }
         HirExprKind::AssignIndex {
             object,
             index,
             value,
         } => {
-            collect_expr_persistence_paths(object, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(index, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(value, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(object, out);
+            collect_expr_persistence_paths(index, out);
+            collect_expr_persistence_paths(value, out);
         }
         HirExprKind::Call { callee, args } => {
-            collect_expr_persistence_paths(callee, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(callee, out);
             for arg in args {
-                collect_expr_persistence_paths(arg, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(arg, out);
             }
         }
         HirExprKind::For { iter, body, .. } => {
-            collect_expr_persistence_paths(iter, wal_out, db_out, record_out, endpoint_out);
-            collect_block_persistence_paths(body, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(iter, out);
+            collect_block_persistence_paths(body, out);
         }
         HirExprKind::While { cond, body } => {
-            collect_expr_persistence_paths(cond, wal_out, db_out, record_out, endpoint_out);
-            collect_block_persistence_paths(body, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(cond, out);
+            collect_block_persistence_paths(body, out);
         }
         HirExprKind::Range { start, end, .. } => {
-            collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(start, out);
+            collect_expr_persistence_paths(end, out);
         }
         HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
             for item in items {
-                collect_expr_persistence_paths(item, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(item, out);
             }
         }
         HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
             for field in fields {
-                collect_expr_persistence_paths(
-                    &field.value,
-                    wal_out,
-                    db_out,
-                    record_out,
-                    endpoint_out,
-                );
+                collect_expr_persistence_paths(&field.value, out);
             }
         }
         HirExprKind::Index { target, index } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(index, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(target, out);
+            collect_expr_persistence_paths(index, out);
         }
         HirExprKind::Slice { target, start, end } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(target, out);
             if let Some(start) = start {
-                collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(start, out);
             }
             if let Some(end) = end {
-                collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
+                collect_expr_persistence_paths(end, out);
             }
         }
         HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
-            collect_expr_persistence_paths(target, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(target, out);
         }
         HirExprKind::Lambda { body, .. } => {
-            collect_function_body_persistence_paths(
-                body,
-                wal_out,
-                db_out,
-                record_out,
-                endpoint_out,
-            );
+            collect_function_body_persistence_paths(body, out);
         }
         HirExprKind::Try { try_block, catch } => {
-            collect_block_persistence_paths(try_block, wal_out, db_out, record_out, endpoint_out);
+            collect_block_persistence_paths(try_block, out);
             if let Some(catch) = catch {
-                collect_block_persistence_paths(
-                    &catch.body,
-                    wal_out,
-                    db_out,
-                    record_out,
-                    endpoint_out,
-                );
+                collect_block_persistence_paths(&catch.body, out);
             }
         }
     }
@@ -17465,21 +17443,18 @@ fn collect_expr_persistence_paths(
 
 fn collect_pattern_persistence_paths(
     pattern: &orv_hir::HirPattern,
-    wal_out: &mut Vec<String>,
-    db_out: &mut Vec<String>,
-    record_out: &mut Vec<String>,
-    endpoint_out: &mut Vec<String>,
+    out: &mut DeployPersistenceAccumulator,
 ) {
     match pattern {
         orv_hir::HirPattern::Literal(expr)
         | orv_hir::HirPattern::Guard(expr)
         | orv_hir::HirPattern::Not(expr)
         | orv_hir::HirPattern::Contains(expr) => {
-            collect_expr_persistence_paths(expr, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(expr, out);
         }
         orv_hir::HirPattern::Range { start, end, .. } => {
-            collect_expr_persistence_paths(start, wal_out, db_out, record_out, endpoint_out);
-            collect_expr_persistence_paths(end, wal_out, db_out, record_out, endpoint_out);
+            collect_expr_persistence_paths(start, out);
+            collect_expr_persistence_paths(end, out);
         }
         orv_hir::HirPattern::Wildcard => {}
     }
@@ -17507,7 +17482,65 @@ fn http_adapter_endpoint(url: &str) -> Option<String> {
         .map(|_| url.to_string())
 }
 
+fn collect_commerce_adapter_persistence_arg(
+    arg: &orv_hir::HirExpr,
+    out: &mut DeployPersistenceAccumulator,
+) {
+    if let Some(url) = hir_static_string(arg) {
+        collect_commerce_adapter_url(&url, out);
+    }
+    if let Some(env) = hir_env_configured_string(arg) {
+        if let Some(default) = &env.default {
+            collect_commerce_adapter_url(default, out);
+        }
+        out.commerce_env.push(env);
+    }
+}
+
+fn collect_commerce_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
+    if let Some(path) = file_adapter_path(url) {
+        out.record_paths.push(path);
+    }
+    if let Some(endpoint) = http_adapter_endpoint(url) {
+        out.commerce_endpoints.push(endpoint);
+    }
+}
+
+fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployCommerceEnv> {
+    match &expr.kind {
+        orv_hir::HirExprKind::Paren(inner) => hir_env_configured_string(inner),
+        orv_hir::HirExprKind::Binary {
+            op: orv_hir::BinaryOp::Coalesce,
+            lhs,
+            rhs,
+        } => {
+            let env = hir_env_variable(lhs)?;
+            Some(DeployCommerceEnv {
+                env,
+                default: hir_static_string(rhs),
+            })
+        }
+        _ => hir_env_variable(expr).map(|env| DeployCommerceEnv { env, default: None }),
+    }
+}
+
+fn hir_env_variable(expr: &orv_hir::HirExpr) -> Option<String> {
+    match &expr.kind {
+        orv_hir::HirExprKind::Paren(inner) => hir_env_variable(inner),
+        orv_hir::HirExprKind::Field { target, field, .. } => match &target.kind {
+            orv_hir::HirExprKind::Domain { name, args, .. } if name == "env" && args.is_empty() => {
+                Some(field.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn hir_static_string(expr: &orv_hir::HirExpr) -> Option<String> {
+    if let orv_hir::HirExprKind::Paren(inner) = &expr.kind {
+        return hir_static_string(inner);
+    }
     let orv_hir::HirExprKind::String(segments) = &expr.kind else {
         return None;
     };
@@ -17602,6 +17635,46 @@ fn deploy_compose_port(
         environment: format!("PORT: \"${{{variable}}}\""),
         display: format!("${{{variable}}}"),
     })
+}
+
+fn deploy_compose_ports(listen: Option<&orv_compiler::ServerListenArtifact>) -> String {
+    deploy_compose_port(listen)
+        .map(|port| format!("    ports:\n      - {}\n", port.binding))
+        .unwrap_or_default()
+}
+
+fn deploy_compose_environment_lines(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(port) = deploy_compose_port(listen) {
+        lines.push(port.environment);
+    }
+    for env in &persistence.commerce_env {
+        let variable = &env.env;
+        let value = match &env.default {
+            Some(default) => format!("{variable}: \"${{{variable}:-{default}}}\""),
+            None => format!("{variable}: \"${{{variable}}}\""),
+        };
+        lines.push(value);
+    }
+    lines
+}
+
+fn deploy_compose_environment(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+) -> String {
+    let lines = deploy_compose_environment_lines(listen, persistence);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("    environment:\n");
+    for line in lines {
+        let _ = writeln!(out, "      {line}");
+    }
+    out
 }
 
 fn deploy_runbook_port_assignment(
@@ -18217,14 +18290,8 @@ fn write_prod_compose_artifact(
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
-    let port = deploy_compose_port(server_artifact.listen.as_ref())
-        .map(|port| {
-            format!(
-                "    ports:\n      - {}\n    environment:\n      {}\n",
-                port.binding, port.environment
-            )
-        })
-        .unwrap_or_default();
+    let ports = deploy_compose_ports(server_artifact.listen.as_ref());
+    let environment = deploy_compose_environment(server_artifact.listen.as_ref(), persistence);
     let volumes = deploy_compose_volumes(persistence);
     let compose = format!(
         r#"services:
@@ -18235,7 +18302,7 @@ fn write_prod_compose_artifact(
       args:
         ORV_RUNTIME_IMAGE: {ORV_REFERENCE_RUNTIME_IMAGE}
     image: orv-reference-app:latest
-{port}{volumes}"#
+{ports}{environment}{volumes}"#
     );
     write_text(&out.join("deploy").join("compose.yaml"), &compose)
 }
@@ -28543,6 +28610,79 @@ entry = "src/main.orv"
         assert!(!compose.contains("../records:/app/records"));
         assert!(runbook.contains("- Commerce endpoint: http://payments.internal/capture"));
         assert!(runbook.contains("- Commerce endpoint: http://shipping.internal/book"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_records_env_configured_http_commerce_endpoints() {
+        let dir = temp_output_dir("build-prod-env-http-commerce-source");
+        std::fs::create_dir_all(&dir).expect("create env http commerce source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "http://shipping.internal/book")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "post", address: "Seoul" })
+    @respond 200 { payment: captured.status, shipment: booked.status }
+  }
+}
+"#,
+        )
+        .expect("write env http commerce source");
+        let out = temp_output_dir("build-prod-env-http-commerce");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["commerce_endpoints"],
+            serde_json::json!([
+                "http://payments.internal/capture",
+                "http://shipping.internal/book"
+            ])
+        );
+        assert_eq!(
+            deploy["server"]["persistence"]["commerce_env"],
+            serde_json::json!([
+                {
+                    "env": "PAYMENT_ADAPTER_URL",
+                    "default": "http://payments.internal/capture"
+                },
+                {
+                    "env": "SHIPPING_ADAPTER_URL",
+                    "default": "http://shipping.internal/book"
+                }
+            ])
+        );
+        assert_eq!(
+            container["persistence"]["commerce_env"],
+            deploy["server"]["persistence"]["commerce_env"]
+        );
+        assert!(compose.contains(
+            r#"PAYMENT_ADAPTER_URL: "${PAYMENT_ADAPTER_URL:-http://payments.internal/capture}""#
+        ));
+        assert!(compose.contains(
+            r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-http://shipping.internal/book}""#
+        ));
+        assert!(runbook.contains(
+            "- Commerce endpoint env: PAYMENT_ADAPTER_URL default http://payments.internal/capture"
+        ));
+        assert!(runbook.contains(
+            "- Commerce endpoint env: SHIPPING_ADAPTER_URL default http://shipping.internal/book"
+        ));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
