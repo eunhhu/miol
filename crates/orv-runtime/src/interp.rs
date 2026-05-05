@@ -5059,11 +5059,23 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
         "connect" => {
             if let Some(url) = args.first() {
                 let url = require_str(url, "db connect url")?;
-                if !url.starts_with("memory://") {
-                    return Err(RuntimeError::native(format!(
-                        "external db adapters are not implemented for `{url}`; supported scheme is memory://"
-                    )));
+                if url.starts_with("memory://") {
+                    return Ok(Value::Db(db.clone()));
                 }
+                if let Some(path) = url.strip_prefix("file://") {
+                    if path.is_empty() {
+                        return Err(RuntimeError::native(
+                            "`@db.connect` file adapter expects a WAL path",
+                        ));
+                    }
+                    let restored = InMemoryDb::load_wal(Path::new(path)).map_err(|e| {
+                        RuntimeError::native(format!("db.connect file adapter failed: {e}"))
+                    })?;
+                    return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
+                }
+                return Err(RuntimeError::native(format!(
+                    "external db adapters are not implemented for `{url}`; supported schemes are memory:// and file://"
+                )));
             }
             Ok(Value::Db(db.clone()))
         }
@@ -8322,6 +8334,35 @@ let found = external.find("User", { name: "Ada" })
         )
         .unwrap();
         assert_eq!(out, "Ada\n");
+    }
+
+    #[test]
+    fn db_connect_file_adapter_replays_and_persists_wal() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-connect-file-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"let external = @db.connect "file://{}"
+let created = external.create("User", {{ name: "Ada" }})"#,
+            path.display()
+        );
+        let second = format!(
+            r#"let external = @db.connect "file://{}"
+let found = external.find("User", {{ name: "Ada" }})
+@out found.name"#,
+            path.display()
+        );
+
+        run_str(&first).unwrap();
+        let out = run_str(&second).unwrap();
+
+        assert_eq!(out, "Ada\n");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

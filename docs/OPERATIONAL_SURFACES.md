@@ -112,7 +112,7 @@ For interactive client entries, `client/manifest.json` binds the page, reactive 
 
 ## DB Operations
 
-Runtime `@db` currently uses an in-memory execution model with explicit JSON snapshot and WAL APIs: `@db.save/load`, `@db.wal(path)`, `@db.checkpoint()`, `@db.savepoint()`, and `@db.rollback(point)`. `@server` boot body DB setup is carried into route handlers, so a server-level `@db.wal("data/shop.wal.jsonl")` replays startup state and persists subsequent route mutations. `@db.connect` accepts the reference `memory://` adapter and rejects external adapter URLs until real PostgreSQL/MySQL/SQLite adapters exist.
+Runtime `@db` currently uses an in-memory execution model with explicit JSON snapshot and WAL APIs: `@db.save/load`, `@db.wal(path)`, `@db.checkpoint()`, `@db.savepoint()`, and `@db.rollback(point)`. `@server` boot body DB setup is carried into route handlers, so a server-level `@db.wal("data/shop.wal.jsonl")` replays startup state and persists subsequent route mutations. `@db.connect` accepts the reference `memory://` adapter and a local WAL-backed `file://path` adapter; other external adapter URLs are rejected until real PostgreSQL/MySQL/SQLite adapters exist.
 
 Runtime commerce adapters currently provide local reference handles for the shop scaffold: `@payment.connect("test://local").capture(...)` returns captured payment metadata and `@shipping.connect("test://local").book(...)` returns shipment booking metadata. External payment/shipping adapter URLs are rejected until real provider integrations exist, so the scaffold does not silently pretend to support live providers.
 

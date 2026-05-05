@@ -152,7 +152,7 @@ Client bundle 보충: interactive client build는 `client/manifest.json`과 `cli
 
 DB PITR 세부: `orv db restore --archive <archive.json> --data <data.json> --at <RFC3339>`는 hash-verified WAL archive manifest를 지정 시점까지 재생해 `@db.save` 호환 snapshot으로 복원한다. archive manifest의 relative source WAL path는 현재 cwd가 아니라 manifest 파일 디렉터리 기준으로 해석된다.
 
-DB adapter 세부: reference runtime의 `@db.connect`는 `memory://` handle만 허용하고 외부 adapter URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
+DB adapter 세부: reference runtime의 `@db.connect`는 `memory://` handle과 local WAL-backed `file://path` handle을 허용하고, 그 밖의 외부 adapter URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
 
 Commerce adapter 세부: reference runtime은 shop scaffold용 local adapter로 `@payment.connect("test://local").capture(...)`와 `@shipping.connect("test://local").book(...)`을 제공한다. 외부 결제/배송 provider URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
 
