@@ -2140,23 +2140,13 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
 \n\
-Persistent data: `data/shop.wal.jsonl`. The runtime replays this WAL on startup and appends product, member, order, payment, and shipment mutations before applying them.\n\
+Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
 Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
 \n\
-Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop WAL and commerce record logs outside the container layer.\n\
+Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
-Archive the local WAL before deploy or backup rotation:\n\
-\n\
-```sh\n\
-orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json\n\
-```\n\
-\n\
-Restore the raw WAL into a snapshot for point-in-time recovery:\n\
-\n\
-```sh\n\
-orv db restore --wal data/shop.wal.jsonl --data data/shop.data.json --at 2026-05-02T12:00:00Z\n\
-```\n\
+Back up `data/shop.sqlite` and commerce record logs with the mounted `data/` volume before deploy or backup rotation.\n\
 \n\
 ## Deploy\n\
 \n\
@@ -18505,7 +18495,7 @@ test "checkout failing runtime body" {
         let entry = dir.join("src").join("main.orv");
         let source = std::fs::read_to_string(&entry).expect("entry source");
         assert!(source.contains("@listen 8080"));
-        assert!(source.contains("@db.wal \"data/shop.wal.jsonl\""));
+        assert!(source.contains(r#"let shopdb = @db.connect "sqlite://data/shop.sqlite""#));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
         assert!(source.contains("@form action=\"/products\" method=post"));
@@ -18548,12 +18538,10 @@ test "checkout failing runtime body" {
         assert!(guide
             .contains("ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server"));
         assert!(guide.contains("The generated launcher path can infer `dist`"));
-        assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
+        assert!(guide.contains("Persistent database: `data/shop.sqlite`"));
         assert!(guide.contains("Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
-        assert!(
-            guide.contains("orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json")
-        );
+        assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("GET /"));
@@ -18619,8 +18607,8 @@ test "checkout failing runtime body" {
         );
         assert!(native_routes.contains("pub fn orv_native_match_route("));
         assert_eq!(
-            deploy["server"]["persistence"]["wal_paths"][0],
-            serde_json::json!("data/shop.wal.jsonl")
+            deploy["server"]["persistence"]["db_paths"][0],
+            serde_json::json!("data/shop.sqlite")
         );
         assert_eq!(
             deploy["server"]["persistence"]["record_paths"],

@@ -5,11 +5,11 @@
 // This fixture is the first HTTP/DB vertical slice for the shopping-mall
 // north-star: product CRUD surface, JSON/form request bodies, route params,
 // browser starter forms, and restart-safe reference persistence through the
-// shared WAL-backed DB.
+// shared SQLite-backed DB.
 
 @server {
   @listen 0
-  @db.wal "data/shop.wal.jsonl"
+  let shopdb = @db.connect "sqlite://data/shop.sqlite"
 
   @route GET /health {
     @respond 200 { ok: true, service: "shopping" }
@@ -92,7 +92,7 @@
   @route POST /products {
     let price: int = @body.price as int
     let stock: int = @body.stock as int
-    let product = await @db.create("Product", {
+    let product = await shopdb.create("Product", {
       sku: @body.sku,
       name: @body.name,
       price: price,
@@ -102,29 +102,29 @@
   }
 
   @route GET /products {
-    let products = await @db.findAll("Product", {})
+    let products = await shopdb.findAll("Product", {})
     @respond 200 { products: products }
   }
 
   @route GET /products/:sku {
-    let product = await @db.find("Product", { sku: @param.sku })
+    let product = await shopdb.find("Product", { sku: @param.sku })
     @respond 200 { product: product }
   }
 
   @route POST /members {
-    let member = await @db.create("Member", @body)
+    let member = await shopdb.create("Member", @body)
     @respond 201 { member: member }
   }
 
   @route GET /members/:handle {
-    let member = await @db.find("Member", { handle: @param.handle })
+    let member = await shopdb.find("Member", { handle: @param.handle })
     @respond 200 { member: member }
   }
 
   @route POST /orders {
     let quantity: int = @body.quantity as int
     let total: int = @body.total as int
-    let product = await @db.find("Product", { sku: @body.sku })
+    let product = await shopdb.find("Product", { sku: @body.sku })
     if product == void {
       @respond 404 { err: "product_not_found", sku: @body.sku }
     }
@@ -132,8 +132,8 @@
       @respond 409 { err: "out_of_stock", sku: @body.sku, stock: product.stock }
     }
     let remainingStock = product.stock - quantity
-    await @db.update("Product", { sku: @body.sku }, { stock: remainingStock })
-    let order = await @db.create("Order", {
+    await shopdb.update("Product", { sku: @body.sku }, { stock: remainingStock })
+    let order = await shopdb.create("Order", {
       customer: @body.customer,
       sku: @body.sku,
       quantity: quantity,
@@ -144,14 +144,14 @@
   }
 
   @route GET /orders/:customer {
-    let order = await @db.find("Order", { customer: @param.customer })
+    let order = await shopdb.find("Order", { customer: @param.customer })
     @respond 200 { order: order }
   }
 
   @route POST /payments {
     let orderId: int = @body.orderId as int
     let amount: int = @body.amount as int
-    let order = await @db.find("Order", { id: orderId })
+    let order = await shopdb.find("Order", { id: orderId })
     if order == void {
       @respond 404 { err: "order_not_found", orderId: orderId }
     }
@@ -168,7 +168,7 @@
       amount: amount,
       method: @body.method
     })
-    let payment = await @db.create("Payment", {
+    let payment = await shopdb.create("Payment", {
       orderId: capture.orderId,
       amount: capture.amount,
       method: capture.method,
@@ -176,14 +176,14 @@
       reference: capture.id,
       status: capture.status
     })
-    await @db.update("Order", { id: orderId }, { status: "paid" })
-    let paidOrder = await @db.find("Order", { id: orderId })
+    await shopdb.update("Order", { id: orderId }, { status: "paid" })
+    let paidOrder = await shopdb.find("Order", { id: orderId })
     @respond 201 { payment: payment, order: paidOrder }
   }
 
   @route POST /shipments {
     let orderId: int = @body.orderId as int
-    let payment = await @db.find("Payment", { orderId: orderId })
+    let payment = await shopdb.find("Payment", { orderId: orderId })
     if payment == void {
       @respond 402 { err: "payment_required", orderId: orderId }
     }
@@ -193,7 +193,7 @@
       carrier: @body.carrier,
       address: @body.address
     })
-    let shipment = await @db.create("Shipment", {
+    let shipment = await shopdb.create("Shipment", {
       orderId: booking.orderId,
       carrier: booking.carrier,
       address: booking.address,
@@ -202,14 +202,14 @@
       status: booking.status,
       tracking: booking.tracking
     })
-    await @db.update("Order", { id: orderId }, { status: "shipped" })
-    let shippedOrder = await @db.find("Order", { id: orderId })
+    await shopdb.update("Order", { id: orderId }, { status: "shipped" })
+    let shippedOrder = await shopdb.find("Order", { id: orderId })
     @respond 201 { shipment: shipment, order: shippedOrder }
   }
 
   @route GET /shipments/:orderId {
     let orderId = int.from(@param.orderId)
-    let shipment = await @db.find("Shipment", { orderId: orderId })
+    let shipment = await shopdb.find("Shipment", { orderId: orderId })
     @respond 200 { shipment: shipment }
   }
 }

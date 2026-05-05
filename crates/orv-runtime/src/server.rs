@@ -2739,8 +2739,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock after epoch")
                 .as_nanos();
-            let wal_path = std::env::temp_dir().join(format!(
-                "orv-shopping-fixture-{}-{unique}.jsonl",
+            let sqlite_path = std::env::temp_dir().join(format!(
+                "orv-shopping-fixture-{}-{unique}.sqlite",
                 std::process::id()
             ));
             let payment_path = std::env::temp_dir().join(format!(
@@ -2752,7 +2752,10 @@ mod tests {
                 std::process::id()
             ));
             let src = read_e2e_fixture("shopping_mall.orv")
-                .replace("data/shop.wal.jsonl", &wal_path.display().to_string())
+                .replace(
+                    "sqlite://data/shop.sqlite",
+                    &format!("sqlite://{}", sqlite_path.display()),
+                )
                 .replace(
                     "file://data/payments.jsonl",
                     &format!("file://{}", payment_path.display()),
@@ -2963,8 +2966,8 @@ mod tests {
 
             handle.abort();
 
-            let restored =
-                crate::db::InMemoryDb::load_wal(&wal_path).expect("replay shopping fixture wal");
+            let restored = crate::db::InMemoryDb::load_sqlite(&sqlite_path)
+                .expect("reload shopping fixture sqlite");
             let snapshot = restored.snapshot_json();
             assert_eq!(
                 snapshot["tables"]["Member"]["rows"][0]["handle"],
@@ -2982,7 +2985,7 @@ mod tests {
             assert!(payment_records.contains(&format!(r#""orderId":{order_id}"#)));
             assert!(shipping_records.contains(r#""kind":"shipping.booking""#));
             assert!(shipping_records.contains(r#""tracking":"TRK-LOCAL""#));
-            let _ = std::fs::remove_file(wal_path);
+            let _ = std::fs::remove_file(sqlite_path);
             let _ = std::fs::remove_file(payment_path);
             let _ = std::fs::remove_file(shipping_path);
         })
