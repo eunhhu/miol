@@ -12396,6 +12396,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             )?,
             "native_server_launcher_package" => verify_native_server_launcher_package(&target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
+            "client_manifest" => verify_client_manifest_target(dir, bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
             "client_wasm" => verify_client_wasm_target(dir, &target)?,
@@ -12817,6 +12818,101 @@ fn verify_client_page_target(bundle: &serde_json::Value, target: &Path) -> anyho
         anyhow::bail!("client_page bundle must declare client_wasm");
     }
     verify_client_page_file(target)
+}
+
+fn verify_client_manifest_target(
+    dir: &Path,
+    bundle: &serde_json::Value,
+    target: &Path,
+) -> anyhow::Result<()> {
+    if json_str(bundle, "path", "client_manifest bundle")? != CLIENT_MANIFEST_PATH {
+        anyhow::bail!("client_manifest bundle path must be {CLIENT_MANIFEST_PATH}");
+    }
+    let runtime_features = bundle
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("client_manifest runtime_features must be an array"))?;
+    if !runtime_features
+        .iter()
+        .any(|feature| feature == "client_wasm")
+    {
+        anyhow::bail!("client_manifest bundle must declare client_wasm");
+    }
+    let manifest = read_json_value(target)?;
+    verify_client_manifest_value(dir, &manifest)
+}
+
+fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
+    if manifest
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("client_manifest schema_version must be 1");
+    }
+    if json_str(manifest, "kind", "client manifest")? != "orv.client.bundle" {
+        anyhow::bail!("client_manifest kind must be orv.client.bundle");
+    }
+    verify_client_manifest_paths(dir, manifest)?;
+    verify_client_manifest_source_binding(dir, manifest)?;
+    verify_client_manifest_exports(manifest)
+}
+
+fn verify_client_manifest_paths(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
+    let page = json_str(manifest, "page", "client manifest")?;
+    if page != CLIENT_PAGE_PATH || !dir.join(page).is_file() {
+        anyhow::bail!("client_manifest page must be {CLIENT_PAGE_PATH}");
+    }
+    let loader = json_str(manifest, "loader", "client manifest")?;
+    if loader != CLIENT_JS_PATH || !dir.join(loader).is_file() {
+        anyhow::bail!("client_manifest loader must be {CLIENT_JS_PATH}");
+    }
+    let wasm = json_str(manifest, "wasm", "client manifest")?;
+    if wasm != CLIENT_WASM_PATH || !dir.join(wasm).is_file() {
+        anyhow::bail!("client_manifest wasm must be {CLIENT_WASM_PATH}");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_source_binding(
+    dir: &Path,
+    manifest: &serde_json::Value,
+) -> anyhow::Result<()> {
+    if json_str(manifest, "source_bundle", "client manifest")? != SOURCE_BUNDLE_PATH {
+        anyhow::bail!("client_manifest source_bundle must be {SOURCE_BUNDLE_PATH}");
+    }
+    let source_bundle = read_json_value(&dir.join(SOURCE_BUNDLE_PATH))?;
+    let expected_hash = stable_json_hash(&source_bundle)?;
+    if json_str(manifest, "source_bundle_hash", "client manifest")? != expected_hash {
+        anyhow::bail!("client_manifest source_bundle_hash does not match source bundle");
+    }
+    if manifest.get("entry") != source_bundle.get("entry") {
+        anyhow::bail!("client_manifest entry does not match source bundle");
+    }
+    if !manifest
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|features| features.iter().any(|feature| feature == "client_wasm"))
+    {
+        anyhow::bail!("client_manifest runtime_features must include client_wasm");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_exports(manifest: &serde_json::Value) -> anyhow::Result<()> {
+    let exports = manifest
+        .get("exports")
+        .ok_or_else(|| anyhow::anyhow!("client_manifest exports must be an object"))?;
+    if json_str(exports, "start", "client manifest exports")? != CLIENT_WASM_START_EXPORT
+        || json_str(exports, "render_ptr", "client manifest exports")?
+            != CLIENT_WASM_RENDER_PTR_EXPORT
+        || json_str(exports, "render_len", "client manifest exports")?
+            != CLIENT_WASM_RENDER_LEN_EXPORT
+        || json_str(exports, "memory", "client manifest exports")? != CLIENT_WASM_MEMORY_EXPORT
+    {
+        anyhow::bail!("client_manifest exports do not match client WASM ABI");
+    }
+    Ok(())
 }
 
 fn verify_client_page_file(target: &Path) -> anyhow::Result<()> {
@@ -14177,6 +14273,16 @@ fn verify_deploy_client_target(
     {
         anyhow::bail!("deploy client target must declare client_wasm");
     }
+    let manifest = json_str(client, "manifest", "deploy client")?;
+    let manifest_target = dir.join(manifest);
+    if !manifest_target.is_file() {
+        anyhow::bail!(
+            "missing deploy client manifest: {}",
+            manifest_target.display()
+        );
+    }
+    let manifest_value = read_json_value(&manifest_target)?;
+    verify_client_manifest_value(dir, &manifest_value)?;
     let page = json_str(client, "page", "deploy client")?;
     let page_target = dir.join(page);
     if !page_target.is_file() {
@@ -14533,11 +14639,14 @@ fn reveal_client_targets(
             .get("kind")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if !matches!(kind, "client_page" | "client_js" | "client_wasm") {
+        if !matches!(
+            kind,
+            "client_manifest" | "client_page" | "client_js" | "client_wasm"
+        ) {
             continue;
         }
         let path = json_str(bundle, "path", "bundle target")?;
-        targets.push(serde_json::json!({
+        let mut target = serde_json::json!({
             "kind": kind,
             "path": path,
             "exists": dir.join(path).is_file(),
@@ -14545,9 +14654,42 @@ fn reveal_client_targets(
                 .get("runtime_features")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([])),
-        }));
+        });
+        if kind == "client_manifest" {
+            add_client_manifest_reveal_fields(dir, path, &mut target)?;
+        }
+        targets.push(target);
     }
     Ok(targets)
+}
+
+fn add_client_manifest_reveal_fields(
+    dir: &Path,
+    path: &str,
+    target: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    let manifest_path = dir.join(path);
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let manifest = read_json_value(&manifest_path)?;
+    target["source_bundle"] = manifest
+        .get("source_bundle")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["source_bundle_hash"] = manifest
+        .get("source_bundle_hash")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["exports"] = manifest
+        .get("exports")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["blocked_by"] = manifest
+        .get("blocked_by")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    Ok(())
 }
 
 fn json_str<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> anyhow::Result<&'a str> {
@@ -15945,6 +16087,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let graph = project_graph_json(&loaded.graph, &origin_map);
     let manifest = orv_compiler::build_manifest(entry.display().to_string(), &origin_map);
     let bundle_plan = orv_compiler::bundle_plan(&manifest);
+    let client_manifest_path = bundle_output_path(&bundle_plan, "client_manifest");
     let client_page_path = bundle_output_path(&bundle_plan, "client_page");
     let client_js_path = bundle_output_path(&bundle_plan, "client_js");
     let client_wasm_path = bundle_output_path(&bundle_plan, "client_wasm");
@@ -16052,6 +16195,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         initial_render: client_initial_render.as_deref().unwrap_or(""),
     };
     let client_bundle_targets = ClientBundleTargets {
+        manifest: client_manifest_path.as_deref(),
         page: client_page_path.as_deref(),
         js: client_js_path.as_deref(),
         wasm: client_wasm_path.as_deref(),
@@ -16071,6 +16215,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             server_artifact.as_ref(),
             ProdBuildTargets {
                 static_page_path: static_page_path.as_deref(),
+                client_manifest_path: client_manifest_path.as_deref(),
                 client_page_path: client_page_path.as_deref(),
                 client_js_path: client_js_path.as_deref(),
                 client_wasm_path: client_wasm_path.as_deref(),
@@ -16097,6 +16242,9 @@ fn write_client_bundle_artifacts(
     let page_path = targets
         .page
         .ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?;
+    let manifest_path = targets
+        .manifest
+        .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
     let js_path = targets
         .js
         .ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
@@ -16115,7 +16263,8 @@ fn write_client_bundle_artifacts(
         binding.source_bundle_hash,
     )?;
     let loader_src = relative_bundle_path(page_path, js_path);
-    write_client_page_shell(&out.join(page_path), entry, &loader_src)
+    write_client_page_shell(&out.join(page_path), entry, &loader_src)?;
+    write_client_bundle_manifest(out, manifest_path, entry, binding, targets)
 }
 
 struct ClientSourceBinding<'a> {
@@ -16125,9 +16274,53 @@ struct ClientSourceBinding<'a> {
 }
 
 struct ClientBundleTargets<'a> {
+    manifest: Option<&'a str>,
     page: Option<&'a str>,
     js: Option<&'a str>,
     wasm: Option<&'a str>,
+}
+
+fn write_client_bundle_manifest(
+    out: &Path,
+    path: &str,
+    entry: &Path,
+    binding: &ClientSourceBinding<'_>,
+    targets: &ClientBundleTargets<'_>,
+) -> anyhow::Result<()> {
+    let page = targets
+        .page
+        .ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?;
+    let loader = targets
+        .js
+        .ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
+    let wasm = targets
+        .wasm
+        .ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.client.bundle",
+        "entry": entry.display().to_string(),
+        "page": page,
+        "loader": loader,
+        "wasm": wasm,
+        "source_bundle": SOURCE_BUNDLE_PATH,
+        "source_bundle_hash": binding.source_bundle_hash,
+        "runtime_features": ["client_wasm"],
+        "exports": {
+            "start": CLIENT_WASM_START_EXPORT,
+            "render_ptr": CLIENT_WASM_RENDER_PTR_EXPORT,
+            "render_len": CLIENT_WASM_RENDER_LEN_EXPORT,
+            "memory": CLIENT_WASM_MEMORY_EXPORT,
+        },
+        "initial_render": {
+            "content_type": "text/html",
+            "encoding": "utf-8",
+            "html_hash": format!("{:016x}", fnv1a64(binding.initial_render.as_bytes())),
+            "byte_length": binding.initial_render.len(),
+        },
+        "blocked_by": ["dynamic-client-codegen", "reactive-dom-diff"],
+    });
+    write_json(&out.join(path), &manifest)
 }
 
 fn validate_prod_server_listen(
@@ -16620,6 +16813,11 @@ fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<Str
 
 const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
+const SOURCE_BUNDLE_PATH: &str = "source-bundle.json";
+const CLIENT_MANIFEST_PATH: &str = "client/manifest.json";
+const CLIENT_PAGE_PATH: &str = "pages/index.html";
+const CLIENT_JS_PATH: &str = "client/app.js";
+const CLIENT_WASM_PATH: &str = "client/app.wasm";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
@@ -17104,6 +17302,7 @@ fn html_attr_escape(value: &str) -> String {
 
 struct ProdBuildTargets<'a> {
     static_page_path: Option<&'a str>,
+    client_manifest_path: Option<&'a str>,
     client_page_path: Option<&'a str>,
     client_js_path: Option<&'a str>,
     client_wasm_path: Option<&'a str>,
@@ -17170,6 +17369,7 @@ fn write_prod_deploy_artifacts(
         });
     let client = if manifest.capabilities.client_wasm {
         serde_json::json!({
+            "manifest": targets.client_manifest_path.ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?,
             "page": targets.client_page_path.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
             "loader": targets.client_js_path.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
             "wasm": targets.client_wasm_path.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
@@ -27362,8 +27562,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            r"let sig count: int = 0
+@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");
@@ -27372,6 +27572,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         let deploy =
             read_json_value(&build_out.join("deploy").join("manifest.json")).expect("deploy");
+        assert_eq!(deploy["client"]["manifest"], "client/manifest.json");
         assert_eq!(deploy["client"]["page"], "pages/index.html");
         assert_eq!(deploy["client"]["loader"], "client/app.js");
         assert_eq!(deploy["client"]["wasm"], "client/app.wasm");
@@ -27560,8 +27761,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            r"let sig count: int = 0
+@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");
@@ -27878,8 +28079,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");
@@ -27904,6 +28104,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let client = reveal["production"]["client"]
             .as_array()
             .expect("client targets");
+        assert!(client.iter().any(|target| {
+            target["kind"] == "client_manifest"
+                && target["path"] == CLIENT_MANIFEST_PATH
+                && target["source_bundle"] == SOURCE_BUNDLE_PATH
+                && target["source_bundle_hash"]
+                    .as_str()
+                    .is_some_and(|hash| !hash.is_empty())
+        }));
         assert!(client
             .iter()
             .any(|target| target["kind"] == "client_page" && target["path"] == "pages/index.html"));
@@ -27921,14 +28129,75 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn build_writes_client_bundle_manifest_contract() {
+        let out = temp_output_dir("client-bundle-manifest");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        assert!(
+            manifest_path.is_file(),
+            "missing {}",
+            manifest_path.display()
+        );
+        let client_manifest = read_json_value(&manifest_path).expect("client manifest");
+        let source_bundle =
+            read_json_value(&build_out.join("source-bundle.json")).expect("source bundle");
+        let expected_source_hash = stable_json_hash(&source_bundle).expect("source hash");
+        assert_manifest_artifact(
+            &build_out.join("build-manifest.json"),
+            "client_manifest",
+            CLIENT_MANIFEST_PATH,
+        );
+        assert_bundle_target(
+            &build_out.join("bundle-plan.json"),
+            "client_manifest",
+            CLIENT_MANIFEST_PATH,
+        );
+        assert_eq!(client_manifest["kind"], "orv.client.bundle");
+        assert_eq!(client_manifest["page"], "pages/index.html");
+        assert_eq!(client_manifest["loader"], "client/app.js");
+        assert_eq!(client_manifest["wasm"], "client/app.wasm");
+        assert_eq!(client_manifest["source_bundle"], "source-bundle.json");
+        assert_eq!(client_manifest["source_bundle_hash"], expected_source_hash);
+        assert_eq!(
+            client_manifest["exports"]["start"],
+            CLIENT_WASM_START_EXPORT
+        );
+        assert_eq!(
+            client_manifest["exports"]["render_ptr"],
+            CLIENT_WASM_RENDER_PTR_EXPORT
+        );
+        assert_eq!(
+            client_manifest["exports"]["render_len"],
+            CLIENT_WASM_RENDER_LEN_EXPORT
+        );
+        assert!(client_manifest["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "dynamic-client-codegen"));
+
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn reveal_origin_uses_build_source_bundle_when_original_client_source_is_missing() {
         let out = temp_output_dir("reveal-client-source-bundle");
         std::fs::create_dir_all(&out).expect("create temp root");
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");
@@ -28934,8 +29203,7 @@ define Auth() -> { @out "auth" }
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            r#"let sig count: int = 0
-@out @html { @body { @p count } }"#,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");

@@ -483,6 +483,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
     }
     if client_wasm {
         artifacts.push(BuildArtifact {
+            kind: "client_manifest".to_string(),
+            path: "client/manifest.json".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "client_page".to_string(),
             path: "pages/index.html".to_string(),
         });
@@ -556,6 +560,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         });
     }
     if manifest.capabilities.client_wasm {
+        bundles.push(BundleTarget {
+            kind: "client_manifest".to_string(),
+            path: "client/manifest.json".to_string(),
+            runtime_features: vec!["client_wasm".to_string()],
+        });
         bundles.push(BundleTarget {
             kind: "client_page".to_string(),
             path: "pages/index.html".to_string(),
@@ -1687,6 +1696,11 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(manifest
             .artifacts
             .iter()
+            .any(|artifact| artifact.kind == "client_manifest"
+                && artifact.path == "client/manifest.json"));
+        assert!(manifest
+            .artifacts
+            .iter()
             .any(|artifact| artifact.kind == "client_wasm" && artifact.path == "client/app.wasm"));
         assert!(manifest
             .artifacts
@@ -1696,6 +1710,11 @@ function greet(name: string): string -> "hi {name}""#,
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == "client_page" && artifact.path == "pages/index.html"));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "client_manifest"
+                && bundle.path == "client/manifest.json"
+                && bundle.runtime_features == vec!["client_wasm"]
+        }));
         assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "client_wasm"
                 && bundle.path == "client/app.wasm"
