@@ -12419,9 +12419,12 @@ fn verify_native_server_plan_value(
     if plan
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
-        != Some(1)
+        != Some(u64::from(orv_compiler::NATIVE_SERVER_PLAN_ARTIFACT_VERSION))
     {
-        anyhow::bail!("native server plan schema_version must be 1");
+        anyhow::bail!(
+            "native server plan schema_version must be {}",
+            orv_compiler::NATIVE_SERVER_PLAN_ARTIFACT_VERSION
+        );
     }
     if json_str(plan, "kind", "native server plan")? != "native_server_plan" {
         anyhow::bail!("native server plan kind must be native_server_plan");
