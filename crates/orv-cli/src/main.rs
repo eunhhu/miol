@@ -2226,6 +2226,8 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `deploy/container.json`\n\
 - `deploy/Dockerfile`\n\
 - `deploy/compose.yaml`\n\
+- `deploy/env.example`\n\
+- `deploy/commerce-adapters.json`\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
@@ -19679,6 +19681,8 @@ test "checkout failing runtime body" {
         assert!(guide.contains("orv verify-build dist"));
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
+        assert!(guide.contains("deploy/env.example"));
+        assert!(guide.contains("deploy/commerce-adapters.json"));
         assert!(guide.contains("server/native-server.json"));
         assert!(guide.contains("server/native/Cargo.toml"));
         assert!(guide.contains("server/native/main.rs"));
