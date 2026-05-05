@@ -27515,6 +27515,9 @@ entry = "src/main.orv"
   @route POST /orders {
     @respond 201 { quantity: @body.quantity as int }
   }
+  @route POST /orders/next {
+    @respond 201 { quantity: (@body.quantity as int) + 1 }
+  }
 }
 "#,
         )
@@ -27564,9 +27567,12 @@ entry = "src/main.orv"
             .expect("native listen address");
 
         let response = send_raw_http_json_post(address, "/orders", r#"{"quantity":"7"}"#);
+        let next_response = send_raw_http_json_post(address, "/orders/next", r#"{"quantity":"7"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
+        assert!(next_response.starts_with("HTTP/1.1 201"));
+        assert!(next_response.contains(r#"{"quantity":8}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -27758,7 +27764,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + 1 }
+    @respond 201 { received: (@body.id as int) + (@body.extra as int) }
   }
 }
 ",
