@@ -14236,6 +14236,10 @@ fn reveal_native_server_targets(
                 .get("target")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "commands": native_plan
+                .get("commands")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "runtime_features": native_plan
                 .get("runtime_features")
                 .cloned()
@@ -27430,6 +27434,17 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["path"] == "server/native-server.json"
                 && target["artifact"] == "server/app.orv-runtime.json"
                 && target["target"]["path"] == "server/app"
+                && target["commands"]["build"]
+                    == serde_json::json!([
+                        "cargo",
+                        "build",
+                        "--manifest-path",
+                        "server/native/Cargo.toml",
+                        "--release"
+                    ])
+                && target["commands"]["run"]["env"]["ORV_BUILD_DIR"] == "."
+                && target["commands"]["run"]["command"]
+                    == serde_json::json!(["./server/native/target/release/orv-native-server"])
                 && target["routes"]
                     .as_array()
                     .expect("native routes")

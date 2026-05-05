@@ -3075,7 +3075,7 @@ mock-server = "0.2.0"
 | `orv run-artifact <file>` | server runtime artifact source bundle 재수화 + reference runtime 실행 |
 | `orv run-build <dir>` | bundle plan 기준 reference artifact 실행, 또는 static page HTML 출력 |
 | `orv dev <file-or-orv.toml> --out <dir> [--hmr] [--watch] [--watch-loop] [--serve]` | build + verify-build + run-build reference dev bootstrap, `--hmr`이면 dev session/transport/client manifest, `--watch`이면 watch session manifest 출력, `--watch-loop`이면 poll loop event manifest 기록, `--hmr --serve`이면 HTTP/1 EventSource endpoint manifest와 server 제공 |
-| `orv reveal <dir> <origin-id>` | build artifact origin id를 source span, ProjectGraph node, route descriptor, native server target 또는 client bundle target으로 역추적 |
+| `orv reveal <dir> <origin-id>` | build artifact origin id를 source span, ProjectGraph node, route descriptor, native server target/build-run command 또는 client bundle target으로 역추적 |
 | `orv test <path> --filter <name> --list` | `.orv` test block 파일 탐색 + reference runtime 실행 또는 발견 목록 JSON 출력 |
 | `orv editor snapshot/reveal/runtime/debug/run-debug/export/trace/trace-stream` | first-party editor bootstrap JSON + build-origin navigation payload + runtime inspection pane JSON + DAP control transport/result JSON + static editor shell artifact with ProjectGraph/panel-list/runtime-frame-detail/DAP launch config/breakpoint-line/trace-detail rendering and optional trace state + captured request trace navigation/EventSource snapshot/frame consumption payload 출력 |
 | `orv lsp snapshot/reveal/serve --stdio` | 에디터 bootstrap JSON, production reveal, LSP initialize/diagnostic/symbol/code-lens/code-action/document-color/folding/selection/semantic-tokens/definition/declaration/typeDefinition/implementation/moniker/call-hierarchy/type-hierarchy/linked-editing/references/highlight/rename/hover/completion 처리 |
@@ -3285,7 +3285,7 @@ let user = await userApi.fetch("/me")   ▸ { id: 42, name: "Alice" }
 
 일반적인 개발 흐름은 `코드 작성 -> 실행/프리뷰 확인`이다. orv 에디터는 이 방향을 지원하되, 반대 방향인 **`프로덕션 관찰 -> 코드 reveal -> 프로젝트 그래프 탐색`**을 같은 수준의 기본 기능으로 제공하는 것을 목표로 한다.
 
-핵심 단위는 **origin map**이다. 현재 origin map 생성기는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에 안정적인 origin id와 span fingerprint를 부여하고, HIR traversal 기반 parent-child `contains` edge와 call expression에서 resolved function으로 이어지는 `calls` edge를 함께 기록한다. 현재 HTTP 런타임은 매칭된 `@route`의 origin id를 `x-orv-origin-id` 응답 헤더로 내보낸다. `orv reveal <dir> <origin-id>`는 build artifact directory의 `origin-map.json`, `project-graph.json`, server runtime artifact, native server plan, bundle plan을 결합해 source span, graph node, route descriptor, native server target 또는 client bundle target을 JSON으로 반환한다. 로드맵 빌드 산출물은 이 id를 통해 더 넓은 프로덕션 이벤트와 원본 `.orv` span을 연결한다.
+핵심 단위는 **origin map**이다. 현재 origin map 생성기는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에 안정적인 origin id와 span fingerprint를 부여하고, HIR traversal 기반 parent-child `contains` edge와 call expression에서 resolved function으로 이어지는 `calls` edge를 함께 기록한다. 현재 HTTP 런타임은 매칭된 `@route`의 origin id를 `x-orv-origin-id` 응답 헤더로 내보낸다. `orv reveal <dir> <origin-id>`는 build artifact directory의 `origin-map.json`, `project-graph.json`, server runtime artifact, native server plan, bundle plan을 결합해 source span, graph node, route descriptor, native server target/build-run command 또는 client bundle target을 JSON으로 반환한다. 로드맵 빌드 산출물은 이 id를 통해 더 넓은 프로덕션 이벤트와 원본 `.orv` span을 연결한다.
 
 | 프로덕션에서 선택한 대상 | reveal 대상 |
 |------------------------|------------|
