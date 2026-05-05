@@ -27442,6 +27442,12 @@ entry = "src/main.orv"
     }
     @respond 201 { sku: @body.sku }
   }
+  @route POST /members {
+    if @body.password != @body.confirm {
+      @respond 400 { err: "password_mismatch" }
+    }
+    @respond 201 { email: @body.email }
+  }
 }
 "#,
         )
@@ -27492,11 +27498,25 @@ entry = "src/main.orv"
 
         let missing = send_raw_http_json_post(address, "/orders", r#"{"sku":""}"#);
         let created = send_raw_http_json_post(address, "/orders", r#"{"sku":"sku-7"}"#);
+        let mismatch = send_raw_http_json_post(
+            address,
+            "/members",
+            r#"{"email":"a@orv.dev","password":"one","confirm":"two"}"#,
+        );
+        let member = send_raw_http_json_post(
+            address,
+            "/members",
+            r#"{"email":"a@orv.dev","password":"same","confirm":"same"}"#,
+        );
 
         assert!(missing.starts_with("HTTP/1.1 400"));
         assert!(missing.contains(r#"{"err":"missing_sku"}"#));
         assert!(created.starts_with("HTTP/1.1 201"));
         assert!(created.contains(r#"{"sku":"sku-7"}"#));
+        assert!(mismatch.starts_with("HTTP/1.1 400"));
+        assert!(mismatch.contains(r#"{"err":"password_mismatch"}"#));
+        assert!(member.starts_with("HTTP/1.1 201"));
+        assert!(member.contains(r#"{"email":"a@orv.dev"}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

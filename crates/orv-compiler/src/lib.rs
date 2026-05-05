@@ -357,6 +357,9 @@ pub struct ServerResponseConditionArtifact {
     pub name: String,
     /// Static string value compared by the condition.
     pub value: String,
+    /// Request body field name used as the dynamic comparison operand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operand_name: Option<String>,
 }
 
 /// One ordered JSON object field backed by a static value or request domain.
@@ -1492,6 +1495,11 @@ fn native_server_response_is_direct(
 fn native_server_response_condition_is_direct(response: &ServerResponseArtifact) -> bool {
     response.condition.as_ref().is_some_and(|condition| {
         !condition.name.is_empty()
+            && condition
+                .operand_name
+                .as_deref()
+                .map(|name| !name.is_empty())
+                .unwrap_or(true)
             && matches!(
                 condition.kind.as_str(),
                 "request_body_field_eq" | "request_body_field_ne"
@@ -2528,12 +2536,21 @@ fn push_native_response_condition(
         "request_body_field_ne" => "!=",
         _ => return false,
     };
-    let _ = writeln!(
-        source,
-        "        if routes::orv_native_body_field_value(route_match, {}) {operator} Some({}) {{",
-        rust_string_literal(&condition.name),
-        rust_string_literal(&condition.value)
-    );
+    if let Some(operand_name) = condition.operand_name.as_deref() {
+        let _ = writeln!(
+            source,
+            "        if routes::orv_native_body_field_value(route_match, {}) {operator} routes::orv_native_body_field_value(route_match, {}) {{",
+            rust_string_literal(&condition.name),
+            rust_string_literal(operand_name)
+        );
+    } else {
+        let _ = writeln!(
+            source,
+            "        if routes::orv_native_body_field_value(route_match, {}) {operator} Some({}) {{",
+            rust_string_literal(&condition.name),
+            rust_string_literal(&condition.value)
+        );
+    }
     true
 }
 
@@ -3285,18 +3302,30 @@ fn static_string_expr(expr: &HirExpr) -> Option<String> {
 fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionArtifact> {
     match &expr.kind {
         HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
-            let (name, value) = request_body_field_name(lhs)
+            let kind = match op {
+                BinaryOp::Eq => "request_body_field_eq",
+                BinaryOp::Ne => "request_body_field_ne",
+                _ => return None,
+            }
+            .to_string();
+            if let Some((name, value)) = request_body_field_name(lhs)
                 .zip(static_string_expr(rhs))
-                .or_else(|| request_body_field_name(rhs).zip(static_string_expr(lhs)))?;
+                .or_else(|| request_body_field_name(rhs).zip(static_string_expr(lhs)))
+            {
+                return Some(ServerResponseConditionArtifact {
+                    kind,
+                    name,
+                    value,
+                    operand_name: None,
+                });
+            }
+            let name = request_body_field_name(lhs)?;
+            let operand_name = request_body_field_name(rhs)?;
             Some(ServerResponseConditionArtifact {
-                kind: match op {
-                    BinaryOp::Eq => "request_body_field_eq",
-                    BinaryOp::Ne => "request_body_field_ne",
-                    _ => return None,
-                }
-                .to_string(),
+                kind,
                 name,
-                value,
+                value: String::new(),
+                operand_name: Some(operand_name),
             })
         }
         HirExprKind::Paren(expr) => native_response_condition(expr),
@@ -5637,6 +5666,47 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.routes[0].responses[1].condition.is_none());
         assert!(handlers
             .contains("routes::orv_native_body_field_value(route_match, \"sku\") == Some(\"\")"));
+        assert!(handlers.contains("status: 400"));
+        assert!(handlers.contains("status: 201"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_body_field_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /members {
+    if @body.password != @body.confirm {
+      @respond 400 { err: "password_mismatch" }
+    }
+    @respond 201 { email: @body.email }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_ne");
+        assert_eq!(condition.name, "password");
+        assert_eq!(condition.operand_name.as_deref(), Some("confirm"));
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"password\") != routes::orv_native_body_field_value(route_match, \"confirm\")"
+        ));
         assert!(handlers.contains("status: 400"));
         assert!(handlers.contains("status: 201"));
         assert!(!handlers.contains("native route body lowering pending"));
