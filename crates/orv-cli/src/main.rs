@@ -16532,8 +16532,17 @@ fn collect_expr_db_wal_paths(expr: &orv_hir::HirExpr, out: &mut Vec<String>) {
     use orv_hir::HirExprKind;
 
     if let HirExprKind::Call { callee, args } = &expr.kind {
-        if hir_call_name(callee) == "@db.wal" {
+        let call_name = hir_call_name(callee);
+        if call_name == "@db.wal" {
             if let Some(path) = args.first().and_then(hir_static_string) {
+                out.push(path);
+            }
+        } else if call_name == "@db.connect" {
+            if let Some(path) = args
+                .first()
+                .and_then(hir_static_string)
+                .and_then(|url| db_file_adapter_wal_path(&url))
+            {
                 out.push(path);
             }
         }
@@ -16693,6 +16702,14 @@ fn collect_pattern_db_wal_paths(pattern: &orv_hir::HirPattern, out: &mut Vec<Str
         }
         orv_hir::HirPattern::Wildcard => {}
     }
+}
+
+fn db_file_adapter_wal_path(url: &str) -> Option<String> {
+    let path = url.strip_prefix("file://")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 fn hir_static_string(expr: &orv_hir::HirExpr) -> Option<String> {
@@ -26191,6 +26208,49 @@ entry = "src/main.orv"
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_prod_mounts_file_db_connect_adapter_wal() {
+        let dir = temp_output_dir("build-prod-file-db-connect-source");
+        std::fs::create_dir_all(&dir).expect("create file db source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let appdb = @db.connect "file://data/app.wal.jsonl"
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write file db source");
+        let out = temp_output_dir("build-prod-file-db-connect");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["wal_paths"][0],
+            serde_json::json!("data/app.wal.jsonl")
+        );
+        assert_eq!(
+            container["persistence"]["volumes"][0]["host"],
+            serde_json::json!("data")
+        );
+        assert!(compose.contains("../data:/app/data"));
+        assert!(runbook.contains("- WAL: data/app.wal.jsonl"));
+        assert!(runbook.contains("- Compose volume: ../data:/app/data"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
