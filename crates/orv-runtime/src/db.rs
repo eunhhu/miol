@@ -3,13 +3,14 @@
 //! # 범위
 //! - 테이블 = `String → Vec<Value::Object>` 맵. row 는 자동 `id` 필드를 받는다.
 //! - `create/find/update/delete` 와 equality/range/contains filter.
-//! - 명시적 JSON snapshot save/load 와 JSONL WAL replay/checkpoint.
+//! - 명시적 JSON snapshot save/load, JSONL WAL replay/checkpoint, `SQLite`
+//!   reference adapter storage.
 //!
 //! # 범위 밖
 //! - 인덱스 (linear scan).
 //! - 트랜잭션/savepoint — WAL 은 단일 파일 append+fsync replay/checkpoint v1 만 지원한다.
 //! - 외부 DB query planner.
-//! - 마이그레이션/스키마 diff, 외부 DB 어댑터.
+//! - 마이그레이션/스키마 diff, PostgreSQL/MySQL 어댑터.
 //! - async/await — 호출 측이 `await` 를 쓰더라도 현재 인터프리터는 sync.
 
 use std::cell::RefCell;
@@ -117,6 +118,7 @@ impl DbQuery {
 pub struct InMemoryDb {
     tables: HashMap<String, Table>,
     wal_path: Option<PathBuf>,
+    sqlite_path: Option<PathBuf>,
 }
 
 /// Single-threaded runtime DB handle.
@@ -150,6 +152,15 @@ pub enum DbSnapshotError {
     /// Snapshot shape is invalid.
     #[error("{0}")]
     Invalid(String),
+    /// `SQLite` adapter error.
+    #[error("sqlite error for {path}: {source}")]
+    Sqlite {
+        /// Path being opened or synchronized.
+        path: PathBuf,
+        /// Source error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,7 +214,9 @@ impl InMemoryDb {
                 }),
             )?;
         }
-        Ok(self.create(table_name, data))
+        let created = self.create(table_name, data);
+        self.sync_sqlite_if_enabled()?;
+        Ok(created)
     }
 
     /// equality filter 로 첫 매칭 row 반환. 없으면 `Value::Void`.
@@ -366,7 +379,9 @@ impl InMemoryDb {
                 }),
             )?;
         }
-        Ok(self.update_query(table_name, query, data, inc))
+        let updated = self.update_query(table_name, query, data, inc);
+        self.sync_sqlite_if_enabled()?;
+        Ok(updated)
     }
 
     /// filter 매칭 row 제거. 제거된 수 반환.
@@ -404,7 +419,9 @@ impl InMemoryDb {
                 }),
             )?;
         }
-        Ok(self.delete_query(table_name, query))
+        let deleted = self.delete_query(table_name, query);
+        self.sync_sqlite_if_enabled()?;
+        Ok(deleted)
     }
 
     /// Serialize the current DB state as a deterministic JSON snapshot.
@@ -528,6 +545,7 @@ impl InMemoryDb {
         Ok(Self {
             tables,
             wal_path: None,
+            sqlite_path: None,
         })
     }
 
@@ -537,6 +555,7 @@ impl InMemoryDb {
         Self {
             tables: self.tables.clone(),
             wal_path: None,
+            sqlite_path: None,
         }
     }
 
@@ -547,7 +566,8 @@ impl InMemoryDb {
     /// state.
     pub fn restore_savepoint(&mut self, savepoint: &Self) -> Result<(), DbSnapshotError> {
         self.tables.clone_from(&savepoint.tables);
-        self.checkpoint_wal_if_enabled()
+        self.checkpoint_wal_if_enabled()?;
+        self.sync_sqlite_if_enabled()
     }
 
     /// Load a DB by replaying a JSONL WAL. Missing WAL means empty DB.
@@ -590,6 +610,7 @@ impl InMemoryDb {
         let mut db = Self {
             tables: HashMap::new(),
             wal_path: Some(path.to_path_buf()),
+            sqlite_path: None,
         };
         let source = match std::fs::read_to_string(path) {
             Ok(source) => source,
@@ -678,10 +699,38 @@ impl InMemoryDb {
             Ok(())
         }
     }
+
+    /// Load a DB from the reference `SQLite` adapter store. Missing DB creates
+    /// an empty store with ORV metadata tables.
+    ///
+    /// # Errors
+    /// Returns an error when `SQLite` cannot be opened, initialized, read, or
+    /// decoded.
+    pub fn load_sqlite(path: &Path) -> Result<Self, DbSnapshotError> {
+        let conn = open_sqlite_database(path)?;
+        ensure_sqlite_schema(path, &conn)?;
+        let mut tables = sqlite_load_meta(path, &conn)?;
+        sqlite_load_rows(path, &conn, &mut tables)?;
+        Ok(Self {
+            tables,
+            wal_path: None,
+            sqlite_path: Some(path.to_path_buf()),
+        })
+    }
+
+    fn sync_sqlite_if_enabled(&self) -> Result<(), DbSnapshotError> {
+        self.sqlite_path.as_ref().map_or_else(
+            || Ok(()),
+            |path| replace_sqlite_snapshot(path, &self.tables),
+        )
+    }
 }
 
 fn append_wal_record(path: &Path, record: &serde_json::Value) -> Result<(), DbSnapshotError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).map_err(|source| DbSnapshotError::Io {
             path: parent.to_path_buf(),
             source,
@@ -706,6 +755,204 @@ fn append_wal_record(path: &Path, record: &serde_json::Value) -> Result<(), DbSn
         .map_err(|source| DbSnapshotError::Io {
             path: path.to_path_buf(),
             source,
+        })
+}
+
+fn open_sqlite_database(path: &Path) -> Result<rusqlite::Connection, DbSnapshotError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| DbSnapshotError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    rusqlite::Connection::open(path).map_err(|source| DbSnapshotError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn ensure_sqlite_schema(path: &Path, conn: &rusqlite::Connection) -> Result<(), DbSnapshotError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orv_meta (
+            table_name TEXT PRIMARY KEY NOT NULL,
+            next_id INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS orv_rows (
+            table_name TEXT NOT NULL,
+            row_id INTEGER NOT NULL,
+            row_json TEXT NOT NULL,
+            PRIMARY KEY (table_name, row_id)
+        );",
+    )
+    .map_err(|source| DbSnapshotError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn sqlite_load_meta(
+    path: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<HashMap<String, Table>, DbSnapshotError> {
+    let mut stmt = conn
+        .prepare("SELECT table_name, next_id FROM orv_meta ORDER BY table_name")
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Table {
+                    rows: Vec::new(),
+                    next_id: row.get::<_, i64>(1)?,
+                },
+            ))
+        })
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut tables = HashMap::new();
+    for row in rows {
+        let (name, table) = row.map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        tables.insert(name, table);
+    }
+    Ok(tables)
+}
+
+fn sqlite_load_rows(
+    path: &Path,
+    conn: &rusqlite::Connection,
+    tables: &mut HashMap<String, Table>,
+) -> Result<(), DbSnapshotError> {
+    let mut stmt = conn
+        .prepare("SELECT table_name, row_id, row_json FROM orv_rows ORDER BY table_name, row_id")
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    for row in rows {
+        let (table_name, row_id, row_json) = row.map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let row_value = serde_json::from_str::<serde_json::Value>(&row_json).map_err(|source| {
+            DbSnapshotError::Json {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let row_object = row_value.as_object().ok_or_else(|| {
+            DbSnapshotError::Invalid(format!(
+                "sqlite row for {table_name}/{row_id} must be object"
+            ))
+        })?;
+        let mut fields = Vec::new();
+        let mut has_id = false;
+        for (field, value) in row_object {
+            if field == "id" {
+                has_id = true;
+            }
+            fields.push((field.clone(), json_to_value(value)?));
+        }
+        if !has_id {
+            fields.insert(0, ("id".to_string(), Value::Int(row_id)));
+        }
+        let table = tables.entry(table_name).or_default();
+        table.next_id = table.next_id.max(row_id);
+        table.rows.push(fields);
+    }
+    Ok(())
+}
+
+fn replace_sqlite_snapshot(
+    path: &Path,
+    tables: &HashMap<String, Table>,
+) -> Result<(), DbSnapshotError> {
+    let mut conn = open_sqlite_database(path)?;
+    ensure_sqlite_schema(path, &conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    tx.execute("DELETE FROM orv_rows", [])
+        .and_then(|_| tx.execute("DELETE FROM orv_meta", []))
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    for (table_name, table) in tables {
+        tx.execute(
+            "INSERT INTO orv_meta (table_name, next_id) VALUES (?1, ?2)",
+            rusqlite::params![table_name, table.next_id],
+        )
+        .map_err(|source| DbSnapshotError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        for row in &table.rows {
+            let row_id = sqlite_row_id(row)?;
+            let row_json = serde_json::to_string(&serde_json::Value::Object(
+                row.iter()
+                    .map(|(field, value)| (field.clone(), value_to_json(value)))
+                    .collect(),
+            ))
+            .map_err(|source| DbSnapshotError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            tx.execute(
+                "INSERT INTO orv_rows (table_name, row_id, row_json) VALUES (?1, ?2, ?3)",
+                rusqlite::params![table_name, row_id, row_json],
+            )
+            .map_err(|source| DbSnapshotError::Sqlite {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+    }
+    tx.commit().map_err(|source| DbSnapshotError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn sqlite_row_id(row: &[(String, Value)]) -> Result<i64, DbSnapshotError> {
+    row.iter()
+        .find_map(|(field, value)| {
+            (field == "id").then(|| match value {
+                Value::Int(id) => Ok(*id),
+                other => Err(DbSnapshotError::Invalid(format!(
+                    "sqlite row id must be int, got {other}"
+                ))),
+            })
+        })
+        .unwrap_or_else(|| {
+            Err(DbSnapshotError::Invalid(
+                "sqlite row missing id".to_string(),
+            ))
         })
 }
 

@@ -5160,8 +5160,19 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                     })?;
                     return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
                 }
+                if let Some(path) = url.strip_prefix("sqlite://") {
+                    if path.is_empty() {
+                        return Err(RuntimeError::native(
+                            "`@db.connect` sqlite adapter expects a database path",
+                        ));
+                    }
+                    let restored = InMemoryDb::load_sqlite(Path::new(path)).map_err(|e| {
+                        RuntimeError::native(format!("db.connect sqlite adapter failed: {e}"))
+                    })?;
+                    return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
+                }
                 return Err(RuntimeError::native(format!(
-                    "external db adapters are not implemented for `{url}`; supported schemes are memory:// and file://"
+                    "external db adapters are not implemented for `{url}`; supported schemes are memory://, file://, and sqlite://"
                 )));
             }
             Ok(Value::Db(db.clone()))
@@ -8449,6 +8460,57 @@ let found = external.find("User", {{ name: "Ada" }})
         let out = run_str(&second).unwrap();
 
         assert_eq!(out, "Ada\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_connect_sqlite_adapter_replays_and_persists_rows() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "orv-runtime-db-connect-sqlite-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let first = format!(
+            r#"let external = @db.connect "sqlite://{}"
+let ada = external.create("User", {{ name: "Ada" }})
+let grace = external.create("User", {{ name: "Grace" }})"#,
+            path.display()
+        );
+        let second = format!(
+            r#"let external = @db.connect "sqlite://{}"
+external.update("User", {{ name: "Ada" }}, {{ name: "Ada Lovelace" }})
+external.delete("User", {{ name: "Grace" }})"#,
+            path.display()
+        );
+        let third = format!(
+            r#"let external = @db.connect "sqlite://{}"
+let found = external.find("User", {{ name: "Ada Lovelace" }})
+let gone = external.find("User", {{ name: "Grace" }})
+let all = external.findAll("User", {{}})
+@out found.name
+@out gone
+@out all.length"#,
+            path.display()
+        );
+
+        run_str(&first).unwrap();
+        run_str(&second).unwrap();
+        let out = run_str(&third).unwrap();
+
+        assert_eq!(out, "Ada Lovelace\n\n1\n");
+        assert!(path.is_file());
+        let conn = rusqlite::Connection::open(&path).expect("open sqlite adapter db");
+        let row_json: String = conn
+            .query_row(
+                "SELECT row_json FROM orv_rows WHERE table_name = 'User' AND row_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite adapter row");
+        assert!(row_json.contains(r#""name":"Ada Lovelace""#));
         let _ = std::fs::remove_file(path);
     }
 
