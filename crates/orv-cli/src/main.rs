@@ -13302,40 +13302,61 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
     if plan.get("entry") != source_bundle.get("entry") {
         anyhow::bail!("client_reactive_plan entry does not match source bundle");
     }
-    if !plan
+    let signals = plan
         .get("signals")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|signals| {
-            signals.iter().all(|signal| {
-                signal
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
-                    && signal
-                        .get("origin_id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some()
-            })
-        })
-    {
+        .ok_or_else(|| anyhow::anyhow!("client_reactive_plan signals must be an array"))?;
+    if !signals.iter().all(|signal| {
+        signal
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+            && signal
+                .get("origin_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            && signal
+                .get("state_key")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            && signal
+                .get("initial_value")
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+    }) {
         anyhow::bail!("client_reactive_plan signals must be an array of source-backed signals");
     }
-    if !plan
+    let bindings = plan
         .get("bindings")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|bindings| {
-            bindings.iter().any(|binding| {
-                binding.get("kind").and_then(serde_json::Value::as_str) == Some("initial_render")
-                    && binding.get("target").and_then(serde_json::Value::as_str)
-                        == Some(CLIENT_PAGE_PATH)
-                    && binding.get("source").and_then(serde_json::Value::as_str)
-                        == Some(CLIENT_WASM_PATH)
-            })
-        })
-    {
+        .ok_or_else(|| anyhow::anyhow!("client_reactive_plan bindings must be an array"))?;
+    if !bindings.iter().any(|binding| {
+        binding.get("kind").and_then(serde_json::Value::as_str) == Some("initial_render")
+            && binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_PAGE_PATH)
+            && binding.get("source").and_then(serde_json::Value::as_str) == Some(CLIENT_WASM_PATH)
+    }) {
         anyhow::bail!(
             "client_reactive_plan initial_render binding must target {CLIENT_PAGE_PATH} from {CLIENT_WASM_PATH}"
         );
+    }
+    if !signals.iter().all(|signal| {
+        let origin_id = signal
+            .get("origin_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let state_key = signal
+            .get("state_key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        bindings.iter().any(|binding| {
+            binding.get("kind").and_then(serde_json::Value::as_str) == Some("signal_state")
+                && binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_JS_PATH)
+                && binding.get("source").and_then(serde_json::Value::as_str) == Some(origin_id)
+                && binding.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
+        })
+    }) {
+        anyhow::bail!("client_reactive_plan signal_state binding is missing");
     }
     if !plan
         .get("blocked_by")
@@ -13396,7 +13417,12 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client reactive plan fetch failed")
         || !source.contains("client reactive plan hash mismatch")
         || !source.contains("client reactive plan initial_render binding mismatch")
+        || !source.contains("client reactive plan signal_state binding mismatch")
+        || !source.contains("createReactiveState")
         || !source.contains("orvReactiveSignals")
+        || !source.contains("orvReactiveBindings")
+        || !source.contains("orvReactiveStateHash")
+        || !source.contains("__ORV_CLIENT_REACTIVE_STATE__")
     {
         anyhow::bail!("client_js bundle does not verify client reactive plan contract");
     }
@@ -16986,6 +17012,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         source_bundle: &source_bundle,
         source_bundle_hash: &source_bundle_hash,
         origin_map: &origin_map,
+        program: &lowered.program,
         initial_render: client_initial_render.as_deref().unwrap_or(""),
     };
     let client_bundle_targets = ClientBundleTargets {
@@ -17073,6 +17100,7 @@ struct ClientSourceBinding<'a> {
     source_bundle: &'a orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &'a str,
     origin_map: &'a orv_compiler::OriginMap,
+    program: &'a orv_hir::HirProgram,
     initial_render: &'a str,
 }
 
@@ -17090,23 +17118,20 @@ fn write_client_reactive_plan(
     entry: &Path,
     binding: &ClientSourceBinding<'_>,
 ) -> anyhow::Result<()> {
-    let signals = binding
-        .origin_map
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == "signal")
-        .map(|signal| {
-            serde_json::json!({
-                "name": &signal.name,
-                "origin_id": &signal.id,
-                "span": {
-                    "file": signal.span.file,
-                    "start": signal.span.start,
-                    "end": signal.span.end,
-                },
-            })
+    let signals = client_reactive_plan_signals(binding);
+    let mut bindings = vec![serde_json::json!({
+        "kind": "initial_render",
+        "target": CLIENT_PAGE_PATH,
+        "source": CLIENT_WASM_PATH,
+    })];
+    bindings.extend(signals.iter().map(|signal| {
+        serde_json::json!({
+            "kind": "signal_state",
+            "target": CLIENT_JS_PATH,
+            "source": signal["origin_id"].clone(),
+            "state_key": signal["state_key"].clone(),
         })
-        .collect::<Vec<_>>();
+    }));
     let plan = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.reactive_plan",
@@ -17115,14 +17140,92 @@ fn write_client_reactive_plan(
         "source_bundle_hash": binding.source_bundle_hash,
         "runtime_features": ["client_wasm"],
         "signals": signals,
-        "bindings": [{
-            "kind": "initial_render",
-            "target": CLIENT_PAGE_PATH,
-            "source": CLIENT_WASM_PATH,
-        }],
+        "bindings": bindings,
         "blocked_by": ["reactive-dom-diff", "dynamic-client-codegen"],
     });
     write_json(&out.join(path), &plan)
+}
+
+fn client_reactive_plan_signals(binding: &ClientSourceBinding<'_>) -> Vec<serde_json::Value> {
+    let initial_values = client_signal_initial_values(binding.program);
+    binding
+        .origin_map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "signal")
+        .map(|signal| {
+            serde_json::json!({
+                "name": &signal.name,
+                "origin_id": &signal.id,
+                "state_key": &signal.name,
+                "initial_value": initial_values
+                    .get(&signal.id)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"kind": "dynamic"})),
+                "span": {
+                    "file": signal.span.file,
+                    "start": signal.span.start,
+                    "end": signal.span.end,
+                },
+            })
+        })
+        .collect()
+}
+
+fn client_signal_initial_values(
+    program: &orv_hir::HirProgram,
+) -> HashMap<String, serde_json::Value> {
+    program
+        .items
+        .iter()
+        .filter_map(|stmt| {
+            let orv_hir::HirStmt::Let(stmt) = stmt else {
+                return None;
+            };
+            (stmt.kind == orv_hir::HirLetKind::Signal).then(|| {
+                (
+                    orv_hir::origin_id("signal", &stmt.name.name, stmt.span),
+                    client_signal_initial_value_json(&stmt.init),
+                )
+            })
+        })
+        .collect()
+}
+
+fn client_signal_initial_value_json(expr: &orv_hir::HirExpr) -> serde_json::Value {
+    match &expr.kind {
+        orv_hir::HirExprKind::Integer(value) => {
+            serde_json::json!({"kind": "int", "value": value})
+        }
+        orv_hir::HirExprKind::Float(value) => {
+            serde_json::json!({"kind": "float", "value": value})
+        }
+        orv_hir::HirExprKind::String(segments)
+            if segments
+                .iter()
+                .all(|segment| matches!(segment, orv_hir::HirStringSegment::Str(_))) =>
+        {
+            let value = segments
+                .iter()
+                .map(|segment| match segment {
+                    orv_hir::HirStringSegment::Str(value) => value.as_str(),
+                    orv_hir::HirStringSegment::Interp(_) => "",
+                })
+                .collect::<String>();
+            serde_json::json!({"kind": "string", "value": value})
+        }
+        orv_hir::HirExprKind::True => serde_json::json!({"kind": "bool", "value": true}),
+        orv_hir::HirExprKind::False => serde_json::json!({"kind": "bool", "value": false}),
+        orv_hir::HirExprKind::Void => serde_json::json!({"kind": "void", "value": null}),
+        _ => serde_json::json!({
+            "kind": "dynamic",
+            "span": {
+                "file": expr.span.file.index(),
+                "start": expr.span.range.start,
+                "end": expr.span.range.end,
+            },
+        }),
+    }
 }
 
 fn write_client_bundle_manifest(
@@ -28766,6 +28869,8 @@ entry = "src/main.orv"
             "validateReactiveBindings",
             "client reactive plan hash mismatch",
             "client reactive plan initial_render binding mismatch",
+            "client reactive plan signal_state binding mismatch",
+            "createReactiveState",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
             "fnv1a64",
@@ -28782,6 +28887,8 @@ entry = "src/main.orv"
             "root.innerHTML",
             "app.wasm",
             "orvReactiveSignals",
+            "orvReactiveBindings",
+            "__ORV_CLIENT_REACTIVE_STATE__",
         ] {
             assert!(
                 loader.contains(expected),
@@ -31458,6 +31565,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_reactive_plan_without_signal_state_binding() {
+        let out = temp_output_dir("verify-build-client-reactive-state-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
+        let mut plan = read_json_value(&plan_path).expect("reactive plan");
+        let bindings = plan["bindings"].as_array_mut().expect("bindings");
+        bindings.retain(|binding| binding["kind"] != "signal_state");
+        write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
+
+        assert!(
+            err.to_string().contains("signal_state binding"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_missing_static_page_output() {
         let out = temp_output_dir("verify-build-missing-static");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -31785,6 +31920,9 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("signals")
             .iter()
             .any(|signal| signal["name"] == "count"
+                && signal["state_key"] == "count"
+                && signal["initial_value"]["kind"] == "int"
+                && signal["initial_value"]["value"] == "0"
                 && signal["origin_id"]
                     .as_str()
                     .is_some_and(|id| !id.is_empty())));
@@ -31795,6 +31933,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .any(|binding| binding["kind"] == "initial_render"
                 && binding["target"] == CLIENT_PAGE_PATH
                 && binding["source"] == CLIENT_WASM_PATH));
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_state"
+                && binding["target"] == CLIENT_JS_PATH
+                && binding["state_key"] == "count"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
         assert!(reactive_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")

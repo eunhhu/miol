@@ -76,7 +76,13 @@ async function loadReactivePlan(manifest) {
   if (!Array.isArray(plan.signals)) {
     throw new Error("orv client reactive plan signals mismatch");
   }
-  if (!plan.signals.every((signal) => typeof signal.name === "string" && typeof signal.origin_id === "string")) {
+  if (!plan.signals.every((signal) =>
+    typeof signal.name === "string" &&
+    typeof signal.origin_id === "string" &&
+    typeof signal.state_key === "string" &&
+    signal.initial_value &&
+    typeof signal.initial_value.kind === "string"
+  )) {
     throw new Error("orv client reactive plan signal metadata mismatch");
   }
   validateReactiveBindings(plan, manifest);
@@ -95,6 +101,44 @@ function validateReactiveBindings(plan, manifest) {
   if (!hasInitialRenderBinding) {
     throw new Error("orv client reactive plan initial_render binding mismatch");
   }
+  const hasSignalStateBindings = plan.signals.every((signal) =>
+    plan.bindings.some((binding) =>
+      binding.kind === "signal_state" &&
+      binding.target === manifest.loader &&
+      binding.source === signal.origin_id &&
+      binding.state_key === signal.state_key
+    )
+  );
+  if (!hasSignalStateBindings) {
+    throw new Error("orv client reactive plan signal_state binding mismatch");
+  }
+}
+
+function decodeSignalInitialValue(metadata) {
+  switch (metadata.kind) {
+    case "int":
+    case "float":
+      return Number(metadata.value);
+    case "string":
+      return String(metadata.value ?? "");
+    case "bool":
+      return Boolean(metadata.value);
+    case "void":
+      return null;
+    default:
+      return metadata.value ?? null;
+  }
+}
+
+function createReactiveState(plan) {
+  return Object.fromEntries(plan.signals.map((signal) => [
+    signal.state_key,
+    {
+      origin_id: signal.origin_id,
+      value: decodeSignalInitialValue(signal.initial_value),
+      initial_value: signal.initial_value,
+    },
+  ]));
 }
 
 async function loadSourceBundle(manifest) {
@@ -148,6 +192,7 @@ function validateWasmBundle(manifest, bytes) {
 async function main() {
   const manifest = await loadClientManifest();
   const reactivePlan = await loadReactivePlan(manifest);
+  const reactiveState = createReactiveState(reactivePlan);
   const sourceBundle = await loadSourceBundle(manifest);
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
@@ -169,7 +214,10 @@ async function main() {
     root.dataset.orvEntry = ORV_CLIENT_BOOTSTRAP.entry;
     root.dataset.orvSourceCount = String(sourceBundle.files?.length ?? 0);
     root.dataset.orvReactiveSignals = String(reactivePlan.signals.length);
+    root.dataset.orvReactiveBindings = String(reactivePlan.bindings.filter((binding) => binding.kind === "signal_state").length);
+    root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
   }
+  globalThis.__ORV_CLIENT_REACTIVE_STATE__ = Object.freeze(reactiveState);
 }
 
 main().catch((error) => {
