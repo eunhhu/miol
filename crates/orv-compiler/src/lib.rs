@@ -430,6 +430,12 @@ pub struct ServerResponseRequestBodyFieldArtifact {
     /// Static JSON operand for the arithmetic operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_json: Option<String>,
+    /// Captured operand class for dynamic arithmetic operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operand_kind: Option<String>,
+    /// Captured operand field name for dynamic arithmetic operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operand_name: Option<String>,
 }
 
 fn default_request_body_field_value_kind() -> String {
@@ -2046,8 +2052,7 @@ pub fn orv_native_handle_route(
                             &mut source,
                             name,
                             "request_body_field",
-                            None,
-                            None,
+                            NativeCapturedJsonOperation::none(),
                             &response.origin_id,
                         );
                     }
@@ -2059,8 +2064,7 @@ pub fn orv_native_handle_route(
                             &mut source,
                             name,
                             "request_body_field_int",
-                            None,
-                            None,
+                            NativeCapturedJsonOperation::none(),
                             &response.origin_id,
                         );
                     }
@@ -2072,8 +2076,7 @@ pub fn orv_native_handle_route(
                             &mut source,
                             name,
                             "request_body_field_float",
-                            None,
-                            None,
+                            NativeCapturedJsonOperation::none(),
                             &response.origin_id,
                         );
                     }
@@ -2152,8 +2155,7 @@ pub fn orv_native_handle_route(
                     &mut source,
                     &field.name,
                     &field.value_kind,
-                    field.op.as_deref(),
-                    field.operand_json.as_deref(),
+                    native_response_field_operation(field),
                     &response.origin_id,
                 );
             }
@@ -2249,8 +2251,7 @@ fn push_native_request_body_field_json_value(
     source: &mut String,
     name: &str,
     value_kind: &str,
-    op: Option<&str>,
-    operand_json: Option<&str>,
+    operation: NativeCapturedJsonOperation<'_>,
     response_origin_id: &str,
 ) -> bool {
     let lookup_expr = format!(
@@ -2261,8 +2262,7 @@ fn push_native_request_body_field_json_value(
         source,
         &lookup_expr,
         value_kind,
-        op,
-        operand_json,
+        operation,
         &NativeCapturedJsonKinds {
             string_kind: "request_body_field",
             int_kind: "request_body_field_int",
@@ -2287,8 +2287,7 @@ fn push_native_route_param_json_value(
         source,
         &lookup_expr,
         value_kind,
-        None,
-        None,
+        NativeCapturedJsonOperation::none(),
         &NativeCapturedJsonKinds {
             string_kind: "route_param",
             int_kind: "route_param_int",
@@ -2313,8 +2312,7 @@ fn push_native_query_param_json_value(
         source,
         &lookup_expr,
         value_kind,
-        None,
-        None,
+        NativeCapturedJsonOperation::none(),
         &NativeCapturedJsonKinds {
             string_kind: "query_param",
             int_kind: "query_param_int",
@@ -2332,12 +2330,41 @@ struct NativeCapturedJsonKinds<'a> {
     error_prefix: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct NativeCapturedJsonOperation<'a> {
+    op: Option<&'a str>,
+    operand_json: Option<&'a str>,
+    operand_kind: Option<&'a str>,
+    operand_name: Option<&'a str>,
+}
+
+impl<'a> NativeCapturedJsonOperation<'a> {
+    fn none() -> Self {
+        Self {
+            op: None,
+            operand_json: None,
+            operand_kind: None,
+            operand_name: None,
+        }
+    }
+}
+
+fn native_response_field_operation(
+    field: &ServerResponseRequestBodyFieldArtifact,
+) -> NativeCapturedJsonOperation<'_> {
+    NativeCapturedJsonOperation {
+        op: field.op.as_deref(),
+        operand_json: field.operand_json.as_deref(),
+        operand_kind: field.operand_kind.as_deref(),
+        operand_name: field.operand_name.as_deref(),
+    }
+}
+
 fn push_native_captured_json_value(
     source: &mut String,
     lookup_expr: &str,
     value_kind: &str,
-    op: Option<&str>,
-    operand_json: Option<&str>,
+    operation: NativeCapturedJsonOperation<'_>,
     kinds: &NativeCapturedJsonKinds<'_>,
     response_origin_id: &str,
 ) -> bool {
@@ -2356,8 +2383,7 @@ fn push_native_captured_json_value(
             );
             if !push_native_int_success_arm(
                 source,
-                op,
-                operand_json,
+                operation,
                 kinds.error_prefix,
                 response_origin_id,
             ) {
@@ -2390,17 +2416,22 @@ fn push_native_captured_json_value(
 
 fn push_native_int_success_arm(
     source: &mut String,
-    op: Option<&str>,
-    operand_json: Option<&str>,
+    operation: NativeCapturedJsonOperation<'_>,
     error_prefix: &str,
     response_origin_id: &str,
 ) -> bool {
-    match (op, operand_json) {
-        (None, None) => {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    match (op, operand_json, operand_kind, operand_name) {
+        (None, None, None, None) => {
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
             true
         }
-        (Some("add" | "mul"), Some(operand_json)) => {
+        (Some("add" | "mul"), Some(operand_json), None, None) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
             };
@@ -2417,6 +2448,36 @@ fn push_native_int_success_arm(
                 "                Some(value) => body.push_str(&value.to_string()),\n                None => {\n",
             );
             let error_body = format!(r#"{{"error":"{} int arithmetic failed"}}"#, error_prefix);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
+            true
+        }
+        (Some("add" | "mul"), None, Some("request_body_field_int"), Some(operand_name)) => {
+            let method = if op == Some("mul") {
+                "checked_mul"
+            } else {
+                "checked_add"
+            };
+            let _ = writeln!(
+                source,
+                "            Ok(value) => match routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\").trim().parse::<i64>() {{",
+                rust_string_literal(operand_name)
+            );
+            let _ = writeln!(
+                source,
+                "                Ok(operand) => match value.{method}(operand) {{"
+            );
+            source.push_str(
+                "                    Some(value) => body.push_str(&value.to_string()),\n                    None => {\n",
+            );
+            let error_body = format!(r#"{{"error":"{} int arithmetic failed"}}"#, error_prefix);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str(
+                "                    },\n                },\n                Err(_) => {\n",
+            );
+            let error_body = format!(r#"{{"error":"{} int operand cast failed"}}"#, error_prefix);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("                },\n            },\n");
@@ -2566,8 +2627,7 @@ fn push_native_object_fields_body(
                     source,
                     name,
                     &field.value_kind,
-                    None,
-                    None,
+                    NativeCapturedJsonOperation::none(),
                     &response.origin_id,
                 );
             }
@@ -2639,8 +2699,7 @@ fn push_native_request_fields_body(
             source,
             &field.name,
             &field.value_kind,
-            field.op.as_deref(),
-            field.operand_json.as_deref(),
+            native_response_field_operation(field),
             &response.origin_id,
         );
     }
@@ -2931,6 +2990,8 @@ fn request_body_field_json_payload(
                     value_kind: value.value_kind,
                     op: value.op,
                     operand_json: value.operand_json,
+                    operand_kind: value.operand_kind,
+                    operand_name: value.operand_name,
                 });
             }
             Some(out)
@@ -3083,6 +3144,8 @@ struct CapturedResponseValue {
     value_kind: String,
     op: Option<String>,
     operand_json: Option<String>,
+    operand_kind: Option<String>,
+    operand_name: Option<String>,
 }
 
 fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseValue {
@@ -3091,6 +3154,8 @@ fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseVa
         value_kind: value_kind.to_string(),
         op: None,
         operand_json: None,
+        operand_kind: None,
+        operand_name: None,
     }
 }
 
@@ -3109,7 +3174,16 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                 }
                 .to_string(),
             );
-            value.operand_json = Some(static_integer(rhs)?.to_string());
+            if let Some(operand) = static_integer(rhs) {
+                value.operand_json = Some(operand.to_string());
+                return Some(value);
+            }
+            let operand = request_body_field_value(rhs)?;
+            if operand.value_kind != "request_body_field_int" || operand.op.is_some() {
+                return None;
+            }
+            value.operand_kind = Some(operand.value_kind);
+            value.operand_name = Some(operand.name);
             Some(value)
         }
         HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some(captured_response_value(
@@ -5067,7 +5141,7 @@ function greet(name: string): string -> "hi {name}""#,
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { quantity: (@body.quantity as int) + (@body.bonus as int) }
+    @respond 201 { quantity: (@body.quantity as int) - (@body.bonus as int) }
   }
 }"#;
         let program = lower(src);
@@ -5200,6 +5274,53 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(".trim().parse::<i64>()"));
         assert!(handlers.contains("value.checked_mul(100)"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_mul_field_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: (@body.quantity as int) * (@body.unit_price as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("unit_price")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"quantity\")"));
+        assert!(
+            handlers.contains("routes::orv_native_body_field_value(route_match, \"unit_price\")")
+        );
+        assert!(handlers.contains("value.checked_mul(operand)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -5592,7 +5713,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) - (@body.extra as int) }
   }
 }";
         let program = lower(src);
