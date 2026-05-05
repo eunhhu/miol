@@ -970,6 +970,7 @@ pub struct OrvNativeDispatch {
     pub content_type: &'static str,
     pub body: &'static str,
     pub origin_id: Option<&'static str>,
+    pub response_origin_id: Option<&'static str>,
     pub params: Vec<routes::OrvNativeParam>,
 }
 
@@ -982,6 +983,7 @@ pub fn orv_native_dispatch(method: &str, path: &str) -> OrvNativeDispatch {
             content_type: "application/json",
             body: "{\"error\":\"native route handler codegen pending\"}",
             origin_id: Some(route_match.route.origin_id),
+            response_origin_id: route_match.route.response_origin_ids.first().copied(),
             params: route_match.params,
         };
     }
@@ -990,6 +992,7 @@ pub fn orv_native_dispatch(method: &str, path: &str) -> OrvNativeDispatch {
         content_type: "application/json",
         body: "{\"error\":\"not found\"}",
         origin_id: None,
+        response_origin_id: None,
         params: Vec::new(),
     }
 }
@@ -2352,6 +2355,10 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("status: 501"));
         assert!(source.contains("native route handler codegen pending"));
         assert!(source.contains("origin_id: Some(route_match.route.origin_id)"));
+        assert!(source.contains("pub response_origin_id: Option<&'static str>"));
+        assert!(source.contains(
+            "response_origin_id: route_match.route.response_origin_ids.first().copied()"
+        ));
         assert!(source.contains("params: route_match.params"));
         assert!(source.contains("status: 404"));
     }

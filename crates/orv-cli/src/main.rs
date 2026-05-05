@@ -26438,6 +26438,10 @@ entry = "src/main.orv"
         assert!(native_router_source_text.contains("routes::orv_native_match_route(method, path)"));
         assert!(native_router_source_text.contains("status: 501"));
         assert!(native_router_source_text.contains("native route handler codegen pending"));
+        assert!(native_router_source_text.contains("pub response_origin_id: Option<&'static str>"));
+        assert!(native_router_source_text.contains(
+            "response_origin_id: route_match.route.response_origin_ids.first().copied()"
+        ));
         assert!(native_router_source_text.contains("status: 404"));
         let native_package =
             std::fs::read_to_string(&native_server_package_path).expect("native package");
@@ -26586,6 +26590,9 @@ entry = "src/main.orv"
         assert!(source.contains("pub fn orv_native_dispatch("));
         assert!(source.contains("routes::orv_native_match_route(method, path)"));
         assert!(source.contains("origin_id: Some(route_match.route.origin_id)"));
+        assert!(source.contains(
+            "response_origin_id: route_match.route.response_origin_ids.first().copied()"
+        ));
         assert!(source.contains("params: route_match.params"));
         assert!(source.contains("status: 501"));
         assert!(source.contains("status: 404"));
