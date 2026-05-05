@@ -30,7 +30,9 @@ use std::thread;
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use http_body_util::{BodyExt, Full, Limited};
+#[cfg(test)]
+use http_body_util::Full;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -259,16 +261,6 @@ pub struct ServerRequestFrame {
 /// - 바인딩 실패도 RuntimeError.
 /// - accept/serve 루프의 I/O 에러는 로그로 흘려보내고 다음 연결로 넘어간다
 ///   (한 커넥션 실패로 서버 전체가 죽지 않도록).
-pub(crate) fn run_server(
-    listen: Option<&HirExpr>,
-    routes: &[HirExpr],
-    body_stmts: &[orv_hir::HirStmt],
-    captured_env: HashMap<NameId, Value>,
-    db: DbHandle,
-) -> Result<Value, RuntimeError> {
-    run_server_with_request_trace_path(listen, routes, body_stmts, captured_env, db, None)
-}
-
 pub(crate) fn run_server_with_request_trace_path(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
