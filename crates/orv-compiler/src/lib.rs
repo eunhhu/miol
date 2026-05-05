@@ -813,6 +813,18 @@ pub struct OrvNativeRoute {
     pub origin_id: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrvNativeRouteMatch {
+    pub route: &'static OrvNativeRoute,
+    pub params: Vec<OrvNativeParam>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrvNativeParam {
+    pub name: &'static str,
+    pub value: String,
+}
+
 pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
 "#,
     );
@@ -830,15 +842,21 @@ pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
 
 pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();
 
-pub fn orv_native_match_route(method: &str, path: &str) -> Option<&'static OrvNativeRoute> {
+pub fn orv_native_match_route(method: &str, path: &str) -> Option<OrvNativeRouteMatch> {
     ORV_NATIVE_ROUTES
         .iter()
-        .find(|route| route.method == method && orv_native_route_path_matches(route.path, path))
+        .find_map(|route| {
+            if route.method != method {
+                return None;
+            }
+            orv_native_route_path_params(route.path, path)
+                .map(|params| OrvNativeRouteMatch { route, params })
+        })
 }
 
-fn orv_native_route_path_matches(pattern: &str, path: &str) -> bool {
+fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec<OrvNativeParam>> {
     if pattern == "*" {
-        return true;
+        return Some(Vec::new());
     }
     let pattern_segments: Vec<&str> = pattern.split('/').collect();
     let path_segments: Vec<&str> = path.split('/').collect();
@@ -850,26 +868,48 @@ fn orv_native_route_path_matches(pattern: &str, path: &str) -> bool {
         {
             let prefix_len = pattern_segments.len() - 1;
             if path_segments.len() <= prefix_len {
-                return false;
+                return None;
             }
-            return pattern_segments
+            let mut params = Vec::new();
+            for (pattern_segment, path_segment) in pattern_segments
                 .iter()
                 .take(prefix_len)
                 .zip(path_segments.iter())
-                .all(|(pattern_segment, path_segment)| {
-                    pattern_segment.starts_with(':') || pattern_segment == path_segment
-                });
+            {
+                if let Some(name) = pattern_segment.strip_prefix(':') {
+                    params.push(OrvNativeParam {
+                        name,
+                        value: (*path_segment).to_string(),
+                    });
+                } else if pattern_segment != path_segment {
+                    return None;
+                }
+            }
+            params.push(OrvNativeParam {
+                name: rest_segment
+                    .strip_prefix(':')
+                    .and_then(|segment| segment.strip_suffix('*'))
+                    .unwrap_or(""),
+                value: path_segments[prefix_len..].join("/"),
+            });
+            return Some(params);
         }
     }
     if pattern_segments.len() != path_segments.len() {
-        return false;
+        return None;
     }
-    pattern_segments
-        .iter()
-        .zip(path_segments.iter())
-        .all(|(pattern_segment, path_segment)| {
-            pattern_segment.starts_with(':') || pattern_segment == path_segment
-        })
+    let mut params = Vec::new();
+    for (pattern_segment, path_segment) in pattern_segments.iter().zip(path_segments.iter()) {
+        if let Some(name) = pattern_segment.strip_prefix(':') {
+            params.push(OrvNativeParam {
+                name,
+                value: (*path_segment).to_string(),
+            });
+        } else if pattern_segment != path_segment {
+            return None;
+        }
+    }
+    Some(params)
 }
 "#,
     );
@@ -2103,8 +2143,7 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute { method: \"GET\", path: \"/ping\", origin_id:"));
         assert!(source.contains("pub fn orv_native_match_route("));
-        assert!(source
-            .contains("route.method == method && orv_native_route_path_matches(route.path, path)"));
+        assert!(source.contains("orv_native_route_path_params(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
@@ -2126,10 +2165,35 @@ function greet(name: string): string -> "hi {name}""#,
         let source = native_server_routes_source(&artifact);
 
         assert!(source.contains("path: \"/products/:sku\""));
-        assert!(source.contains("orv_native_route_path_matches(route.path, path)"));
-        assert!(source.contains("fn orv_native_route_path_matches(pattern: &str, path: &str)"));
-        assert!(source.contains("pattern_segment.starts_with(':')"));
+        assert!(source.contains("orv_native_route_path_params(route.path, path)"));
+        assert!(
+            source.contains("fn orv_native_route_path_params(pattern: &'static str, path: &str)")
+        );
+        assert!(source.contains("pattern_segment.strip_prefix(':')"));
         assert!(source.contains("pattern_segments.len() != path_segments.len()"));
+    }
+
+    #[test]
+    fn native_server_routes_source_generates_param_capture_contract() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:sku {
+    @respond 200 { ok: true }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(&manifest, &map, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("pub struct OrvNativeRouteMatch"));
+        assert!(source.contains("pub struct OrvNativeParam"));
+        assert!(source.contains("pub params: Vec<OrvNativeParam>"));
+        assert!(source.contains("OrvNativeParam {"));
+        assert!(source.contains("if let Some(name) = pattern_segment.strip_prefix(':')"));
+        assert!(source.contains("name,"));
+        assert!(source.contains("value: (*path_segment).to_string()"));
     }
 
     #[test]

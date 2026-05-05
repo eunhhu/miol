@@ -18610,8 +18610,10 @@ test "checkout failing runtime body" {
             serde_json::json!("server/native/routes.rs")
         );
         assert!(native_routes.contains("pub fn orv_native_match_route("));
-        assert!(native_routes.contains("orv_native_route_path_matches(route.path, path)"));
-        assert!(native_routes.contains("pattern_segment.starts_with(':')"));
+        assert!(native_routes.contains("pub struct OrvNativeRouteMatch"));
+        assert!(native_routes.contains("pub struct OrvNativeParam"));
+        assert!(native_routes.contains("orv_native_route_path_params(route.path, path)"));
+        assert!(native_routes.contains("pattern_segment.strip_prefix(':')"));
         assert_eq!(
             deploy["server"]["persistence"]["db_paths"][0],
             serde_json::json!("data/shop.sqlite")
@@ -26014,8 +26016,7 @@ entry = "src/main.orv"
         assert!(native_routes.contains("method: \"GET\""));
         assert!(native_routes.contains("path: \"/ping\""));
         assert!(native_routes.contains("pub fn orv_native_match_route("));
-        assert!(native_routes
-            .contains("route.method == method && orv_native_route_path_matches(route.path, path)"));
+        assert!(native_routes.contains("orv_native_route_path_params(route.path, path)"));
         assert!(native_routes.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(native_routes
             .contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();"));
@@ -26117,8 +26118,7 @@ entry = "src/main.orv"
         assert!(source.contains("method: \"GET\""));
         assert!(source.contains("path: \"/ping\""));
         assert!(source.contains("pub fn orv_native_match_route("));
-        assert!(source
-            .contains("route.method == method && orv_native_route_path_matches(route.path, path)"));
+        assert!(source.contains("orv_native_route_path_params(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
