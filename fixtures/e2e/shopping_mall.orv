@@ -192,7 +192,7 @@
         actual: amount
       }
     }
-    let payments = @payment.connect("file://data/payments.jsonl")
+    let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")
     let capture = payments.capture({
       orderId: orderId,
       amount: amount,
@@ -217,7 +217,7 @@
     if payment == void {
       @respond 402 { err: "payment_required", orderId: orderId }
     }
-    let shipping = @shipping.connect("file://data/shipments.jsonl")
+    let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "file://data/shipments.jsonl")
     let booking = shipping.book({
       orderId: orderId,
       carrier: @body.carrier,

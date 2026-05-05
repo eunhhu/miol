@@ -2192,7 +2192,9 @@ Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-m
 \n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
-Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
+Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
+\n\
+Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints without editing source.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -17184,14 +17186,10 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     for env in &persistence.commerce_env {
         match &env.default {
             Some(default) => {
-                let _ = writeln!(
-                    out,
-                    "- Commerce endpoint env: {} default {default}",
-                    env.env
-                );
+                let _ = writeln!(out, "- Commerce adapter env: {} default {default}", env.env);
             }
             None => {
-                let _ = writeln!(out, "- Commerce endpoint env: {}", env.env);
+                let _ = writeln!(out, "- Commerce adapter env: {}", env.env);
             }
         }
     }
@@ -19334,8 +19332,12 @@ test "checkout failing runtime body" {
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
-        assert!(source.contains(r#"@payment.connect("file://data/payments.jsonl")"#));
-        assert!(source.contains(r#"@shipping.connect("file://data/shipments.jsonl")"#));
+        assert!(source.contains(
+            r#"@payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")"#
+        ));
+        assert!(source.contains(
+            r#"@shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "file://data/shipments.jsonl")"#
+        ));
         cmd_check(&dir).expect("check shop project");
         let out = dir.join("dist");
         cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
@@ -19373,6 +19375,8 @@ test "checkout failing runtime body" {
         assert!(guide.contains("The generated launcher path can infer `dist`"));
         assert!(guide.contains("Persistent database: `data/shop.sqlite`"));
         assert!(guide.contains("Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`"));
+        assert!(guide.contains("PAYMENT_ADAPTER_URL"));
+        assert!(guide.contains("SHIPPING_ADAPTER_URL"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
@@ -19467,6 +19471,19 @@ test "checkout failing runtime body" {
             serde_json::json!(["data/payments.jsonl", "data/shipments.jsonl"])
         );
         assert_eq!(
+            deploy["server"]["persistence"]["commerce_env"],
+            serde_json::json!([
+                {
+                    "env": "PAYMENT_ADAPTER_URL",
+                    "default": "file://data/payments.jsonl"
+                },
+                {
+                    "env": "SHIPPING_ADAPTER_URL",
+                    "default": "file://data/shipments.jsonl"
+                }
+            ])
+        );
+        assert_eq!(
             container["persistence"]["volumes"][0]["host"],
             serde_json::json!("data")
         );
@@ -19475,10 +19492,22 @@ test "checkout failing runtime body" {
             serde_json::json!("/app/data")
         );
         assert!(compose.contains("../data:/app/data"));
+        assert!(compose.contains(
+            r#"PAYMENT_ADAPTER_URL: "${PAYMENT_ADAPTER_URL:-file://data/payments.jsonl}""#
+        ));
+        assert!(compose.contains(
+            r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-file://data/shipments.jsonl}""#
+        ));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
         assert!(runbook.contains("- Record log: data/shipments.jsonl"));
+        assert!(runbook.contains(
+            "- Commerce adapter env: PAYMENT_ADAPTER_URL default file://data/payments.jsonl"
+        ));
+        assert!(runbook.contains(
+            "- Commerce adapter env: SHIPPING_ADAPTER_URL default file://data/shipments.jsonl"
+        ));
         cmd_verify_build(&out).expect("verify shop prod build");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -28678,10 +28707,10 @@ entry = "src/main.orv"
             r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-http://shipping.internal/book}""#
         ));
         assert!(runbook.contains(
-            "- Commerce endpoint env: PAYMENT_ADAPTER_URL default http://payments.internal/capture"
+            "- Commerce adapter env: PAYMENT_ADAPTER_URL default http://payments.internal/capture"
         ));
         assert!(runbook.contains(
-            "- Commerce endpoint env: SHIPPING_ADAPTER_URL default http://shipping.internal/book"
+            "- Commerce adapter env: SHIPPING_ADAPTER_URL default http://shipping.internal/book"
         ));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
