@@ -39,8 +39,8 @@ use codespan_reporting::term::termcolor::WriteColor;
 use orv_diagnostics::{ByteRange, FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
 use orv_syntax::ast::{
-    BinaryOp as AstBinaryOp, Block, ConstraintValue, Expr, ExprKind, FunctionBody, FunctionStmt,
-    Program, Stmt, StringSegment, TypeConstraint, TypeRef, TypeRefKind, UnaryOp as AstUnaryOp,
+    Block, ConstraintValue, Expr, ExprKind, FunctionBody, FunctionStmt, Program, Stmt,
+    TypeConstraint, TypeRef, TypeRefKind,
 };
 
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
@@ -2342,10 +2342,12 @@ fn cmd_db_verify(path: &Path, schema: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_db_apply(path: &Path, schema: &Path) -> anyhow::Result<()> {
     cmd_db_apply_with_history(path, schema, None)
 }
 
+#[cfg(test)]
 fn cmd_db_migrate(path: &Path, schema: &Path, history: Option<&Path>) -> anyhow::Result<()> {
     cmd_db_apply_with_history(path, schema, history)
 }
@@ -2401,6 +2403,7 @@ fn cmd_db_apply_with_data(
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_db_rollback(schema: &Path) -> anyhow::Result<()> {
     cmd_db_rollback_with_data(schema, None)
 }
@@ -6728,73 +6731,6 @@ struct DapStackFrameState {
     line: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum DapDebugValue {
-    Int(i64),
-    Float(f64),
-    String(String),
-    Regex { pattern: String, flags: String },
-    Bool(bool),
-    Void,
-    Array(Vec<Self>),
-    Tuple(Vec<Self>),
-    Object(Vec<(String, Self)>),
-}
-
-impl DapDebugValue {
-    fn display_value(&self) -> String {
-        match self {
-            Self::Int(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
-            Self::String(value) => {
-                serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
-            }
-            Self::Regex { pattern, flags } => format!("r\"{pattern}\"{flags}"),
-            Self::Bool(value) => value.to_string(),
-            Self::Void => "void".to_string(),
-            Self::Array(items) => {
-                let items = items
-                    .iter()
-                    .map(Self::display_value)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[{items}]")
-            }
-            Self::Tuple(items) => {
-                let items = items
-                    .iter()
-                    .map(Self::display_value)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("({items})")
-            }
-            Self::Object(fields) => {
-                let fields = fields
-                    .iter()
-                    .map(|(name, value)| format!("{name}: {}", value.display_value()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ {fields} }}")
-            }
-        }
-    }
-
-    fn value_type(&self) -> String {
-        match self {
-            Self::Int(_) => "int",
-            Self::Float(_) => "float",
-            Self::String(_) => "string",
-            Self::Regex { .. } => "regex",
-            Self::Bool(_) => "bool",
-            Self::Void => "void",
-            Self::Array(_) => "array",
-            Self::Tuple(_) => "tuple",
-            Self::Object(_) => "object",
-        }
-        .to_string()
-    }
-}
-
 impl DapSession {
     fn message_response(&mut self, request: &serde_json::Value) -> Option<serde_json::Value> {
         if request.get("type").and_then(serde_json::Value::as_str) != Some("request") {
@@ -8589,16 +8525,6 @@ impl DapSession {
             .collect()
     }
 
-    fn first_verified_breakpoint_line(&self, path: &Path) -> Option<u64> {
-        let normalized = dap_normalize_path(path);
-        self.breakpoints.get(&normalized).and_then(|breakpoints| {
-            breakpoints
-                .iter()
-                .find(|breakpoint| breakpoint.verified && breakpoint.log_message.is_none())
-                .map(|breakpoint| breakpoint.line)
-        })
-    }
-
     fn first_verified_breakpoint_frame(&self, frames: &[DapFrameState]) -> Option<usize> {
         frames
             .iter()
@@ -9869,227 +9795,10 @@ fn dap_set_value_json(variable: &DapVariable) -> serde_json::Value {
     })
 }
 
-fn dap_local_variables(program: &Program, files: &[SourceFile]) -> Vec<DapVariable> {
-    let mut locals = Vec::new();
-    let mut env = HashMap::new();
-    for stmt in &program.items {
-        let local = match stmt {
-            Stmt::Let(stmt) => dap_local_variable(
-                &stmt.name.name,
-                stmt.ty.as_ref(),
-                &stmt.init,
-                stmt.span,
-                files,
-                &env,
-            ),
-            Stmt::Const(stmt) => dap_local_variable(
-                &stmt.name.name,
-                stmt.ty.as_ref(),
-                &stmt.init,
-                stmt.span,
-                files,
-                &env,
-            ),
-            _ => None,
-        };
-        if let Some((variable, value)) = local {
-            env.insert(variable.name.clone(), value);
-            locals.push(variable);
-        }
-    }
-    locals
-}
-
-fn dap_local_variable(
-    name: &str,
-    ty: Option<&TypeRef>,
-    init: &Expr,
-    span: Span,
-    files: &[SourceFile],
-    env: &HashMap<String, DapDebugValue>,
-) -> Option<(DapVariable, DapDebugValue)> {
-    let value = dap_expr_debug_value(init, env)?;
-    let line = dap_span_line(span, files)?;
-    let variable = DapVariable {
-        name: name.to_string(),
-        value: value.display_value(),
-        value_type: ty.map_or_else(|| value.value_type(), type_ref_string),
-        line,
-        variables_reference: 0,
-    };
-    Some((variable, value))
-}
-
 fn dap_span_line(span: Span, files: &[SourceFile]) -> Option<u64> {
     let file = files.iter().find(|file| file.id == span.file)?;
     let start = byte_position(&file.source, span.range.start);
     Some(u64::try_from(start.0 + 1).unwrap_or(u64::MAX))
-}
-
-fn dap_expr_debug_value(
-    expr: &Expr,
-    env: &HashMap<String, DapDebugValue>,
-) -> Option<DapDebugValue> {
-    match &expr.kind {
-        ExprKind::Integer(value) => value.parse::<i64>().ok().map(DapDebugValue::Int),
-        ExprKind::Float(value) => value.parse::<f64>().ok().map(DapDebugValue::Float),
-        ExprKind::String(segments) => {
-            dap_string_debug_value(segments, env).map(DapDebugValue::String)
-        }
-        ExprKind::Regex { pattern, flags } => Some(DapDebugValue::Regex {
-            pattern: pattern.clone(),
-            flags: flags.clone(),
-        }),
-        ExprKind::True => Some(DapDebugValue::Bool(true)),
-        ExprKind::False => Some(DapDebugValue::Bool(false)),
-        ExprKind::Void => Some(DapDebugValue::Void),
-        ExprKind::Ident(ident) => env.get(&ident.name).cloned(),
-        ExprKind::Paren(inner) => dap_expr_debug_value(inner, env),
-        ExprKind::Unary { op, expr } => {
-            let value = dap_expr_debug_value(expr, env)?;
-            dap_apply_debug_unary(*op, value)
-        }
-        ExprKind::Binary { op, lhs, rhs } => {
-            let lhs = dap_expr_debug_value(lhs, env)?;
-            let rhs = dap_expr_debug_value(rhs, env)?;
-            dap_apply_debug_binary(*op, lhs, rhs)
-        }
-        ExprKind::Array(items) => items
-            .iter()
-            .map(|item| dap_expr_debug_value(item, env))
-            .collect::<Option<Vec<_>>>()
-            .map(DapDebugValue::Array),
-        ExprKind::Tuple(items) => items
-            .iter()
-            .map(|item| dap_expr_debug_value(item, env))
-            .collect::<Option<Vec<_>>>()
-            .map(DapDebugValue::Tuple),
-        ExprKind::Object(fields) => fields
-            .iter()
-            .filter(|field| !field.is_spread)
-            .map(|field| {
-                Some((
-                    field.name.name.clone(),
-                    dap_expr_debug_value(&field.value, env)?,
-                ))
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(DapDebugValue::Object),
-        _ => None,
-    }
-}
-
-fn dap_string_debug_value(
-    segments: &[StringSegment],
-    env: &HashMap<String, DapDebugValue>,
-) -> Option<String> {
-    let mut value = String::new();
-    for segment in segments {
-        match segment {
-            StringSegment::Str(text) => value.push_str(text),
-            StringSegment::Interp(expr) => {
-                value.push_str(&dap_expr_debug_value(expr, env)?.display_value());
-            }
-        }
-    }
-    Some(value)
-}
-
-fn dap_apply_debug_unary(op: AstUnaryOp, value: DapDebugValue) -> Option<DapDebugValue> {
-    match (op, value) {
-        (AstUnaryOp::Not, DapDebugValue::Bool(value)) => Some(DapDebugValue::Bool(!value)),
-        (AstUnaryOp::Neg, DapDebugValue::Int(value)) => Some(DapDebugValue::Int(-value)),
-        (AstUnaryOp::Neg, DapDebugValue::Float(value)) => Some(DapDebugValue::Float(-value)),
-        _ => None,
-    }
-}
-
-fn dap_apply_debug_binary(
-    op: AstBinaryOp,
-    lhs: DapDebugValue,
-    rhs: DapDebugValue,
-) -> Option<DapDebugValue> {
-    match op {
-        AstBinaryOp::Add => dap_debug_add(lhs, rhs),
-        AstBinaryOp::Sub => dap_debug_numeric(
-            lhs,
-            rhs,
-            |left, right| left - right,
-            |left, right| left - right,
-        ),
-        AstBinaryOp::Mul => dap_debug_numeric(
-            lhs,
-            rhs,
-            |left, right| left * right,
-            |left, right| left * right,
-        ),
-        AstBinaryOp::Div => dap_debug_numeric(
-            lhs,
-            rhs,
-            |left, right| left / right,
-            |left, right| left / right,
-        ),
-        AstBinaryOp::Rem => dap_debug_numeric(
-            lhs,
-            rhs,
-            |left, right| left % right,
-            |left, right| left % right,
-        ),
-        AstBinaryOp::Eq => Some(DapDebugValue::Bool(lhs == rhs)),
-        AstBinaryOp::Ne => Some(DapDebugValue::Bool(lhs != rhs)),
-        AstBinaryOp::And => match (lhs, rhs) {
-            (DapDebugValue::Bool(left), DapDebugValue::Bool(right)) => {
-                Some(DapDebugValue::Bool(left && right))
-            }
-            _ => None,
-        },
-        AstBinaryOp::Or => match (lhs, rhs) {
-            (DapDebugValue::Bool(left), DapDebugValue::Bool(right)) => {
-                Some(DapDebugValue::Bool(left || right))
-            }
-            _ => None,
-        },
-        AstBinaryOp::Coalesce => {
-            if lhs == DapDebugValue::Void {
-                Some(rhs)
-            } else {
-                Some(lhs)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn dap_debug_add(lhs: DapDebugValue, rhs: DapDebugValue) -> Option<DapDebugValue> {
-    match (lhs, rhs) {
-        (DapDebugValue::Int(left), DapDebugValue::Int(right)) => {
-            Some(DapDebugValue::Int(left + right))
-        }
-        (DapDebugValue::Float(left), DapDebugValue::Float(right)) => {
-            Some(DapDebugValue::Float(left + right))
-        }
-        (DapDebugValue::String(left), DapDebugValue::String(right)) => {
-            Some(DapDebugValue::String(format!("{left}{right}")))
-        }
-        _ => None,
-    }
-}
-
-fn dap_debug_numeric(
-    lhs: DapDebugValue,
-    rhs: DapDebugValue,
-    int_op: impl FnOnce(i64, i64) -> i64,
-    float_op: impl FnOnce(f64, f64) -> f64,
-) -> Option<DapDebugValue> {
-    match (lhs, rhs) {
-        (DapDebugValue::Int(left), DapDebugValue::Int(right)) => {
-            Some(DapDebugValue::Int(int_op(left, right)))
-        }
-        (DapDebugValue::Float(left), DapDebugValue::Float(right)) => {
-            Some(DapDebugValue::Float(float_op(left, right)))
-        }
-        _ => None,
-    }
 }
 
 fn dap_evaluate_project_value(
@@ -16007,6 +15716,7 @@ fn run_static_build_with_writer<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_artifact_with_writer<W: std::io::Write>(path: &Path, writer: &mut W) -> anyhow::Result<()> {
     run_artifact_with_writer_with_trace(path, None, writer)
 }
