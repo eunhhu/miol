@@ -25,9 +25,11 @@ use orv_hir::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 /// B4 `@env` 테스트 override.
 ///
@@ -3881,6 +3883,14 @@ fn call_commerce_adapter_method(
         .map(value_to_display)
         .unwrap_or_else(|| "test".to_string());
     let result = match (object_kind(fields).unwrap_or_default(), method) {
+        ("payment.adapter", "capture") if provider == "http" => {
+            payment_capture_value(&provider, args)?;
+            http_commerce_adapter_value(fields, "payment.capture", args)?
+        }
+        ("shipping.adapter", "book") if provider == "http" => {
+            shipping_booking_value(&provider, args)?;
+            http_commerce_adapter_value(fields, "shipping.booking", args)?
+        }
         ("payment.adapter", "capture") => payment_capture_value(&provider, args)?,
         ("shipping.adapter", "book") => shipping_booking_value(&provider, args)?,
         (kind, _) => {
@@ -3899,13 +3909,142 @@ fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeEr
             "`@{kind}.connect` expects adapter url"
         )));
     };
-    if matches!(scheme, "test" | "local" | "file") {
+    if matches!(scheme, "test" | "local" | "file" | "http") {
         Ok(scheme.to_string())
     } else {
         Err(RuntimeError::native(format!(
-            "external {kind} adapters are not implemented for `{url}`; supported schemes are test://, local://, and file://"
+            "external {kind} adapters are not implemented for `{url}`; supported schemes are test://, local://, file://, and http://"
         )))
     }
+}
+
+fn http_commerce_adapter_value(
+    fields: &[(String, Value)],
+    kind: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let Some(url) = object_field(fields, "url").map(value_to_display) else {
+        return Err(RuntimeError::native("http commerce adapter missing url"));
+    };
+    let payload = args.first().cloned().unwrap_or(Value::Void);
+    let request = serde_json::json!({
+        "kind": kind,
+        "payload": runtime_value_json(&payload),
+    })
+    .to_string();
+    let response = http_post_json(&url, &request)?;
+    let value = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter response was not JSON: {source}"
+        ))
+    })?;
+    Ok(runtime_value_from_json(value))
+}
+
+struct HttpAdapterUrl {
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+fn http_post_json(url: &str, body: &str) -> Result<String, RuntimeError> {
+    let parsed = parse_http_adapter_url(url)?;
+    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter failed to connect {url}: {source}"
+        ))
+    })?;
+    let timeout = Some(Duration::from_secs(5));
+    stream.set_read_timeout(timeout).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter failed to set read timeout: {source}"
+        ))
+    })?;
+    stream.set_write_timeout(timeout).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter failed to set write timeout: {source}"
+        ))
+    })?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\ncontent-type: application/json\r\naccept: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        parsed.path,
+        parsed.host_header,
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter failed to write request: {source}"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter failed to read response: {source}"
+        ))
+    })?;
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| RuntimeError::native("http commerce adapter response missing headers"))?;
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| RuntimeError::native("http commerce adapter response missing status"))?;
+    let response_body = String::from_utf8(bytes[header_end + 4..].to_vec()).map_err(|source| {
+        RuntimeError::native(format!(
+            "http commerce adapter response body was not utf-8: {source}"
+        ))
+    })?;
+    if !(200..300).contains(&status) {
+        return Err(RuntimeError::native(format!(
+            "http commerce adapter returned {status}: {response_body}"
+        )));
+    }
+    Ok(response_body)
+}
+
+fn parse_http_adapter_url(url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(RuntimeError::native(format!(
+            "http commerce adapter only supports http:// URLs in the reference runtime: {url}"
+        )));
+    };
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, "/".to_string()), |(authority, path)| {
+            (authority, format!("/{path}"))
+        });
+    if authority.is_empty() {
+        return Err(RuntimeError::native(
+            "http commerce adapter URL missing host",
+        ));
+    }
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        let port = port.parse::<u16>().map_err(|source| {
+            RuntimeError::native(format!(
+                "http commerce adapter URL has invalid port: {source}"
+            ))
+        })?;
+        (host.to_string(), port)
+    } else {
+        (authority.to_string(), 80)
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::native(
+            "http commerce adapter URL missing host",
+        ));
+    }
+    Ok(HttpAdapterUrl {
+        host,
+        host_header: authority.to_string(),
+        port,
+        path,
+    })
 }
 
 fn append_file_commerce_adapter_record(
@@ -3988,6 +4127,28 @@ fn runtime_value_json(value: &Value) -> serde_json::Value {
                 .collect(),
         ),
         other => serde_json::Value::String(value_to_display(other)),
+    }
+}
+
+fn runtime_value_from_json(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Void,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(Value::Int)
+            .or_else(|| value.as_f64().map(Value::Float))
+            .unwrap_or(Value::Void),
+        serde_json::Value::String(value) => Value::Str(value),
+        serde_json::Value::Array(values) => {
+            Value::Array(values.into_iter().map(runtime_value_from_json).collect())
+        }
+        serde_json::Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, runtime_value_from_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -9106,6 +9267,58 @@ let booking = shipping.book({{ orderId: 7, carrier: "post", address: "Seoul" }})
     }
 
     #[test]
+    fn payment_and_shipping_http_adapters_post_json_payloads() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind adapter test server");
+        let address = listener.local_addr().expect("adapter test server address");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept adapter request");
+                let request = read_test_http_request(&mut stream);
+                let response = if request.starts_with("POST /capture ") {
+                    r#"{"provider":"http","status":"captured_remote","remoteId":"PAY-HTTP"}"#
+                } else if request.starts_with("POST /book ") {
+                    r#"{"provider":"http","status":"ready_remote","tracking":"TRK-HTTP"}"#
+                } else {
+                    r#"{"error":"unexpected path"}"#
+                };
+                server_requests.lock().unwrap().push(request);
+                write_test_http_json_response(&mut stream, response);
+            }
+        });
+        let source = format!(
+            r#"let payments = @payment.connect("http://{address}/capture")
+let captured = payments.capture({{ orderId: 7, amount: 25000, method: "card" }})
+let shipping = @shipping.connect("http://{address}/book")
+let booking = shipping.book({{ orderId: 7, carrier: "post", address: "Seoul" }})
+@out payments.provider
+@out captured.status
+@out captured.remoteId
+@out shipping.provider
+@out booking.status
+@out booking.tracking"#
+        );
+
+        let out = run_str(&source).unwrap();
+        server.join().expect("adapter test server finished");
+
+        assert_eq!(
+            out,
+            "http\ncaptured_remote\nPAY-HTTP\nhttp\nready_remote\nTRK-HTTP\n"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""kind":"payment.capture""#));
+        assert!(requests[0].contains(r#""orderId":7"#));
+        assert!(requests[0].contains(r#""amount":25000"#));
+        assert!(requests[1].contains(r#""kind":"shipping.booking""#));
+        assert!(requests[1].contains(r#""carrier":"post""#));
+        assert!(requests[1].contains(r#""address":"Seoul""#));
+    }
+
+    #[test]
     fn payment_and_shipping_external_adapters_fail_until_implemented() {
         let payment_err = run_str(r#"let payments = @payment.connect("stripe://live")"#)
             .expect_err("external payment adapter must fail until implemented");
@@ -9126,6 +9339,50 @@ let booking = shipping.book({{ orderId: 7, carrier: "post", address: "Seoul" }})
             "{}",
             shipping_err.message
         );
+    }
+
+    fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+
+        let mut bytes = Vec::new();
+        let mut buf = [0_u8; 512];
+        let header_end = loop {
+            let read = stream.read(&mut buf).expect("read adapter request");
+            assert!(read > 0, "adapter request closed before headers");
+            bytes.extend_from_slice(&buf[..read]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buf).expect("read adapter request body");
+            assert!(read > 0, "adapter request closed before body");
+            bytes.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8(bytes).expect("adapter request utf-8")
+    }
+
+    fn write_test_http_json_response(stream: &mut std::net::TcpStream, body: &str) {
+        use std::io::Write as _;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write adapter response");
     }
 
     #[test]
