@@ -12400,11 +12400,15 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
             "native_runtime_image_plan" => verify_native_runtime_image_plan_target(dir, &target)?,
-            "native_server_launcher_source" => verify_native_server_launcher_source(
-                &target,
-                SERVER_ARTIFACT_PATH,
-                NATIVE_SERVER_PLAN_PATH,
-            )?,
+            "native_server_launcher_source" => {
+                let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
+                verify_native_server_launcher_source(
+                    &target,
+                    SERVER_ARTIFACT_PATH,
+                    NATIVE_SERVER_PLAN_PATH,
+                    &artifact,
+                )?;
+            }
             "native_server_routes_source" => {
                 let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
                 verify_native_server_routes_source(&target, &artifact)?;
@@ -12516,6 +12520,7 @@ fn verify_native_runtime_image_plan_artifact(
     verify_native_runtime_image_plan_value(&plan, artifact_path, native_plan_path, artifact)
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_native_server_plan_value(
     dir: &Path,
     plan: &serde_json::Value,
@@ -12550,6 +12555,7 @@ fn verify_native_server_plan_value(
         &dir.join(source_path),
         artifact_path,
         NATIVE_SERVER_PLAN_PATH,
+        artifact,
     )?;
     verify_native_server_plan_routes_source(dir, plan, artifact)?;
     verify_native_server_plan_router_source(dir, plan)?;
@@ -12817,6 +12823,7 @@ fn verify_native_server_launcher_source(
     target: &Path,
     artifact_path: &str,
     native_plan_path: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
     if !target.is_file() {
         anyhow::bail!(
@@ -12851,11 +12858,19 @@ fn verify_native_server_launcher_source(
     {
         anyhow::bail!("native server launcher source must validate server artifact");
     }
-    if !source.contains(r#"Command::new("orv")"#) || !source.contains(r#".arg("run-artifact")"#) {
-        anyhow::bail!("native server launcher source must run `orv run-artifact`");
+    if !source.contains("fn orv_native_serve() -> std::io::Result<()>")
+        || !source.contains("std::net::TcpListener::bind(orv_native_listen_address())")
+    {
+        anyhow::bail!("native server launcher source must serve HTTP directly");
     }
-    if !source.contains("std::env::args_os().skip(1)") {
-        anyhow::bail!("native server launcher source must forward process arguments");
+    if !source.contains("router::orv_native_dispatch(&request.method, &request.path)") {
+        anyhow::bail!("native server launcher source must dispatch through generated router");
+    }
+    if !source.contains("fn orv_native_http_response(") {
+        anyhow::bail!("native server launcher source must serialize native HTTP responses");
+    }
+    if source.contains(r#"Command::new("orv")"#) || source.contains(r#".arg("run-artifact")"#) {
+        anyhow::bail!("native server launcher source must not shell through `orv run-artifact`");
     }
     if !source.contains("mod routes;") || !source.contains("routes::ORV_NATIVE_ROUTE_COUNT") {
         anyhow::bail!("native server launcher source must link generated routes source");
@@ -12872,7 +12887,8 @@ fn verify_native_server_launcher_source(
     if !source.contains("mod handlers;") || !source.contains("handlers::ORV_NATIVE_HANDLER_COUNT") {
         anyhow::bail!("native server launcher source must link generated handlers source");
     }
-    let expected = orv_compiler::native_server_launcher_source(artifact_path, native_plan_path);
+    let expected =
+        orv_compiler::native_server_launcher_source(artifact_path, native_plan_path, artifact);
     if source != expected {
         anyhow::bail!("native server launcher source must match generated source");
     }
@@ -16585,6 +16601,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             native_server_source_path,
             server_artifact_path,
             native_server_plan_path,
+            server_artifact,
         )?;
         write_native_server_routes_source(out, native_server_routes_source_path, server_artifact)?;
         write_native_server_router_source(out, native_server_router_source_path)?;
@@ -17750,9 +17767,13 @@ fn write_native_server_launcher_source(
     path: &str,
     server_artifact_path: &str,
     native_server_plan_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
-    let source =
-        orv_compiler::native_server_launcher_source(server_artifact_path, native_server_plan_path);
+    let source = orv_compiler::native_server_launcher_source(
+        server_artifact_path,
+        native_server_plan_path,
+        server_artifact,
+    );
     write_text(&out.join(path), &source)
 }
 
@@ -26528,8 +26549,14 @@ entry = "src/main.orv"
         assert!(native_source.contains("native_plan.is_file()"));
         assert!(native_source.contains("build_dir.join(ORV_SERVER_ARTIFACT)"));
         assert!(native_source.contains("artifact.is_file()"));
-        assert!(native_source.contains("Command::new(\"orv\")"));
-        assert!(native_source.contains("run-artifact"));
+        assert!(native_source.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(native_source.contains("std::net::TcpListener::bind(orv_native_listen_address())"));
+        assert!(
+            native_source.contains("router::orv_native_dispatch(&request.method, &request.path)")
+        );
+        assert!(native_source.contains("fn orv_native_http_response("));
+        assert!(!native_source.contains("Command::new(\"orv\")"));
+        assert!(!native_source.contains(".arg(\"run-artifact\")"));
         assert!(native_source.contains("mod routes;"));
         assert!(native_source.contains("mod router;"));
         assert!(native_source.contains("mod handlers;"));
@@ -27378,14 +27405,17 @@ entry = "src/main.orv"
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
         let source_path = out.join("server").join("native").join("main.rs");
         let mut source = std::fs::read_to_string(&source_path).expect("native source");
-        source = source.replace("run-artifact", "run");
+        source = source.replace(
+            "router::orv_native_dispatch(&request.method, &request.path)",
+            "router::orv_native_dispatch(\"GET\", \"/wrong\")",
+        );
         write_text(&source_path, &source).expect("write corrupt native source");
 
         let err = cmd_verify_build(&out).expect_err("native server source mismatch");
 
         assert!(err
             .to_string()
-            .contains("native server launcher source must run `orv run-artifact`"));
+            .contains("native server launcher source must dispatch through generated router"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
