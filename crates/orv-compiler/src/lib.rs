@@ -833,7 +833,24 @@ pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();
 pub fn orv_native_match_route(method: &str, path: &str) -> Option<&'static OrvNativeRoute> {
     ORV_NATIVE_ROUTES
         .iter()
-        .find(|route| route.method == method && route.path == path)
+        .find(|route| route.method == method && orv_native_route_path_matches(route.path, path))
+}
+
+fn orv_native_route_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+    if pattern_segments.len() != path_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(path_segments.iter())
+        .all(|(pattern_segment, path_segment)| {
+            pattern_segment.starts_with(':') || pattern_segment == path_segment
+        })
 }
 "#,
     );
@@ -2067,11 +2084,33 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute { method: \"GET\", path: \"/ping\", origin_id:"));
         assert!(source.contains("pub fn orv_native_match_route("));
-        assert!(source.contains("route.method == method && route.path == path"));
+        assert!(source
+            .contains("route.method == method && orv_native_route_path_matches(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );
+    }
+
+    #[test]
+    fn native_server_routes_source_generates_param_route_matcher() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:sku {
+    @respond 200 { ok: true }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(&manifest, &map, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("path: \"/products/:sku\""));
+        assert!(source.contains("orv_native_route_path_matches(route.path, path)"));
+        assert!(source.contains("fn orv_native_route_path_matches(pattern: &str, path: &str)"));
+        assert!(source.contains("pattern_segment.starts_with(':')"));
+        assert!(source.contains("pattern_segments.len() != path_segments.len()"));
     }
 
     #[test]
