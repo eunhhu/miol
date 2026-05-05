@@ -26211,6 +26211,35 @@ entry = "src/main.orv"
         let _ = std::fs::remove_dir_all(&out);
     }
 
+    #[test]
+    fn build_writes_cargo_checkable_native_launcher_package() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("native-server-cargo-check");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "native launcher cargo check failed:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("warning:"),
+            "native launcher cargo check should be warning-free:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
     fn assert_manifest_artifact(path: &Path, kind: &str, artifact_path: &str) {
         let manifest = read_json_value(path).expect("build manifest");
         assert!(
