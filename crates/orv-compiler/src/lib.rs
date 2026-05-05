@@ -14,7 +14,7 @@ use orv_diagnostics::Span;
 use orv_hir::{
     origin_fingerprint, origin_id, BinaryOp, HirBlock, HirCatchClause, HirExpr, HirExprKind,
     HirFunctionBody, HirLetKind, HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment,
-    NameId, UnaryOp,
+    HirTypeRef, HirTypeRefKind, NameId, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -406,6 +406,20 @@ pub struct ServerResponseRequestBodyFieldArtifact {
     pub field: String,
     /// Request body field name.
     pub name: String,
+    /// Field value class: `request_body_field` or `request_body_field_int`.
+    #[serde(
+        default = "default_request_body_field_value_kind",
+        skip_serializing_if = "is_default_request_body_field_value_kind"
+    )]
+    pub value_kind: String,
+}
+
+fn default_request_body_field_value_kind() -> String {
+    "request_body_field".to_string()
+}
+
+fn is_default_request_body_field_value_kind(value: &str) -> bool {
+    value == "request_body_field"
 }
 
 /// One compiled server listen descriptor.
@@ -1459,7 +1473,9 @@ fn native_server_response_uses_object_fields(
                     .name
                     .as_ref()
                     .is_some_and(|name| route_params.iter().any(|route_param| route_param == name)),
-                "query_param" | "request_body_field" => field.name.is_some(),
+                "query_param" | "request_body_field" | "request_body_field_int" => {
+                    field.name.is_some()
+                }
                 "request_body_json" => true,
                 _ => false,
             })
@@ -1964,10 +1980,21 @@ pub fn orv_native_handle_route(
                     "request_body_field" => {
                         uses_request_body_field_json = true;
                         let name = field.name.as_deref().unwrap_or_default();
-                        let _ = writeln!(
-                            source,
-                            "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                            rust_string_literal(name)
+                        let _ = push_native_request_body_field_json_value(
+                            &mut source,
+                            name,
+                            "request_body_field",
+                            &response.origin_id,
+                        );
+                    }
+                    "request_body_field_int" => {
+                        uses_request_body_field_json = true;
+                        let name = field.name.as_deref().unwrap_or_default();
+                        let _ = push_native_request_body_field_json_value(
+                            &mut source,
+                            name,
+                            "request_body_field_int",
+                            &response.origin_id,
                         );
                     }
                     _ => source.push_str("        body.push_str(\"null\");\n"),
@@ -2039,10 +2066,11 @@ pub fn orv_native_handle_route(
                     source.push_str("        body.push(',');\n");
                 }
                 push_native_json_field_prefix(&mut source, &field.field);
-                let _ = writeln!(
-                    source,
-                    "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                    rust_string_literal(&field.name)
+                let _ = push_native_request_body_field_json_value(
+                    &mut source,
+                    &field.name,
+                    &field.value_kind,
+                    &response.origin_id,
                 );
             }
             source.push_str("        body.push('}');\n");
@@ -2130,6 +2158,42 @@ fn push_native_json_field_prefix(source: &mut String, field: &str) {
         "        body.push_str({});",
         rust_string_literal(&field_prefix)
     );
+}
+
+fn push_native_request_body_field_json_value(
+    source: &mut String,
+    name: &str,
+    value_kind: &str,
+    response_origin_id: &str,
+) -> bool {
+    match value_kind {
+        "request_body_field" => {
+            let _ = writeln!(
+                source,
+                "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                rust_string_literal(name)
+            );
+            true
+        }
+        "request_body_field_int" => {
+            let _ = writeln!(
+                source,
+                "        match routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\").trim().parse::<i64>() {{",
+                rust_string_literal(name)
+            );
+            source.push_str(
+                "            Ok(value) => body.push_str(&value.to_string()),\n            Err(_) => {\n",
+            );
+            let body_expr = format!(
+                "{}.to_string()",
+                rust_string_literal(r#"{"error":"native request body int cast failed"}"#)
+            );
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("            },\n        }\n");
+            true
+        }
+        _ => false,
+    }
 }
 
 fn push_native_handler_response_return(
@@ -2230,10 +2294,21 @@ fn push_native_response_body_return(
                 "request_body_field" => {
                     *uses_request_body_field_json = true;
                     let name = field.name.as_deref().unwrap_or_default();
-                    let _ = writeln!(
+                    let _ = push_native_request_body_field_json_value(
                         source,
-                        "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                        rust_string_literal(name)
+                        name,
+                        "request_body_field",
+                        &response.origin_id,
+                    );
+                }
+                "request_body_field_int" => {
+                    *uses_request_body_field_json = true;
+                    let name = field.name.as_deref().unwrap_or_default();
+                    let _ = push_native_request_body_field_json_value(
+                        source,
+                        name,
+                        "request_body_field_int",
+                        &response.origin_id,
                     );
                 }
                 _ => return false,
@@ -2284,10 +2359,11 @@ fn push_native_response_body_return(
                 source.push_str("        body.push(',');\n");
             }
             push_native_json_field_prefix(source, &field.field);
-            let _ = writeln!(
+            let _ = push_native_request_body_field_json_value(
                 source,
-                "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                rust_string_literal(&field.name)
+                &field.name,
+                &field.value_kind,
+                &response.origin_id,
             );
         }
         source.push_str("        body.push('}');\n");
@@ -2566,9 +2642,11 @@ fn request_body_field_json_payload(
                 if field.is_spread {
                     return None;
                 }
+                let (name, value_kind) = request_body_field_value(&field.value)?;
                 out.push(ServerResponseRequestBodyFieldArtifact {
                     field: field.name.clone(),
-                    name: request_body_field_name(&field.value)?,
+                    name,
+                    value_kind,
                 });
             }
             Some(out)
@@ -2620,15 +2698,16 @@ fn mixed_object_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseObjectF
                         value_json: None,
                         name: None,
                     }
-                } else {
-                    let name = request_body_field_name(&field.value)?;
+                } else if let Some((name, value_kind)) = request_body_field_value(&field.value) {
                     has_dynamic = true;
                     ServerResponseObjectFieldArtifact {
                         field: field.name.clone(),
-                        value_kind: "request_body_field".to_string(),
+                        value_kind,
                         value_json: None,
                         name: Some(name),
                     }
+                } else {
+                    return None;
                 };
                 out.push(object_field);
             }
@@ -2667,6 +2746,31 @@ fn request_body_field_name(expr: &HirExpr) -> Option<String> {
         HirExprKind::Paren(expr) => request_body_field_name(expr),
         _ => None,
     }
+}
+
+fn request_body_field_value(expr: &HirExpr) -> Option<(String, String)> {
+    match &expr.kind {
+        HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some((
+            request_body_field_name(expr)?,
+            "request_body_field_int".to_string(),
+        )),
+        HirExprKind::Paren(expr) => request_body_field_value(expr),
+        _ => Some((
+            request_body_field_name(expr)?,
+            "request_body_field".to_string(),
+        )),
+    }
+}
+
+fn is_integer_type_ref(ty: &HirTypeRef) -> bool {
+    matches!(
+        &ty.kind,
+        HirTypeRefKind::Named(name)
+            if matches!(
+                name.as_str(),
+                "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong"
+            )
+    )
 }
 
 fn is_route_param_domain(expr: &HirExpr) -> bool {
@@ -4590,7 +4694,7 @@ function greet(name: string): string -> "hi {name}""#,
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { quantity: @body.quantity as int }
+    @respond 201 { quantity: (@body.quantity as int) + 1 }
   }
 }"#;
         let program = lower(src);
@@ -4608,6 +4712,42 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(launcher.contains("fn orv_native_reference_bridge("));
         assert!(launcher.contains(r#"std::process::Command::new("orv")"#));
         assert!(!launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_cast_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { quantity: @body.quantity as int }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "quantity");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert!(handlers.contains(".trim().parse::<i64>()"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"quantity\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
     }
 
     #[test]
@@ -4888,7 +5028,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: @body.id as int }
+    @respond 201 { received: (@body.id as int) + 1 }
   }
 }";
         let program = lower(src);
