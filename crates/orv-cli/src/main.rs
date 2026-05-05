@@ -12255,6 +12255,12 @@ fn stable_json_hash(value: &serde_json::Value) -> anyhow::Result<String> {
     Ok(format!("{:016x}", fnv1a64(&bytes)))
 }
 
+fn file_content_hash(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    Ok(format!("{:016x}", fnv1a64(&bytes)))
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
@@ -13167,6 +13173,7 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
     }
     verify_client_manifest_paths(dir, manifest)?;
     verify_client_manifest_source_binding(dir, manifest)?;
+    verify_client_manifest_wasm_hash(dir, manifest)?;
     verify_client_manifest_exports(manifest)
 }
 
@@ -13211,6 +13218,18 @@ fn verify_client_manifest_source_binding(
         .is_some_and(|features| features.iter().any(|feature| feature == "client_wasm"))
     {
         anyhow::bail!("client_manifest runtime_features must include client_wasm");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_wasm_hash(
+    dir: &Path,
+    manifest: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let wasm = json_str(manifest, "wasm", "client manifest")?;
+    let expected_hash = file_content_hash(&dir.join(wasm))?;
+    if json_str(manifest, "wasm_hash", "client manifest")? != expected_hash {
+        anyhow::bail!("client_manifest wasm_hash does not match wasm bundle");
     }
     Ok(())
 }
@@ -13357,6 +13376,8 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client manifest fetch failed")
         || !source.contains("client manifest hash mismatch")
         || !source.contains("client manifest export mismatch")
+        || !source.contains("validateWasmBundle")
+        || !source.contains("client wasm hash mismatch")
     {
         anyhow::bail!("client_js bundle does not verify client manifest contract");
     }
@@ -15392,6 +15413,10 @@ fn add_client_manifest_reveal_fields(
         .get("source_bundle_hash")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    target["wasm_hash"] = manifest
+        .get("wasm_hash")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     target["exports"] = manifest
         .get("exports")
         .cloned()
@@ -17111,6 +17136,7 @@ fn write_client_bundle_manifest(
     let reactive_plan = targets
         .reactive_plan
         .ok_or_else(|| anyhow::anyhow!("missing client_reactive_plan bundle target"))?;
+    let wasm_hash = file_content_hash(&out.join(wasm))?;
     let manifest = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.bundle",
@@ -17119,6 +17145,7 @@ fn write_client_bundle_manifest(
         "page": page,
         "loader": loader,
         "wasm": wasm,
+        "wasm_hash": wasm_hash,
         "source_bundle": SOURCE_BUNDLE_PATH,
         "source_bundle_hash": binding.source_bundle_hash,
         "runtime_features": ["client_wasm"],
@@ -28724,6 +28751,8 @@ entry = "src/main.orv"
             "manifestUrl",
             "loadClientManifest",
             "client manifest hash mismatch",
+            "validateWasmBundle",
+            "client wasm hash mismatch",
             "reactivePlanUrl",
             "loadReactivePlan",
             "validateReactiveBindings",
@@ -31067,6 +31096,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         push_wasm_len(&mut wasm, custom_section.len());
         wasm.extend(custom_section);
         std::fs::write(build_out.join("client").join("app.wasm"), wasm).expect("rewrite wasm");
+        refresh_client_manifest_wasm_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client wasm");
 
@@ -31103,6 +31133,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         custom_section.extend_from_slice(&original_metadata);
         push_wasm_section(&mut wasm, 0, &custom_section);
         std::fs::write(build_out.join("client").join("app.wasm"), wasm).expect("rewrite wasm");
+        refresh_client_manifest_wasm_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client wasm");
 
@@ -31137,6 +31168,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert_eq!(wasm[count_offset], b'0');
         wasm[count_offset] = b'1';
         std::fs::write(&wasm_path, wasm).expect("rewrite wasm");
+        refresh_client_manifest_wasm_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client wasm render data");
 
@@ -31164,11 +31196,39 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let mut wasm = std::fs::read(&wasm_path).expect("client wasm");
         corrupt_generated_render_len_const(&mut wasm, 0);
         std::fs::write(&wasm_path, wasm).expect("rewrite wasm");
+        refresh_client_manifest_wasm_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client wasm render len");
 
         assert!(
             err.to_string().contains("orv_render_len"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_manifest_wasm_hash_mismatch() {
+        let out = temp_output_dir("verify-build-client-manifest-wasm-hash");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["wasm_hash"] = serde_json::json!("fnv1a64:bad");
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client manifest wasm hash");
+
+        assert!(
+            err.to_string().contains("wasm_hash"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
@@ -31205,6 +31265,15 @@ models = { path = "../../shared/models", version = "2.0.0" }
             offset = section_end;
         }
         panic!("render_len function body not found");
+    }
+
+    fn refresh_client_manifest_wasm_hash(build_out: &Path) {
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        let wasm_hash =
+            file_content_hash(&build_out.join(CLIENT_WASM_PATH)).expect("client wasm hash");
+        manifest["wasm_hash"] = serde_json::json!(wasm_hash);
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest wasm hash");
     }
 
     #[test]
@@ -31573,6 +31642,9 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["source_bundle_hash"]
                     .as_str()
                     .is_some_and(|hash| !hash.is_empty())
+                && target["wasm_hash"]
+                    .as_str()
+                    .is_some_and(|hash| !hash.is_empty())
         }));
         assert!(client.iter().any(|target| {
             target["kind"] == "client_reactive_plan"
@@ -31622,6 +31694,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let source_bundle =
             read_json_value(&build_out.join("source-bundle.json")).expect("source bundle");
         let expected_source_hash = stable_json_hash(&source_bundle).expect("source hash");
+        let expected_wasm_hash =
+            file_content_hash(&build_out.join(CLIENT_WASM_PATH)).expect("wasm hash");
         assert_manifest_artifact(
             &build_out.join("build-manifest.json"),
             "client_manifest",
@@ -31636,6 +31710,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert_eq!(client_manifest["page"], "pages/index.html");
         assert_eq!(client_manifest["loader"], "client/app.js");
         assert_eq!(client_manifest["wasm"], "client/app.wasm");
+        assert_eq!(client_manifest["wasm_hash"], expected_wasm_hash);
         assert_eq!(client_manifest["source_bundle"], "source-bundle.json");
         assert_eq!(client_manifest["source_bundle_hash"], expected_source_hash);
         assert_eq!(

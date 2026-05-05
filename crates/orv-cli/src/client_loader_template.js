@@ -138,12 +138,20 @@ function validateInitialRender(manifest, html) {
   }
 }
 
+function validateWasmBundle(manifest, bytes) {
+  const actualHash = fnv1a64(new Uint8Array(bytes));
+  if (actualHash !== manifest.wasm_hash) {
+    throw new Error(`orv client wasm hash mismatch: expected ${manifest.wasm_hash}, got ${actualHash}`);
+  }
+}
+
 async function main() {
   const manifest = await loadClientManifest();
   const reactivePlan = await loadReactivePlan(manifest);
   const sourceBundle = await loadSourceBundle(manifest);
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
+  validateWasmBundle(manifest, bytes);
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const initialRender = readInitialRender(instance);
   validateInitialRender(manifest, initialRender);
