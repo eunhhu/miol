@@ -139,7 +139,8 @@ function validateReactiveBindings(plan, manifest) {
         binding.source === signal.origin_id &&
         binding.state_key === signal.state_key
       ) &&
-      signalAttrTemplateIsValid(binding, plan.signals)
+      signalAttrTemplateIsValid(binding, plan.signals) &&
+      signalAttrConditionIsValid(binding, plan.signals)
     );
   if (!signalAttrBindingsAreValid) {
     throw new Error("orv client reactive plan signal_attr binding mismatch");
@@ -212,6 +213,18 @@ function signalAttrTemplateIsValid(binding, signals) {
       }
       return false;
     });
+}
+
+function signalAttrConditionIsValid(binding, signals) {
+  if (binding.attr_condition === undefined) {
+    return true;
+  }
+  return binding.attr_condition &&
+    typeof binding.attr_condition.state_key === "string" &&
+    binding.attr_condition.state_key === binding.state_key &&
+    typeof binding.attr_condition.truthy === "string" &&
+    typeof binding.attr_condition.falsy === "string" &&
+    signals.some((signal) => signal.state_key === binding.attr_condition.state_key);
 }
 
 function decodeSignalInitialValue(metadata) {
@@ -319,6 +332,9 @@ function setElementSignalAttr(element, attr, value) {
 
 function renderSignalAttrBinding(binding, reactiveState) {
   if (!Array.isArray(binding.attr_template)) {
+    if (binding.attr_condition) {
+      return renderSignalAttrCondition(binding.attr_condition, reactiveState);
+    }
     return reactiveState[binding.state_key]?.value;
   }
   return binding.attr_template.map((segment) => {
@@ -330,6 +346,10 @@ function renderSignalAttrBinding(binding, reactiveState) {
     }
     return "";
   }).join("");
+}
+
+function renderSignalAttrCondition(condition, reactiveState) {
+  return reactiveState[condition.state_key]?.value ? condition.truthy : condition.falsy;
 }
 
 function bindReactiveAttrs(plan, root, reactiveState) {
