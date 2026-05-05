@@ -13361,6 +13361,9 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
     if !client_reactive_plan_signal_text_bindings_are_valid(signals, bindings) {
         anyhow::bail!("client_reactive_plan signal_text binding is invalid");
     }
+    if !client_reactive_plan_signal_event_bindings_are_valid(signals, bindings) {
+        anyhow::bail!("client_reactive_plan signal_event binding is invalid");
+    }
     if !plan
         .get("blocked_by")
         .and_then(serde_json::Value::as_array)
@@ -13423,6 +13426,60 @@ fn client_reactive_plan_signal_text_binding_is_valid(
             signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
                 && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
         })
+}
+
+fn client_reactive_plan_signal_event_bindings_are_valid(
+    signals: &[serde_json::Value],
+    bindings: &[serde_json::Value],
+) -> bool {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.get("kind").and_then(serde_json::Value::as_str) == Some("signal_event")
+        })
+        .all(|binding| client_reactive_plan_signal_event_binding_is_valid(signals, binding))
+}
+
+fn client_reactive_plan_signal_event_binding_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    let origin_id = binding
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let state_key = binding
+        .get("state_key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_PAGE_PATH)
+        && binding
+            .get("selector")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|selector| !selector.is_empty())
+        && binding
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event| !event.is_empty())
+        && client_signal_event_action_is_valid(binding.get("action"))
+        && signals.iter().any(|signal| {
+            signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
+                && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
+        })
+}
+
+fn client_signal_event_action_is_valid(action: Option<&serde_json::Value>) -> bool {
+    let Some(action) = action else {
+        return false;
+    };
+    matches!(
+        action.get("kind").and_then(serde_json::Value::as_str),
+        Some("assign" | "assign_add" | "assign_sub")
+    ) && action
+        .get("value")
+        .and_then(|value| value.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
 }
 
 fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
@@ -17325,6 +17382,7 @@ fn collect_client_dom_bindings_expr(
         orv_hir::HirExprKind::Domain { name, args, .. } => {
             if inside_html {
                 collect_client_dom_bindings_for_tag(name, args, signals, out);
+                collect_client_event_bindings_for_tag(name, args, signals, out);
             }
             for arg in args {
                 collect_client_dom_bindings_expr(arg, inside_html, signals, out);
@@ -17469,6 +17527,106 @@ fn collect_client_dom_bindings_nested_expr(
         }
         _ => {}
     }
+}
+
+#[derive(Clone, Debug)]
+struct ClientSignalEventAction {
+    origin_id: String,
+    state_key: String,
+    action: serde_json::Value,
+}
+
+fn collect_client_event_bindings_for_tag(
+    tag: &str,
+    args: &[orv_hir::HirExpr],
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    for arg in args {
+        let orv_hir::HirExprKind::Assign { target, value } = &arg.kind else {
+            continue;
+        };
+        let Some(event) = client_event_attr_name(&target.name) else {
+            continue;
+        };
+        let Some(action) = client_signal_event_action(value, signals) else {
+            continue;
+        };
+        out.push(serde_json::json!({
+            "kind": "signal_event",
+            "target": CLIENT_PAGE_PATH,
+            "source": action.origin_id,
+            "state_key": action.state_key,
+            "selector": tag,
+            "event": event,
+            "action": action.action,
+            "span": {
+                "file": value.span.file.index(),
+                "start": value.span.range.start,
+                "end": value.span.range.end,
+            },
+        }));
+    }
+}
+
+fn client_event_attr_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("on")?;
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    first
+        .is_ascii_uppercase()
+        .then(|| format!("{}{}", first.to_ascii_lowercase(), chars.as_str()))
+}
+
+fn client_signal_event_action(
+    expr: &orv_hir::HirExpr,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<ClientSignalEventAction> {
+    if let orv_hir::HirExprKind::Block(block) = &expr.kind {
+        let [orv_hir::HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+            return None;
+        };
+        return client_signal_event_action(expr, signals);
+    }
+    let orv_hir::HirExprKind::Assign { target, value } = &expr.kind else {
+        return None;
+    };
+    let signal = signals.get(&target.id)?;
+    let action = client_signal_assignment_action(target.id, value);
+    Some(ClientSignalEventAction {
+        origin_id: signal.origin_id.clone(),
+        state_key: signal.state_key.clone(),
+        action,
+    })
+}
+
+fn client_signal_assignment_action(
+    target: orv_hir::NameId,
+    value: &orv_hir::HirExpr,
+) -> serde_json::Value {
+    if let orv_hir::HirExprKind::Binary { op, lhs, rhs } = &value.kind {
+        if client_expr_is_ident(lhs, target) {
+            let kind = match op {
+                orv_hir::BinaryOp::Add => Some("assign_add"),
+                orv_hir::BinaryOp::Sub => Some("assign_sub"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return serde_json::json!({
+                    "kind": kind,
+                    "value": client_signal_initial_value_json(rhs),
+                });
+            }
+        }
+    }
+    serde_json::json!({
+        "kind": "assign",
+        "value": client_signal_initial_value_json(value),
+    })
+}
+
+fn client_expr_is_ident(expr: &orv_hir::HirExpr, id: orv_hir::NameId) -> bool {
+    matches!(&expr.kind, orv_hir::HirExprKind::Ident(ident) if ident.id == id)
 }
 
 fn collect_client_dom_bindings_for_tag(
@@ -29198,8 +29356,11 @@ entry = "src/main.orv"
             "client reactive plan initial_render binding mismatch",
             "client reactive plan signal_state binding mismatch",
             "client reactive plan signal_text binding mismatch",
+            "client reactive plan signal_event binding mismatch",
             "createReactiveState",
             "bindReactiveDom",
+            "bindReactiveEvents",
+            "applySignalAction",
             "setSignal",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
@@ -29219,6 +29380,7 @@ entry = "src/main.orv"
             "orvReactiveSignals",
             "orvReactiveBindings",
             "orvReactiveDomBindings",
+            "orvReactiveEventBindings",
             "__ORV_CLIENT_REACTIVE_STATE__",
             "__ORV_SET_SIGNAL__",
         ] {
@@ -32294,6 +32456,42 @@ models = { path = "../../shared/models", version = "2.0.0" }
             "client/reactive-plan.json"
         );
 
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_event_binding_contract() {
+        let out = temp_output_dir("client-reactive-event-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count @button onClick={count += 1} \"+\" } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_event"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "count"
+                && binding["selector"] == "button"
+                && binding["event"] == "click"
+                && binding["action"]["kind"] == "assign_add"
+                && binding["action"]["value"]["kind"] == "int"
+                && binding["action"]["value"]["value"] == "1"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert_client_loader_contract(&loader);
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

@@ -126,6 +126,26 @@ function validateReactiveBindings(plan, manifest) {
   if (!signalTextBindingsAreValid) {
     throw new Error("orv client reactive plan signal_text binding mismatch");
   }
+  const signalEventBindingsAreValid = plan.bindings
+    .filter((binding) => binding.kind === "signal_event")
+    .every((binding) =>
+      binding.target === manifest.page &&
+      typeof binding.selector === "string" &&
+      binding.selector.length > 0 &&
+      typeof binding.event === "string" &&
+      binding.event.length > 0 &&
+      binding.action &&
+      ["assign", "assign_add", "assign_sub"].includes(binding.action.kind) &&
+      binding.action.value &&
+      typeof binding.action.value.kind === "string" &&
+      plan.signals.some((signal) =>
+        binding.source === signal.origin_id &&
+        binding.state_key === signal.state_key
+      )
+    );
+  if (!signalEventBindingsAreValid) {
+    throw new Error("orv client reactive plan signal_event binding mismatch");
+  }
 }
 
 function decodeSignalInitialValue(metadata) {
@@ -190,6 +210,55 @@ function bindReactiveDom(plan, root, reactiveState) {
       }
     },
   };
+}
+
+function signalEventAttributeName(eventName) {
+  return `on${eventName.charAt(0).toUpperCase()}${eventName.slice(1)}`;
+}
+
+function applySignalAction(action, currentValue) {
+  const value = decodeSignalInitialValue(action.value);
+  switch (action.kind) {
+    case "assign":
+      return value;
+    case "assign_add":
+      return currentValue + value;
+    case "assign_sub":
+      return currentValue - value;
+    default:
+      throw new Error(`orv client signal event action is unsupported: ${action.kind}`);
+  }
+}
+
+function bindReactiveEvents(plan, root, reactiveState, setSignal) {
+  if (!root) {
+    return { count: 0 };
+  }
+  let count = 0;
+  const eventBindings = plan.bindings.filter((binding) => binding.kind === "signal_event");
+  const cursors = new Map();
+  for (const binding of eventBindings) {
+    const state = reactiveState[binding.state_key];
+    if (!state) {
+      continue;
+    }
+    const attr = signalEventAttributeName(binding.event);
+    const key = `${binding.selector}\u0000${binding.event}`;
+    const cursor = cursors.get(key) || 0;
+    const candidates = Array.from(root.querySelectorAll(binding.selector))
+      .filter((element) => element.getAttribute(attr) === "handler" || element.getAttribute(attr.toLowerCase()) === "handler");
+    const element = candidates[cursor];
+    cursors.set(key, cursor + 1);
+    if (!element) {
+      continue;
+    }
+    element.dataset.orvSignalEvent = binding.state_key;
+    element.addEventListener(binding.event, () => {
+      setSignal(binding.state_key, applySignalAction(binding.action, state.value));
+    });
+    count += 1;
+  }
+  return { count };
 }
 
 async function loadSourceBundle(manifest) {
@@ -266,6 +335,7 @@ async function main() {
       root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
     }
   }
+  const reactiveEvents = bindReactiveEvents(reactivePlan, root, reactiveState, setSignal);
   if (typeof instance.exports.orv_start === "function") {
     instance.exports.orv_start();
   }
@@ -279,6 +349,7 @@ async function main() {
     root.dataset.orvReactiveSignals = String(reactivePlan.signals.length);
     root.dataset.orvReactiveBindings = String(reactivePlan.bindings.filter((binding) => binding.kind === "signal_state").length);
     root.dataset.orvReactiveDomBindings = String(reactiveDom.count);
+    root.dataset.orvReactiveEventBindings = String(reactiveEvents.count);
     root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
   }
   globalThis.__ORV_CLIENT_REACTIVE_STATE__ = Object.freeze(reactiveState);
