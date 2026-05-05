@@ -44,6 +44,7 @@ use orv_syntax::ast::{
 };
 
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
+const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 
@@ -1412,6 +1413,7 @@ fn cmd_editor_run_debug(
     breakpoints: &[EditorDebugBreakpoint],
 ) -> anyhow::Result<()> {
     let value = editor_debug_runner_session_json(state, controls, breakpoints)?;
+    write_editor_debug_runner_result_if_configured(state, &value)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -4978,6 +4980,41 @@ fn editor_debug_runner_session_json(
     }))
 }
 
+fn write_editor_debug_runner_result_if_configured(
+    state_path: &Path,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let Some(result_path) = value
+        .pointer("/runner/result/path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    write_json(
+        &resolve_editor_debug_runner_result_path(state_path, result_path),
+        value,
+    )
+}
+
+fn resolve_editor_debug_runner_result_path(state_path: &Path, result_path: &str) -> PathBuf {
+    let result_path = Path::new(result_path);
+    if result_path.is_absolute() {
+        return result_path.to_path_buf();
+    }
+    editor_debug_runner_artifact_root(state_path).join(result_path)
+}
+
+fn editor_debug_runner_artifact_root(state_path: &Path) -> PathBuf {
+    let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = state_path.file_name().and_then(|name| name.to_str());
+    let parent_name = parent.file_name().and_then(|name| name.to_str());
+    if file_name == Some("session-runner.json") && parent_name == Some("debug") {
+        return parent.parent().unwrap_or(parent).to_path_buf();
+    }
+    parent.to_path_buf()
+}
+
 fn editor_debug_push_breakpoint_requests(
     requests: &mut Vec<serde_json::Value>,
     next_seq: &mut u64,
@@ -5077,6 +5114,11 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
             "framing": "content-length",
         },
         "command": editor_debug_control_runner_command(EditorDebugControl::Next),
+        "result": {
+            "path": EDITOR_DEBUG_SESSION_RESULT_PATH,
+            "kind": "orv.editor.debug.runner.result",
+            "media_type": "application/json",
+        },
         "session": {
             "launch": {
                 "live": true,
@@ -5322,6 +5364,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "shell": "index.html",
             "state": "state.json",
             "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
+            "debug_session_result": EDITOR_DEBUG_SESSION_RESULT_PATH,
         },
         "debug": {
             "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
@@ -5338,6 +5381,14 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .pointer("/session/breakpoint_format")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("<path>:<line>")),
+            "result_path": runner
+                .pointer("/result/path")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(EDITOR_DEBUG_SESSION_RESULT_PATH)),
+            "result_kind": runner
+                .pointer("/result/kind")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("orv.editor.debug.runner.result")),
             "breakpoint_count": breakpoint_count,
             "reuse_session": runner
                 .pointer("/session/reuse_session")
@@ -30772,6 +30823,10 @@ define Auth() -> { @out "auth" }
             state["debug"]["session_runner"]["session"]["breakpoint_argument"],
             "--breakpoint"
         );
+        assert_eq!(
+            state["debug"]["session_runner"]["result"]["path"],
+            EDITOR_DEBUG_SESSION_RESULT_PATH
+        );
         assert_editor_debug_runner_artifact(&out, &state);
         assert_editor_native_host_manifest(&out, &state);
         assert_editor_debug_configurations(&state);
@@ -30785,6 +30840,7 @@ define Auth() -> { @out "auth" }
         let runner =
             read_json_value(&out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH)).expect("debug runner");
         assert_eq!(runner, state["debug"]["session_runner"]);
+        assert_eq!(runner["result"]["path"], EDITOR_DEBUG_SESSION_RESULT_PATH);
         let run = editor_debug_runner_session_json(
             &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
             &[EditorDebugControl::Next],
@@ -30806,6 +30862,10 @@ define Auth() -> { @out "auth" }
             EDITOR_DEBUG_SESSION_RUNNER_PATH
         );
         assert_eq!(
+            native_host["artifacts"]["debug_session_result"],
+            EDITOR_DEBUG_SESSION_RESULT_PATH
+        );
+        assert_eq!(
             native_host["debug"]["adapter_command"],
             serde_json::json!(["orv", "dap", "serve", "--stdio"])
         );
@@ -30815,6 +30875,14 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(native_host["debug"]["breakpoint_argument"], "--breakpoint");
         assert_eq!(native_host["debug"]["breakpoint_format"], "<path>:<line>");
+        assert_eq!(
+            native_host["debug"]["result_path"],
+            EDITOR_DEBUG_SESSION_RESULT_PATH
+        );
+        assert_eq!(
+            native_host["debug"]["result_kind"],
+            "orv.editor.debug.runner.result"
+        );
         assert!(native_host["debug"]["breakpoint_count"]
             .as_u64()
             .is_some_and(|count| count > 0));
@@ -31133,6 +31201,38 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["kind"], "orv.editor.debug.runner.result");
         assert_eq!(run["debug"]["breakpoints"][0]["response"]["success"], true);
         assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_writes_exported_runner_result_artifact() {
+        let dir = temp_output_dir("editor-run-debug-result-artifact");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let out = dir.join("editor");
+        cmd_editor_export(&path, &out).expect("editor export");
+        let result_path = out.join(EDITOR_DEBUG_SESSION_RESULT_PATH);
+        assert!(!result_path.exists());
+
+        cmd_editor_run_debug(
+            &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next, EditorDebugControl::Next],
+            &[],
+        )
+        .expect("run exported debug runner");
+
+        let result = read_json_value(&result_path).expect("debug runner result artifact");
+        assert_eq!(result["kind"], "orv.editor.debug.runner.result");
+        assert_eq!(result["debug"]["stack"]["stackFrames"][0]["line"], 3);
+        assert_eq!(
+            result["runner"]["result"]["path"],
+            EDITOR_DEBUG_SESSION_RESULT_PATH
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
