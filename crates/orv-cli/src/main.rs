@@ -27733,6 +27733,9 @@ entry = "src/main.orv"
       parity: (@param.id as int) % 2
     }
   }
+  @route GET /products/:id/shift/:offset {
+    @respond 200 { shifted: (@param.id as int) + (@param.offset as int) }
+  }
   @route GET /products/:id/mixed {
     @respond 200 {
       kind: "calc",
@@ -27745,6 +27748,9 @@ entry = "src/main.orv"
   }
   @route GET /search/next {
     @respond 200 { next: (@query.page as int) + 1 }
+  }
+  @route GET /search/step {
+    @respond 200 { next: (@query.page as int) + (@query.step as int) }
   }
   @route GET /search/math {
     @respond 200 {
@@ -27762,6 +27768,10 @@ entry = "src/main.orv"
 
         cmd_build(&path, &out).expect("build artifacts");
         cmd_verify_build(&out).expect("verify param/query cast native server build");
+        let launcher = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native launcher");
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let output = std::process::Command::new(cargo)
             .arg("build")
@@ -27804,21 +27814,27 @@ entry = "src/main.orv"
 
         let route_response = send_raw_http(address, "/products/42");
         let route_math_response = send_raw_http(address, "/products/13/math");
+        let route_shift_response = send_raw_http(address, "/products/13/shift/4");
         let route_mixed_response = send_raw_http(address, "/products/41/mixed?page=13");
         let query_response = send_raw_http(address, "/search?page=12.5");
         let next_response = send_raw_http(address, "/search/next?page=12");
+        let step_response = send_raw_http(address, "/search/step?page=12&step=3");
         let math_response = send_raw_http(address, "/search/math?page=13");
 
         assert!(route_response.starts_with("HTTP/1.1 200"));
         assert!(route_response.contains(r#"{"id":42}"#));
         assert!(route_math_response.starts_with("HTTP/1.1 200"));
         assert!(route_math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
+        assert!(route_shift_response.starts_with("HTTP/1.1 200"));
+        assert!(route_shift_response.contains(r#"{"shifted":17}"#));
         assert!(route_mixed_response.starts_with("HTTP/1.1 200"));
         assert!(route_mixed_response.contains(r#"{"kind":"calc","next_id":42,"prev_page":12}"#));
         assert!(query_response.starts_with("HTTP/1.1 200"));
         assert!(query_response.contains(r#"{"page":12.5}"#));
         assert!(next_response.starts_with("HTTP/1.1 200"));
         assert!(next_response.contains(r#"{"next":13}"#));
+        assert!(step_response.starts_with("HTTP/1.1 200"));
+        assert!(step_response.contains(r#"{"next":15}"#));
         assert!(math_response.starts_with("HTTP/1.1 200"));
         assert!(math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
 
