@@ -13591,7 +13591,7 @@ fn client_signal_event_action_is_valid(action: Option<&serde_json::Value>) -> bo
         return false;
     };
     match action.get("kind").and_then(serde_json::Value::as_str) {
-        Some("assign_toggle") => true,
+        Some("assign_toggle" | "assign_event_target_value") => true,
         Some("assign" | "assign_add" | "assign_sub") => action
             .get("value")
             .and_then(|value| value.get("kind"))
@@ -13645,6 +13645,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("bindReactiveEvents")
         || !source.contains("applySignalAction")
         || !source.contains("assign_toggle")
+        || !source.contains("assign_event_target_value")
         || !source.contains("setSignal")
         || !source.contains("orvReactiveSignals")
         || !source.contains("orvReactiveBindings")
@@ -17724,6 +17725,9 @@ fn client_signal_event_action(
         };
         return client_signal_event_action(expr, signals);
     }
+    if let orv_hir::HirExprKind::Lambda { body, .. } = &expr.kind {
+        return client_signal_event_action_from_function_body(body, signals);
+    }
     let orv_hir::HirExprKind::Assign { target, value } = &expr.kind else {
         return None;
     };
@@ -17736,10 +17740,30 @@ fn client_signal_event_action(
     })
 }
 
+fn client_signal_event_action_from_function_body(
+    body: &orv_hir::HirFunctionBody,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<ClientSignalEventAction> {
+    match body {
+        orv_hir::HirFunctionBody::Expr(expr) => client_signal_event_action(expr, signals),
+        orv_hir::HirFunctionBody::Block(block) => {
+            let [orv_hir::HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+                return None;
+            };
+            client_signal_event_action(expr, signals)
+        }
+    }
+}
+
 fn client_signal_assignment_action(
     target: orv_hir::NameId,
     value: &orv_hir::HirExpr,
 ) -> serde_json::Value {
+    if client_expr_is_event_target_value(value) {
+        return serde_json::json!({
+            "kind": "assign_event_target_value",
+        });
+    }
     if let orv_hir::HirExprKind::Unary {
         op: orv_hir::UnaryOp::Not,
         expr,
@@ -17774,6 +17798,29 @@ fn client_signal_assignment_action(
 
 fn client_expr_is_ident(expr: &orv_hir::HirExpr, id: orv_hir::NameId) -> bool {
     matches!(&expr.kind, orv_hir::HirExprKind::Ident(ident) if ident.id == id)
+}
+
+fn client_expr_is_event_target_value(expr: &orv_hir::HirExpr) -> bool {
+    let orv_hir::HirExprKind::Field {
+        target,
+        field: value,
+        ..
+    } = &expr.kind
+    else {
+        return false;
+    };
+    if value != "value" {
+        return false;
+    }
+    let orv_hir::HirExprKind::Field {
+        target: event,
+        field,
+        ..
+    } = &target.kind
+    else {
+        return false;
+    };
+    field == "target" && matches!(event.kind, orv_hir::HirExprKind::Ident(_))
 }
 
 fn collect_client_attr_bindings_for_tag(
@@ -29647,6 +29694,7 @@ entry = "src/main.orv"
             "bindReactiveEvents",
             "applySignalAction",
             "assign_toggle",
+            "assign_event_target_value",
             "setSignal",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
@@ -32925,6 +32973,41 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let loader =
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("assign_toggle"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_event_input_value_binding_contract() {
+        let out = temp_output_dir("client-reactive-event-input-value-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig email: string = ""
+@out @html { @body { @input value={email} onInput={(e) -> email = e.target.value} } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_event"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "email"
+                && binding["selector"] == "input"
+                && binding["event"] == "input"
+                && binding["action"]["kind"] == "assign_event_target_value"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("assign_event_target_value"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

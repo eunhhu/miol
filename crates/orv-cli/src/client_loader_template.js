@@ -154,7 +154,7 @@ function validateReactiveBindings(plan, manifest) {
       binding.event.length > 0 &&
       binding.action &&
       (
-        binding.action.kind === "assign_toggle" ||
+        ["assign_toggle", "assign_event_target_value"].includes(binding.action.kind) ||
         (
           ["assign", "assign_add", "assign_sub"].includes(binding.action.kind) &&
           binding.action.value &&
@@ -368,7 +368,7 @@ function signalEventAttributeName(eventName) {
   return `on${eventName.charAt(0).toUpperCase()}${eventName.slice(1)}`;
 }
 
-function applySignalAction(action, currentValue) {
+function applySignalAction(action, currentValue, event) {
   switch (action.kind) {
     case "assign":
       return decodeSignalInitialValue(action.value);
@@ -378,6 +378,8 @@ function applySignalAction(action, currentValue) {
       return currentValue - decodeSignalInitialValue(action.value);
     case "assign_toggle":
       return !Boolean(currentValue);
+    case "assign_event_target_value":
+      return event?.target?.value ?? "";
     default:
       throw new Error(`orv client signal event action is unsupported: ${action.kind}`);
   }
@@ -406,8 +408,8 @@ function bindReactiveEvents(plan, root, reactiveState, setSignal) {
       continue;
     }
     element.dataset.orvSignalEvent = binding.state_key;
-    element.addEventListener(binding.event, () => {
-      setSignal(binding.state_key, applySignalAction(binding.action, state.value));
+    element.addEventListener(binding.event, (event) => {
+      setSignal(binding.state_key, applySignalAction(binding.action, state.value, event));
     });
     count += 1;
   }
