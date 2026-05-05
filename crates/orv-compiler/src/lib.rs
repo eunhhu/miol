@@ -347,6 +347,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             kind: "native_server_launcher_source".to_string(),
             path: "server/native/main.rs".to_string(),
         });
+        artifacts.push(BuildArtifact {
+            kind: "native_server_launcher_package".to_string(),
+            path: "server/native/Cargo.toml".to_string(),
+        });
     }
     if has_static_page(has_server, &runtime_features) {
         artifacts.push(BuildArtifact {
@@ -405,6 +409,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "native_server_launcher_source".to_string(),
             path: "server/native/main.rs".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_server_launcher_package".to_string(),
+            path: "server/native/Cargo.toml".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
     }
@@ -1452,6 +1461,12 @@ function greet(name: string): string -> "hi {name}""#,
                 && bundle.runtime_features.contains(&"http_server".to_string())
                 && bundle.runtime_features.contains(&"router".to_string())
         }));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "native_server_launcher_package"
+                && bundle.path == "server/native/Cargo.toml"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
     }
 
     #[test]
@@ -1479,6 +1494,10 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_launcher_source"
                 && artifact.path == "server/native/main.rs"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "native_server_launcher_package"
+                && artifact.path == "server/native/Cargo.toml"
         }));
     }
 

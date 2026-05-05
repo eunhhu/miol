@@ -2144,6 +2144,7 @@ PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
 - `server/native-server.json`\n\
+- `server/native/Cargo.toml`\n\
 - `server/native/main.rs`\n\
 \n\
 ## Routes\n\
@@ -12332,6 +12333,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
                 SERVER_ARTIFACT_PATH,
                 NATIVE_SERVER_PLAN_PATH,
             )?,
+            "native_server_launcher_package" => verify_native_server_launcher_package(&target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
@@ -12432,6 +12434,8 @@ fn verify_native_server_plan_value(
         artifact_path,
         NATIVE_SERVER_PLAN_PATH,
     )?;
+    let package_path = json_str(plan, "package", "native server plan")?;
+    verify_native_server_launcher_package(&dir.join(package_path))?;
     let launch = read_server_launch_artifact(&dir.join(launcher_path))?;
     if launch.artifact != artifact_path {
         anyhow::bail!("native server plan launcher artifact does not match server artifact");
@@ -12478,6 +12482,54 @@ fn verify_native_server_plan_value(
     let artifact_routes = serde_json::to_value(&artifact.routes)?;
     if plan.get("routes") != Some(&artifact_routes) {
         anyhow::bail!("native server plan routes do not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_server_launcher_package(target: &Path) -> anyhow::Result<()> {
+    if !target.is_file() {
+        anyhow::bail!(
+            "missing native server launcher package: {}",
+            target.display()
+        );
+    }
+    let source = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    let manifest = toml::from_str::<toml::Value>(&source)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", target.display()))?;
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("native server launcher package must have [package]"))?;
+    if package.get("name").and_then(toml::Value::as_str) != Some("orv-native-server") {
+        anyhow::bail!("native server launcher package name must be orv-native-server");
+    }
+    if package.get("edition").and_then(toml::Value::as_str) != Some("2021") {
+        anyhow::bail!("native server launcher package edition must be 2021");
+    }
+    if package.get("publish").and_then(toml::Value::as_bool) != Some(false) {
+        anyhow::bail!("native server launcher package publish must be false");
+    }
+    if manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|dependencies| !dependencies.is_empty())
+    {
+        anyhow::bail!("native server launcher package must not declare dependencies");
+    }
+    let bins = manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("native server launcher package must declare [[bin]]"))?;
+    let bin = bins
+        .iter()
+        .find_map(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("native server launcher package bin must be a table"))?;
+    if bin.get("name").and_then(toml::Value::as_str) != Some("orv-native-server") {
+        anyhow::bail!("native server launcher package bin name must be orv-native-server");
+    }
+    if bin.get("path").and_then(toml::Value::as_str) != Some("main.rs") {
+        anyhow::bail!("native server launcher package bin path must be main.rs");
     }
     Ok(())
 }
@@ -15614,6 +15666,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let server_launch_path = SERVER_LAUNCH_PATH;
     let native_server_plan_path = NATIVE_SERVER_PLAN_PATH;
     let native_server_source_path = NATIVE_SERVER_SOURCE_PATH;
+    let native_server_package_path = NATIVE_SERVER_PACKAGE_PATH;
     let source_bundle = orv_compiler::source_bundle_artifact(
         entry.display().to_string(),
         loaded
@@ -15674,6 +15727,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             server_artifact_path,
             server_launch_path,
             native_server_source_path,
+            native_server_package_path,
             server_artifact,
         )?;
         write_native_server_launcher_source(
@@ -15682,6 +15736,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             server_artifact_path,
             native_server_plan_path,
         )?;
+        write_native_server_launcher_package(out, native_server_package_path)?;
     }
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
@@ -16265,6 +16320,7 @@ const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
 const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
+const NATIVE_SERVER_PACKAGE_PATH: &str = "server/native/Cargo.toml";
 const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
@@ -16568,6 +16624,7 @@ fn write_native_server_plan_artifact(
     server_artifact_path: &str,
     server_launch_path: &str,
     native_server_source_path: &str,
+    native_server_package_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
     let plan = serde_json::json!({
@@ -16579,6 +16636,7 @@ fn write_native_server_plan_artifact(
         "artifact": server_artifact_path,
         "launcher": server_launch_path,
         "source": native_server_source_path,
+        "package": native_server_package_path,
         "target": {
             "kind": "server_binary",
             "path": NATIVE_SERVER_BINARY_PATH,
@@ -16636,6 +16694,20 @@ fn main() -> std::process::ExitCode {{
 "#
     );
     write_text(&out.join(path), &source)
+}
+
+fn write_native_server_launcher_package(out: &Path, path: &str) -> anyhow::Result<()> {
+    let manifest = r#"[package]
+name = "orv-native-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "orv-native-server"
+path = "main.rs"
+"#;
+    write_text(&out.join(path), manifest)
 }
 
 fn relative_bundle_path(from: &str, to: &str) -> String {
@@ -17810,6 +17882,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("server/native-server.json"));
+        assert!(guide.contains("server/native/Cargo.toml"));
         assert!(guide.contains("server/native/main.rs"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
@@ -24952,6 +25025,7 @@ entry = "src/main.orv"
         let server_artifact_path = out.join("server").join("app.orv-runtime.json");
         let server_launch_path = out.join("server").join("launch.json");
         let native_server_plan_path = out.join("server").join("native-server.json");
+        let native_server_package_path = out.join("server").join("native").join("Cargo.toml");
         let native_server_source_path = out.join("server").join("native").join("main.rs");
         let graph_path = out.join("project-graph.json");
         let source_bundle_path = out.join("source-bundle.json");
@@ -24989,6 +25063,11 @@ entry = "src/main.orv"
             native_server_source_path.is_file(),
             "missing {}",
             native_server_source_path.display()
+        );
+        assert!(
+            native_server_package_path.is_file(),
+            "missing {}",
+            native_server_package_path.display()
         );
         assert!(graph_path.is_file(), "missing {}", graph_path.display());
         assert!(
@@ -25060,6 +25139,14 @@ entry = "src/main.orv"
                 |artifact| artifact["kind"] == "native_server_launcher_source"
                     && artifact["path"] == "server/native/main.rs"
             ));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(
+                |artifact| artifact["kind"] == "native_server_launcher_package"
+                    && artifact["path"] == "server/native/Cargo.toml"
+            ));
         let source_bundle: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&source_bundle_path).expect("source bundle"),
         )
@@ -25100,6 +25187,12 @@ entry = "src/main.orv"
             .iter()
             .any(|bundle| bundle["kind"] == "native_server_launcher_source"
                 && bundle["path"] == "server/native/main.rs"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "native_server_launcher_package"
+                && bundle["path"] == "server/native/Cargo.toml"));
         let server_artifact: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&server_artifact_path).expect("server artifact"),
         )
@@ -25152,6 +25245,7 @@ entry = "src/main.orv"
         assert_eq!(native_plan["artifact"], "server/app.orv-runtime.json");
         assert_eq!(native_plan["launcher"], "server/launch.json");
         assert_eq!(native_plan["source"], "server/native/main.rs");
+        assert_eq!(native_plan["package"], "server/native/Cargo.toml");
         assert_eq!(native_plan["runtime"], "reference-interpreter");
         assert_eq!(native_plan["target"]["kind"], "server_binary");
         assert_eq!(native_plan["target"]["path"], "server/app");
@@ -25174,6 +25268,10 @@ entry = "src/main.orv"
         assert!(native_source.contains("server/app.orv-runtime.json"));
         assert!(native_source.contains("Command::new(\"orv\")"));
         assert!(native_source.contains("run-artifact"));
+        let native_package =
+            std::fs::read_to_string(&native_server_package_path).expect("native package");
+        assert!(native_package.contains("name = \"orv-native-server\""));
+        assert!(native_package.contains("path = \"main.rs\""));
 
         cmd_verify_build(&out).expect("verify build artifacts");
 
@@ -25447,6 +25545,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("native server launcher source must run `orv run-artifact`"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_native_server_launcher_package_mismatch() {
+        let (src_dir, path) = prod_server_source("native-server-package-source");
+        let out = temp_output_dir("native-server-package-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let package_path = out.join("server").join("native").join("Cargo.toml");
+        let mut package = std::fs::read_to_string(&package_path).expect("native package");
+        package = package.replace("path = \"main.rs\"", "path = \"wrong.rs\"");
+        write_text(&package_path, &package).expect("write corrupt native package");
+
+        let err = cmd_verify_build(&out).expect_err("native server package mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("native server launcher package bin path must be main.rs"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
