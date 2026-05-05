@@ -12583,6 +12583,11 @@ fn verify_native_server_launcher_source(
     if !source.contains(&plan_line) {
         anyhow::bail!("native server launcher source must reference {native_plan_path}");
     }
+    if !source.contains("build_dir.join(ORV_NATIVE_SERVER_PLAN)")
+        || !source.contains("native_plan.is_file()")
+    {
+        anyhow::bail!("native server launcher source must validate native server plan");
+    }
     if !source.contains(r#"Command::new("orv")"#) || !source.contains(r#".arg("run-artifact")"#) {
         anyhow::bail!("native server launcher source must run `orv run-artifact`");
     }
@@ -16721,6 +16726,14 @@ fn main() -> std::process::ExitCode {{
     let build_dir = std::env::var_os("ORV_BUILD_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let native_plan = build_dir.join(ORV_NATIVE_SERVER_PLAN);
+    if !native_plan.is_file() {{
+        eprintln!(
+            "missing orv native server plan {{}}; set ORV_BUILD_DIR to the build artifact directory",
+            native_plan.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }}
     let artifact = build_dir.join(ORV_SERVER_ARTIFACT);
     let status = std::process::Command::new("orv")
         .arg("run-artifact")
@@ -25348,6 +25361,8 @@ entry = "src/main.orv"
             std::fs::read_to_string(&native_server_source_path).expect("native source");
         assert!(native_source.contains("const ORV_SERVER_ARTIFACT"));
         assert!(native_source.contains("server/app.orv-runtime.json"));
+        assert!(native_source.contains("build_dir.join(ORV_NATIVE_SERVER_PLAN)"));
+        assert!(native_source.contains("native_plan.is_file()"));
         assert!(native_source.contains("Command::new(\"orv\")"));
         assert!(native_source.contains("run-artifact"));
         let native_package =
