@@ -161,6 +161,8 @@ pub struct NativeServerPlanArtifact {
     pub launcher: String,
     /// Relative generated Rust launcher source path.
     pub source: String,
+    /// Relative generated Rust route table source path.
+    pub routes_source: String,
     /// Relative generated Rust launcher package path.
     pub package: String,
     /// Relative native runtime image plan artifact path.
@@ -471,6 +473,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "server/native/main.rs".to_string(),
         });
         artifacts.push(BuildArtifact {
+            kind: "native_server_routes_source".to_string(),
+            path: "server/native/routes.rs".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "native_server_launcher_package".to_string(),
             path: "server/native/Cargo.toml".to_string(),
         });
@@ -545,6 +551,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "native_server_launcher_source".to_string(),
             path: "server/native/main.rs".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_server_routes_source".to_string(),
+            path: "server/native/routes.rs".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
         bundles.push(BundleTarget {
@@ -1608,6 +1619,12 @@ function greet(name: string): string -> "hi {name}""#,
                 && bundle.runtime_features.contains(&"router".to_string())
         }));
         assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "native_server_routes_source"
+                && bundle.path == "server/native/routes.rs"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
+        assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "native_server_launcher_package"
                 && bundle.path == "server/native/Cargo.toml"
                 && bundle.runtime_features.contains(&"http_server".to_string())
@@ -1640,6 +1657,10 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_launcher_source"
                 && artifact.path == "server/native/main.rs"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "native_server_routes_source"
+                && artifact.path == "server/native/routes.rs"
         }));
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_launcher_package"
