@@ -27185,6 +27185,83 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_lowers_mixed_static_and_request_body_field_response_into_native_handler_source() {
+        let dir = temp_output_dir("native-mixed-body-field-response-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 404 { err: "product_not_found", sku: @body.sku }
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let out = temp_output_dir("native-mixed-body-field-response-build");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let response = &server_artifact["routes"][0]["responses"][0];
+        let handlers =
+            std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
+                .expect("handlers source");
+        let launcher = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native launcher");
+
+        assert_eq!(response["status"], 404);
+        assert_eq!(response["body_kind"], "mixed_json");
+        assert_eq!(response["body_object_fields"][0]["field"], "err");
+        assert_eq!(
+            response["body_object_fields"][0]["value_kind"],
+            "static_json"
+        );
+        assert_eq!(
+            response["body_object_fields"][0]["value_json"],
+            r#""product_not_found""#
+        );
+        assert_eq!(response["body_object_fields"][1]["field"], "sku");
+        assert_eq!(
+            response["body_object_fields"][1]["value_kind"],
+            "request_body_field"
+        );
+        assert_eq!(response["body_object_fields"][1]["name"], "sku");
+        assert!(handlers.contains("body.push_str(\"\\\"err\\\":\");"));
+        assert!(handlers.contains("body.push_str(\"\\\"product_not_found\\\"\");"));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
+        assert!(handlers.contains("orv_native_push_json_string("));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+        cmd_verify_build(&out).expect("verify mixed native build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check mixed native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "mixed native launcher cargo check failed:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("warning:"),
+            "mixed native launcher cargo check should be warning-free:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn build_writes_cargo_checkable_native_launcher_package() {
         let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
         let out = temp_output_dir("native-server-cargo-check");
