@@ -92,6 +92,8 @@
 
 **Editor DAP native-host breakpoint delta (2026-05-05):** `orv editor export` now mirrors executable breakpoint runner commands into `native-host.json` under `debug.breakpoint_commands`, alongside source path, line, and `setBreakpoints` request preview. Native editor hosts can now wire line-level breakpoint actions from the manifest without reparsing `state.json` or the static shell.
 
+**Editor DAP native-host configuration delta (2026-05-06):** `orv editor export` now mirrors launch/live/attach debug configurations into `native-host.json` under `debug.configurations` with `configuration_count`, matching the existing control and breakpoint command inventories so native editor hosts can wire DAP launch surfaces without reparsing `state.json`.
+
 **LSP signature help delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/signatureHelp`, returning function parameter labels, return type, and active parameter index for in-call cursor positions.
 
 **LSP inlay hint delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/inlayHint`, emitting parameter-name hints for direct function calls.

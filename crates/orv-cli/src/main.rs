@@ -5335,6 +5335,12 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .get("controls")
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
+    let configurations = debug
+        .get("configurations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let configuration_count = configurations.len();
     let breakpoint_count = debug
         .get("breakpoint_sources")
         .and_then(serde_json::Value::as_array)
@@ -5376,6 +5382,8 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
             "adapter_command": adapter.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "dap", "serve", "--stdio"])),
             "runner_command": runner.get("command").cloned().unwrap_or_else(|| editor_debug_control_runner_command(EditorDebugControl::Next)),
+            "configurations": configurations,
+            "configuration_count": configuration_count,
             "control_commands": control_commands,
             "breakpoint_commands": breakpoint_commands,
             "control_count": controls,
@@ -32466,6 +32474,18 @@ define Auth() -> { @out "auth" }
             native_host["debug"]["result_kind"],
             "orv.editor.debug.runner.result"
         );
+        assert_eq!(native_host["debug"]["configuration_count"], 3);
+        let configurations = native_host["debug"]["configurations"]
+            .as_array()
+            .expect("native host debug configurations");
+        assert!(configurations
+            .iter()
+            .any(|config| config["name"] == "Live Launch ORV" && config["live"] == true));
+        assert!(configurations.iter().any(|config| {
+            config["name"] == "Attach ORV Runtime"
+                && config["request"] == "attach"
+                && config["attachRuntimeMode"] == "inProcess"
+        }));
         assert!(native_host["debug"]["breakpoint_count"]
             .as_u64()
             .is_some_and(|count| count > 0));
