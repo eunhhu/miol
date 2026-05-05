@@ -32585,7 +32585,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let entry = out.join("page.orv");
         std::fs::write(
             &entry,
-            "let sig input: string = \"hi\"\n@out @html { @body { @input { value=input } } }",
+            "let sig input: string = \"hi\"\n@out @html { @body { @input value={input} } }",
         )
         .expect("write entry");
         let build_out = out.join("dist");

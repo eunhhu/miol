@@ -3998,12 +3998,47 @@ impl Parser {
     }
 
     fn parse_domain_prop_value(&mut self, domain_name: &str, key: &str) -> Option<Expr> {
+        if let Some(value) = self.try_parse_braced_prop_expr() {
+            return Some(value);
+        }
         if should_stringify_bare_prop_value(domain_name, key) {
             if let Some(value) = self.try_parse_bare_attr_value() {
                 return Some(value);
             }
         }
         self.parse_expr()
+    }
+
+    fn try_parse_braced_prop_expr(&mut self) -> Option<Expr> {
+        if !self.looks_like_braced_prop_expr() {
+            return None;
+        }
+        let lbrace = self.advance();
+        let expr = self.parse_expr()?;
+        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        Some(Expr {
+            kind: expr.kind,
+            span: lbrace.span.join(rbrace.span),
+        })
+    }
+
+    fn looks_like_braced_prop_expr(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::LBrace) {
+            return false;
+        }
+        match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+            Some(TokenKind::RBrace | TokenKind::DotDotDot) => return false,
+            Some(TokenKind::Ident(_) | TokenKind::Keyword(_)) => {
+                if matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Colon | TokenKind::Comma)
+                ) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn try_parse_bare_attr_value(&mut self) -> Option<Expr> {
@@ -5042,6 +5077,20 @@ mod tests {
             &args[2].kind,
             ExprKind::Assign { target, value } if target.name == "checked"
                 && matches!(value.kind, ExprKind::True)
+        ));
+    }
+
+    #[test]
+    fn html_prop_braced_value_parses_as_expression() {
+        let r = parse_str(r#"@input value={input}"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (name, args) = domain_of(&r.program.items[0]);
+        assert_eq!(name.name, "input");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(
+            &args[0].kind,
+            ExprKind::Assign { target, value } if target.name == "value"
+                && matches!(&value.kind, ExprKind::Ident(id) if id.name == "input")
         ));
     }
 

@@ -7359,6 +7359,16 @@ let third: int = 3
     }
 
     #[test]
+    fn html_renders_braced_attribute_expression() {
+        let out = run_str(
+            r#"let input: string = "hi"
+@out @html { @input value={input} }"#,
+        )
+        .unwrap();
+        assert_eq!(out, "<html><input value=\"hi\"></html>\n");
+    }
+
+    #[test]
     fn html_renders_block_attributes_before_children() {
         let out = run_str(
             r#"@out @html {
