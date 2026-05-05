@@ -58,7 +58,9 @@
 
 **Native empty response delta (2026-05-06):** Static `@respond` payloads with 1xx/204/304 statuses and explicit `void` payloads now lower into `empty` metadata and generated native handlers. The direct HTTP response writer suppresses body bytes and body `content-type` for those statuses to match reference runtime HTTP semantics.
 
-**Native mixed object response delta (2026-05-06):** Single-response `@respond` object bodies that mix static literal fields with direct request-domain fields, such as `{ err: "product_not_found", sku: @body.sku }`, now lower into ordered `mixed_json` metadata and generated native handlers. The direct launcher remains limited to routes with exactly one lowered response; routes with multiple `@respond` control-flow branches continue to use the reference bridge until native control-flow lowering exists, avoiding incorrect first-response dispatch.
+**Native mixed object response delta (2026-05-06):** Single-response `@respond` object bodies that mix static literal fields with direct request-domain fields, such as `{ err: "product_not_found", sku: @body.sku }`, now lower into ordered `mixed_json` metadata and generated native handlers.
+
+**Native guarded response flow delta (2026-05-06):** Simple route handlers shaped as one or more `if @body.field == "literal" { @respond ... }` guards followed by an unconditional `@respond` now lower response guard metadata into `server/app.orv-runtime.json` and generated native handlers. The direct launcher serves these guarded multi-response routes without the reference bridge; dynamic guarded routes with casts, DB calls, or unsupported branch shapes still fall back.
 
 **Native response origin delta (2026-05-05):** Server route descriptors now include contained `@respond` origin ids as `response_origin_ids`, and generated `server/native/routes.rs` mirrors them in `OrvNativeRoute`. This gives future native handler codegen and production trace/reveal tooling a stable route-to-response origin contract before body lowering exists.
 

@@ -325,6 +325,9 @@ pub struct ServerResponseArtifact {
     pub status: Option<i64>,
     /// Response body lowering class.
     pub body_kind: String,
+    /// Native response guard condition for simple route-level control flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<ServerResponseConditionArtifact>,
     /// Statically lowered JSON body, when the payload is literal-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_json: Option<String>,
@@ -343,6 +346,17 @@ pub struct ServerResponseArtifact {
     /// Object JSON fields lowered from request body fields such as `{ handle: @body.handle }`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub body_request_fields: Vec<ServerResponseRequestBodyFieldArtifact>,
+}
+
+/// One native-lowerable response guard condition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerResponseConditionArtifact {
+    /// Condition class, currently `request_body_field_eq` or `request_body_field_ne`.
+    pub kind: String,
+    /// Request body field name used by the condition.
+    pub name: String,
+    /// Static string value compared by the condition.
+    pub value: String,
 }
 
 /// One ordered JSON object field backed by a static value or request domain.
@@ -1385,22 +1399,50 @@ fn native_server_direct_http_capable(artifact: &ServerRuntimeArtifact) -> bool {
 }
 
 fn native_server_route_has_native_response(route: &ServerRouteArtifact) -> bool {
-    if route.responses.len() != 1 {
+    let route_params = native_server_route_param_names(&route.path);
+    if route.responses.len() == 1 {
+        let response = &route.responses[0];
+        return response.condition.is_none()
+            && native_server_response_is_direct(response, &route_params);
+    }
+    if route.responses.len() < 2 {
         return false;
     }
-    let route_params = native_server_route_param_names(&route.path);
-    let response = &route.responses[0];
+    route.responses.iter().enumerate().all(|(index, response)| {
+        native_server_response_is_direct(response, &route_params)
+            && if index + 1 == route.responses.len() {
+                response.condition.is_none()
+            } else {
+                native_server_response_condition_is_direct(response)
+            }
+    })
+}
+
+fn native_server_response_is_direct(
+    response: &ServerResponseArtifact,
+    route_params: &[String],
+) -> bool {
     response
         .status
         .and_then(|status| u16::try_from(status).ok())
         .is_some()
         && (response.body_kind == "empty"
             || response.body_json.is_some()
-            || native_server_response_uses_object_fields(response, &route_params)
-            || native_server_response_uses_route_params(response, &route_params)
+            || native_server_response_uses_object_fields(response, route_params)
+            || native_server_response_uses_route_params(response, route_params)
             || !response.body_query_params.is_empty()
             || !response.body_request_json.is_empty()
             || !response.body_request_fields.is_empty())
+}
+
+fn native_server_response_condition_is_direct(response: &ServerResponseArtifact) -> bool {
+    response.condition.as_ref().is_some_and(|condition| {
+        !condition.name.is_empty()
+            && matches!(
+                condition.kind.as_str(),
+                "request_body_field_eq" | "request_body_field_ne"
+            )
+    })
 }
 
 fn native_server_response_uses_object_fields(
@@ -1792,6 +1834,46 @@ pub fn orv_native_handle_route(
     let mut uses_query_param_json = false;
     let mut uses_request_body_field_json = false;
     for route in &artifact.routes {
+        if route.responses.len() > 1 && native_server_route_has_native_response(route) {
+            native_route_count += 1;
+            let _ = writeln!(
+                source,
+                "    if route_match.route.origin_id == {} {{",
+                rust_string_literal(&route.origin_id)
+            );
+            for response in &route.responses {
+                let Some(status) = response.status else {
+                    continue;
+                };
+                if !(100..=999).contains(&status) {
+                    continue;
+                }
+                if let Some(condition) = response.condition.as_ref() {
+                    if push_native_response_condition(&mut source, condition) {
+                        let _ = push_native_response_body_return(
+                            &mut source,
+                            response,
+                            status,
+                            &mut uses_route_param_json,
+                            &mut uses_query_param_json,
+                            &mut uses_request_body_field_json,
+                        );
+                        source.push_str("        }\n");
+                    }
+                } else {
+                    let _ = push_native_response_body_return(
+                        &mut source,
+                        response,
+                        status,
+                        &mut uses_route_param_json,
+                        &mut uses_query_param_json,
+                        &mut uses_request_body_field_json,
+                    );
+                }
+            }
+            source.push_str("    }\n");
+            continue;
+        }
         let Some(response) = route.responses.first() else {
             continue;
         };
@@ -1815,6 +1897,7 @@ pub fn orv_native_handle_route(
                 &body_expr,
                 &response.origin_id,
             );
+            source.push_str("    }\n");
             continue;
         }
         if response.body_kind == "empty" {
@@ -1830,6 +1913,7 @@ pub fn orv_native_handle_route(
                 "String::new()",
                 &response.origin_id,
             );
+            source.push_str("    }\n");
             continue;
         }
         if !response.body_object_fields.is_empty() {
@@ -1891,6 +1975,7 @@ pub fn orv_native_handle_route(
             }
             source.push_str("        body.push('}');\n");
             push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
+            source.push_str("    }\n");
             continue;
         }
         if !response.body_query_params.is_empty() {
@@ -1915,6 +2000,7 @@ pub fn orv_native_handle_route(
             }
             source.push_str("        body.push('}');\n");
             push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
+            source.push_str("    }\n");
             continue;
         }
         if !response.body_request_json.is_empty() {
@@ -1936,6 +2022,7 @@ pub fn orv_native_handle_route(
             }
             source.push_str("        body.push('}');\n");
             push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
+            source.push_str("    }\n");
             continue;
         }
         if !response.body_request_fields.is_empty() {
@@ -1960,6 +2047,7 @@ pub fn orv_native_handle_route(
             }
             source.push_str("        body.push('}');\n");
             push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
+            source.push_str("    }\n");
             continue;
         }
         if !response.body_route_params.is_empty() {
@@ -1984,6 +2072,7 @@ pub fn orv_native_handle_route(
             }
             source.push_str("        body.push('}');\n");
             push_native_handler_response_return(&mut source, status, "body", &response.origin_id);
+            source.push_str("    }\n");
         }
     }
     if native_route_count == artifact.routes.len() {
@@ -2059,9 +2148,171 @@ fn push_native_handler_response_return(
             response_origin_id: Some({}),
             params: route_match.params.clone(),
         }};
-    }}"#,
+        "#,
         rust_string_literal(response_origin_id)
     );
+}
+
+fn push_native_response_condition(
+    source: &mut String,
+    condition: &ServerResponseConditionArtifact,
+) -> bool {
+    let operator = match condition.kind.as_str() {
+        "request_body_field_eq" => "==",
+        "request_body_field_ne" => "!=",
+        _ => return false,
+    };
+    let _ = writeln!(
+        source,
+        "        if routes::orv_native_body_field_value(route_match, {}) {operator} Some({}) {{",
+        rust_string_literal(&condition.name),
+        rust_string_literal(&condition.value)
+    );
+    true
+}
+
+fn push_native_response_body_return(
+    source: &mut String,
+    response: &ServerResponseArtifact,
+    status: i64,
+    uses_route_param_json: &mut bool,
+    uses_query_param_json: &mut bool,
+    uses_request_body_field_json: &mut bool,
+) -> bool {
+    if let Some(body_json) = response.body_json.as_ref() {
+        let body_expr = format!("{}.to_string()", rust_string_literal(body_json));
+        push_native_handler_response_return(source, status, &body_expr, &response.origin_id);
+        return true;
+    }
+    if response.body_kind == "empty" {
+        push_native_handler_response_return(source, status, "String::new()", &response.origin_id);
+        return true;
+    }
+    if !response.body_object_fields.is_empty() {
+        source.push_str("        let mut body = String::from(\"{\");\n");
+        for (index, field) in response.body_object_fields.iter().enumerate() {
+            if index > 0 {
+                source.push_str("        body.push(',');\n");
+            }
+            push_native_json_field_prefix(source, &field.field);
+            match field.value_kind.as_str() {
+                "static_json" => {
+                    let value_json = field.value_json.as_deref().unwrap_or("null");
+                    let _ = writeln!(
+                        source,
+                        "        body.push_str({});",
+                        rust_string_literal(value_json)
+                    );
+                }
+                "route_param" => {
+                    *uses_route_param_json = true;
+                    let name = field.name.as_deref().unwrap_or_default();
+                    let _ = writeln!(
+                        source,
+                        "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                        rust_string_literal(name)
+                    );
+                }
+                "query_param" => {
+                    *uses_query_param_json = true;
+                    let name = field.name.as_deref().unwrap_or_default();
+                    let _ = writeln!(
+                        source,
+                        "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                        rust_string_literal(name)
+                    );
+                }
+                "request_body_json" => {
+                    source.push_str(
+                        "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
+                    );
+                }
+                "request_body_field" => {
+                    *uses_request_body_field_json = true;
+                    let name = field.name.as_deref().unwrap_or_default();
+                    let _ = writeln!(
+                        source,
+                        "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                        rust_string_literal(name)
+                    );
+                }
+                _ => return false,
+            }
+        }
+        source.push_str("        body.push('}');\n");
+        push_native_handler_response_return(source, status, "body", &response.origin_id);
+        return true;
+    }
+    if !response.body_query_params.is_empty() {
+        *uses_query_param_json = true;
+        source.push_str("        let mut body = String::from(\"{\");\n");
+        for (index, field) in response.body_query_params.iter().enumerate() {
+            if index > 0 {
+                source.push_str("        body.push(',');\n");
+            }
+            push_native_json_field_prefix(source, &field.field);
+            let _ = writeln!(
+                source,
+                "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                rust_string_literal(&field.param)
+            );
+        }
+        source.push_str("        body.push('}');\n");
+        push_native_handler_response_return(source, status, "body", &response.origin_id);
+        return true;
+    }
+    if !response.body_request_json.is_empty() {
+        source.push_str("        let mut body = String::from(\"{\");\n");
+        for (index, field) in response.body_request_json.iter().enumerate() {
+            if index > 0 {
+                source.push_str("        body.push(',');\n");
+            }
+            push_native_json_field_prefix(source, &field.field);
+            source.push_str(
+                "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
+            );
+        }
+        source.push_str("        body.push('}');\n");
+        push_native_handler_response_return(source, status, "body", &response.origin_id);
+        return true;
+    }
+    if !response.body_request_fields.is_empty() {
+        *uses_request_body_field_json = true;
+        source.push_str("        let mut body = String::from(\"{\");\n");
+        for (index, field) in response.body_request_fields.iter().enumerate() {
+            if index > 0 {
+                source.push_str("        body.push(',');\n");
+            }
+            push_native_json_field_prefix(source, &field.field);
+            let _ = writeln!(
+                source,
+                "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                rust_string_literal(&field.name)
+            );
+        }
+        source.push_str("        body.push('}');\n");
+        push_native_handler_response_return(source, status, "body", &response.origin_id);
+        return true;
+    }
+    if !response.body_route_params.is_empty() {
+        *uses_route_param_json = true;
+        source.push_str("        let mut body = String::from(\"{\");\n");
+        for (index, field) in response.body_route_params.iter().enumerate() {
+            if index > 0 {
+                source.push_str("        body.push(',');\n");
+            }
+            push_native_json_field_prefix(source, &field.field);
+            let _ = writeln!(
+                source,
+                "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                rust_string_literal(&field.param)
+            );
+        }
+        source.push_str("        body.push('}');\n");
+        push_native_handler_response_return(source, status, "body", &response.origin_id);
+        return true;
+    }
+    false
 }
 
 fn rust_string_literal(value: &str) -> String {
@@ -2160,6 +2411,89 @@ fn response_payload_is_void(expr: &HirExpr) -> bool {
         HirExprKind::Void => true,
         HirExprKind::Paren(expr) => response_payload_is_void(expr),
         _ => false,
+    }
+}
+
+fn server_response_artifact(
+    expr: &HirExpr,
+    status: &HirExpr,
+    payload: &HirExpr,
+    condition: Option<ServerResponseConditionArtifact>,
+) -> ServerResponseArtifact {
+    let status_value = static_integer(status);
+    let static_payload_json = static_json_payload(payload);
+    let body_empty = response_payload_is_void(payload)
+        || (status_value.is_some_and(response_status_disallows_body)
+            && static_payload_json.is_some());
+    let body_json = (!body_empty).then_some(static_payload_json).flatten();
+    let body_object_fields = if body_json.is_none() && !body_empty {
+        mixed_object_json_payload(payload).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let body_route_params = if body_json.is_none() && body_object_fields.is_empty() && !body_empty {
+        route_param_json_payload(payload).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let body_query_params = if body_json.is_none()
+        && body_object_fields.is_empty()
+        && body_route_params.is_empty()
+        && !body_empty
+    {
+        query_param_json_payload(payload).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let body_request_json = if body_json.is_none()
+        && body_object_fields.is_empty()
+        && body_route_params.is_empty()
+        && body_query_params.is_empty()
+        && !body_empty
+    {
+        request_body_json_payload(payload).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let body_request_fields = if body_json.is_none()
+        && body_object_fields.is_empty()
+        && body_route_params.is_empty()
+        && body_query_params.is_empty()
+        && body_request_json.is_empty()
+        && !body_empty
+    {
+        request_body_field_json_payload(payload).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let body_kind = if body_empty {
+        "empty"
+    } else if body_json.is_some() {
+        "static_json"
+    } else if !body_object_fields.is_empty() {
+        "mixed_json"
+    } else if !body_route_params.is_empty() {
+        "route_param_json"
+    } else if !body_query_params.is_empty() {
+        "query_param_json"
+    } else if !body_request_json.is_empty() {
+        "request_body_json"
+    } else if !body_request_fields.is_empty() {
+        "request_body_field_json"
+    } else {
+        "dynamic"
+    };
+    ServerResponseArtifact {
+        origin_id: origin_id("domain", "respond", expr.span),
+        status: status_value,
+        body_kind: body_kind.to_string(),
+        condition,
+        body_json,
+        body_object_fields,
+        body_route_params,
+        body_query_params,
+        body_request_json,
+        body_request_fields,
     }
 }
 
@@ -2368,6 +2702,88 @@ fn static_string_segments(segments: &[HirStringSegment]) -> Option<String> {
         }
     }
     Some(out)
+}
+
+fn static_string_expr(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::String(segments) => static_string_segments(segments),
+        HirExprKind::Paren(expr) => static_string_expr(expr),
+        _ => None,
+    }
+}
+
+fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionArtifact> {
+    match &expr.kind {
+        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+            let (name, value) = request_body_field_name(lhs)
+                .zip(static_string_expr(rhs))
+                .or_else(|| request_body_field_name(rhs).zip(static_string_expr(lhs)))?;
+            Some(ServerResponseConditionArtifact {
+                kind: match op {
+                    BinaryOp::Eq => "request_body_field_eq",
+                    BinaryOp::Ne => "request_body_field_ne",
+                    _ => return None,
+                }
+                .to_string(),
+                name,
+                value,
+            })
+        }
+        HirExprKind::Paren(expr) => native_response_condition(expr),
+        _ => None,
+    }
+}
+
+fn guarded_route_response_artifacts(handler: &HirBlock) -> Option<Vec<ServerResponseArtifact>> {
+    if handler.stmts.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(handler.stmts.len());
+    for (index, stmt) in handler.stmts.iter().enumerate() {
+        if index + 1 == handler.stmts.len() {
+            let (respond, status, payload) = response_expr_from_stmt(stmt)?;
+            out.push(server_response_artifact(respond, status, payload, None));
+            continue;
+        }
+        let HirStmt::Expr(expr) = stmt else {
+            return None;
+        };
+        let HirExprKind::If {
+            cond,
+            then,
+            else_branch: None,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        if then.stmts.len() != 1 {
+            return None;
+        }
+        let condition = native_response_condition(cond)?;
+        let (respond, status, payload) = response_expr_from_stmt(&then.stmts[0])?;
+        out.push(server_response_artifact(
+            respond,
+            status,
+            payload,
+            Some(condition),
+        ));
+    }
+    Some(out)
+}
+
+fn response_expr_from_stmt(stmt: &HirStmt) -> Option<(&HirExpr, &HirExpr, &HirExpr)> {
+    let HirStmt::Expr(expr) = stmt else {
+        return None;
+    };
+    response_expr(expr)
+}
+
+fn response_expr(expr: &HirExpr) -> Option<(&HirExpr, &HirExpr, &HirExpr)> {
+    match &expr.kind {
+        HirExprKind::Respond { status, payload } => Some((expr, status, payload)),
+        HirExprKind::Paren(expr) => response_expr(expr),
+        _ => None,
+    }
 }
 
 fn write_json_string(value: &str, out: &mut String) {
@@ -2590,87 +3006,17 @@ fn collect_expr_response_artifacts(
         } => {
             let name = format!("{method} {path}");
             let route_origin = origin_id("route", &name, expr.span);
-            collect_block_response_artifacts(handler, Some(&route_origin), out);
+            if let Some(responses) = guarded_route_response_artifacts(handler) {
+                out.entry(route_origin).or_default().extend(responses);
+            } else {
+                collect_block_response_artifacts(handler, Some(&route_origin), out);
+            }
         }
         HirExprKind::Respond { status, payload } => {
             if let Some(route_origin_id) = route_origin_id {
-                let status_value = static_integer(status);
-                let static_payload_json = static_json_payload(payload);
-                let body_empty = response_payload_is_void(payload)
-                    || (status_value.is_some_and(response_status_disallows_body)
-                        && static_payload_json.is_some());
-                let body_json = (!body_empty).then_some(static_payload_json).flatten();
-                let body_object_fields = if body_json.is_none() && !body_empty {
-                    mixed_object_json_payload(payload).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let body_route_params =
-                    if body_json.is_none() && body_object_fields.is_empty() && !body_empty {
-                        route_param_json_payload(payload).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                let body_query_params = if body_json.is_none()
-                    && body_object_fields.is_empty()
-                    && body_route_params.is_empty()
-                    && !body_empty
-                {
-                    query_param_json_payload(payload).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let body_request_json = if body_json.is_none()
-                    && body_object_fields.is_empty()
-                    && body_route_params.is_empty()
-                    && body_query_params.is_empty()
-                    && !body_empty
-                {
-                    request_body_json_payload(payload).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let body_request_fields = if body_json.is_none()
-                    && body_object_fields.is_empty()
-                    && body_route_params.is_empty()
-                    && body_query_params.is_empty()
-                    && body_request_json.is_empty()
-                    && !body_empty
-                {
-                    request_body_field_json_payload(payload).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let body_kind = if body_empty {
-                    "empty"
-                } else if body_json.is_some() {
-                    "static_json"
-                } else if !body_object_fields.is_empty() {
-                    "mixed_json"
-                } else if !body_route_params.is_empty() {
-                    "route_param_json"
-                } else if !body_query_params.is_empty() {
-                    "query_param_json"
-                } else if !body_request_json.is_empty() {
-                    "request_body_json"
-                } else if !body_request_fields.is_empty() {
-                    "request_body_field_json"
-                } else {
-                    "dynamic"
-                };
                 out.entry(route_origin_id.to_string())
                     .or_default()
-                    .push(ServerResponseArtifact {
-                        origin_id: origin_id("domain", "respond", expr.span),
-                        status: status_value,
-                        body_kind: body_kind.to_string(),
-                        body_json,
-                        body_object_fields,
-                        body_route_params,
-                        body_query_params,
-                        body_request_json,
-                        body_request_fields,
-                    });
+                    .push(server_response_artifact(expr, status, payload, None));
             }
             collect_expr_response_artifacts(status, route_origin_id, out);
             collect_expr_response_artifacts(payload, route_origin_id, out);
@@ -4237,14 +4583,14 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
-    fn native_server_launcher_falls_back_for_multi_response_routes() {
+    fn native_server_launcher_falls_back_for_dynamic_multi_response_routes() {
         let src = r#"@server {
   @listen 8080
   @route POST /orders {
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { ok: true }
+    @respond 201 { quantity: @body.quantity as int }
   }
 }"#;
         let program = lower(src);
@@ -4262,6 +4608,61 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(launcher.contains("fn orv_native_reference_bridge("));
         assert!(launcher.contains(r#"std::process::Command::new("orv")"#));
         assert!(!launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_simple_guarded_multi_response_route() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if @body.sku == "" {
+      @respond 400 { err: "missing_sku" }
+    }
+    @respond 201 { sku: @body.sku }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(artifact.routes[0].responses.len(), 2);
+        assert_eq!(
+            artifact.routes[0].responses[0]
+                .condition
+                .as_ref()
+                .map(|condition| condition.kind.as_str()),
+            Some("request_body_field_eq")
+        );
+        assert_eq!(
+            artifact.routes[0].responses[0]
+                .condition
+                .as_ref()
+                .map(|condition| condition.name.as_str()),
+            Some("sku")
+        );
+        assert_eq!(
+            artifact.routes[0].responses[0]
+                .condition
+                .as_ref()
+                .map(|condition| condition.value.as_str()),
+            Some("")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers
+            .contains("routes::orv_native_body_field_value(route_match, \"sku\") == Some(\"\")"));
+        assert!(handlers.contains("status: 400"));
+        assert!(handlers.contains("status: 201"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
     }
 
     #[test]
