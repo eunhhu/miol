@@ -4,8 +4,8 @@
 //! owns small compiler artifacts that can be derived from HIR without emitting a
 //! server binary or optimized client WASM bundle. HTML-only entries can plan a
 //! static page artifact with no shipped runtime features, and server entries
-//! declare native server plan/source contracts without claiming final native
-//! codegen yet.
+//! declare native server plan/package/source/command contracts without claiming
+//! final native codegen yet.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
