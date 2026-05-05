@@ -12133,6 +12133,9 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
                 let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
                 verify_native_server_routes_source(&target, &artifact)?;
             }
+            "native_server_router_source" => {
+                verify_native_server_router_source(&target)?;
+            }
             "native_server_launcher_package" => verify_native_server_launcher_package(&target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_manifest" => verify_client_manifest_target(dir, bundle, &target)?,
@@ -12269,6 +12272,7 @@ fn verify_native_server_plan_value(
         NATIVE_SERVER_PLAN_PATH,
     )?;
     verify_native_server_plan_routes_source(dir, plan, artifact)?;
+    verify_native_server_plan_router_source(dir, plan)?;
     let package_path = json_str(plan, "package", "native server plan")?;
     verify_native_server_launcher_package(&dir.join(package_path))?;
     verify_native_server_plan_runtime_image(plan)?;
@@ -12352,6 +12356,19 @@ fn verify_native_server_plan_routes_source(
         );
     }
     verify_native_server_routes_source(&dir.join(routes_source_path), artifact)
+}
+
+fn verify_native_server_plan_router_source(
+    dir: &Path,
+    plan: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let router_source_path = json_str(plan, "router_source", "native server plan")?;
+    if router_source_path != NATIVE_SERVER_ROUTER_SOURCE_PATH {
+        anyhow::bail!(
+            "native server plan router_source must be {NATIVE_SERVER_ROUTER_SOURCE_PATH}"
+        );
+    }
+    verify_native_server_router_source(&dir.join(router_source_path))
 }
 
 fn verify_native_server_plan_runtime_image(plan: &serde_json::Value) -> anyhow::Result<()> {
@@ -12551,6 +12568,12 @@ fn verify_native_server_launcher_source(
     if !source.contains(r#"routes::orv_native_match_route("__orv_probe__", "__orv_probe__")"#) {
         anyhow::bail!("native server launcher source must link generated route matcher");
     }
+    if !source.contains("mod router;") || !source.contains("router::ORV_NATIVE_HANDLER_COUNT") {
+        anyhow::bail!("native server launcher source must link generated router source");
+    }
+    if !source.contains(r#"router::orv_native_dispatch("__orv_probe__", "__orv_probe__")"#) {
+        anyhow::bail!("native server launcher source must link generated router dispatch");
+    }
     let expected = orv_compiler::native_server_launcher_source(artifact_path, native_plan_path);
     if source != expected {
         anyhow::bail!("native server launcher source must match generated source");
@@ -12570,6 +12593,19 @@ fn verify_native_server_routes_source(
     let expected = orv_compiler::native_server_routes_source(artifact);
     if source != expected {
         anyhow::bail!("native server routes source must match server runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_server_router_source(target: &Path) -> anyhow::Result<()> {
+    if !target.is_file() {
+        anyhow::bail!("missing native server router source: {}", target.display());
+    }
+    let source = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    let expected = orv_compiler::native_server_router_source();
+    if source != expected {
+        anyhow::bail!("native server router source must match generated source");
     }
     Ok(())
 }
@@ -13747,7 +13783,8 @@ fn verify_deploy_server_target(
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
     let native_plan = json_str(server, "native_plan", "deploy server")?;
     let native_runtime_image_plan = json_str(server, "native_runtime_image_plan", "deploy server")?;
-    let native_routes_source = json_str(server, "native_routes_source", "deploy server")?;
+    let native_route_table_source = json_str(server, "native_routes_source", "deploy server")?;
+    let native_dispatch_source = json_str(server, "native_router_source", "deploy server")?;
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
@@ -13783,12 +13820,18 @@ fn verify_deploy_server_target(
         native_plan,
         &artifact,
     )?;
-    if native_routes_source != NATIVE_SERVER_ROUTES_SOURCE_PATH {
+    if native_route_table_source != NATIVE_SERVER_ROUTES_SOURCE_PATH {
         anyhow::bail!(
             "deploy server native_routes_source must be {NATIVE_SERVER_ROUTES_SOURCE_PATH}"
         );
     }
-    verify_native_server_routes_source(&dir.join(native_routes_source), &artifact)?;
+    verify_native_server_routes_source(&dir.join(native_route_table_source), &artifact)?;
+    if native_dispatch_source != NATIVE_SERVER_ROUTER_SOURCE_PATH {
+        anyhow::bail!(
+            "deploy server native_router_source must be {NATIVE_SERVER_ROUTER_SOURCE_PATH}"
+        );
+    }
+    verify_native_server_router_source(&dir.join(native_dispatch_source))?;
     verify_deploy_container_artifact(
         dir,
         container,
@@ -14448,6 +14491,7 @@ fn reveal_native_server_targets(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "routes_source": reveal_native_server_routes_source(dir, &native_plan)?,
+            "router_source": reveal_native_server_router_source(dir, &native_plan)?,
             "target": native_plan
                 .get("target")
                 .cloned()
@@ -14494,6 +14538,33 @@ fn reveal_native_server_routes_source(
         "path": path,
         "exists": true,
         "route_count": source.matches("OrvNativeRoute { method:").count(),
+    }))
+}
+
+fn reveal_native_server_router_source(
+    dir: &Path,
+    native_plan: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(path) = native_plan
+        .get("router_source")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let target_path = dir.join(path);
+    if !target_path.is_file() {
+        return Ok(serde_json::json!({
+            "path": path,
+            "exists": false,
+        }));
+    }
+    let source = std::fs::read_to_string(&target_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target_path.display()))?;
+    Ok(serde_json::json!({
+        "path": path,
+        "exists": true,
+        "dispatch": source.contains("pub fn orv_native_dispatch("),
+        "handler_count_contract": source.contains("ORV_NATIVE_HANDLER_COUNT"),
     }))
 }
 
@@ -16075,6 +16146,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let native_runtime_image_plan_path = NATIVE_RUNTIME_IMAGE_PLAN_PATH;
     let native_server_source_path = NATIVE_SERVER_SOURCE_PATH;
     let native_server_routes_source_path = NATIVE_SERVER_ROUTES_SOURCE_PATH;
+    let native_server_router_source_path = NATIVE_SERVER_ROUTER_SOURCE_PATH;
     let native_server_package_path = NATIVE_SERVER_PACKAGE_PATH;
     let source_bundle = orv_compiler::source_bundle_artifact(
         entry.display().to_string(),
@@ -16136,6 +16208,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             launcher: server_launch_path,
             source: native_server_source_path,
             routes_source: native_server_routes_source_path,
+            router_source: native_server_router_source_path,
             package: native_server_package_path,
             runtime_image_plan: native_runtime_image_plan_path,
         };
@@ -16154,6 +16227,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             native_server_plan_path,
         )?;
         write_native_server_routes_source(out, native_server_routes_source_path, server_artifact)?;
+        write_native_server_router_source(out, native_server_router_source_path)?;
         write_native_server_launcher_package(out, native_server_package_path)?;
     }
     if let Some((path, html)) = static_page {
@@ -16195,6 +16269,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
                 native_server_plan: native_server_plan_path,
                 native_runtime_image_plan: native_runtime_image_plan_path,
                 native_server_routes_source: native_server_routes_source_path,
+                native_server_router_source: native_server_router_source_path,
             },
         )?;
     }
@@ -16974,6 +17049,7 @@ const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
 const NATIVE_RUNTIME_IMAGE_PLAN_PATH: &str = "server/runtime-image.json";
 const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
 const NATIVE_SERVER_ROUTES_SOURCE_PATH: &str = "server/native/routes.rs";
+const NATIVE_SERVER_ROUTER_SOURCE_PATH: &str = "server/native/router.rs";
 const NATIVE_SERVER_PACKAGE_PATH: &str = "server/native/Cargo.toml";
 const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
 const NATIVE_SERVER_LAUNCHER_BINARY_PATH: &str = "./server/native/target/release/orv-native-server";
@@ -17217,6 +17293,7 @@ struct NativeServerPlanPaths<'a> {
     launcher: &'a str,
     source: &'a str,
     routes_source: &'a str,
+    router_source: &'a str,
     package: &'a str,
     runtime_image_plan: &'a str,
 }
@@ -17236,6 +17313,7 @@ fn write_native_server_plan_artifact(
         launcher: paths.launcher.to_string(),
         source: paths.source.to_string(),
         routes_source: paths.routes_source.to_string(),
+        router_source: paths.router_source.to_string(),
         package: paths.package.to_string(),
         runtime_image_plan: paths.runtime_image_plan.to_string(),
         target: orv_compiler::NativeServerTargetArtifact {
@@ -17318,6 +17396,11 @@ fn write_native_server_routes_source(
     write_text(&out.join(path), &source)
 }
 
+fn write_native_server_router_source(out: &Path, path: &str) -> anyhow::Result<()> {
+    let source = orv_compiler::native_server_router_source();
+    write_text(&out.join(path), &source)
+}
+
 fn write_native_server_launcher_package(out: &Path, path: &str) -> anyhow::Result<()> {
     let manifest = r#"[package]
 name = "orv-native-server"
@@ -17357,6 +17440,7 @@ struct ProdBuildTargets<'a> {
     native_server_plan: &'a str,
     native_runtime_image_plan: &'a str,
     native_server_routes_source: &'a str,
+    native_server_router_source: &'a str,
 }
 
 fn write_prod_deploy_artifacts(
@@ -17396,6 +17480,7 @@ fn write_prod_deploy_artifacts(
             "native_plan": targets.native_server_plan,
             "native_runtime_image_plan": targets.native_runtime_image_plan,
             "native_routes_source": targets.native_server_routes_source,
+            "native_router_source": targets.native_server_router_source,
             "container": container,
             "dockerfile": dockerfile,
             "compose": compose,
@@ -18608,6 +18693,10 @@ test "checkout failing runtime body" {
         assert_eq!(
             deploy["server"]["native_routes_source"],
             serde_json::json!("server/native/routes.rs")
+        );
+        assert_eq!(
+            deploy["server"]["native_router_source"],
+            serde_json::json!("server/native/router.rs")
         );
         assert!(native_routes.contains("pub fn orv_native_match_route("));
         assert!(native_routes.contains("pub struct OrvNativeRouteMatch"));
@@ -25722,6 +25811,7 @@ entry = "src/main.orv"
         let native_server_package_path = out.join("server").join("native").join("Cargo.toml");
         let native_server_source_path = out.join("server").join("native").join("main.rs");
         let native_server_routes_path = out.join("server").join("native").join("routes.rs");
+        let native_server_router_path = out.join("server").join("native").join("router.rs");
         let graph_path = out.join("project-graph.json");
         let source_bundle_path = out.join("source-bundle.json");
         assert!(
@@ -25763,6 +25853,11 @@ entry = "src/main.orv"
             native_server_routes_path.is_file(),
             "missing {}",
             native_server_routes_path.display()
+        );
+        assert!(
+            native_server_router_path.is_file(),
+            "missing {}",
+            native_server_router_path.display()
         );
         assert!(
             native_server_package_path.is_file(),
@@ -25849,6 +25944,12 @@ entry = "src/main.orv"
             .as_array()
             .expect("artifacts array")
             .iter()
+            .any(|artifact| artifact["kind"] == "native_server_router_source"
+                && artifact["path"] == "server/native/router.rs"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
             .any(
                 |artifact| artifact["kind"] == "native_server_launcher_package"
                     && artifact["path"] == "server/native/Cargo.toml"
@@ -25899,6 +26000,12 @@ entry = "src/main.orv"
             .iter()
             .any(|bundle| bundle["kind"] == "native_server_routes_source"
                 && bundle["path"] == "server/native/routes.rs"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "native_server_router_source"
+                && bundle["path"] == "server/native/router.rs"));
         assert!(plan["bundles"]
             .as_array()
             .expect("bundles array")
@@ -25958,6 +26065,7 @@ entry = "src/main.orv"
         assert_eq!(native_plan["launcher"], "server/launch.json");
         assert_eq!(native_plan["source"], "server/native/main.rs");
         assert_eq!(native_plan["routes_source"], "server/native/routes.rs");
+        assert_eq!(native_plan["router_source"], "server/native/router.rs");
         assert_eq!(native_plan["package"], "server/native/Cargo.toml");
         assert_eq!(native_plan["runtime"], "reference-interpreter");
         assert_eq!(native_plan["target"]["kind"], "server_binary");
@@ -26003,23 +26111,39 @@ entry = "src/main.orv"
         assert!(native_source.contains("Command::new(\"orv\")"));
         assert!(native_source.contains("run-artifact"));
         assert!(native_source.contains("mod routes;"));
+        assert!(native_source.contains("mod router;"));
         assert!(native_source.contains("routes::ORV_NATIVE_ROUTE_COUNT"));
         assert!(native_source
             .contains(r#"routes::orv_native_match_route("__orv_probe__", "__orv_probe__")"#));
-        let native_routes =
+        assert!(native_source.contains("router::ORV_NATIVE_HANDLER_COUNT"));
+        assert!(native_source
+            .contains(r#"router::orv_native_dispatch("__orv_probe__", "__orv_probe__")"#));
+        let native_route_table_source =
             std::fs::read_to_string(&native_server_routes_path).expect("native routes source");
         let route_origin = server_artifact["routes"][0]["origin_id"]
             .as_str()
             .expect("route origin id");
-        assert!(native_routes.contains("pub struct OrvNativeRoute"));
-        assert!(native_routes.contains("pub const ORV_NATIVE_ROUTES"));
-        assert!(native_routes.contains("method: \"GET\""));
-        assert!(native_routes.contains("path: \"/ping\""));
-        assert!(native_routes.contains("pub fn orv_native_match_route("));
-        assert!(native_routes.contains("orv_native_route_path_params(route.path, path)"));
-        assert!(native_routes.contains(&format!("origin_id: \"{route_origin}\"")));
-        assert!(native_routes
+        assert!(native_route_table_source.contains("pub struct OrvNativeRoute"));
+        assert!(native_route_table_source.contains("pub const ORV_NATIVE_ROUTES"));
+        assert!(native_route_table_source.contains("method: \"GET\""));
+        assert!(native_route_table_source.contains("path: \"/ping\""));
+        assert!(native_route_table_source.contains("pub fn orv_native_match_route("));
+        assert!(
+            native_route_table_source.contains("orv_native_route_path_params(route.path, path)")
+        );
+        assert!(native_route_table_source.contains(&format!("origin_id: \"{route_origin}\"")));
+        assert!(native_route_table_source
             .contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();"));
+        let native_router_source_text =
+            std::fs::read_to_string(&native_server_router_path).expect("native router source");
+        assert!(native_router_source_text.contains("use crate::routes;"));
+        assert!(native_router_source_text.contains("pub struct OrvNativeDispatch"));
+        assert!(native_router_source_text.contains("pub const ORV_NATIVE_HANDLER_COUNT"));
+        assert!(native_router_source_text.contains("pub fn orv_native_dispatch("));
+        assert!(native_router_source_text.contains("routes::orv_native_match_route(method, path)"));
+        assert!(native_router_source_text.contains("status: 501"));
+        assert!(native_router_source_text.contains("native route handler codegen pending"));
+        assert!(native_router_source_text.contains("status: 404"));
         let native_package =
             std::fs::read_to_string(&native_server_package_path).expect("native package");
         assert!(native_package.contains("name = \"orv-native-server\""));
@@ -26123,6 +26247,48 @@ entry = "src/main.orv"
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );
+
+        cmd_verify_build(&out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_native_server_router_source_contract() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("native-server-router-source");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let router_source_path = out.join("server").join("native").join("router.rs");
+        assert!(
+            router_source_path.is_file(),
+            "missing {}",
+            router_source_path.display()
+        );
+        assert_manifest_artifact(
+            &out.join("build-manifest.json"),
+            "native_server_router_source",
+            "server/native/router.rs",
+        );
+        assert_bundle_target(
+            &out.join("bundle-plan.json"),
+            "native_server_router_source",
+            "server/native/router.rs",
+        );
+        let native_plan =
+            read_json_value(&out.join(NATIVE_SERVER_PLAN_PATH)).expect("native server plan");
+        let source = std::fs::read_to_string(&router_source_path).expect("router source");
+
+        assert_eq!(native_plan["router_source"], "server/native/router.rs");
+        assert!(source.contains("use crate::routes;"));
+        assert!(source.contains("pub struct OrvNativeDispatch"));
+        assert!(source.contains("pub const ORV_NATIVE_HANDLER_COUNT"));
+        assert!(source.contains("pub fn orv_native_dispatch("));
+        assert!(source.contains("routes::orv_native_match_route(method, path)"));
+        assert!(source.contains("origin_id: Some(route_match.route.origin_id)"));
+        assert!(source.contains("params: route_match.params"));
+        assert!(source.contains("status: 501"));
+        assert!(source.contains("status: 404"));
 
         cmd_verify_build(&out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
@@ -26288,6 +26454,10 @@ entry = "src/main.orv"
         assert_eq!(
             deploy["server"]["native_routes_source"],
             "server/native/routes.rs"
+        );
+        assert_eq!(
+            deploy["server"]["native_router_source"],
+            "server/native/router.rs"
         );
         assert_eq!(
             deploy["server"]["runtime_image"],
@@ -26721,6 +26891,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("native server routes source must match server runtime artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_native_server_router_source_mismatch() {
+        let (src_dir, path) = prod_server_source("native-server-router-source");
+        let out = temp_output_dir("native-server-router-source-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let router_path = out.join("server").join("native").join("router.rs");
+        let mut source = std::fs::read_to_string(&router_path).expect("native router source");
+        source = source.replace("status: 501", "status: 200");
+        write_text(&router_path, &source).expect("write corrupt native router source");
+
+        let err = cmd_verify_build(&out).expect_err("native router source mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("native server router source must match generated source"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -28539,6 +28729,10 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["routes_source"]["path"] == "server/native/routes.rs"
                 && target["routes_source"]["exists"] == true
                 && target["routes_source"]["route_count"] == 1
+                && target["router_source"]["path"] == "server/native/router.rs"
+                && target["router_source"]["exists"] == true
+                && target["router_source"]["dispatch"] == true
+                && target["router_source"]["handler_count_contract"] == true
                 && target["runtime_image"]["path"] == "server/runtime-image.json"
                 && target["runtime_image"]["reference_image"]
                     == "ghcr.io/orv-lang/orv-reference:latest"

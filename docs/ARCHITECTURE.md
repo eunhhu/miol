@@ -130,12 +130,12 @@ HIR → tree-walking 실행
 HIR → origin map JSON
 ```
 
-현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, native server plan, native route source, bundle plan을 읽어 source span, graph node, route descriptor, native server target/build-run command/routes source summary 또는 client manifest/bundle target을 JSON으로 반환한다. `orv editor reveal <dir> <origin-id>`는 같은 origin id를 first-party editor focus/source/production navigation payload로 변환한다. `orv editor trace <dir> --trace <trace.json>`은 captured request trace frame의 origin id를 같은 editor navigation payload로 확장하고, `orv editor trace-stream <dir> --events <trace-events.sse>`는 EventSource body의 `orv:trace` snapshot과 `orv:trace.frame` payload를 같은 구조로 소비한다. DAP in-process attach와 env 기반 server run capture는 `orv-runtime`의 공유 `orv.production.trace` JSON schema/file writer를 사용하고, open-ended live streaming은 `/__orv/trace/events`의 유지 연결과 per-frame event로 시작됐다.
+현재 `orv-compiler`는 HIR의 실행 가능한 도메인/라우트/응답/호출 노드에서 안정적인 origin id, source span fingerprint, traversal 기반 parent-child `contains` edge, call expression에서 resolved function으로 이어지는 `calls` edge를 생성한다. `orv origins <file>`은 이 artifact를 JSON으로 출력한다. `orv reveal <dir> <origin-id>`는 build artifact directory의 origin map, ProjectGraph, server runtime artifact, native server plan, native route/router source, bundle plan을 읽어 source span, graph node, route descriptor, native server target/build-run command/routes/router source summary 또는 client manifest/bundle target을 JSON으로 반환한다. `orv editor reveal <dir> <origin-id>`는 같은 origin id를 first-party editor focus/source/production navigation payload로 변환한다. `orv editor trace <dir> --trace <trace.json>`은 captured request trace frame의 origin id를 같은 editor navigation payload로 확장하고, `orv editor trace-stream <dir> --events <trace-events.sse>`는 EventSource body의 `orv:trace` snapshot과 `orv:trace.frame` payload를 같은 구조로 소비한다. DAP in-process attach와 env 기반 server run capture는 `orv-runtime`의 공유 `orv.production.trace` JSON schema/file writer를 사용하고, open-ended live streaming은 `/__orv/trace/events`의 유지 연결과 per-frame event로 시작됐다.
 
 ### 4.6단계: 초기 build artifact (orv-compiler + orv-cli)
 
 ```
-HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.json + project-graph.json + source-bundle.json + server/app.orv-runtime.json + server/launch.json + server/native-server.json + server/runtime-image.json + server/native/Cargo.toml + server/native/main.rs + server/native/routes.rs | pages/index.html | client/manifest.json + client/reactive-plan.json + client/app.js + client/app.wasm
+HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.json + project-graph.json + source-bundle.json + server/app.orv-runtime.json + server/launch.json + server/native-server.json + server/runtime-image.json + server/native/Cargo.toml + server/native/main.rs + server/native/routes.rs + server/native/router.rs | pages/index.html | client/manifest.json + client/reactive-plan.json + client/app.js + client/app.wasm
 ```
 
 현재 `orv build <file-or-orv.toml> --out <dir>`은 native 프로덕션 바이너리를 만들지 않고 deterministic build artifact directory를 생성한다. 이 단계의 목적은 production bundler가 사용할 zero-overhead 입력 계약을 먼저 고정하는 것이다.
@@ -143,7 +143,7 @@ HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.js
 핵심 구조는 다음으로 제한한다.
 
 - Graph artifacts: `build-manifest.json`, `bundle-plan.json`, `origin-map.json`, `project-graph.json`, `source-bundle.json`
-- Server artifacts: `server/app.orv-runtime.json`, `server/launch.json`, `server/native-server.json`, `server/runtime-image.json`, `server/native/Cargo.toml`, `server/native/main.rs`, `server/native/routes.rs`
+- Server artifacts: `server/app.orv-runtime.json`, `server/launch.json`, `server/native-server.json`, `server/runtime-image.json`, `server/native/Cargo.toml`, `server/native/main.rs`, `server/native/routes.rs`, `server/native/router.rs`
 - Static/client artifacts: zero-runtime `pages/index.html`, 또는 interactive `client/manifest.json`/`client/reactive-plan.json`/`client/app.js`/`client/app.wasm`
 - Verification/reveal surfaces: `orv verify-build`, `orv run-build`, `orv dev`, `orv reveal`, `orv lsp reveal`, `orv editor reveal`
 
@@ -151,7 +151,7 @@ HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.js
 
 운영 세부와 검증 항목은 [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md)의 build/deploy 섹션에 둔다. 언어 목표 모델과 구현 상태 delta는 [SPEC.md](SPEC.md) §13에 둔다.
 
-`server/runtime-image.json`은 reference runtime image, planned OCI image tag, native binary path, route/listen/runtime feature shape를 같은 schema로 고정한다. `server/native/routes.rs`는 같은 route descriptors를 Rust route table and `:param`/`:rest*`-aware matcher, param-capture, lookup-helper source로 고정해 future native router codegen 입력을 만든다. `deploy/manifest.json`은 이를 `server.native_runtime_image_plan`과 `server.native_routes_source`로 참조하고, `orv verify-build`는 native plan, image plan, route source가 같은 server artifact를 가리키는지 검증한다.
+`server/runtime-image.json`은 reference runtime image, planned OCI image tag, native binary path, route/listen/runtime feature shape를 같은 schema로 고정한다. `server/native/routes.rs`는 같은 route descriptors를 Rust route table and `:param`/`:rest*`-aware matcher, param-capture, lookup-helper source로 고정하고, `server/native/router.rs`는 그 route table을 소비하는 temporary native dispatch contract를 고정해 future native handler codegen 입력을 만든다. `deploy/manifest.json`은 이를 `server.native_runtime_image_plan`, `server.native_routes_source`, `server.native_router_source`로 참조하고, `orv verify-build`는 native plan, image plan, route/router source가 같은 server artifact를 가리키는지 검증한다.
 
 ### 로드맵: 의미 기반 프로젝트 그래프 확장
 
