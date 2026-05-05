@@ -13506,6 +13506,44 @@ fn client_reactive_plan_signal_attr_binding_is_valid(
             signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
                 && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
         })
+        && client_signal_attr_template_is_valid(signals, binding)
+}
+
+fn client_signal_attr_template_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    let Some(template) = binding.get("attr_template") else {
+        return true;
+    };
+    let Some(segments) = template.as_array() else {
+        return false;
+    };
+    let binding_state_key = binding
+        .get("state_key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    !segments.is_empty()
+        && segments.iter().all(|segment| {
+            match segment.get("kind").and_then(serde_json::Value::as_str) {
+                Some("text") => segment
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                Some("signal") => {
+                    let state_key = segment
+                        .get("state_key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    state_key == binding_state_key
+                        && signals.iter().any(|signal| {
+                            signal.get("state_key").and_then(serde_json::Value::as_str)
+                                == Some(state_key)
+                        })
+                }
+                _ => false,
+            }
+        })
 }
 
 fn client_reactive_plan_signal_event_bindings_are_valid(
@@ -13599,6 +13637,8 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client reactive plan signal_event binding mismatch")
         || !source.contains("renderSignalTextBinding")
         || !source.contains("text_template")
+        || !source.contains("renderSignalAttrBinding")
+        || !source.contains("attr_template")
         || !source.contains("createReactiveState")
         || !source.contains("bindReactiveDom")
         || !source.contains("bindReactiveAttrs")
@@ -17746,14 +17786,14 @@ fn collect_client_attr_bindings_for_tag(
         if client_event_attr_name(&target.name).is_some() {
             return;
         }
-        let Some(signal) = client_signal_attr_source(value, signals) else {
+        let Some(binding) = client_signal_text_binding(value, signals) else {
             return;
         };
-        out.push(serde_json::json!({
+        let mut attr_binding = serde_json::json!({
             "kind": "signal_attr",
             "target": CLIENT_PAGE_PATH,
-            "source": &signal.origin_id,
-            "state_key": &signal.state_key,
+            "source": binding.origin_id,
+            "state_key": binding.state_key,
             "selector": tag,
             "attr": &target.name,
             "span": {
@@ -17761,7 +17801,17 @@ fn collect_client_attr_bindings_for_tag(
                 "start": value.span.range.start,
                 "end": value.span.range.end,
             },
-        }));
+        });
+        if let Some(attr_template) = binding.text_template {
+            attr_binding
+                .as_object_mut()
+                .expect("signal attr binding is an object")
+                .insert(
+                    "attr_template".to_string(),
+                    serde_json::Value::Array(attr_template),
+                );
+        }
+        out.push(attr_binding);
     });
 }
 
@@ -17786,22 +17836,6 @@ fn for_each_client_tag_attr_assignment<'a>(
             _ => {}
         }
     }
-}
-
-fn client_signal_attr_source<'a>(
-    expr: &orv_hir::HirExpr,
-    signals: &'a HashMap<orv_hir::NameId, ClientSignalDomSource>,
-) -> Option<&'a ClientSignalDomSource> {
-    if let orv_hir::HirExprKind::Block(block) = &expr.kind {
-        let [orv_hir::HirStmt::Expr(expr)] = block.stmts.as_slice() else {
-            return None;
-        };
-        return client_signal_attr_source(expr, signals);
-    }
-    let orv_hir::HirExprKind::Ident(ident) = &expr.kind else {
-        return None;
-    };
-    signals.get(&ident.id)
 }
 
 fn collect_client_dom_bindings_for_tag(
@@ -29605,6 +29639,8 @@ entry = "src/main.orv"
             "client reactive plan signal_event binding mismatch",
             "renderSignalTextBinding",
             "text_template",
+            "renderSignalAttrBinding",
+            "attr_template",
             "createReactiveState",
             "bindReactiveDom",
             "bindReactiveAttrs",
@@ -32779,6 +32815,46 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let loader =
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert_client_loader_contract(&loader);
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_attr_template_binding_contract() {
+        let out = temp_output_dir("client-reactive-attr-template-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig input: string = "hi"
+@out @html { @body { @input placeholder="{input}!" } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_attr"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "input"
+                && binding["selector"] == "input"
+                && binding["attr"] == "placeholder"
+                && binding["attr_template"]
+                    .as_array()
+                    .is_some_and(|segments| segments.iter().any(|segment| {
+                        segment["kind"] == "signal" && segment["state_key"] == "input"
+                    }))
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("renderSignalAttrBinding"));
+        assert!(loader.contains("attr_template"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

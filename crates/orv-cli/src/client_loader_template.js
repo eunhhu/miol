@@ -138,7 +138,8 @@ function validateReactiveBindings(plan, manifest) {
       plan.signals.some((signal) =>
         binding.source === signal.origin_id &&
         binding.state_key === signal.state_key
-      )
+      ) &&
+      signalAttrTemplateIsValid(binding, plan.signals)
     );
   if (!signalAttrBindingsAreValid) {
     throw new Error("orv client reactive plan signal_attr binding mismatch");
@@ -177,6 +178,25 @@ function signalTextTemplateIsValid(binding, signals) {
   return Array.isArray(binding.text_template) &&
     binding.text_template.length > 0 &&
     binding.text_template.every((segment) => {
+      if (segment.kind === "text") {
+        return typeof segment.value === "string";
+      }
+      if (segment.kind === "signal") {
+        return typeof segment.state_key === "string" &&
+          segment.state_key === binding.state_key &&
+          signals.some((signal) => signal.state_key === segment.state_key);
+      }
+      return false;
+    });
+}
+
+function signalAttrTemplateIsValid(binding, signals) {
+  if (binding.attr_template === undefined) {
+    return true;
+  }
+  return Array.isArray(binding.attr_template) &&
+    binding.attr_template.length > 0 &&
+    binding.attr_template.every((segment) => {
       if (segment.kind === "text") {
         return typeof segment.value === "string";
       }
@@ -292,6 +312,21 @@ function setElementSignalAttr(element, attr, value) {
   element.setAttribute(attr, text);
 }
 
+function renderSignalAttrBinding(binding, reactiveState) {
+  if (!Array.isArray(binding.attr_template)) {
+    return reactiveState[binding.state_key]?.value;
+  }
+  return binding.attr_template.map((segment) => {
+    if (segment.kind === "text") {
+      return segment.value;
+    }
+    if (segment.kind === "signal") {
+      return displaySignalValue(reactiveState[segment.state_key]?.value);
+    }
+    return "";
+  }).join("");
+}
+
 function bindReactiveAttrs(plan, root, reactiveState) {
   const bindings = new Map();
   if (!root) {
@@ -303,7 +338,7 @@ function bindReactiveAttrs(plan, root, reactiveState) {
     if (!state) {
       continue;
     }
-    const expected = displaySignalValue(state.value);
+    const expected = displaySignalValue(renderSignalAttrBinding(binding, reactiveState));
     const element = Array.from(root.querySelectorAll(binding.selector))
       .find((candidate) => displaySignalValue(elementSignalAttrValue(candidate, binding.attr)) === expected);
     if (!element) {
@@ -311,15 +346,19 @@ function bindReactiveAttrs(plan, root, reactiveState) {
     }
     element.dataset.orvSignalAttr = binding.state_key;
     const current = bindings.get(binding.state_key) || [];
-    current.push({ element, attr: binding.attr });
+    current.push({ element, binding });
     bindings.set(binding.state_key, current);
   }
   return {
     count: [...bindings.values()].reduce((total, items) => total + items.length, 0),
-    update(stateKey, value) {
+    update(stateKey) {
       const attrs = bindings.get(stateKey) || [];
-      for (const binding of attrs) {
-        setElementSignalAttr(binding.element, binding.attr, value);
+      for (const item of attrs) {
+        setElementSignalAttr(
+          item.element,
+          item.binding.attr,
+          renderSignalAttrBinding(item.binding, reactiveState),
+        );
       }
     },
   };
