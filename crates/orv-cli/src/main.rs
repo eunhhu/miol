@@ -13361,6 +13361,9 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
     if !client_reactive_plan_signal_text_bindings_are_valid(signals, bindings) {
         anyhow::bail!("client_reactive_plan signal_text binding is invalid");
     }
+    if !client_reactive_plan_signal_attr_bindings_are_valid(signals, bindings) {
+        anyhow::bail!("client_reactive_plan signal_attr binding is invalid");
+    }
     if !client_reactive_plan_signal_event_bindings_are_valid(signals, bindings) {
         anyhow::bail!("client_reactive_plan signal_event binding is invalid");
     }
@@ -13422,6 +13425,45 @@ fn client_reactive_plan_signal_text_binding_is_valid(
             .get("selector")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|selector| !selector.is_empty())
+        && signals.iter().any(|signal| {
+            signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
+                && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
+        })
+}
+
+fn client_reactive_plan_signal_attr_bindings_are_valid(
+    signals: &[serde_json::Value],
+    bindings: &[serde_json::Value],
+) -> bool {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.get("kind").and_then(serde_json::Value::as_str) == Some("signal_attr")
+        })
+        .all(|binding| client_reactive_plan_signal_attr_binding_is_valid(signals, binding))
+}
+
+fn client_reactive_plan_signal_attr_binding_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    let origin_id = binding
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let state_key = binding
+        .get("state_key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_PAGE_PATH)
+        && binding
+            .get("selector")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|selector| !selector.is_empty())
+        && binding
+            .get("attr")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|attr| !attr.is_empty())
         && signals.iter().any(|signal| {
             signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
                 && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
@@ -13514,12 +13556,19 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client reactive plan initial_render binding mismatch")
         || !source.contains("client reactive plan signal_state binding mismatch")
         || !source.contains("client reactive plan signal_text binding mismatch")
+        || !source.contains("client reactive plan signal_attr binding mismatch")
+        || !source.contains("client reactive plan signal_event binding mismatch")
         || !source.contains("createReactiveState")
         || !source.contains("bindReactiveDom")
+        || !source.contains("bindReactiveAttrs")
+        || !source.contains("bindReactiveEvents")
+        || !source.contains("applySignalAction")
         || !source.contains("setSignal")
         || !source.contains("orvReactiveSignals")
         || !source.contains("orvReactiveBindings")
         || !source.contains("orvReactiveDomBindings")
+        || !source.contains("orvReactiveAttrBindings")
+        || !source.contains("orvReactiveEventBindings")
         || !source.contains("orvReactiveStateHash")
         || !source.contains("__ORV_CLIENT_REACTIVE_STATE__")
         || !source.contains("__ORV_SET_SIGNAL__")
@@ -17382,6 +17431,7 @@ fn collect_client_dom_bindings_expr(
         orv_hir::HirExprKind::Domain { name, args, .. } => {
             if inside_html {
                 collect_client_dom_bindings_for_tag(name, args, signals, out);
+                collect_client_attr_bindings_for_tag(name, args, signals, out);
                 collect_client_event_bindings_for_tag(name, args, signals, out);
             }
             for arg in args {
@@ -17542,15 +17592,12 @@ fn collect_client_event_bindings_for_tag(
     signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
     out: &mut Vec<serde_json::Value>,
 ) {
-    for arg in args {
-        let orv_hir::HirExprKind::Assign { target, value } = &arg.kind else {
-            continue;
-        };
+    for_each_client_tag_attr_assignment(args, |target, value| {
         let Some(event) = client_event_attr_name(&target.name) else {
-            continue;
+            return;
         };
         let Some(action) = client_signal_event_action(value, signals) else {
-            continue;
+            return;
         };
         out.push(serde_json::json!({
             "kind": "signal_event",
@@ -17566,7 +17613,7 @@ fn collect_client_event_bindings_for_tag(
                 "end": value.span.range.end,
             },
         }));
-    }
+    });
 }
 
 fn client_event_attr_name(name: &str) -> Option<String> {
@@ -17627,6 +17674,74 @@ fn client_signal_assignment_action(
 
 fn client_expr_is_ident(expr: &orv_hir::HirExpr, id: orv_hir::NameId) -> bool {
     matches!(&expr.kind, orv_hir::HirExprKind::Ident(ident) if ident.id == id)
+}
+
+fn collect_client_attr_bindings_for_tag(
+    tag: &str,
+    args: &[orv_hir::HirExpr],
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    for_each_client_tag_attr_assignment(args, |target, value| {
+        if client_event_attr_name(&target.name).is_some() {
+            return;
+        }
+        let Some(signal) = client_signal_attr_source(value, signals) else {
+            return;
+        };
+        out.push(serde_json::json!({
+            "kind": "signal_attr",
+            "target": CLIENT_PAGE_PATH,
+            "source": &signal.origin_id,
+            "state_key": &signal.state_key,
+            "selector": tag,
+            "attr": &target.name,
+            "span": {
+                "file": value.span.file.index(),
+                "start": value.span.range.start,
+                "end": value.span.range.end,
+            },
+        }));
+    });
+}
+
+fn for_each_client_tag_attr_assignment<'a>(
+    args: &'a [orv_hir::HirExpr],
+    mut visit: impl FnMut(&'a orv_hir::HirIdent, &'a orv_hir::HirExpr),
+) {
+    for arg in args {
+        match &arg.kind {
+            orv_hir::HirExprKind::Assign { target, value } => visit(target, value),
+            orv_hir::HirExprKind::Block(block) => {
+                for stmt in &block.stmts {
+                    let orv_hir::HirStmt::Expr(expr) = stmt else {
+                        break;
+                    };
+                    let orv_hir::HirExprKind::Assign { target, value } = &expr.kind else {
+                        break;
+                    };
+                    visit(target, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn client_signal_attr_source<'a>(
+    expr: &orv_hir::HirExpr,
+    signals: &'a HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<&'a ClientSignalDomSource> {
+    if let orv_hir::HirExprKind::Block(block) = &expr.kind {
+        let [orv_hir::HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+            return None;
+        };
+        return client_signal_attr_source(expr, signals);
+    }
+    let orv_hir::HirExprKind::Ident(ident) = &expr.kind else {
+        return None;
+    };
+    signals.get(&ident.id)
 }
 
 fn collect_client_dom_bindings_for_tag(
@@ -29356,9 +29471,11 @@ entry = "src/main.orv"
             "client reactive plan initial_render binding mismatch",
             "client reactive plan signal_state binding mismatch",
             "client reactive plan signal_text binding mismatch",
+            "client reactive plan signal_attr binding mismatch",
             "client reactive plan signal_event binding mismatch",
             "createReactiveState",
             "bindReactiveDom",
+            "bindReactiveAttrs",
             "bindReactiveEvents",
             "applySignalAction",
             "setSignal",
@@ -29380,6 +29497,7 @@ entry = "src/main.orv"
             "orvReactiveSignals",
             "orvReactiveBindings",
             "orvReactiveDomBindings",
+            "orvReactiveAttrBindings",
             "orvReactiveEventBindings",
             "__ORV_CLIENT_REACTIVE_STATE__",
             "__ORV_SET_SIGNAL__",
@@ -32456,6 +32574,39 @@ models = { path = "../../shared/models", version = "2.0.0" }
             "client/reactive-plan.json"
         );
 
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_attr_binding_contract() {
+        let out = temp_output_dir("client-reactive-attr-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig input: string = \"hi\"\n@out @html { @body { @input { value=input } } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_attr"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "input"
+                && binding["selector"] == "input"
+                && binding["attr"] == "value"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert_client_loader_contract(&loader);
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

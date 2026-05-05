@@ -126,6 +126,22 @@ function validateReactiveBindings(plan, manifest) {
   if (!signalTextBindingsAreValid) {
     throw new Error("orv client reactive plan signal_text binding mismatch");
   }
+  const signalAttrBindingsAreValid = plan.bindings
+    .filter((binding) => binding.kind === "signal_attr")
+    .every((binding) =>
+      binding.target === manifest.page &&
+      typeof binding.selector === "string" &&
+      binding.selector.length > 0 &&
+      typeof binding.attr === "string" &&
+      binding.attr.length > 0 &&
+      plan.signals.some((signal) =>
+        binding.source === signal.origin_id &&
+        binding.state_key === signal.state_key
+      )
+    );
+  if (!signalAttrBindingsAreValid) {
+    throw new Error("orv client reactive plan signal_attr binding mismatch");
+  }
   const signalEventBindingsAreValid = plan.bindings
     .filter((binding) => binding.kind === "signal_event")
     .every((binding) =>
@@ -207,6 +223,63 @@ function bindReactiveDom(plan, root, reactiveState) {
       const elements = bindings.get(stateKey) || [];
       for (const element of elements) {
         element.textContent = displaySignalValue(value);
+      }
+    },
+  };
+}
+
+function elementSignalAttrValue(element, attr) {
+  if (attr in element && typeof element[attr] !== "function") {
+    return element[attr];
+  }
+  return element.getAttribute(attr);
+}
+
+function setElementSignalAttr(element, attr, value) {
+  if (attr === "checked") {
+    element.checked = Boolean(value);
+    if (element.checked) {
+      element.setAttribute(attr, "");
+    } else {
+      element.removeAttribute(attr);
+    }
+    return;
+  }
+  const text = displaySignalValue(value);
+  if (attr in element && typeof element[attr] !== "function") {
+    element[attr] = value == null ? "" : value;
+  }
+  element.setAttribute(attr, text);
+}
+
+function bindReactiveAttrs(plan, root, reactiveState) {
+  const bindings = new Map();
+  if (!root) {
+    return { count: 0, update() {} };
+  }
+  const attrBindings = plan.bindings.filter((binding) => binding.kind === "signal_attr");
+  for (const binding of attrBindings) {
+    const state = reactiveState[binding.state_key];
+    if (!state) {
+      continue;
+    }
+    const expected = displaySignalValue(state.value);
+    const element = Array.from(root.querySelectorAll(binding.selector))
+      .find((candidate) => displaySignalValue(elementSignalAttrValue(candidate, binding.attr)) === expected);
+    if (!element) {
+      continue;
+    }
+    element.dataset.orvSignalAttr = binding.state_key;
+    const current = bindings.get(binding.state_key) || [];
+    current.push({ element, attr: binding.attr });
+    bindings.set(binding.state_key, current);
+  }
+  return {
+    count: [...bindings.values()].reduce((total, items) => total + items.length, 0),
+    update(stateKey, value) {
+      const attrs = bindings.get(stateKey) || [];
+      for (const binding of attrs) {
+        setElementSignalAttr(binding.element, binding.attr, value);
       }
     },
   };
@@ -324,6 +397,7 @@ async function main() {
     root.innerHTML = initialRender;
   }
   const reactiveDom = bindReactiveDom(reactivePlan, root, reactiveState);
+  let reactiveAttrs = { count: 0, update() {} };
   function setSignal(stateKey, value) {
     const state = reactiveState[stateKey];
     if (!state) {
@@ -331,10 +405,12 @@ async function main() {
     }
     state.value = value;
     reactiveDom.update(stateKey, value);
+    reactiveAttrs.update(stateKey, value);
     if (root) {
       root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
     }
   }
+  reactiveAttrs = bindReactiveAttrs(reactivePlan, root, reactiveState);
   const reactiveEvents = bindReactiveEvents(reactivePlan, root, reactiveState, setSignal);
   if (typeof instance.exports.orv_start === "function") {
     instance.exports.orv_start();
@@ -349,6 +425,7 @@ async function main() {
     root.dataset.orvReactiveSignals = String(reactivePlan.signals.length);
     root.dataset.orvReactiveBindings = String(reactivePlan.bindings.filter((binding) => binding.kind === "signal_state").length);
     root.dataset.orvReactiveDomBindings = String(reactiveDom.count);
+    root.dataset.orvReactiveAttrBindings = String(reactiveAttrs.count);
     root.dataset.orvReactiveEventBindings = String(reactiveEvents.count);
     root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
   }
