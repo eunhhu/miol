@@ -2164,6 +2164,7 @@ ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server\n\
 - `server/native-server.json`\n\
 - `server/native/Cargo.toml`\n\
 - `server/native/main.rs`\n\
+- `server/native/routes.rs`\n\
 \n\
 ## Routes\n\
 \n\
@@ -18370,6 +18371,12 @@ entry = "src/main.orv"
         })
     }
 
+    fn native_routes_source_includes(source: &str, method: &str, path: &str) -> bool {
+        source.contains(&format!(
+            "OrvNativeRoute {{ method: {method:?}, path: {path:?},"
+        ))
+    }
+
     fn protocol_frames(output: &str) -> Vec<serde_json::Value> {
         let mut offset = 0;
         let mut frames = Vec::new();
@@ -18638,6 +18645,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("server/native-server.json"));
         assert!(guide.contains("server/native/Cargo.toml"));
         assert!(guide.contains("server/native/main.rs"));
+        assert!(guide.contains("server/native/routes.rs"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
         assert!(
@@ -18674,6 +18682,9 @@ test "checkout failing runtime body" {
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
         let compose =
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let native_routes =
+            std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
+                .expect("native routes source");
         for (method, path) in [
             ("GET", "/"),
             ("POST", "/members"),
@@ -18686,7 +18697,13 @@ test "checkout failing runtime body" {
                 method,
                 path
             ));
+            assert!(native_routes_source_includes(&native_routes, method, path));
         }
+        assert_eq!(
+            deploy["server"]["native_routes_source"],
+            serde_json::json!("server/native/routes.rs")
+        );
+        assert!(native_routes.contains("pub fn orv_native_match_route("));
         assert_eq!(
             deploy["server"]["persistence"]["wal_paths"][0],
             serde_json::json!("data/shop.wal.jsonl")
