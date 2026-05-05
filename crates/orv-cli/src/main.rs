@@ -14275,6 +14275,7 @@ fn verify_deploy_server_target(
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
+    let env_example = json_str(server, "env_example", "deploy server")?;
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -14347,13 +14348,14 @@ fn verify_deploy_server_target(
         artifact.listen.as_ref(),
         &persistence,
     )?;
+    verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
     verify_deploy_runbook_artifact(
         dir,
         runbook,
         compose,
+        env_example,
         routes_artifact,
-        artifact.listen.as_ref(),
-        &artifact.routes,
+        &artifact,
         &persistence,
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
@@ -14510,13 +14512,33 @@ fn verify_deploy_compose_artifact(
     Ok(())
 }
 
+fn verify_deploy_env_example_artifact(
+    dir: &Path,
+    path: &str,
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let env_path = dir.join(path);
+    if !env_path.is_file() {
+        anyhow::bail!("missing deploy env example: {}", env_path.display());
+    }
+    let env_example = std::fs::read_to_string(&env_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", env_path.display()))?;
+    for assignment in deploy_env_example_assignments(listen, persistence) {
+        if !env_example.contains(&assignment) {
+            anyhow::bail!("deploy env example must include {assignment}");
+        }
+    }
+    Ok(())
+}
+
 fn verify_deploy_runbook_artifact(
     dir: &Path,
     path: &str,
     compose_path: &str,
+    env_example_path: &str,
     routes_artifact: &str,
-    listen: Option<&orv_compiler::ServerListenArtifact>,
-    routes: &[orv_compiler::ServerRouteArtifact],
+    artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
     let runbook_path = dir.join(path);
@@ -14531,6 +14553,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains(routes_artifact) {
         anyhow::bail!("deploy runbook must reference {routes_artifact}");
+    }
+    if !runbook.contains(env_example_path) {
+        anyhow::bail!("deploy runbook must reference {env_example_path}");
     }
     if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document request trace capture command");
@@ -14600,12 +14625,12 @@ fn verify_deploy_runbook_artifact(
             anyhow::bail!("deploy runbook must document persistent volume {mount}");
         }
     }
-    if let Some(port) = deploy_runbook_port_assignment(listen) {
+    if let Some(port) = deploy_runbook_port_assignment(artifact.listen.as_ref()) {
         if !runbook.contains(&port) {
             anyhow::bail!("deploy runbook must document {port}");
         }
     }
-    for route in routes {
+    for route in &artifact.routes {
         let route_line = format!("- {} {}", route.method, route.path);
         if !runbook.contains(&route_line) {
             let method = &route.method;
@@ -17732,6 +17757,46 @@ fn deploy_compose_environment(
     out
 }
 
+fn deploy_env_example_assignments(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+) -> Vec<String> {
+    let mut assignments = Vec::new();
+    if let Some(port) = deploy_env_example_port_assignment(listen) {
+        assignments.push(port);
+    }
+    assignments.extend(persistence.db_env.iter().map(deploy_adapter_env_assignment));
+    assignments.extend(
+        persistence
+            .commerce_env
+            .iter()
+            .map(deploy_adapter_env_assignment),
+    );
+    assignments
+}
+
+fn deploy_env_example_port_assignment(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+) -> Option<String> {
+    let listen = listen?;
+    if let Some(port) = listen.port.filter(|port| *port > 0) {
+        return Some(format!("PORT={port}"));
+    }
+    let env = listen.env.as_ref()?;
+    let value = env
+        .default_port
+        .filter(|port| *port > 0)
+        .map_or_else(String::new, |port| port.to_string());
+    Some(format!("{}={value}", env.variable))
+}
+
+fn deploy_adapter_env_assignment(env: &DeployAdapterEnv) -> String {
+    match &env.default {
+        Some(default) => format!("{}={default}", env.env),
+        None => format!("{}=", env.env),
+    }
+}
+
 fn deploy_runbook_port_assignment(
     listen: Option<&orv_compiler::ServerListenArtifact>,
 ) -> Option<String> {
@@ -18215,6 +18280,7 @@ fn write_prod_deploy_artifacts(
         let container = "deploy/container.json";
         let dockerfile = "deploy/Dockerfile";
         let compose = "deploy/compose.yaml";
+        let env_example = "deploy/env.example";
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -18229,7 +18295,15 @@ fn write_prod_deploy_artifacts(
             &persistence,
         )?;
         write_prod_compose_artifact(out, dockerfile, server_artifact, &persistence)?;
-        write_prod_deploy_runbook(out, compose, routes_artifact, server_artifact, &persistence)?;
+        write_prod_env_example_artifact(out, env_example, server_artifact, &persistence)?;
+        write_prod_deploy_runbook(
+            out,
+            compose,
+            env_example,
+            routes_artifact,
+            server_artifact,
+            &persistence,
+        )?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
             "runtime_features": server_artifact.runtime_features.clone(),
@@ -18244,6 +18318,7 @@ fn write_prod_deploy_artifacts(
             "container": container,
             "dockerfile": dockerfile,
             "compose": compose,
+            "env_example": env_example,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
@@ -18362,9 +18437,23 @@ fn write_prod_compose_artifact(
     write_text(&out.join("deploy").join("compose.yaml"), &compose)
 }
 
+fn write_prod_env_example_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let mut env_example = String::from("# orv deploy environment\n");
+    for assignment in deploy_env_example_assignments(server_artifact.listen.as_ref(), persistence) {
+        let _ = writeln!(env_example, "{assignment}");
+    }
+    write_text(&out.join(path), &env_example)
+}
+
 fn write_prod_deploy_runbook(
     out: &Path,
     compose_path: &str,
+    env_example_path: &str,
     routes_artifact: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
@@ -18391,6 +18480,7 @@ fn write_prod_deploy_runbook(
 ## Artifacts
 
 - Compose: {compose_path}
+- Env example: {env_example_path}
 - Routes: {routes_artifact}
 
 ## Native Launcher
@@ -19466,6 +19556,8 @@ test "checkout failing runtime body" {
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
         let compose =
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let env_example =
+            std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
         let native_routes =
             std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
                 .expect("native routes source");
@@ -19569,8 +19661,13 @@ test "checkout failing runtime body" {
         assert!(compose.contains(
             r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-file://data/shipments.jsonl}""#
         ));
+        assert!(env_example.contains("PORT=8080"));
+        assert!(env_example.contains("SHOP_DATABASE_URL=sqlite://data/shop.sqlite"));
+        assert!(env_example.contains("PAYMENT_ADAPTER_URL=file://data/payments.jsonl"));
+        assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
+        assert!(runbook.contains("deploy/env.example"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
@@ -28376,6 +28473,7 @@ entry = "src/main.orv"
         let deploy_container_path = out.join("deploy").join("container.json");
         let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
         let deploy_compose_path = out.join("deploy").join("compose.yaml");
+        let deploy_env_example_path = out.join("deploy").join("env.example");
         let deploy_runbook_path = out.join("deploy").join("README.md");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
@@ -28399,6 +28497,11 @@ entry = "src/main.orv"
             deploy_compose_path.is_file(),
             "missing {}",
             deploy_compose_path.display()
+        );
+        assert!(
+            deploy_env_example_path.is_file(),
+            "missing {}",
+            deploy_env_example_path.display()
         );
         assert!(
             deploy_runbook_path.is_file(),
@@ -28430,6 +28533,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["container"], "deploy/container.json");
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
         assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
+        assert_eq!(deploy["server"]["env_example"], "deploy/env.example");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
         assert_eq!(
@@ -28487,8 +28591,11 @@ entry = "src/main.orv"
         assert!(compose.contains("ORV_RUNTIME_IMAGE: ghcr.io/orv-lang/orv-reference:latest"));
         assert!(compose.contains(r#""8080:8080""#));
         assert!(compose.contains(r#"PORT: "8080""#));
+        let env_example = std::fs::read_to_string(&deploy_env_example_path).expect("env example");
+        assert!(env_example.contains("PORT=8080"));
         let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
         assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
+        assert!(runbook.contains("deploy/env.example"));
         assert!(runbook.contains("PORT=8080"));
         assert!(runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release"));
         assert!(
@@ -28856,6 +28963,7 @@ entry = "src/main.orv"
         let deploy_container_path = out.join("deploy").join("container.json");
         let deploy_dockerfile_path = out.join("deploy").join("Dockerfile");
         let deploy_compose_path = out.join("deploy").join("compose.yaml");
+        let deploy_env_example_path = out.join("deploy").join("env.example");
         let deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
         let container = read_json_value(&deploy_container_path).expect("deploy container");
 
@@ -28871,6 +28979,8 @@ entry = "src/main.orv"
         let compose = std::fs::read_to_string(&deploy_compose_path).expect("compose");
         assert!(compose.contains(r#""${PORT:-8080}:8080""#));
         assert!(compose.contains(r#"PORT: "${PORT:-8080}""#));
+        let env_example = std::fs::read_to_string(&deploy_env_example_path).expect("env example");
+        assert!(env_example.contains("PORT=8080"));
 
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(src_dir);
