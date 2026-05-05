@@ -118,6 +118,8 @@
 
 **Editor trace stream runner delta (2026-05-05):** Trace-enabled editor exports now add `trace.stream_runner` to both `state.json` and `native-host.json`, with the checked command `orv editor trace-stream <build-dir> --events trace/events.sse`; the static shell renders a Trace Stream Runner pane so native hosts can pipe captured EventSource bodies back into the same editor trace-stream normalizer.
 
+**Editor trace native frame inventory delta (2026-05-06):** Trace-enabled editor exports now mirror `trace.status_filters` and `trace.frames[*]` into `native-host.json`, including request summary, origin id, and source/production navigation payloads, so native editor hosts can render trace lists without reparsing the full `state.json`.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure
