@@ -360,6 +360,9 @@ pub struct ServerResponseConditionArtifact {
     /// Captured field or parameter name used as the dynamic comparison operand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
+    /// Captured operand source used as the dynamic comparison operand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operand_kind: Option<String>,
 }
 
 /// One ordered JSON object field backed by a static value or request domain.
@@ -1538,7 +1541,11 @@ fn native_server_response_condition_is_direct(
             &condition.name,
             route_params,
         ) && condition.operand_name.as_deref().is_none_or(|name| {
-            native_response_condition_name_is_direct(condition.kind.as_str(), name, route_params)
+            let operand_kind = condition
+                .operand_kind
+                .as_deref()
+                .unwrap_or_else(|| native_response_condition_operand_kind(condition.kind.as_str()));
+            native_response_condition_operand_is_direct(operand_kind, name, route_params)
         }) && matches!(
             condition.kind.as_str(),
             "request_body_field_eq"
@@ -1551,18 +1558,37 @@ fn native_server_response_condition_is_direct(
     })
 }
 
+fn native_response_condition_operand_kind(kind: &str) -> &'static str {
+    match kind {
+        "route_param_eq" | "route_param_ne" => "route_param",
+        "query_param_eq" | "query_param_ne" => "query_param",
+        "request_body_field_eq" | "request_body_field_ne" => "request_body_field",
+        _ => "",
+    }
+}
+
+fn native_response_condition_operand_is_direct(
+    operand_kind: &str,
+    name: &str,
+    route_params: &[String],
+) -> bool {
+    match operand_kind {
+        "route_param" => route_params.iter().any(|param| param == name),
+        "query_param" | "request_body_field" => !name.is_empty(),
+        _ => false,
+    }
+}
+
 fn native_response_condition_name_is_direct(
     kind: &str,
     name: &str,
     route_params: &[String],
 ) -> bool {
-    match kind {
-        "route_param_eq" | "route_param_ne" => route_params.iter().any(|param| param == name),
-        "query_param_eq" | "query_param_ne" | "request_body_field_eq" | "request_body_field_ne" => {
-            !name.is_empty()
-        }
-        _ => false,
-    }
+    native_response_condition_operand_is_direct(
+        native_response_condition_operand_kind(kind),
+        name,
+        route_params,
+    )
 }
 
 fn native_server_response_uses_object_fields(
@@ -2731,9 +2757,14 @@ fn push_native_response_condition(
         return false;
     };
     if let Some(operand_name) = condition.operand_name.as_deref() {
+        let operand_lookup = condition
+            .operand_kind
+            .as_deref()
+            .and_then(native_response_condition_operand_lookup)
+            .unwrap_or(lookup);
         let _ = writeln!(
             source,
-            "        if {lookup}(route_match, {}) {operator} {lookup}(route_match, {}) {{",
+            "        if {lookup}(route_match, {}) {operator} {operand_lookup}(route_match, {}) {{",
             rust_string_literal(&condition.name),
             rust_string_literal(operand_name)
         );
@@ -2746,6 +2777,15 @@ fn push_native_response_condition(
         );
     }
     true
+}
+
+fn native_response_condition_operand_lookup(operand_kind: &str) -> Option<&'static str> {
+    match operand_kind {
+        "request_body_field" => Some("routes::orv_native_body_field_value"),
+        "route_param" => Some("routes::orv_native_param_value"),
+        "query_param" => Some("routes::orv_native_query_value"),
+        _ => None,
+    }
 }
 
 fn native_response_condition_lookup(kind: &str) -> Option<(&'static str, &'static str)> {
@@ -3664,69 +3704,74 @@ fn native_captured_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
-    for source in [
-        CapturedConditionSource {
-            eq_kind: "request_body_field_eq",
-            ne_kind: "request_body_field_ne",
-            name: request_body_field_name,
-        },
-        CapturedConditionSource {
-            eq_kind: "route_param_eq",
-            ne_kind: "route_param_ne",
-            name: route_param_field_name,
-        },
-        CapturedConditionSource {
-            eq_kind: "query_param_eq",
-            ne_kind: "query_param_ne",
-            name: query_param_field_name,
-        },
-    ] {
-        if let Some(condition) = source.condition(op, lhs, rhs) {
-            return Some(condition);
+    if let Some(left) = captured_condition_operand(lhs) {
+        if let Some(value) = static_string_expr(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_operand(op, left.kind)?,
+                name: left.name,
+                value,
+                operand_name: None,
+                operand_kind: None,
+            });
         }
+        let right = captured_condition_operand(rhs)?;
+        return Some(ServerResponseConditionArtifact {
+            kind: condition_kind_for_operand(op, left.kind)?,
+            name: left.name,
+            value: String::new(),
+            operand_name: Some(right.name),
+            operand_kind: Some(right.kind.to_string()),
+        });
+    }
+    let right = captured_condition_operand(rhs)?;
+    let value = static_string_expr(lhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_operand(op, right.kind)?,
+        name: right.name,
+        value,
+        operand_name: None,
+        operand_kind: None,
+    })
+}
+
+struct CapturedConditionOperand {
+    kind: &'static str,
+    name: String,
+}
+
+fn captured_condition_operand(expr: &HirExpr) -> Option<CapturedConditionOperand> {
+    if let Some(name) = request_body_field_name(expr) {
+        return Some(CapturedConditionOperand {
+            kind: "request_body_field",
+            name,
+        });
+    }
+    if let Some(name) = route_param_field_name(expr) {
+        return Some(CapturedConditionOperand {
+            kind: "route_param",
+            name,
+        });
+    }
+    if let Some(name) = query_param_field_name(expr) {
+        return Some(CapturedConditionOperand {
+            kind: "query_param",
+            name,
+        });
     }
     None
 }
 
-struct CapturedConditionSource {
-    eq_kind: &'static str,
-    ne_kind: &'static str,
-    name: fn(&HirExpr) -> Option<String>,
-}
-
-impl CapturedConditionSource {
-    fn condition(
-        &self,
-        op: BinaryOp,
-        lhs: &HirExpr,
-        rhs: &HirExpr,
-    ) -> Option<ServerResponseConditionArtifact> {
-        let kind = match op {
-            BinaryOp::Eq => self.eq_kind,
-            BinaryOp::Ne => self.ne_kind,
-            _ => return None,
-        }
-        .to_string();
-        if let Some((name, value)) = (self.name)(lhs)
-            .zip(static_string_expr(rhs))
-            .or_else(|| (self.name)(rhs).zip(static_string_expr(lhs)))
-        {
-            return Some(ServerResponseConditionArtifact {
-                kind,
-                name,
-                value,
-                operand_name: None,
-            });
-        }
-        let name = (self.name)(lhs)?;
-        let operand_name = (self.name)(rhs)?;
-        Some(ServerResponseConditionArtifact {
-            kind,
-            name,
-            value: String::new(),
-            operand_name: Some(operand_name),
-        })
-    }
+fn condition_kind_for_operand(op: BinaryOp, operand_kind: &str) -> Option<String> {
+    let kind = match (operand_kind, op) {
+        ("request_body_field", BinaryOp::Eq) => "request_body_field_eq",
+        ("request_body_field", BinaryOp::Ne) => "request_body_field_ne",
+        ("route_param", BinaryOp::Eq) => "route_param_eq",
+        ("route_param", BinaryOp::Ne) => "route_param_ne",
+        ("query_param", BinaryOp::Eq) => "query_param_eq",
+        ("query_param", BinaryOp::Ne) => "query_param_ne",
+        _ => return None,
+    };
+    Some(kind.to_string())
 }
 
 fn guarded_route_response_artifacts(handler: &HirBlock) -> Option<Vec<ServerResponseArtifact>> {
@@ -6390,6 +6435,46 @@ function greet(name: string): string -> "hi {name}""#,
         ));
         assert!(handlers.contains("status: 400"));
         assert!(handlers.contains("status: 201"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_body_field_query_param_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /sessions {
+    if @body.token == @query.token {
+      @respond 201 { ok: true }
+    }
+    @respond 401 { err: "token_mismatch" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_eq");
+        assert_eq!(condition.name, "token");
+        assert_eq!(condition.operand_name.as_deref(), Some("token"));
+        assert_eq!(condition.operand_kind.as_deref(), Some("query_param"));
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"token\") == routes::orv_native_query_value(route_match, \"token\")"
+        ));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

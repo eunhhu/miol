@@ -27448,6 +27448,12 @@ entry = "src/main.orv"
     }
     @respond 201 { email: @body.email }
   }
+  @route POST /sessions {
+    if @body.token == @query.token {
+      @respond 201 { ok: true }
+    }
+    @respond 401 { err: "token_mismatch" }
+  }
   @route GET /catalog/:kind {
     if @param.kind == "sale" {
       @respond 200 { kind: @param.kind }
@@ -27524,6 +27530,9 @@ entry = "src/main.orv"
             "/members",
             r#"{"email":"a@orv.dev","password":"same","confirm":"same"}"#,
         );
+        let session = send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"abc"}"#);
+        let rejected_session =
+            send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"xyz"}"#);
         let sale = send_raw_http(address, "/catalog/sale");
         let regular = send_raw_http(address, "/catalog/full");
         let expanded = send_raw_http(address, "/search?mode=expanded");
@@ -27537,6 +27546,10 @@ entry = "src/main.orv"
         assert!(mismatch.contains(r#"{"err":"password_mismatch"}"#));
         assert!(member.starts_with("HTTP/1.1 201"));
         assert!(member.contains(r#"{"email":"a@orv.dev"}"#));
+        assert!(session.starts_with("HTTP/1.1 201"));
+        assert!(session.contains(r#"{"ok":true}"#));
+        assert!(rejected_session.starts_with("HTTP/1.1 401"));
+        assert!(rejected_session.contains(r#"{"err":"token_mismatch"}"#));
         assert!(sale.starts_with("HTTP/1.1 200"));
         assert!(sale.contains(r#"{"kind":"sale"}"#));
         assert!(regular.starts_with("HTTP/1.1 200"));
