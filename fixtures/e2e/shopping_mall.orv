@@ -20,6 +20,9 @@
       @body {
         @h1 "Miol Shop"
         @p "Catalog, member signup, payment capture, and shipment booking are ready."
+        @nav {
+          @a href="/admin" "Admin dashboard"
+        }
         @section {
           class="shop-actions"
           @h2 "Browser checkout forms"
@@ -84,6 +87,33 @@
           @li "POST /orders"
           @li "POST /payments"
           @li "POST /shipments"
+        }
+      }
+    }
+  }
+
+  @route GET /admin {
+    @serve @html {
+      @body {
+        @h1 "Miol Shop Admin"
+        @p "Operations dashboard for catalog, members, orders, payments, shipments, and persistent records."
+        @section {
+          class="admin-dashboard"
+          @h2 "Read models"
+          @ul {
+            @li { @a href="/products" "Catalog API" }
+            @li { @a href="/orders/demo" "Orders by customer" }
+            @li { @a href="/shipments/1" "Shipment lookup" }
+          }
+        }
+        @section {
+          class="admin-storage"
+          @h2 "Persistent storage"
+          @ul {
+            @li "SQLite database: data/shop.sqlite"
+            @li "Payment records: data/payments.jsonl"
+            @li "Shipment records: data/shipments.jsonl"
+          }
         }
       }
     }

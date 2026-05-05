@@ -2186,6 +2186,8 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
 \n\
+Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links and persistent storage paths.\n\
+\n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
 Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
@@ -2229,6 +2231,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 ## Routes\n\
 \n\
 - `GET /`\n\
+- `GET /admin`\n\
 - `GET /health`\n\
 - `POST /products`\n\
 - `GET /products`\n\
@@ -18813,6 +18816,9 @@ test "checkout failing runtime body" {
         assert!(source.contains(r#"let shopdb = @db.connect "sqlite://data/shop.sqlite""#));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
+        assert!(source.contains("@a href=\"/admin\" \"Admin dashboard\""));
+        assert!(source.contains("@route GET /admin"));
+        assert!(source.contains("Operations dashboard"));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@route POST /members"));
@@ -18859,7 +18865,9 @@ test "checkout failing runtime body" {
         assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
+        assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("GET /"));
+        assert!(guide.contains("GET /admin"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
@@ -18887,6 +18895,7 @@ test "checkout failing runtime body" {
                 .expect("native routes source");
         for (method, path) in [
             ("GET", "/"),
+            ("GET", "/admin"),
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),

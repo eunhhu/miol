@@ -28,6 +28,8 @@
 
 Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project].entry`, or a project directory containing `orv.toml`.
 
+`orv init <dir> --template shop` writes the reference shop starter with `GET /` browser checkout forms, a `GET /admin` operations dashboard for catalog/order/shipment read models and persistence paths, SQLite-backed `data/shop.sqlite`, file-backed commerce record logs under `data/`, and generated build/deploy/native launcher guidance.
+
 `orv graph <file> --view --out <dir>` writes `graph.json` and a static `index.html` ProjectGraph view with source/semantic depth stats, node/edge visualization, node search/kind filtering, and origin rows.
 
 `orv dev --hmr` writes `dev/session.json`, `dev/transport.json`, and `dev/hmr-client.js` for the reference EventSource HMR browser transport; `orv dev --watch` writes `dev/watch.json`; `orv dev --watch-loop [--watch-iterations <n>]` runs the poll-loop build/verify/run path while writing `dev/events.json`; and `orv dev --hmr --serve [--serve-port <port>]` starts the reference HTTP/1 HMR endpoint with `dev/server.json`, `/__orv/hmr/session`, and `/__orv/hmr/events`.

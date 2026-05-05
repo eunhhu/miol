@@ -2788,8 +2788,18 @@ mod tests {
             assert!(home_html.contains("<form action=\"/products\" method=\"post\">"));
             assert!(home_html.contains("<input type=\"number\" name=\"stock\" required>"));
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
+            assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /shipments"));
+
+            let (admin_status, admin_ct, admin_body) =
+                send_request(addr, "GET", "/admin", None).await;
+            assert_eq!(admin_status, 200);
+            assert_eq!(admin_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let admin_html = String::from_utf8(admin_body).expect("admin html");
+            assert!(admin_html.contains("<h1>Miol Shop Admin</h1>"));
+            assert!(admin_html.contains("Operations dashboard"));
+            assert!(admin_html.contains("data/shop.sqlite"));
 
             let (health_status, _, health_body) = send_request(addr, "GET", "/health", None).await;
             assert_eq!(health_status, 200);
