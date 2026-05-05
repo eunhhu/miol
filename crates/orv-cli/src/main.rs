@@ -27448,6 +27448,18 @@ entry = "src/main.orv"
     }
     @respond 201 { email: @body.email }
   }
+  @route GET /catalog/:kind {
+    if @param.kind == "sale" {
+      @respond 200 { kind: @param.kind }
+    }
+    @respond 200 { kind: "regular" }
+  }
+  @route GET /search {
+    if @query.mode != "compact" {
+      @respond 200 { mode: @query.mode }
+    }
+    @respond 200 { mode: "compact" }
+  }
 }
 "#,
         )
@@ -27456,6 +27468,10 @@ entry = "src/main.orv"
 
         cmd_build(&path, &out).expect("build artifacts");
         cmd_verify_build(&out).expect("verify guarded native server build");
+        let launcher = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native launcher");
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let output = std::process::Command::new(cargo)
             .arg("build")
@@ -27508,6 +27524,10 @@ entry = "src/main.orv"
             "/members",
             r#"{"email":"a@orv.dev","password":"same","confirm":"same"}"#,
         );
+        let sale = send_raw_http(address, "/catalog/sale");
+        let regular = send_raw_http(address, "/catalog/full");
+        let expanded = send_raw_http(address, "/search?mode=expanded");
+        let compact = send_raw_http(address, "/search?mode=compact");
 
         assert!(missing.starts_with("HTTP/1.1 400"));
         assert!(missing.contains(r#"{"err":"missing_sku"}"#));
@@ -27517,6 +27537,14 @@ entry = "src/main.orv"
         assert!(mismatch.contains(r#"{"err":"password_mismatch"}"#));
         assert!(member.starts_with("HTTP/1.1 201"));
         assert!(member.contains(r#"{"email":"a@orv.dev"}"#));
+        assert!(sale.starts_with("HTTP/1.1 200"));
+        assert!(sale.contains(r#"{"kind":"sale"}"#));
+        assert!(regular.starts_with("HTTP/1.1 200"));
+        assert!(regular.contains(r#"{"kind":"regular"}"#));
+        assert!(expanded.starts_with("HTTP/1.1 200"));
+        assert!(expanded.contains(r#"{"mode":"expanded"}"#));
+        assert!(compact.starts_with("HTTP/1.1 200"));
+        assert!(compact.contains(r#"{"mode":"compact"}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

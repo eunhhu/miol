@@ -351,13 +351,13 @@ pub struct ServerResponseArtifact {
 /// One native-lowerable response guard condition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServerResponseConditionArtifact {
-    /// Condition class, currently `request_body_field_eq` or `request_body_field_ne`.
+    /// Condition class, for example `request_body_field_eq`, `route_param_eq`, or `query_param_ne`.
     pub kind: String,
-    /// Request body field name used by the condition.
+    /// Captured field or parameter name used by the condition.
     pub name: String,
     /// Static string value compared by the condition.
     pub value: String,
-    /// Request body field name used as the dynamic comparison operand.
+    /// Captured field or parameter name used as the dynamic comparison operand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
 }
@@ -1506,7 +1506,7 @@ fn native_server_route_has_native_response(route: &ServerRouteArtifact) -> bool 
             && if index + 1 == route.responses.len() {
                 response.condition.is_none()
             } else {
-                native_server_response_condition_is_direct(response)
+                native_server_response_condition_is_direct(response, &route_params)
             }
     })
 }
@@ -1528,19 +1528,41 @@ fn native_server_response_is_direct(
             || native_server_response_uses_request_fields(response, route_params))
 }
 
-fn native_server_response_condition_is_direct(response: &ServerResponseArtifact) -> bool {
+fn native_server_response_condition_is_direct(
+    response: &ServerResponseArtifact,
+    route_params: &[String],
+) -> bool {
     response.condition.as_ref().is_some_and(|condition| {
-        !condition.name.is_empty()
-            && condition
-                .operand_name
-                .as_deref()
-                .map(|name| !name.is_empty())
-                .unwrap_or(true)
-            && matches!(
-                condition.kind.as_str(),
-                "request_body_field_eq" | "request_body_field_ne"
-            )
+        native_response_condition_name_is_direct(
+            condition.kind.as_str(),
+            &condition.name,
+            route_params,
+        ) && condition.operand_name.as_deref().is_none_or(|name| {
+            native_response_condition_name_is_direct(condition.kind.as_str(), name, route_params)
+        }) && matches!(
+            condition.kind.as_str(),
+            "request_body_field_eq"
+                | "request_body_field_ne"
+                | "route_param_eq"
+                | "route_param_ne"
+                | "query_param_eq"
+                | "query_param_ne"
+        )
     })
+}
+
+fn native_response_condition_name_is_direct(
+    kind: &str,
+    name: &str,
+    route_params: &[String],
+) -> bool {
+    match kind {
+        "route_param_eq" | "route_param_ne" => route_params.iter().any(|param| param == name),
+        "query_param_eq" | "query_param_ne" | "request_body_field_eq" | "request_body_field_ne" => {
+            !name.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn native_server_response_uses_object_fields(
@@ -2482,17 +2504,6 @@ struct NativeCapturedJsonOperation<'a> {
     operand_name: Option<&'a str>,
 }
 
-impl<'a> NativeCapturedJsonOperation<'a> {
-    fn none() -> Self {
-        Self {
-            op: None,
-            operand_json: None,
-            operand_kind: None,
-            operand_name: None,
-        }
-    }
-}
-
 fn native_response_field_operation(
     field: &ServerResponseRequestBodyFieldArtifact,
 ) -> NativeCapturedJsonOperation<'_> {
@@ -2716,27 +2727,37 @@ fn push_native_response_condition(
     source: &mut String,
     condition: &ServerResponseConditionArtifact,
 ) -> bool {
-    let operator = match condition.kind.as_str() {
-        "request_body_field_eq" => "==",
-        "request_body_field_ne" => "!=",
-        _ => return false,
+    let Some((lookup, operator)) = native_response_condition_lookup(condition.kind.as_str()) else {
+        return false;
     };
     if let Some(operand_name) = condition.operand_name.as_deref() {
         let _ = writeln!(
             source,
-            "        if routes::orv_native_body_field_value(route_match, {}) {operator} routes::orv_native_body_field_value(route_match, {}) {{",
+            "        if {lookup}(route_match, {}) {operator} {lookup}(route_match, {}) {{",
             rust_string_literal(&condition.name),
             rust_string_literal(operand_name)
         );
     } else {
         let _ = writeln!(
             source,
-            "        if routes::orv_native_body_field_value(route_match, {}) {operator} Some({}) {{",
+            "        if {lookup}(route_match, {}) {operator} Some({}) {{",
             rust_string_literal(&condition.name),
             rust_string_literal(&condition.value)
         );
     }
     true
+}
+
+fn native_response_condition_lookup(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "request_body_field_eq" => Some(("routes::orv_native_body_field_value", "==")),
+        "request_body_field_ne" => Some(("routes::orv_native_body_field_value", "!=")),
+        "route_param_eq" => Some(("routes::orv_native_param_value", "==")),
+        "route_param_ne" => Some(("routes::orv_native_param_value", "!=")),
+        "query_param_eq" => Some(("routes::orv_native_query_value", "==")),
+        "query_param_ne" => Some(("routes::orv_native_query_value", "!=")),
+        _ => None,
+    }
 }
 
 fn push_native_response_body_return(
@@ -3631,34 +3652,80 @@ fn static_string_expr(expr: &HirExpr) -> Option<String> {
 fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionArtifact> {
     match &expr.kind {
         HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
-            let kind = match op {
-                BinaryOp::Eq => "request_body_field_eq",
-                BinaryOp::Ne => "request_body_field_ne",
-                _ => return None,
-            }
-            .to_string();
-            if let Some((name, value)) = request_body_field_name(lhs)
-                .zip(static_string_expr(rhs))
-                .or_else(|| request_body_field_name(rhs).zip(static_string_expr(lhs)))
-            {
-                return Some(ServerResponseConditionArtifact {
-                    kind,
-                    name,
-                    value,
-                    operand_name: None,
-                });
-            }
-            let name = request_body_field_name(lhs)?;
-            let operand_name = request_body_field_name(rhs)?;
-            Some(ServerResponseConditionArtifact {
-                kind,
-                name,
-                value: String::new(),
-                operand_name: Some(operand_name),
-            })
+            native_captured_response_condition(*op, lhs, rhs)
         }
         HirExprKind::Paren(expr) => native_response_condition(expr),
         _ => None,
+    }
+}
+
+fn native_captured_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    for source in [
+        CapturedConditionSource {
+            eq_kind: "request_body_field_eq",
+            ne_kind: "request_body_field_ne",
+            name: request_body_field_name,
+        },
+        CapturedConditionSource {
+            eq_kind: "route_param_eq",
+            ne_kind: "route_param_ne",
+            name: route_param_field_name,
+        },
+        CapturedConditionSource {
+            eq_kind: "query_param_eq",
+            ne_kind: "query_param_ne",
+            name: query_param_field_name,
+        },
+    ] {
+        if let Some(condition) = source.condition(op, lhs, rhs) {
+            return Some(condition);
+        }
+    }
+    None
+}
+
+struct CapturedConditionSource {
+    eq_kind: &'static str,
+    ne_kind: &'static str,
+    name: fn(&HirExpr) -> Option<String>,
+}
+
+impl CapturedConditionSource {
+    fn condition(
+        &self,
+        op: BinaryOp,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+    ) -> Option<ServerResponseConditionArtifact> {
+        let kind = match op {
+            BinaryOp::Eq => self.eq_kind,
+            BinaryOp::Ne => self.ne_kind,
+            _ => return None,
+        }
+        .to_string();
+        if let Some((name, value)) = (self.name)(lhs)
+            .zip(static_string_expr(rhs))
+            .or_else(|| (self.name)(rhs).zip(static_string_expr(lhs)))
+        {
+            return Some(ServerResponseConditionArtifact {
+                kind,
+                name,
+                value,
+                operand_name: None,
+            });
+        }
+        let name = (self.name)(lhs)?;
+        let operand_name = (self.name)(rhs)?;
+        Some(ServerResponseConditionArtifact {
+            kind,
+            name,
+            value: String::new(),
+            operand_name: Some(operand_name),
+        })
     }
 }
 
@@ -6323,6 +6390,83 @@ function greet(name: string): string -> "hi {name}""#,
         ));
         assert!(handlers.contains("status: 400"));
         assert!(handlers.contains("status: 201"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_route_param_static_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route GET /products/:kind {
+    if @param.kind == "sale" {
+      @respond 200 { kind: @param.kind }
+    }
+    @respond 200 { kind: "regular" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "route_param_eq");
+        assert_eq!(condition.name, "kind");
+        assert_eq!(condition.value, "sale");
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers
+            .contains("routes::orv_native_param_value(route_match, \"kind\") == Some(\"sale\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_query_param_static_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route GET /search {
+    if @query.mode != "compact" {
+      @respond 200 { mode: @query.mode }
+    }
+    @respond 200 { mode: "compact" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "query_param_ne");
+        assert_eq!(condition.name, "mode");
+        assert_eq!(condition.value, "compact");
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_query_value(route_match, \"mode\") != Some(\"compact\")"
+        ));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
