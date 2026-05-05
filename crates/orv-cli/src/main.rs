@@ -27065,6 +27065,78 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_lowers_request_body_field_response_into_native_handler_source() {
+        let dir = temp_output_dir("native-request-body-field-response-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r"@server {
+  @listen 8080
+  @route POST /members {
+    @respond 201 { handle: @body.handle, email: @body.email }
+  }
+}
+",
+        )
+        .expect("write source");
+        let out = temp_output_dir("native-request-body-field-response-build");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let response = &server_artifact["routes"][0]["responses"][0];
+        let routes = std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
+            .expect("routes source");
+        let handlers =
+            std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
+                .expect("handlers source");
+        let launcher = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native launcher");
+
+        assert_eq!(response["status"], 201);
+        assert_eq!(response["body_kind"], "request_body_field_json");
+        assert_eq!(response["body_request_fields"][0]["field"], "handle");
+        assert_eq!(response["body_request_fields"][0]["name"], "handle");
+        assert_eq!(response["body_request_fields"][1]["field"], "email");
+        assert_eq!(response["body_request_fields"][1]["name"], "email");
+        assert!(routes.contains("pub body_fields: Vec<OrvNativeParam>"));
+        assert!(routes.contains("pub fn orv_native_body_field_value<'a>("));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"handle\")"));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"email\")"));
+        assert!(handlers.contains("orv_native_push_json_string("));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("orv_native_parse_body_fields("));
+        assert!(launcher.contains("orv_native_parse_json_object_fields("));
+        assert!(launcher.contains("orv_native_parse_query(&body)"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+        cmd_verify_build(&out).expect("verify request body field native build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check request body field native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "request body field native launcher cargo check failed:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("warning:"),
+            "request body field native launcher cargo check should be warning-free:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn build_writes_cargo_checkable_native_launcher_package() {
         let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
         let out = temp_output_dir("native-server-cargo-check");
@@ -27103,7 +27175,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: @body.id }
+    @respond 201 { received: @body.id as int }
   }
 }
 ",
