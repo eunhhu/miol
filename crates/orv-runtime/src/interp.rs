@@ -3880,13 +3880,17 @@ fn call_commerce_adapter_method(
     let provider = object_field(fields, "provider")
         .map(value_to_display)
         .unwrap_or_else(|| "test".to_string());
-    match (object_kind(fields).unwrap_or_default(), method) {
-        ("payment.adapter", "capture") => payment_capture_value(&provider, args),
-        ("shipping.adapter", "book") => shipping_booking_value(&provider, args),
-        (kind, _) => Err(RuntimeError::native(format!(
-            "no method `{method}` on {kind}"
-        ))),
-    }
+    let result = match (object_kind(fields).unwrap_or_default(), method) {
+        ("payment.adapter", "capture") => payment_capture_value(&provider, args)?,
+        ("shipping.adapter", "book") => shipping_booking_value(&provider, args)?,
+        (kind, _) => {
+            return Err(RuntimeError::native(format!(
+                "no method `{method}` on {kind}"
+            )))
+        }
+    };
+    append_file_commerce_adapter_record(fields, &result)?;
+    Ok(result)
 }
 
 fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeError> {
@@ -3895,12 +3899,95 @@ fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeEr
             "`@{kind}.connect` expects adapter url"
         )));
     };
-    if matches!(scheme, "test" | "local") {
+    if matches!(scheme, "test" | "local" | "file") {
         Ok(scheme.to_string())
     } else {
         Err(RuntimeError::native(format!(
-            "external {kind} adapters are not implemented for `{url}`; supported schemes are test:// and local://"
+            "external {kind} adapters are not implemented for `{url}`; supported schemes are test://, local://, and file://"
         )))
+    }
+}
+
+fn append_file_commerce_adapter_record(
+    fields: &[(String, Value)],
+    record: &Value,
+) -> Result<(), RuntimeError> {
+    let Some(url) = object_field(fields, "url").map(value_to_display) else {
+        return Ok(());
+    };
+    let Some(path) = url.strip_prefix("file://") else {
+        return Ok(());
+    };
+    if path.is_empty() {
+        return Err(RuntimeError::native(
+            "file commerce adapter expects a JSONL record path",
+        ));
+    }
+    let path = Path::new(path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            RuntimeError::native(format!(
+                "commerce adapter failed to create {}: {source}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| {
+            RuntimeError::native(format!(
+                "commerce adapter failed to open {}: {source}",
+                path.display()
+            ))
+        })?;
+    let bytes = serde_json::to_vec(&runtime_value_json(record)).map_err(|source| {
+        RuntimeError::native(format!(
+            "commerce adapter failed to encode record: {source}"
+        ))
+    })?;
+    file.write_all(&bytes).map_err(|source| {
+        RuntimeError::native(format!(
+            "commerce adapter failed to write {}: {source}",
+            path.display()
+        ))
+    })?;
+    file.write_all(b"\n").map_err(|source| {
+        RuntimeError::native(format!(
+            "commerce adapter failed to finish {}: {source}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|source| {
+        RuntimeError::native(format!(
+            "commerce adapter failed to sync {}: {source}",
+            path.display()
+        ))
+    })
+}
+
+fn runtime_value_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Void => serde_json::Value::Null,
+        Value::Bool(value) => serde_json::Value::Bool(*value),
+        Value::Int(value) => serde_json::Value::Number((*value).into()),
+        Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::Str(value) => serde_json::Value::String(value.clone()),
+        Value::Array(values) | Value::Tuple(values) => {
+            serde_json::Value::Array(values.iter().map(runtime_value_json).collect())
+        }
+        Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), runtime_value_json(value)))
+                .collect(),
+        ),
+        other => serde_json::Value::String(value_to_display(other)),
     }
 }
 
@@ -8916,6 +9003,44 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
         )
         .unwrap();
         assert_eq!(out, "test\ncaptured\n25000\ntest\nready\nTRK-LOCAL\n");
+    }
+
+    #[test]
+    fn payment_and_shipping_file_adapters_append_records() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let payment_path = std::env::temp_dir().join(format!(
+            "orv-runtime-payment-file-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let shipping_path = std::env::temp_dir().join(format!(
+            "orv-runtime-shipping-file-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let source = format!(
+            r#"let payments = @payment.connect("file://{}")
+let captured = payments.capture({{ orderId: 7, amount: 25000, method: "card" }})
+let shipping = @shipping.connect("file://{}")
+let booking = shipping.book({{ orderId: 7, carrier: "post", address: "Seoul" }})
+@out captured.provider
+@out booking.provider"#,
+            payment_path.display(),
+            shipping_path.display()
+        );
+
+        let out = run_str(&source).unwrap();
+
+        assert_eq!(out, "file\nfile\n");
+        let payments = std::fs::read_to_string(&payment_path).expect("payment adapter records");
+        let shipments = std::fs::read_to_string(&shipping_path).expect("shipping adapter records");
+        assert!(payments.contains(r#""kind":"payment.capture""#));
+        assert!(payments.contains(r#""orderId":7"#));
+        assert!(shipments.contains(r#""kind":"shipping.booking""#));
+        assert!(shipments.contains(r#""tracking":"TRK-LOCAL""#));
+        let _ = std::fs::remove_file(payment_path);
+        let _ = std::fs::remove_file(shipping_path);
     }
 
     #[test]

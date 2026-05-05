@@ -154,7 +154,7 @@ DB PITR 세부: `orv db restore --archive <archive.json> --data <data.json> --at
 
 DB adapter 세부: reference runtime의 `@db.connect`는 `memory://` handle과 local WAL-backed `file://path` handle을 허용하고, 그 밖의 외부 adapter URL은 실제 adapter 구현 전까지 명시적으로 실패한다. `@db.connect` 사용 build/deploy/server runtime artifact는 `db_adapter` runtime feature를 기록한다. Prod deploy persistence는 `@db.wal("data/app.wal.jsonl")`와 `@db.connect "file://data/app.wal.jsonl"`를 모두 찾아 Compose volume을 만든다.
 
-Commerce adapter 세부: reference runtime은 shop scaffold용 local adapter로 `@payment.connect("test://local").capture(...)`와 `@shipping.connect("test://local").book(...)`을 제공한다. 해당 연결을 쓰는 build/deploy/server runtime artifact는 `payment_adapter`/`shipping_adapter` runtime feature를 기록한다. 외부 결제/배송 provider URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
+Commerce adapter 세부: reference runtime은 shop scaffold용 local adapter로 `@payment.connect("test://local").capture(...)`와 `@shipping.connect("test://local").book(...)`을 제공한다. `file://path.jsonl` commerce adapter URL은 capture/booking record를 local JSONL 파일에 append+sync 한다. 해당 연결을 쓰는 build/deploy/server runtime artifact는 `payment_adapter`/`shipping_adapter` runtime feature를 기록한다. 외부 결제/배송 provider URL은 실제 adapter 구현 전까지 명시적으로 실패한다.
 
 Package lock 세부: `orv lock`은 prerelease/build metadata 포함 exact version을 그대로 고정하고, local/file/HTTP/HTTPS registry `index.json`이 있으면 `*`, `x`, segment wildcard, caret, tilde, whitespace-AND comparator, `||` disjunction range를 exact version으로 해석하며 원래 range는 `requested_version`으로 보존한다. `auth_token_env`는 secret 대신 env var 이름만 lockfile에 보존하고 HTTP/HTTPS registry index/fetch 요청에 Bearer token을 붙인다.
 
