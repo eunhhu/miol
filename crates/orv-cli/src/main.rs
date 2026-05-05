@@ -13805,6 +13805,7 @@ fn client_signal_event_action_is_valid(action: Option<&serde_json::Value>) -> bo
         Some(
             "assign_toggle"
             | "assign_event_target_value"
+            | "assign_event_target_checked"
             | "assign_event_target_value_float"
             | "assign_event_target_value_int",
         ) => true,
@@ -13869,6 +13870,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("applySignalAction")
         || !source.contains("assign_toggle")
         || !source.contains("assign_event_target_value")
+        || !source.contains("assign_event_target_checked")
         || !source.contains("assign_event_target_value_float")
         || !source.contains("assign_event_target_value_int")
         || !source.contains("setSignal")
@@ -17999,6 +18001,11 @@ fn client_signal_assignment_action(
             "kind": "assign_event_target_value",
         });
     }
+    if client_expr_is_event_target_checked(value) {
+        return serde_json::json!({
+            "kind": "assign_event_target_checked",
+        });
+    }
     if let Some(kind) = client_event_target_value_conversion_action(value) {
         return serde_json::json!({
             "kind": kind,
@@ -18041,6 +18048,14 @@ fn client_expr_is_ident(expr: &orv_hir::HirExpr, id: orv_hir::NameId) -> bool {
 }
 
 fn client_expr_is_event_target_value(expr: &orv_hir::HirExpr) -> bool {
+    client_expr_is_event_target_field(expr, "value")
+}
+
+fn client_expr_is_event_target_checked(expr: &orv_hir::HirExpr) -> bool {
+    client_expr_is_event_target_field(expr, "checked")
+}
+
+fn client_expr_is_event_target_field(expr: &orv_hir::HirExpr, expected_field: &str) -> bool {
     let orv_hir::HirExprKind::Field {
         target,
         field: value,
@@ -18049,7 +18064,7 @@ fn client_expr_is_event_target_value(expr: &orv_hir::HirExpr) -> bool {
     else {
         return false;
     };
-    if value != "value" {
+    if value != expected_field {
         return false;
     }
     let orv_hir::HirExprKind::Field {
@@ -30241,6 +30256,7 @@ entry = "src/main.orv"
             "bindReactiveEvents",
             "applySignalAction",
             "assign_toggle",
+            "assign_event_target_checked",
             "assign_event_target_value",
             "assign_event_target_value_float",
             "assign_event_target_value_int",
@@ -33725,6 +33741,41 @@ let sig count: int = 0
         let loader =
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("assign_event_target_value"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_event_input_checked_binding_contract() {
+        let out = temp_output_dir("client-reactive-event-input-checked-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig accepted: bool = false
+@out @html { @body { @input type="checkbox" checked={accepted} onChange={(e) -> accepted = e.target.checked} } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_event"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "accepted"
+                && binding["selector"] == "input"
+                && binding["event"] == "change"
+                && binding["action"]["kind"] == "assign_event_target_checked"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("assign_event_target_checked"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

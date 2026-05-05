@@ -161,6 +161,7 @@ function validateReactiveBindings(plan, manifest) {
       (
         [
           "assign_toggle",
+          "assign_event_target_checked",
           "assign_event_target_value",
           "assign_event_target_value_float",
           "assign_event_target_value_int",
@@ -551,6 +552,8 @@ function applySignalAction(action, currentValue, event) {
       return currentValue - decodeSignalInitialValue(action.value);
     case "assign_toggle":
       return !Boolean(currentValue);
+    case "assign_event_target_checked":
+      return Boolean(event?.target?.checked);
     case "assign_event_target_value":
       return event?.target?.value ?? "";
     case "assign_event_target_value_float":
