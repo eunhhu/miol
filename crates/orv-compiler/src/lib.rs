@@ -3165,16 +3165,27 @@ fn route_param_field_value(expr: &HirExpr) -> Option<(String, String)> {
 
 fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
-        HirExprKind::Binary {
-            op: BinaryOp::Add,
-            lhs,
-            rhs,
-        } => {
+        HirExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+            ) =>
+        {
             let mut value = query_param_field_value(lhs)?;
             if value.value_kind != "query_param_int" || value.op.is_some() {
                 return None;
             }
-            value.op = Some("add".to_string());
+            value.op = Some(
+                match op {
+                    BinaryOp::Add => "add",
+                    BinaryOp::Sub => "sub",
+                    BinaryOp::Mul => "mul",
+                    BinaryOp::Div => "div",
+                    BinaryOp::Rem => "rem",
+                    _ => return None,
+                }
+                .to_string(),
+            );
             value.operand_json = Some(static_integer(rhs)?.to_string());
             Some(value)
         }
@@ -5691,6 +5702,63 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(handlers.contains("routes::orv_native_query_value(route_match, \"page\")"));
         assert!(handlers.contains("value.checked_add(1)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_query_param_int_static_arithmetic_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /search {
+    @respond 200 {
+      prev: (@query.page as int) - 1,
+      doubled: (@query.page as int) * 2,
+      half: (@query.page as int) / 2,
+      parity: (@query.page as int) % 2
+    }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "query_param_json");
+        assert_eq!(response.body_query_params.len(), 4);
+        assert_eq!(response.body_query_params[0].op.as_deref(), Some("sub"));
+        assert_eq!(
+            response.body_query_params[0].operand_json.as_deref(),
+            Some("1")
+        );
+        assert_eq!(response.body_query_params[1].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_query_params[1].operand_json.as_deref(),
+            Some("2")
+        );
+        assert_eq!(response.body_query_params[2].op.as_deref(), Some("div"));
+        assert_eq!(
+            response.body_query_params[2].operand_json.as_deref(),
+            Some("2")
+        );
+        assert_eq!(response.body_query_params[3].op.as_deref(), Some("rem"));
+        assert_eq!(
+            response.body_query_params[3].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("value.checked_sub(1)"));
+        assert!(handlers.contains("value.checked_mul(2)"));
+        assert!(handlers.contains("value.checked_div(2)"));
+        assert!(handlers.contains("value.checked_rem(2)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

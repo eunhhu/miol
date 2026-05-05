@@ -27731,6 +27731,14 @@ entry = "src/main.orv"
   @route GET /search/next {
     @respond 200 { next: (@query.page as int) + 1 }
   }
+  @route GET /search/math {
+    @respond 200 {
+      prev: (@query.page as int) - 1,
+      doubled: (@query.page as int) * 2,
+      half: (@query.page as int) / 2,
+      parity: (@query.page as int) % 2
+    }
+  }
 }
 ",
         )
@@ -27782,6 +27790,7 @@ entry = "src/main.orv"
         let route_response = send_raw_http(address, "/products/42");
         let query_response = send_raw_http(address, "/search?page=12.5");
         let next_response = send_raw_http(address, "/search/next?page=12");
+        let math_response = send_raw_http(address, "/search/math?page=13");
 
         assert!(route_response.starts_with("HTTP/1.1 200"));
         assert!(route_response.contains(r#"{"id":42}"#));
@@ -27789,6 +27798,8 @@ entry = "src/main.orv"
         assert!(query_response.contains(r#"{"page":12.5}"#));
         assert!(next_response.starts_with("HTTP/1.1 200"));
         assert!(next_response.contains(r#"{"next":13}"#));
+        assert!(math_response.starts_with("HTTP/1.1 200"));
+        assert!(math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
