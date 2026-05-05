@@ -27466,6 +27466,12 @@ entry = "src/main.orv"
     }
     @respond 409 { err: "out_of_stock" }
   }
+  @route POST /amount {
+    if (@body.amount as float) > 0.0 {
+      @respond 201 { accepted: true, amount: @body.amount as float }
+    }
+    @respond 400 { err: "bad_amount" }
+  }
   @route GET /catalog/:kind {
     if @param.kind == "sale" {
       @respond 200 { kind: @param.kind }
@@ -27553,6 +27559,8 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/inventory", r#"{"quantity":"3","stock":"5"}"#);
         let rejected_inventory =
             send_raw_http_json_post(address, "/inventory", r#"{"quantity":"7","stock":"5"}"#);
+        let accepted_amount = send_raw_http_json_post(address, "/amount", r#"{"amount":"12.5"}"#);
+        let rejected_amount = send_raw_http_json_post(address, "/amount", r#"{"amount":"0.0"}"#);
         let sale = send_raw_http(address, "/catalog/sale");
         let regular = send_raw_http(address, "/catalog/full");
         let expanded = send_raw_http(address, "/search?mode=expanded");
@@ -27578,6 +27586,10 @@ entry = "src/main.orv"
         assert!(accepted_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_inventory.contains(r#"{"err":"out_of_stock"}"#));
+        assert!(accepted_amount.starts_with("HTTP/1.1 201"));
+        assert!(accepted_amount.contains(r#"{"accepted":true,"amount":12.5}"#));
+        assert!(rejected_amount.starts_with("HTTP/1.1 400"));
+        assert!(rejected_amount.contains(r#"{"err":"bad_amount"}"#));
         assert!(sale.starts_with("HTTP/1.1 200"));
         assert!(sale.contains(r#"{"kind":"sale"}"#));
         assert!(regular.starts_with("HTTP/1.1 200"));
