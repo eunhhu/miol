@@ -1159,6 +1159,10 @@ fn project_graph_view_html(graph: &serde_json::Value) -> String {
         .pointer("/semantic/origin_map/entries")
         .and_then(serde_json::Value::as_array)
         .map_or(&[][..], Vec::as_slice);
+    let node_kinds = nodes
+        .iter()
+        .filter_map(|node| node.get("kind").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
     let svg = project_graph_view_svg(nodes, edges);
     let mut html = String::new();
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
@@ -1172,6 +1176,7 @@ fn project_graph_view_html(graph: &serde_json::Value) -> String {
     html.push_str(".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:18px 0}");
     html.push_str(".stat{border:1px solid #d7d7cf;background:#fff;padding:10px;border-radius:6px}");
     html.push_str(".stat b{display:block;font-size:20px}.graph{overflow:auto;border:1px solid #d7d7cf;background:#fff;border-radius:6px}");
+    html.push_str(".filters{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:18px 0}.filters label{display:grid;gap:4px;color:#555}.filters input,.filters select{min-width:180px;border:1px solid #d7d7cf;background:#fff;padding:7px;font:inherit}");
     html.push_str("svg{display:block;min-width:900px}.edge{stroke:#b8b8ad;stroke-width:1.4}.node-label{font-size:12px;fill:#242424}.node-kind{font-size:10px;fill:#555}");
     html.push_str("table{width:100%;border-collapse:collapse;margin-top:18px;background:#fff;border:1px solid #d7d7cf}th,td{padding:8px;border-bottom:1px solid #e5e5df;text-align:left}th{font-size:12px;text-transform:uppercase;color:#555}</style>");
     html.push_str("</head><body data-node-count=\"");
@@ -1196,14 +1201,28 @@ fn project_graph_view_html(graph: &serde_json::Value) -> String {
     }
     html.push_str("</section><section class=\"graph\">");
     html.push_str(&svg);
-    html.push_str("</section><table><thead><tr><th>ID</th><th>Kind</th><th>Name</th><th>File</th></tr></thead><tbody>");
+    html.push_str("</section><section class=\"filters\"><label>Search<input id=\"graph-search\" type=\"search\" autocomplete=\"off\"></label><label>Kind<select id=\"graph-kind-filter\"><option value=\"\">All</option>");
+    for kind in node_kinds {
+        html.push_str("<option value=\"");
+        html.push_str(&html_escape_text(kind));
+        html.push_str("\">");
+        html.push_str(&html_escape_text(kind));
+        html.push_str("</option>");
+    }
+    html.push_str("</select></label></section><table><thead><tr><th>ID</th><th>Kind</th><th>Name</th><th>File</th></tr></thead><tbody>");
     for node in nodes {
-        html.push_str("<tr><td>");
+        let kind = json_str_or_empty(node, "kind");
+        let name = json_str_or_empty(node, "name");
+        html.push_str("<tr data-graph-node-row data-node-kind=\"");
+        html.push_str(&html_escape_text(kind));
+        html.push_str("\" data-node-name=\"");
+        html.push_str(&html_escape_text(name));
+        html.push_str("\"><td>");
         html.push_str(&html_escape_text(&json_u64_field(node, "id").to_string()));
         html.push_str("</td><td>");
-        html.push_str(&html_escape_text(json_str_or_empty(node, "kind")));
+        html.push_str(&html_escape_text(kind));
         html.push_str("</td><td>");
-        html.push_str(&html_escape_text(json_str_or_empty(node, "name")));
+        html.push_str(&html_escape_text(name));
         html.push_str("</td><td>");
         html.push_str(&html_escape_text(&json_u64_field(node, "file").to_string()));
         html.push_str("</td></tr>");
@@ -1218,7 +1237,7 @@ fn project_graph_view_html(graph: &serde_json::Value) -> String {
         html.push_str(&html_escape_text(json_str_or_empty(entry, "name")));
         html.push_str("</td></tr>");
     }
-    html.push_str("</tbody></table></main></body></html>");
+    html.push_str("</tbody></table><script>function filterProjectGraphRows(){const query=(document.getElementById('graph-search')?.value||'').toLowerCase();const kind=document.getElementById('graph-kind-filter')?.value||'';for(const row of document.querySelectorAll('[data-graph-node-row]')){const matchesKind=!kind||row.dataset.nodeKind===kind;const matchesText=!query||row.textContent.toLowerCase().includes(query);row.hidden=!(matchesKind&&matchesText);}}document.getElementById('graph-search')?.addEventListener('input',filterProjectGraphRows);document.getElementById('graph-kind-filter')?.addEventListener('change',filterProjectGraphRows);filterProjectGraphRows();</script></main></body></html>");
     html
 }
 
@@ -29919,6 +29938,11 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("<svg role=\"img\""));
         assert!(html.contains("graph.json"));
         assert!(html.contains("GET /ping"));
+        assert!(html.contains("id=\"graph-search\""));
+        assert!(html.contains("id=\"graph-kind-filter\""));
+        assert!(html.contains("data-graph-node-row"));
+        assert!(html.contains("data-node-kind=\"domain\""));
+        assert!(html.contains("filterProjectGraphRows"));
         let _ = std::fs::remove_dir_all(&out);
     }
 

@@ -3061,7 +3061,7 @@ mock-server = "0.2.0"
 | `orv check <file>` | 파싱, 이름 해석, 타입/도메인 진단만 수행 |
 | `orv dump <file>` | 파싱된 AST를 디버그 출력 |
 | `orv origins <file>` | HIR 기반 origin map JSON 출력 |
-| `orv graph <file> [--view --out <dir>]` | AST ProjectGraph v1 + HIR origin map/edge JSON 출력 또는 정적 ProjectGraph HTML view artifact 생성 |
+| `orv graph <file> [--view --out <dir>]` | AST ProjectGraph v1 + HIR origin map/edge JSON 출력 또는 search/kind filter가 있는 정적 ProjectGraph HTML view artifact 생성 |
 | `orv build <file-or-orv.toml> --out <dir> [--prod]` | 초기 build manifest + bundle plan + origin map + project graph + source bundle + server runtime/launch/native-server-plan/native-runtime-image-plan/native-launcher-package/source/command artifact, HTML-only static page, 또는 client manifest/reactive-plan/page/JS/WASM bootstrap 출력, prod profile이면 deploy manifest/container/Dockerfile/Compose/runbook/entrypoint 추가 |
 | `orv add <pkg> <version> [--dev] [--path <path>] [--registry <url>] [--manifest <dir-or-orv.toml>]` | dependency section 편집 후 `orv.lock` 재생성 |
 | `orv remove <pkg> [--dev] [--manifest <dir-or-orv.toml>]` | dependency section 제거 후 `orv.lock` 재생성 |
