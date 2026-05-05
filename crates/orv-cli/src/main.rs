@@ -44,6 +44,7 @@ use orv_syntax::ast::{
 };
 
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
+const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -1367,6 +1368,10 @@ fn cmd_editor_export_with_options(
         .pointer("/debug/session_runner")
         .ok_or_else(|| anyhow::anyhow!("editor export state missing debug.session_runner"))?;
     write_json(&out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH), runner)?;
+    write_json(
+        &out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH),
+        &editor_native_host_manifest_json(&entry, &state),
+    )?;
     write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
     println!(
         "{}",
@@ -1375,7 +1380,7 @@ fn cmd_editor_export_with_options(
             "kind": "orv.editor.export",
             "entry": entry.display().to_string(),
             "out": out.display().to_string(),
-            "files": ["index.html", "state.json", EDITOR_DEBUG_SESSION_RUNNER_PATH],
+            "files": ["index.html", "state.json", EDITOR_DEBUG_SESSION_RUNNER_PATH, EDITOR_NATIVE_HOST_MANIFEST_PATH],
         }))?
     );
     Ok(())
@@ -5070,6 +5075,45 @@ fn editor_export_state_json_with_trace(
             .insert("trace".to_string(), editor_trace_json(build, trace)?);
     }
     Ok(state)
+}
+
+fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> serde_json::Value {
+    let debug = state.get("debug").unwrap_or(&serde_json::Value::Null);
+    let adapter = debug.get("adapter").unwrap_or(&serde_json::Value::Null);
+    let runner = debug
+        .get("session_runner")
+        .unwrap_or(&serde_json::Value::Null);
+    let controls = debug
+        .get("controls")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let trace_enabled = state.get("trace").is_some();
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.native_host",
+        "entry": entry.display().to_string(),
+        "artifacts": {
+            "shell": "index.html",
+            "state": "state.json",
+            "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
+        },
+        "debug": {
+            "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
+            "adapter_command": adapter.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "dap", "serve", "--stdio"])),
+            "runner_command": runner.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "editor", "run-debug", EDITOR_DEBUG_SESSION_RUNNER_PATH, "--control", EditorDebugControl::Next.cli_value()])),
+            "control_count": controls,
+            "reuse_session": runner
+                .pointer("/session/reuse_session")
+                .cloned()
+                .unwrap_or(serde_json::json!(true)),
+        },
+        "capabilities": {
+            "project_graph": true,
+            "runtime_inspection": true,
+            "dap_controls": controls > 0,
+            "trace_navigation": trace_enabled,
+        },
+    })
 }
 
 struct EditorGraphPanel {
@@ -28149,11 +28193,56 @@ define Auth() -> { @out "auth" }
             true
         );
         assert_editor_debug_runner_artifact(&out, &state);
+        assert_editor_native_host_manifest(&out, &state);
+        assert_editor_debug_configurations(&state);
+        assert_editor_debug_breakpoint_sources(&state);
+        assert_editor_debug_controls(&state);
+        assert_editor_debug_html(&html);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn assert_editor_debug_runner_artifact(out: &Path, state: &serde_json::Value) {
+        let runner =
+            read_json_value(&out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH)).expect("debug runner");
+        assert_eq!(runner, state["debug"]["session_runner"]);
+        let run = editor_debug_runner_session_json(
+            &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+        )
+        .expect("run standalone debug runner");
+        assert_eq!(run["kind"], "orv.editor.debug.runner.result");
+        assert_eq!(run["runner"], runner);
+    }
+
+    fn assert_editor_native_host_manifest(out: &Path, state: &serde_json::Value) {
+        let native_host =
+            read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
+        assert_eq!(native_host["kind"], "orv.editor.native_host");
+        assert_eq!(native_host["artifacts"]["shell"], "index.html");
+        assert_eq!(native_host["artifacts"]["state"], "state.json");
+        assert_eq!(
+            native_host["artifacts"]["debug_session_runner"],
+            EDITOR_DEBUG_SESSION_RUNNER_PATH
+        );
+        assert_eq!(
+            native_host["debug"]["adapter_command"],
+            serde_json::json!(["orv", "dap", "serve", "--stdio"])
+        );
+        assert_eq!(
+            native_host["debug"]["runner_command"],
+            state["debug"]["session_runner"]["command"]
+        );
+    }
+
+    fn assert_editor_debug_configurations(state: &serde_json::Value) {
         assert!(state["debug"]["configurations"]
             .as_array()
             .expect("debug configurations")
             .iter()
             .any(|config| config["name"] == "Live Launch ORV" && config["live"] == true));
+    }
+
+    fn assert_editor_debug_breakpoint_sources(state: &serde_json::Value) {
         let breakpoint_sources = state["debug"]["breakpoint_sources"]
             .as_array()
             .expect("breakpoint sources");
@@ -28165,6 +28254,9 @@ define Auth() -> { @out "auth" }
                     .as_array()
                     .is_some_and(|lines| lines.iter().any(|line| line == 1))
         }));
+    }
+
+    fn assert_editor_debug_controls(state: &serde_json::Value) {
         let controls = state["debug"]["controls"]
             .as_array()
             .expect("debug controls");
@@ -28203,6 +28295,9 @@ define Auth() -> { @out "auth" }
             "Disconnect",
             &serde_json::json!({"command": "disconnect", "arguments": {"terminateDebuggee": true}}),
         );
+    }
+
+    fn assert_editor_debug_html(html: &str) {
         assert!(html.contains("id=\"debug-config-list\""));
         assert!(html.contains("id=\"debug-control-list\""));
         assert!(html.contains("Debug Controls"));
@@ -28210,20 +28305,6 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("id=\"debug-runner-detail\""));
         assert!(html.contains("renderDebugRunner"));
         assert!(html.contains("renderDebugDetail"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn assert_editor_debug_runner_artifact(out: &Path, state: &serde_json::Value) {
-        let runner =
-            read_json_value(&out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH)).expect("debug runner");
-        assert_eq!(runner, state["debug"]["session_runner"]);
-        let run = editor_debug_runner_session_json(
-            &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
-            &[EditorDebugControl::Next],
-        )
-        .expect("run standalone debug runner");
-        assert_eq!(run["kind"], "orv.editor.debug.runner.result");
-        assert_eq!(run["runner"], runner);
     }
 
     fn assert_editor_debug_control(
@@ -28379,6 +28460,8 @@ define Auth() -> { @out "auth" }
 
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
+        let native_host =
+            read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
         assert!(html.contains("Trace"));
         assert!(html.contains("id=\"trace-list\""));
         assert!(html.contains("id=\"trace-detail\""));
@@ -28390,6 +28473,7 @@ define Auth() -> { @out "auth" }
             state["trace"]["frames"][0]["navigation"]["focus"]["panel"],
             "routes"
         );
+        assert_eq!(native_host["capabilities"]["trace_navigation"], true);
         let _ = std::fs::remove_dir_all(dir);
     }
 
