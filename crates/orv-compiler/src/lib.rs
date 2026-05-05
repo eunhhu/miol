@@ -487,6 +487,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "client/manifest.json".to_string(),
         });
         artifacts.push(BuildArtifact {
+            kind: "client_reactive_plan".to_string(),
+            path: "client/reactive-plan.json".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "client_page".to_string(),
             path: "pages/index.html".to_string(),
         });
@@ -563,6 +567,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "client_manifest".to_string(),
             path: "client/manifest.json".to_string(),
+            runtime_features: vec!["client_wasm".to_string()],
+        });
+        bundles.push(BundleTarget {
+            kind: "client_reactive_plan".to_string(),
+            path: "client/reactive-plan.json".to_string(),
             runtime_features: vec!["client_wasm".to_string()],
         });
         bundles.push(BundleTarget {
@@ -1701,6 +1710,11 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(manifest
             .artifacts
             .iter()
+            .any(|artifact| artifact.kind == "client_reactive_plan"
+                && artifact.path == "client/reactive-plan.json"));
+        assert!(manifest
+            .artifacts
+            .iter()
             .any(|artifact| artifact.kind == "client_wasm" && artifact.path == "client/app.wasm"));
         assert!(manifest
             .artifacts
@@ -1713,6 +1727,11 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "client_manifest"
                 && bundle.path == "client/manifest.json"
+                && bundle.runtime_features == vec!["client_wasm"]
+        }));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "client_reactive_plan"
+                && bundle.path == "client/reactive-plan.json"
                 && bundle.runtime_features == vec!["client_wasm"]
         }));
         assert!(plan.bundles.iter().any(|bundle| {

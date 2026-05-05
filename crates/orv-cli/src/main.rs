@@ -12397,6 +12397,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             "native_server_launcher_package" => verify_native_server_launcher_package(&target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_manifest" => verify_client_manifest_target(dir, bundle, &target)?,
+            "client_reactive_plan" => verify_client_reactive_plan_target(dir, bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
             "client_wasm" => verify_client_wasm_target(dir, &target)?,
@@ -12859,6 +12860,10 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
 }
 
 fn verify_client_manifest_paths(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
+    let reactive_plan = json_str(manifest, "reactive_plan", "client manifest")?;
+    if reactive_plan != CLIENT_REACTIVE_PLAN_PATH || !dir.join(reactive_plan).is_file() {
+        anyhow::bail!("client_manifest reactive_plan must be {CLIENT_REACTIVE_PLAN_PATH}");
+    }
     let page = json_str(manifest, "page", "client manifest")?;
     if page != CLIENT_PAGE_PATH || !dir.join(page).is_file() {
         anyhow::bail!("client_manifest page must be {CLIENT_PAGE_PATH}");
@@ -12911,6 +12916,78 @@ fn verify_client_manifest_exports(manifest: &serde_json::Value) -> anyhow::Resul
         || json_str(exports, "memory", "client manifest exports")? != CLIENT_WASM_MEMORY_EXPORT
     {
         anyhow::bail!("client_manifest exports do not match client WASM ABI");
+    }
+    Ok(())
+}
+
+fn verify_client_reactive_plan_target(
+    dir: &Path,
+    bundle: &serde_json::Value,
+    target: &Path,
+) -> anyhow::Result<()> {
+    if json_str(bundle, "path", "client_reactive_plan bundle")? != CLIENT_REACTIVE_PLAN_PATH {
+        anyhow::bail!("client_reactive_plan bundle path must be {CLIENT_REACTIVE_PLAN_PATH}");
+    }
+    let runtime_features = bundle
+        .get("runtime_features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("client_reactive_plan runtime_features must be an array"))?;
+    if !runtime_features
+        .iter()
+        .any(|feature| feature == "client_wasm")
+    {
+        anyhow::bail!("client_reactive_plan bundle must declare client_wasm");
+    }
+    let plan = read_json_value(target)?;
+    verify_client_reactive_plan_value(dir, &plan)
+}
+
+fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> anyhow::Result<()> {
+    if plan
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("client_reactive_plan schema_version must be 1");
+    }
+    if json_str(plan, "kind", "client reactive plan")? != "orv.client.reactive_plan" {
+        anyhow::bail!("client_reactive_plan kind must be orv.client.reactive_plan");
+    }
+    if json_str(plan, "source_bundle", "client reactive plan")? != SOURCE_BUNDLE_PATH {
+        anyhow::bail!("client_reactive_plan source_bundle must be {SOURCE_BUNDLE_PATH}");
+    }
+    let source_bundle = read_json_value(&dir.join(SOURCE_BUNDLE_PATH))?;
+    let expected_hash = stable_json_hash(&source_bundle)?;
+    if json_str(plan, "source_bundle_hash", "client reactive plan")? != expected_hash {
+        anyhow::bail!("client_reactive_plan source_bundle_hash does not match source bundle");
+    }
+    if plan.get("entry") != source_bundle.get("entry") {
+        anyhow::bail!("client_reactive_plan entry does not match source bundle");
+    }
+    if !plan
+        .get("signals")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|signals| {
+            signals.iter().all(|signal| {
+                signal
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                    && signal
+                        .get("origin_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            })
+        })
+    {
+        anyhow::bail!("client_reactive_plan signals must be an array of source-backed signals");
+    }
+    if !plan
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item == "reactive-dom-diff"))
+    {
+        anyhow::bail!("client_reactive_plan blocked_by must include reactive-dom-diff");
     }
     Ok(())
 }
@@ -13169,10 +13246,10 @@ fn verify_dev_hmr_session_if_present(dir: &Path, plan: &serde_json::Value) -> an
         .get("reload")
         .ok_or_else(|| anyhow::anyhow!("dev session reload must be an object"))?;
     let has_client_target = bundles.iter().any(|target| {
-        matches!(
-            target.get("kind").and_then(serde_json::Value::as_str),
-            Some("client_page" | "client_js" | "client_wasm")
-        )
+        target
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_client_bundle_kind)
     });
     let expected_strategy = if has_client_target {
         "hot-reload"
@@ -13441,10 +13518,10 @@ fn bundle_plan_has_client_target(plan: &serde_json::Value) -> anyhow::Result<boo
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
     Ok(bundles.iter().any(|target| {
-        matches!(
-            target.get("kind").and_then(serde_json::Value::as_str),
-            Some("client_page" | "client_js" | "client_wasm")
-        )
+        target
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_client_bundle_kind)
     }))
 }
 
@@ -14648,10 +14725,7 @@ fn reveal_client_targets(
             .get("kind")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if !matches!(
-            kind,
-            "client_manifest" | "client_page" | "client_js" | "client_wasm"
-        ) {
+        if !is_client_bundle_kind(kind) {
             continue;
         }
         let path = json_str(bundle, "path", "bundle target")?;
@@ -14666,10 +14740,19 @@ fn reveal_client_targets(
         });
         if kind == "client_manifest" {
             add_client_manifest_reveal_fields(dir, path, &mut target)?;
+        } else if kind == "client_reactive_plan" {
+            add_client_reactive_plan_reveal_fields(dir, path, &mut target)?;
         }
         targets.push(target);
     }
     Ok(targets)
+}
+
+fn is_client_bundle_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "client_manifest" | "client_reactive_plan" | "client_page" | "client_js" | "client_wasm"
+    )
 }
 
 fn add_client_manifest_reveal_fields(
@@ -14695,6 +14778,38 @@ fn add_client_manifest_reveal_fields(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     target["blocked_by"] = manifest
+        .get("blocked_by")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    Ok(())
+}
+
+fn add_client_reactive_plan_reveal_fields(
+    dir: &Path,
+    path: &str,
+    target: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    let plan_path = dir.join(path);
+    if !plan_path.is_file() {
+        return Ok(());
+    }
+    let plan = read_json_value(&plan_path)?;
+    target["source_bundle"] = plan
+        .get("source_bundle")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["source_bundle_hash"] = plan
+        .get("source_bundle_hash")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["signal_count"] = plan
+        .get("signals")
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(
+            || serde_json::json!(0),
+            |signals| serde_json::json!(signals.len()),
+        );
+    target["blocked_by"] = plan
         .get("blocked_by")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
@@ -15707,10 +15822,10 @@ fn dev_session_inputs(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let has_client_target = targets.iter().any(|target| {
-        matches!(
-            target.get("kind").and_then(serde_json::Value::as_str),
-            Some("client_page" | "client_js" | "client_wasm")
-        )
+        target
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_client_bundle_kind)
     });
     Ok((sources, targets, has_client_target))
 }
@@ -16097,6 +16212,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let manifest = orv_compiler::build_manifest(entry.display().to_string(), &origin_map);
     let bundle_plan = orv_compiler::bundle_plan(&manifest);
     let client_manifest_path = bundle_output_path(&bundle_plan, "client_manifest");
+    let client_reactive_plan_path = bundle_output_path(&bundle_plan, "client_reactive_plan");
     let client_page_path = bundle_output_path(&bundle_plan, "client_page");
     let client_js_path = bundle_output_path(&bundle_plan, "client_js");
     let client_wasm_path = bundle_output_path(&bundle_plan, "client_wasm");
@@ -16150,7 +16266,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     )?;
     write_json(
         &out.join("origin-map.json"),
-        &serde_json::to_value(origin_map)?,
+        &serde_json::to_value(&origin_map)?,
     )?;
     write_json(&out.join("project-graph.json"), &graph)?;
     let source_bundle_value = serde_json::to_value(&source_bundle)?;
@@ -16201,10 +16317,12 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let client_source_binding = ClientSourceBinding {
         source_bundle: &source_bundle,
         source_bundle_hash: &source_bundle_hash,
+        origin_map: &origin_map,
         initial_render: client_initial_render.as_deref().unwrap_or(""),
     };
     let client_bundle_targets = ClientBundleTargets {
         manifest: client_manifest_path.as_deref(),
+        reactive_plan: client_reactive_plan_path.as_deref(),
         page: client_page_path.as_deref(),
         js: client_js_path.as_deref(),
         wasm: client_wasm_path.as_deref(),
@@ -16254,6 +16372,9 @@ fn write_client_bundle_artifacts(
     let manifest_path = targets
         .manifest
         .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
+    let reactive_plan_path = targets
+        .reactive_plan
+        .ok_or_else(|| anyhow::anyhow!("missing client_reactive_plan bundle target"))?;
     let js_path = targets
         .js
         .ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?;
@@ -16273,20 +16394,64 @@ fn write_client_bundle_artifacts(
     )?;
     let loader_src = relative_bundle_path(page_path, js_path);
     write_client_page_shell(&out.join(page_path), entry, &loader_src)?;
+    write_client_reactive_plan(out, reactive_plan_path, entry, binding)?;
     write_client_bundle_manifest(out, manifest_path, entry, binding, targets)
 }
 
 struct ClientSourceBinding<'a> {
     source_bundle: &'a orv_compiler::SourceBundleArtifact,
     source_bundle_hash: &'a str,
+    origin_map: &'a orv_compiler::OriginMap,
     initial_render: &'a str,
 }
 
 struct ClientBundleTargets<'a> {
     manifest: Option<&'a str>,
+    reactive_plan: Option<&'a str>,
     page: Option<&'a str>,
     js: Option<&'a str>,
     wasm: Option<&'a str>,
+}
+
+fn write_client_reactive_plan(
+    out: &Path,
+    path: &str,
+    entry: &Path,
+    binding: &ClientSourceBinding<'_>,
+) -> anyhow::Result<()> {
+    let signals = binding
+        .origin_map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "signal")
+        .map(|signal| {
+            serde_json::json!({
+                "name": &signal.name,
+                "origin_id": &signal.id,
+                "span": {
+                    "file": signal.span.file,
+                    "start": signal.span.start,
+                    "end": signal.span.end,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let plan = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.client.reactive_plan",
+        "entry": entry.display().to_string(),
+        "source_bundle": SOURCE_BUNDLE_PATH,
+        "source_bundle_hash": binding.source_bundle_hash,
+        "runtime_features": ["client_wasm"],
+        "signals": signals,
+        "bindings": [{
+            "kind": "initial_render",
+            "target": CLIENT_PAGE_PATH,
+            "source": CLIENT_WASM_PATH,
+        }],
+        "blocked_by": ["reactive-dom-diff", "dynamic-client-codegen"],
+    });
+    write_json(&out.join(path), &plan)
 }
 
 fn write_client_bundle_manifest(
@@ -16305,10 +16470,14 @@ fn write_client_bundle_manifest(
     let wasm = targets
         .wasm
         .ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?;
+    let reactive_plan = targets
+        .reactive_plan
+        .ok_or_else(|| anyhow::anyhow!("missing client_reactive_plan bundle target"))?;
     let manifest = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.bundle",
         "entry": entry.display().to_string(),
+        "reactive_plan": reactive_plan,
         "page": page,
         "loader": loader,
         "wasm": wasm,
@@ -16824,6 +16993,7 @@ const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const SOURCE_BUNDLE_PATH: &str = "source-bundle.json";
 const CLIENT_MANIFEST_PATH: &str = "client/manifest.json";
+const CLIENT_REACTIVE_PLAN_PATH: &str = "client/reactive-plan.json";
 const CLIENT_PAGE_PATH: &str = "pages/index.html";
 const CLIENT_JS_PATH: &str = "client/app.js";
 const CLIENT_WASM_PATH: &str = "client/app.wasm";
@@ -28087,6 +28257,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
                     .as_str()
                     .is_some_and(|hash| !hash.is_empty())
         }));
+        assert!(client.iter().any(|target| {
+            target["kind"] == "client_reactive_plan"
+                && target["path"] == CLIENT_REACTIVE_PLAN_PATH
+                && target["signal_count"] == 1
+                && target["source_bundle_hash"]
+                    .as_str()
+                    .is_some_and(|hash| !hash.is_empty())
+        }));
         assert!(client
             .iter()
             .any(|target| target["kind"] == "client_page" && target["path"] == "pages/index.html"));
@@ -28160,6 +28338,67 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("blocked_by")
             .iter()
             .any(|item| item == "dynamic-client-codegen"));
+
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_reactive_plan_contract() {
+        let out = temp_output_dir("client-reactive-plan");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_path = build_out.join("client").join("reactive-plan.json");
+        assert!(
+            reactive_path.is_file(),
+            "missing {}",
+            reactive_path.display()
+        );
+        let reactive_plan = read_json_value(&reactive_path).expect("reactive plan");
+        let source_bundle =
+            read_json_value(&build_out.join("source-bundle.json")).expect("source bundle");
+        let expected_source_hash = stable_json_hash(&source_bundle).expect("source hash");
+        assert_manifest_artifact(
+            &build_out.join("build-manifest.json"),
+            "client_reactive_plan",
+            "client/reactive-plan.json",
+        );
+        assert_bundle_target(
+            &build_out.join("bundle-plan.json"),
+            "client_reactive_plan",
+            "client/reactive-plan.json",
+        );
+        assert_eq!(reactive_plan["kind"], "orv.client.reactive_plan");
+        assert_eq!(reactive_plan["source_bundle"], SOURCE_BUNDLE_PATH);
+        assert_eq!(reactive_plan["source_bundle_hash"], expected_source_hash);
+        assert!(reactive_plan["signals"]
+            .as_array()
+            .expect("signals")
+            .iter()
+            .any(|signal| signal["name"] == "count"
+                && signal["origin_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())));
+        assert!(reactive_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "reactive-dom-diff"));
+        let client_manifest =
+            read_json_value(&build_out.join(CLIENT_MANIFEST_PATH)).expect("client manifest");
+        assert_eq!(
+            client_manifest["reactive_plan"],
+            "client/reactive-plan.json"
+        );
 
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);

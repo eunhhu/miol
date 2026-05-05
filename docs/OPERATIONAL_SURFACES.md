@@ -85,7 +85,7 @@ Runtime debug state comes from the reference runtime debug trace. Long-running `
 - `server/native/Cargo.toml`
 - `server/native/main.rs`
 - `pages/index.html` for HTML-only zero-runtime entries
-- `client/manifest.json`, `client/app.js`, and a source-bound `client/app.wasm` with initial-render memory exports for interactive client entries
+- `client/manifest.json`, `client/reactive-plan.json`, `client/app.js`, and a source-bound `client/app.wasm` with initial-render memory exports for interactive client entries
 
 `orv build --prod` adds deploy artifacts:
 
@@ -103,7 +103,7 @@ When a server artifact contains static `@db.wal` paths such as `data/shop.wal.js
 
 `source-bundle.json` records source path/content/hash snapshots so reveal, LSP reveal, artifact verification, artifact reanalysis, and reference artifact execution do not depend on the original source files.
 
-For interactive client entries, `client/manifest.json` binds the page, JS loader, WASM module, source bundle hash, WASM exports, initial render metadata, runtime features, and dynamic-client-codegen blockers into one checked artifact. The generated `client/app.js` fetches this manifest before loading the source bundle and WASM, rejects schema/hash/WASM/export mismatches, and then records the resolved manifest URL on the client root. `orv verify-build` validates the manifest against the generated page/loader/WASM/source bundle, prod `deploy/manifest.json` references it as `client.manifest`, and reveal/editor/LSP production payloads expose it for client origins.
+For interactive client entries, `client/manifest.json` binds the page, reactive plan, JS loader, WASM module, source bundle hash, WASM exports, initial render metadata, runtime features, and dynamic-client-codegen blockers into one checked artifact. `client/reactive-plan.json` records source-backed `let sig` origins, the initial-render binding, source bundle hash, and `reactive-dom-diff` blocker for the future DOM-diff codegen pass. The generated `client/app.js` fetches the manifest before loading the source bundle and WASM, rejects schema/hash/WASM/export mismatches, and then records the resolved manifest URL on the client root. `orv verify-build` validates the manifest and reactive plan against the generated page/loader/WASM/source bundle, prod `deploy/manifest.json` references the manifest as `client.manifest`, and reveal/editor/LSP production payloads expose both client contracts for client origins.
 
 ## DB Operations
 
