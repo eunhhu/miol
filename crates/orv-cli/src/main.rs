@@ -13832,6 +13832,9 @@ fn verify_deploy_server_target(
     {
         anyhow::bail!("deploy server runtime does not match runtime artifact");
     }
+    if server.get("runtime_features") != Some(&serde_json::to_value(&artifact.runtime_features)?) {
+        anyhow::bail!("deploy server runtime_features do not match runtime artifact");
+    }
     verify_deploy_listen_value(
         server.get("listen"),
         artifact.listen.as_ref(),
@@ -17283,6 +17286,7 @@ fn write_prod_deploy_artifacts(
         write_prod_deploy_runbook(out, compose, routes_artifact, server_artifact, &persistence)?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
+            "runtime_features": server_artifact.runtime_features.clone(),
             "artifact": targets.server_artifact,
             "entrypoint": entrypoint,
             "routes_artifact": routes_artifact,
@@ -18451,9 +18455,9 @@ test "checkout failing runtime body" {
         let out = dir.join("dist");
         cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
 
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
         let runtime =
             read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
-        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
         let container =
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
         let compose =
@@ -26229,7 +26233,10 @@ entry = "src/main.orv"
 
         cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
 
+        let manifest = read_json_value(&out.join("build-manifest.json")).expect("manifest");
         let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let runtime =
+            read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
         let container =
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
         let compose =
@@ -26241,6 +26248,21 @@ entry = "src/main.orv"
             deploy["server"]["persistence"]["wal_paths"][0],
             serde_json::json!("data/app.wal.jsonl")
         );
+        assert!(manifest["capabilities"]["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .iter()
+            .any(|feature| feature == "db_adapter"));
+        assert!(runtime["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .iter()
+            .any(|feature| feature == "db_adapter"));
+        assert!(deploy["server"]["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .iter()
+            .any(|feature| feature == "db_adapter"));
         assert_eq!(
             container["persistence"]["volumes"][0]["host"],
             serde_json::json!("data")

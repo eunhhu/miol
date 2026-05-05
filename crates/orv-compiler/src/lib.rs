@@ -1007,20 +1007,20 @@ fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usi
         features.insert("router");
     }
     for entry in &origin_map.entries {
-        if entry.kind != "domain" {
-            continue;
-        }
-        match entry.name.as_str() {
-            "db" => {
+        match (entry.kind.as_str(), entry.name.as_str()) {
+            ("domain", "db") => {
                 features.insert("in_memory_db");
             }
-            "html" => {
+            ("call", "@db.connect") => {
+                features.insert("db_adapter");
+            }
+            ("domain", "html") => {
                 features.insert("html_renderer");
             }
-            "out" => {
+            ("domain", "out") => {
                 features.insert("console_io");
             }
-            "serve" => {
+            ("domain", "serve") => {
                 features.insert("static_file_server");
             }
             _ => {}
@@ -1684,6 +1684,30 @@ function greet(name: string): string -> "hi {name}""#,
             .capabilities
             .runtime_features
             .contains(&"static_file_server".to_string()));
+    }
+
+    #[test]
+    fn build_manifest_declares_db_adapter_runtime_feature_for_db_connect() {
+        let program = lower(
+            r#"@server {
+  @listen 8080
+  let external = @db.connect "file://data/app.wal.jsonl"
+  @route GET /ping {
+    @respond 200 external.find("User", { name: "Ada" })
+  }
+}"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+
+        assert!(manifest
+            .capabilities
+            .runtime_features
+            .contains(&"in_memory_db".to_string()));
+        assert!(manifest
+            .capabilities
+            .runtime_features
+            .contains(&"db_adapter".to_string()));
     }
 
     #[test]
