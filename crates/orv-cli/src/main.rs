@@ -2134,6 +2134,13 @@ cd dist\n\
 PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
 ```\n\
 \n\
+## Native Launcher\n\
+\n\
+```sh\n\
+cargo build --manifest-path dist/server/native/Cargo.toml --release\n\
+ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server\n\
+```\n\
+\n\
 ## Deploy artifacts\n\
 \n\
 - `deploy/manifest.json`\n\
@@ -13778,6 +13785,12 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document editor trace navigation command");
     }
+    if !runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release") {
+        anyhow::bail!("deploy runbook must document native launcher build command");
+    }
+    if !runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server") {
+        anyhow::bail!("deploy runbook must document native launcher run command");
+    }
     if !runbook.contains("/__orv/trace/events") {
         anyhow::bail!("deploy runbook must document live trace event stream endpoint");
     }
@@ -16926,6 +16939,13 @@ fn write_prod_deploy_runbook(
 - Compose: {compose_path}
 - Routes: {routes_artifact}
 
+## Native Launcher
+
+```sh
+cargo build --manifest-path server/native/Cargo.toml --release
+ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server
+```
+
 ## Request Trace
 
 ```sh
@@ -17886,6 +17906,11 @@ test "checkout failing runtime body" {
         assert!(guide.contains("server/native/main.rs"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(
+            guide.contains("cargo build --manifest-path dist/server/native/Cargo.toml --release")
+        );
+        assert!(guide
+            .contains("ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server"));
         assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(
@@ -25387,6 +25412,10 @@ entry = "src/main.orv"
         let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
         assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
         assert!(runbook.contains("PORT=8080"));
+        assert!(runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release"));
+        assert!(
+            runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server")
+        );
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
