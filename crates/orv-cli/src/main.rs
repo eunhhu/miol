@@ -24854,6 +24854,24 @@ entry = "src/main.orv"
             .iter()
             .any(|artifact| artifact["kind"] == "source_bundle"
                 && artifact["path"] == "source-bundle.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "server_runtime"
+                && artifact["path"] == "server/app.orv-runtime.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "server_launcher"
+                && artifact["path"] == "server/launch.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(|artifact| artifact["kind"] == "native_server_plan"
+                && artifact["path"] == "server/native-server.json"));
         let source_bundle: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&source_bundle_path).expect("source bundle"),
         )

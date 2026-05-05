@@ -329,6 +329,20 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "source-bundle.json".to_string(),
         },
     ];
+    if has_server {
+        artifacts.push(BuildArtifact {
+            kind: "server_runtime".to_string(),
+            path: "server/app.orv-runtime.json".to_string(),
+        });
+        artifacts.push(BuildArtifact {
+            kind: "server_launcher".to_string(),
+            path: "server/launch.json".to_string(),
+        });
+        artifacts.push(BuildArtifact {
+            kind: "native_server_plan".to_string(),
+            path: "server/native-server.json".to_string(),
+        });
+    }
     if has_static_page(has_server, &runtime_features) {
         artifacts.push(BuildArtifact {
             kind: "static_page".to_string(),
@@ -1421,6 +1435,30 @@ function greet(name: string): string -> "hi {name}""#,
                 && bundle.path == "server/native-server.json"
                 && bundle.runtime_features.contains(&"http_server".to_string())
                 && bundle.runtime_features.contains(&"router".to_string())
+        }));
+    }
+
+    #[test]
+    fn build_manifest_declares_server_artifacts() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "server_runtime" && artifact.path == "server/app.orv-runtime.json"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "server_launcher" && artifact.path == "server/launch.json"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "native_server_plan" && artifact.path == "server/native-server.json"
         }));
     }
 
