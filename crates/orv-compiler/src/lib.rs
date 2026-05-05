@@ -14,7 +14,7 @@ use orv_diagnostics::Span;
 use orv_hir::{
     origin_fingerprint, origin_id, BinaryOp, HirBlock, HirCatchClause, HirExpr, HirExprKind,
     HirFunctionBody, HirLetKind, HirObjectField, HirPattern, HirProgram, HirStmt, HirStringSegment,
-    NameId,
+    NameId, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -310,6 +310,24 @@ pub struct ServerRouteArtifact {
     /// `@respond` origin ids contained in this route handler.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub response_origin_ids: Vec<String>,
+    /// Lowered `@respond` descriptors contained in this route handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses: Vec<ServerResponseArtifact>,
+}
+
+/// One source-backed response descriptor contained by a route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerResponseArtifact {
+    /// `@respond` origin id.
+    pub origin_id: String,
+    /// Statically known HTTP status, when the status expression is literal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+    /// Response body lowering class.
+    pub body_kind: String,
+    /// Statically lowered JSON body, when the payload is literal-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_json: Option<String>,
 }
 
 /// One compiled server listen descriptor.
@@ -668,11 +686,33 @@ pub fn server_runtime_artifact(
     origin_map: &OriginMap,
     sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
 ) -> ServerRuntimeArtifact {
+    let responses_by_route = HashMap::new();
+    server_runtime_artifact_with_responses(manifest, origin_map, &responses_by_route, sources)
+}
+
+/// Build a server runtime descriptor and lower static route response metadata.
+#[must_use]
+pub fn server_runtime_artifact_with_program(
+    manifest: &BuildManifest,
+    origin_map: &OriginMap,
+    program: &HirProgram,
+    sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> ServerRuntimeArtifact {
+    let responses_by_route = route_response_artifacts(program);
+    server_runtime_artifact_with_responses(manifest, origin_map, &responses_by_route, sources)
+}
+
+fn server_runtime_artifact_with_responses(
+    manifest: &BuildManifest,
+    origin_map: &OriginMap,
+    responses_by_route: &HashMap<String, Vec<ServerResponseArtifact>>,
+    sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> ServerRuntimeArtifact {
     let routes = origin_map
         .entries
         .iter()
         .filter(|entry| entry.kind == "route")
-        .filter_map(|entry| route_artifact(entry, origin_map))
+        .filter_map(|entry| route_artifact(entry, origin_map, responses_by_route))
         .collect();
     let listen = origin_map
         .entries
@@ -1067,14 +1107,53 @@ pub const ORV_NATIVE_HANDLERS: &[OrvNativeHandlerDescriptor] = &[
         );
     }
     source.push_str(
-        r#"];
+        r"];
 
 pub const ORV_NATIVE_HANDLER_COUNT: usize = routes::ORV_NATIVE_ROUTE_COUNT;
 
 pub fn orv_native_handle_route(
     route_match: &routes::OrvNativeRouteMatch,
 ) -> OrvNativeHandlerResponse {
-    OrvNativeHandlerResponse {
+",
+    );
+    let mut static_route_count = 0usize;
+    for route in &artifact.routes {
+        let Some(response) = route.responses.first() else {
+            continue;
+        };
+        let (Some(status), Some(body_json)) = (response.status, response.body_json.as_ref()) else {
+            continue;
+        };
+        if !(100..=999).contains(&status) {
+            continue;
+        }
+        static_route_count += 1;
+        let _ = writeln!(
+            source,
+            r#"    if route_match.route.origin_id == {} {{
+        return OrvNativeHandlerResponse {{
+            status: {status},
+            content_type: "application/json",
+            body: {},
+            origin_id: Some(route_match.route.origin_id),
+            response_origin_id: Some({}),
+            params: route_match.params.clone(),
+        }};
+    }}"#,
+            rust_string_literal(&route.origin_id),
+            rust_string_literal(body_json),
+            rust_string_literal(&response.origin_id)
+        );
+    }
+    if static_route_count == artifact.routes.len() {
+        source.push_str(
+            r#"    unreachable!("orv native static handler table missing route")
+}
+"#,
+        );
+    } else {
+        source.push_str(
+            r#"    OrvNativeHandlerResponse {
         status: 501,
         content_type: "application/json",
         body: "{\"error\":\"native route body lowering pending\"}",
@@ -1084,7 +1163,8 @@ pub fn orv_native_handle_route(
     }
 }
 "#,
-    );
+        );
+    }
     source
 }
 
@@ -1105,6 +1185,105 @@ fn rust_string_literal(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn static_integer(expr: &HirExpr) -> Option<i64> {
+    match &expr.kind {
+        HirExprKind::Integer(value) => value.parse::<i64>().ok(),
+        HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => static_integer(expr).map(|value| -value),
+        HirExprKind::Paren(expr) => static_integer(expr),
+        _ => None,
+    }
+}
+
+fn static_json_payload(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::Integer(value) => value.parse::<i64>().ok().map(|value| value.to_string()),
+        HirExprKind::Float(value) => value.parse::<f64>().ok().map(|_| value.clone()),
+        HirExprKind::String(segments) => static_string_segments(segments).map(|value| {
+            let mut out = String::new();
+            write_json_string(&value, &mut out);
+            out
+        }),
+        HirExprKind::True => Some("true".to_string()),
+        HirExprKind::False => Some("false".to_string()),
+        HirExprKind::Void => Some("null".to_string()),
+        HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => static_json_payload(expr).and_then(|value| {
+            if value.starts_with('-')
+                || !(value.bytes().all(|byte| byte.is_ascii_digit()) || value.contains('.'))
+            {
+                None
+            } else {
+                Some(format!("-{value}"))
+            }
+        }),
+        HirExprKind::Paren(expr) => static_json_payload(expr),
+        HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
+            let mut out = String::from("[");
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&static_json_payload(item)?);
+            }
+            out.push(']');
+            Some(out)
+        }
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            let mut out = String::from("{");
+            for (index, field) in fields.iter().enumerate() {
+                if field.is_spread {
+                    return None;
+                }
+                if index > 0 {
+                    out.push(',');
+                }
+                write_json_string(&field.name, &mut out);
+                out.push(':');
+                out.push_str(&static_json_payload(&field.value)?);
+            }
+            out.push('}');
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn static_string_segments(segments: &[HirStringSegment]) -> Option<String> {
+    let mut out = String::new();
+    for segment in segments {
+        match segment {
+            HirStringSegment::Str(value) => out.push_str(value),
+            HirStringSegment::Interp(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+fn write_json_string(value: &str, out: &mut String) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                let _ = write!(out, "\\u{:04x}", u32::from(ch));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
 }
 
 /// Verify that a server runtime artifact is internally consistent.
@@ -1202,14 +1381,266 @@ pub fn verify_source_bundle_artifact(artifact: &SourceBundleArtifact) -> Result<
     }
 }
 
-fn route_artifact(entry: &OriginEntry, origin_map: &OriginMap) -> Option<ServerRouteArtifact> {
+fn route_artifact(
+    entry: &OriginEntry,
+    origin_map: &OriginMap,
+    responses_by_route: &HashMap<String, Vec<ServerResponseArtifact>>,
+) -> Option<ServerRouteArtifact> {
     let (method, path) = entry.name.split_once(' ')?;
     Some(ServerRouteArtifact {
         method: method.to_string(),
         path: path.to_string(),
         origin_id: entry.id.clone(),
         response_origin_ids: route_response_origin_ids(&entry.id, origin_map),
+        responses: responses_by_route
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_default(),
     })
+}
+
+fn route_response_artifacts(program: &HirProgram) -> HashMap<String, Vec<ServerResponseArtifact>> {
+    let mut out = HashMap::new();
+    for stmt in &program.items {
+        collect_stmt_response_artifacts(stmt, None, &mut out);
+    }
+    out
+}
+
+fn collect_stmt_response_artifacts(
+    stmt: &HirStmt,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerResponseArtifact>>,
+) {
+    match stmt {
+        HirStmt::Let(stmt) => collect_expr_response_artifacts(&stmt.init, route_origin_id, out),
+        HirStmt::Const(stmt) => collect_expr_response_artifacts(&stmt.init, route_origin_id, out),
+        HirStmt::Function(stmt) => {
+            collect_function_body_response_artifacts(&stmt.body, route_origin_id, out);
+        }
+        HirStmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                collect_expr_response_artifacts(value, route_origin_id, out);
+            }
+        }
+        HirStmt::Expr(expr) => collect_expr_response_artifacts(expr, route_origin_id, out),
+        HirStmt::Struct(_) | HirStmt::Enum(_) | HirStmt::TypeAlias(_) | HirStmt::Import(_) => {}
+    }
+}
+
+fn collect_block_response_artifacts(
+    block: &HirBlock,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerResponseArtifact>>,
+) {
+    for stmt in &block.stmts {
+        collect_stmt_response_artifacts(stmt, route_origin_id, out);
+    }
+}
+
+fn collect_function_body_response_artifacts(
+    body: &HirFunctionBody,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerResponseArtifact>>,
+) {
+    match body {
+        HirFunctionBody::Block(block) => {
+            collect_block_response_artifacts(block, route_origin_id, out)
+        }
+        HirFunctionBody::Expr(expr) => collect_expr_response_artifacts(expr, route_origin_id, out),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn collect_expr_response_artifacts(
+    expr: &HirExpr,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerResponseArtifact>>,
+) {
+    match &expr.kind {
+        HirExprKind::Route {
+            method,
+            path,
+            handler,
+            ..
+        } => {
+            let name = format!("{method} {path}");
+            let route_origin = origin_id("route", &name, expr.span);
+            collect_block_response_artifacts(handler, Some(&route_origin), out);
+        }
+        HirExprKind::Respond { status, payload } => {
+            if let Some(route_origin_id) = route_origin_id {
+                out.entry(route_origin_id.to_string())
+                    .or_default()
+                    .push(ServerResponseArtifact {
+                        origin_id: origin_id("domain", "respond", expr.span),
+                        status: static_integer(status),
+                        body_json: static_json_payload(payload),
+                        body_kind: static_json_payload(payload)
+                            .map_or_else(|| "dynamic".to_string(), |_| "static_json".to_string()),
+                    });
+            }
+            collect_expr_response_artifacts(status, route_origin_id, out);
+            collect_expr_response_artifacts(payload, route_origin_id, out);
+        }
+        HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        } => {
+            if let Some(listen) = listen {
+                collect_expr_response_artifacts(listen, route_origin_id, out);
+            }
+            for route in routes {
+                collect_expr_response_artifacts(route, route_origin_id, out);
+            }
+            for stmt in body_stmts {
+                collect_stmt_response_artifacts(stmt, route_origin_id, out);
+            }
+        }
+        HirExprKind::Out(inner)
+        | HirExprKind::Unary { expr: inner, .. }
+        | HirExprKind::Paren(inner)
+        | HirExprKind::Throw(inner)
+        | HirExprKind::Await(inner)
+        | HirExprKind::Cast { expr: inner, .. } => {
+            collect_expr_response_artifacts(inner, route_origin_id, out);
+        }
+        HirExprKind::Html(block) | HirExprKind::Block(block) => {
+            collect_block_response_artifacts(block, route_origin_id, out);
+        }
+        HirExprKind::Domain { args, .. } => {
+            for arg in args {
+                collect_expr_response_artifacts(arg, route_origin_id, out);
+            }
+        }
+        HirExprKind::Call { callee, args } => {
+            collect_expr_response_artifacts(callee, route_origin_id, out);
+            for arg in args {
+                collect_expr_response_artifacts(arg, route_origin_id, out);
+            }
+        }
+        HirExprKind::String(segments) => {
+            for segment in segments {
+                if let HirStringSegment::Interp(expr) = segment {
+                    collect_expr_response_artifacts(expr, route_origin_id, out);
+                }
+            }
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_expr_response_artifacts(lhs, route_origin_id, out);
+            collect_expr_response_artifacts(rhs, route_origin_id, out);
+        }
+        HirExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => {
+            collect_expr_response_artifacts(cond, route_origin_id, out);
+            collect_block_response_artifacts(then, route_origin_id, out);
+            if let Some(expr) = else_branch {
+                collect_expr_response_artifacts(expr, route_origin_id, out);
+            }
+        }
+        HirExprKind::When { scrutinee, arms } => {
+            collect_expr_response_artifacts(scrutinee, route_origin_id, out);
+            for arm in arms {
+                collect_pattern_response_artifacts(&arm.pattern, route_origin_id, out);
+                collect_expr_response_artifacts(&arm.body, route_origin_id, out);
+            }
+        }
+        HirExprKind::Assign { value, .. } => {
+            collect_expr_response_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::AssignField { object, value, .. } => {
+            collect_expr_response_artifacts(object, route_origin_id, out);
+            collect_expr_response_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => {
+            collect_expr_response_artifacts(object, route_origin_id, out);
+            collect_expr_response_artifacts(index, route_origin_id, out);
+            collect_expr_response_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::For { iter, body, .. } => {
+            collect_expr_response_artifacts(iter, route_origin_id, out);
+            collect_block_response_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::While { cond, body } => {
+            collect_expr_response_artifacts(cond, route_origin_id, out);
+            collect_block_response_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::Range { start, end, .. } => {
+            collect_expr_response_artifacts(start, route_origin_id, out);
+            collect_expr_response_artifacts(end, route_origin_id, out);
+        }
+        HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
+            for item in items {
+                collect_expr_response_artifacts(item, route_origin_id, out);
+            }
+        }
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                collect_expr_response_artifacts(&field.value, route_origin_id, out);
+            }
+        }
+        HirExprKind::Index { target, index } => {
+            collect_expr_response_artifacts(target, route_origin_id, out);
+            collect_expr_response_artifacts(index, route_origin_id, out);
+        }
+        HirExprKind::Slice { target, start, end } => {
+            collect_expr_response_artifacts(target, route_origin_id, out);
+            if let Some(start) = start {
+                collect_expr_response_artifacts(start, route_origin_id, out);
+            }
+            if let Some(end) = end {
+                collect_expr_response_artifacts(end, route_origin_id, out);
+            }
+        }
+        HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
+            collect_expr_response_artifacts(target, route_origin_id, out);
+        }
+        HirExprKind::Lambda { body, .. } => {
+            collect_function_body_response_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::Try { try_block, catch } => {
+            collect_block_response_artifacts(try_block, route_origin_id, out);
+            if let Some(catch) = catch {
+                collect_block_response_artifacts(&catch.body, route_origin_id, out);
+            }
+        }
+        HirExprKind::Integer(_)
+        | HirExprKind::Float(_)
+        | HirExprKind::Regex { .. }
+        | HirExprKind::True
+        | HirExprKind::False
+        | HirExprKind::Void
+        | HirExprKind::TypeName(_)
+        | HirExprKind::Ident(_)
+        | HirExprKind::Break
+        | HirExprKind::Continue => {}
+    }
+}
+
+fn collect_pattern_response_artifacts(
+    pattern: &HirPattern,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerResponseArtifact>>,
+) {
+    match pattern {
+        HirPattern::Literal(expr)
+        | HirPattern::Guard(expr)
+        | HirPattern::Not(expr)
+        | HirPattern::Contains(expr) => collect_expr_response_artifacts(expr, route_origin_id, out),
+        HirPattern::Range { start, end, .. } => {
+            collect_expr_response_artifacts(start, route_origin_id, out);
+            collect_expr_response_artifacts(end, route_origin_id, out);
+        }
+        HirPattern::Wildcard => {}
+    }
 }
 
 fn route_response_origin_ids(route_origin_id: &str, origin_map: &OriginMap) -> Vec<String> {
@@ -1892,8 +2323,8 @@ function greet(name: string): string -> "hi {name}""#,
     #[test]
     fn origin_map_records_signal_and_await_client_markers() {
         let program = lower(
-            r#"let sig count: int = 0
-@out await count"#,
+            r"let sig count: int = 0
+@out await count",
         );
         let map = origin_map(&program);
 
@@ -2328,6 +2759,33 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.source_bundle.files[0]
             .content_hash
             .starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn server_runtime_artifact_with_program_records_static_response_body() {
+        let src = r#"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true, msg: "pong" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let source = native_server_handlers_source(&artifact);
+
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.body_kind, "static_json");
+        assert_eq!(
+            response.body_json.as_deref(),
+            Some(r#"{"ok":true,"msg":"pong"}"#)
+        );
+        assert!(source.contains("status: 200"));
+        assert!(source.contains(r#"body: "{\"ok\":true,\"msg\":\"pong\"}""#));
+        assert!(!source.contains("native route body lowering pending"));
     }
 
     #[test]

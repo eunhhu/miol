@@ -14920,7 +14920,8 @@ fn reveal_native_server_handlers_source(
         "handler_count_contract": source.contains("ORV_NATIVE_HANDLER_COUNT"),
         "body_lowering_placeholder": source.contains("native route body lowering pending"),
         "response_origin_dispatch": source.contains("pub response_origin_id: Option<&'static str>")
-            && source.contains("response_origin_id: route_match.route.response_origin_ids.first().copied()"),
+            && (source.contains("response_origin_id: route_match.route.response_origin_ids.first().copied()")
+                || source.contains("response_origin_id: Some(")),
     }))
 }
 
@@ -16513,9 +16514,10 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             .map(|file| (file.path.display().to_string(), file.source.clone())),
     );
     let server_artifact = manifest.capabilities.has_server.then(|| {
-        orv_compiler::server_runtime_artifact(
+        orv_compiler::server_runtime_artifact_with_program(
             &manifest,
             &origin_map,
+            &lowered.program,
             loaded
                 .files
                 .iter()
@@ -26590,11 +26592,10 @@ entry = "src/main.orv"
         );
         assert!(native_handlers_source_text
             .contains(&format!("response_origin_ids: &[\"{response_origin}\"]")));
-        assert!(native_handlers_source_text.contains(
-            "response_origin_id: route_match.route.response_origin_ids.first().copied()"
-        ));
-        assert!(native_handlers_source_text.contains("status: 501"));
-        assert!(native_handlers_source_text.contains("native route body lowering pending"));
+        assert!(native_handlers_source_text.contains("response_origin_id: Some("));
+        assert!(native_handlers_source_text.contains("status: 200"));
+        assert!(native_handlers_source_text.contains(r#"body: "{\"ok\":true,\"msg\":\"pong\"}""#));
+        assert!(!native_handlers_source_text.contains("native route body lowering pending"));
         let native_package =
             std::fs::read_to_string(&native_server_package_path).expect("native package");
         assert!(native_package.contains("name = \"orv-native-server\""));
@@ -26790,12 +26791,35 @@ entry = "src/main.orv"
             "pub const ORV_NATIVE_HANDLER_COUNT: usize = routes::ORV_NATIVE_ROUTE_COUNT;"
         ));
         assert!(source.contains("pub fn orv_native_handle_route("));
-        assert!(source.contains(
-            "response_origin_id: route_match.route.response_origin_ids.first().copied()"
-        ));
+        assert!(source.contains("response_origin_id: Some("));
         assert!(source.contains(response_origin));
-        assert!(source.contains("status: 501"));
-        assert!(source.contains("native route body lowering pending"));
+        assert!(source.contains("status: 200"));
+        assert!(source.contains(r#"body: "{\"ok\":true,\"msg\":\"pong\"}""#));
+        assert!(!source.contains("native route body lowering pending"));
+
+        cmd_verify_build(&out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_lowers_static_response_body_into_native_handler_source() {
+        let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+        let out = temp_output_dir("native-static-response-handler");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let response = &server_artifact["routes"][0]["responses"][0];
+        let handlers_source_path = out.join("server").join("native").join("handlers.rs");
+        let source = std::fs::read_to_string(&handlers_source_path).expect("handlers source");
+
+        assert_eq!(response["status"], 200);
+        assert_eq!(response["body_kind"], "static_json");
+        assert_eq!(response["body_json"], r#"{"ok":true,"msg":"pong"}"#);
+        assert!(source.contains("status: 200"));
+        assert!(source.contains(r#"body: "{\"ok\":true,\"msg\":\"pong\"}""#));
+        assert!(!source.contains("native route body lowering pending"));
 
         cmd_verify_build(&out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
@@ -29251,7 +29275,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["handlers_source"]["path"] == "server/native/handlers.rs"
                 && target["handlers_source"]["exists"] == true
                 && target["handlers_source"]["handler_count_contract"] == true
-                && target["handlers_source"]["body_lowering_placeholder"] == true
+                && target["handlers_source"]["body_lowering_placeholder"] == false
                 && target["handlers_source"]["response_origin_dispatch"] == true
                 && target["runtime_image"]["path"] == "server/runtime-image.json"
                 && target["runtime_image"]["reference_image"]
