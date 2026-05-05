@@ -27725,6 +27725,14 @@ entry = "src/main.orv"
   @route GET /products/:id {
     @respond 200 { id: @param.id as int }
   }
+  @route GET /products/:id/math {
+    @respond 200 {
+      prev: (@param.id as int) - 1,
+      doubled: (@param.id as int) * 2,
+      half: (@param.id as int) / 2,
+      parity: (@param.id as int) % 2
+    }
+  }
   @route GET /search {
     @respond 200 { page: @query.page as float }
   }
@@ -27788,12 +27796,15 @@ entry = "src/main.orv"
             .expect("native listen address");
 
         let route_response = send_raw_http(address, "/products/42");
+        let route_math_response = send_raw_http(address, "/products/13/math");
         let query_response = send_raw_http(address, "/search?page=12.5");
         let next_response = send_raw_http(address, "/search/next?page=12");
         let math_response = send_raw_http(address, "/search/math?page=13");
 
         assert!(route_response.starts_with("HTTP/1.1 200"));
         assert!(route_response.contains(r#"{"id":42}"#));
+        assert!(route_math_response.starts_with("HTTP/1.1 200"));
+        assert!(route_math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
         assert!(query_response.starts_with("HTTP/1.1 200"));
         assert!(query_response.contains(r#"{"page":12.5}"#));
         assert!(next_response.starts_with("HTTP/1.1 200"));

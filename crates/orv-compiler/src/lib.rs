@@ -390,6 +390,12 @@ pub struct ServerResponseRouteParamArtifact {
         skip_serializing_if = "is_default_route_param_value_kind"
     )]
     pub value_kind: String,
+    /// Arithmetic operation applied to the captured numeric value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Static JSON operand for numeric arithmetic operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operand_json: Option<String>,
 }
 
 /// One JSON object field backed by a captured query param.
@@ -2039,6 +2045,7 @@ pub fn orv_native_handle_route(
                             &mut source,
                             name,
                             &field.value_kind,
+                            NativeCapturedJsonOperation::none(),
                             &response.origin_id,
                         );
                     }
@@ -2198,6 +2205,7 @@ pub fn orv_native_handle_route(
                     &mut source,
                     &field.param,
                     &field.value_kind,
+                    native_route_param_operation(field),
                     &response.origin_id,
                 );
             }
@@ -2293,6 +2301,7 @@ fn push_native_route_param_json_value(
     source: &mut String,
     name: &str,
     value_kind: &str,
+    operation: NativeCapturedJsonOperation<'_>,
     response_origin_id: &str,
 ) -> bool {
     let lookup_expr = format!(
@@ -2303,7 +2312,7 @@ fn push_native_route_param_json_value(
         source,
         &lookup_expr,
         value_kind,
-        NativeCapturedJsonOperation::none(),
+        operation,
         &NativeCapturedJsonKinds {
             string_kind: "route_param",
             int_kind: "route_param_int",
@@ -2374,6 +2383,17 @@ fn native_response_field_operation(
         operand_json: field.operand_json.as_deref(),
         operand_kind: field.operand_kind.as_deref(),
         operand_name: field.operand_name.as_deref(),
+    }
+}
+
+fn native_route_param_operation(
+    field: &ServerResponseRouteParamArtifact,
+) -> NativeCapturedJsonOperation<'_> {
+    NativeCapturedJsonOperation {
+        op: field.op.as_deref(),
+        operand_json: field.operand_json.as_deref(),
+        operand_kind: None,
+        operand_name: None,
     }
 }
 
@@ -2649,6 +2669,7 @@ fn push_native_object_fields_body(
                     source,
                     name,
                     &field.value_kind,
+                    NativeCapturedJsonOperation::none(),
                     &response.origin_id,
                 );
             }
@@ -2772,6 +2793,7 @@ fn push_native_route_params_body(
             source,
             &field.param,
             &field.value_kind,
+            native_route_param_operation(field),
             &response.origin_id,
         );
     }
@@ -2968,11 +2990,13 @@ fn route_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseRoutePar
                 if field.is_spread {
                     return None;
                 }
-                let (param, value_kind) = route_param_field_value(&field.value)?;
+                let value = route_param_field_value(&field.value)?;
                 out.push(ServerResponseRouteParamArtifact {
                     field: field.name.clone(),
-                    param,
-                    value_kind,
+                    param: value.name,
+                    value_kind: value.value_kind,
+                    op: value.op,
+                    operand_json: value.operand_json,
                 });
             }
             Some(out)
@@ -3090,13 +3114,13 @@ fn mixed_response_object_field(
             name: None,
         });
     }
-    if let Some((name, value_kind)) = route_param_field_value(&field.value) {
+    if let Some(value) = route_param_field_value(&field.value).filter(|value| value.op.is_none()) {
         *has_dynamic = true;
         return Some(ServerResponseObjectFieldArtifact {
             field: field.name.clone(),
-            value_kind,
+            value_kind: value.value_kind,
             value_json: None,
-            name: Some(name),
+            name: Some(value.name),
         });
     }
     if let Some(value) = query_param_field_value(&field.value).filter(|value| value.op.is_none()) {
@@ -3149,17 +3173,45 @@ fn query_param_field_name(expr: &HirExpr) -> Option<String> {
     }
 }
 
-fn route_param_field_value(expr: &HirExpr) -> Option<(String, String)> {
+fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
-        HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => {
-            Some((route_param_field_name(expr)?, "route_param_int".to_string()))
+        HirExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+            ) =>
+        {
+            let mut value = route_param_field_value(lhs)?;
+            if value.value_kind != "route_param_int" || value.op.is_some() {
+                return None;
+            }
+            value.op = Some(
+                match op {
+                    BinaryOp::Add => "add",
+                    BinaryOp::Sub => "sub",
+                    BinaryOp::Mul => "mul",
+                    BinaryOp::Div => "div",
+                    BinaryOp::Rem => "rem",
+                    _ => return None,
+                }
+                .to_string(),
+            );
+            value.operand_json = Some(static_integer(rhs)?.to_string());
+            Some(value)
         }
-        HirExprKind::Cast { expr, ty } if is_float_type_ref(ty) => Some((
+        HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some(captured_response_value(
             route_param_field_name(expr)?,
-            "route_param_float".to_string(),
+            "route_param_int",
+        )),
+        HirExprKind::Cast { expr, ty } if is_float_type_ref(ty) => Some(captured_response_value(
+            route_param_field_name(expr)?,
+            "route_param_float",
         )),
         HirExprKind::Paren(expr) => route_param_field_value(expr),
-        _ => Some((route_param_field_name(expr)?, "route_param".to_string())),
+        _ => Some(captured_response_value(
+            route_param_field_name(expr)?,
+            "route_param",
+        )),
     }
 }
 
@@ -5627,6 +5679,63 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(!handlers.contains(
             "orv_native_push_json_string(routes::orv_native_param_value(route_match, \"id\")"
         ));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_route_param_int_static_arithmetic_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:id {
+    @respond 200 {
+      prev: (@param.id as int) - 1,
+      doubled: (@param.id as int) * 2,
+      half: (@param.id as int) / 2,
+      parity: (@param.id as int) % 2
+    }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "route_param_json");
+        assert_eq!(response.body_route_params.len(), 4);
+        assert_eq!(response.body_route_params[0].op.as_deref(), Some("sub"));
+        assert_eq!(
+            response.body_route_params[0].operand_json.as_deref(),
+            Some("1")
+        );
+        assert_eq!(response.body_route_params[1].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_route_params[1].operand_json.as_deref(),
+            Some("2")
+        );
+        assert_eq!(response.body_route_params[2].op.as_deref(), Some("div"));
+        assert_eq!(
+            response.body_route_params[2].operand_json.as_deref(),
+            Some("2")
+        );
+        assert_eq!(response.body_route_params[3].op.as_deref(), Some("rem"));
+        assert_eq!(
+            response.body_route_params[3].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("value.checked_sub(1)"));
+        assert!(handlers.contains("value.checked_mul(2)"));
+        assert!(handlers.contains("value.checked_div(2)"));
+        assert!(handlers.contains("value.checked_rem(2)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
