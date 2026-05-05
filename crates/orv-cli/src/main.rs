@@ -14445,6 +14445,7 @@ fn reveal_native_server_targets(
                 .get("target")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "runtime_image": reveal_native_runtime_image_plan(dir, &native_plan)?,
             "commands": native_plan
                 .get("commands")
                 .cloned()
@@ -14461,6 +14462,58 @@ fn reveal_native_server_targets(
         }));
     }
     Ok(targets)
+}
+
+fn reveal_native_runtime_image_plan(
+    dir: &Path,
+    native_plan: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(path) = native_plan
+        .get("runtime_image_plan")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let target_path = dir.join(path);
+    if !target_path.is_file() {
+        return Ok(serde_json::json!({
+            "path": path,
+            "exists": false,
+        }));
+    }
+    let image_plan = read_json_value(&target_path)?;
+    Ok(serde_json::json!({
+        "path": path,
+        "exists": true,
+        "kind": image_plan
+            .get("kind")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "status": image_plan
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "artifact": image_plan
+            .get("artifact")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "reference_image": image_plan
+            .get("reference_image")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "target": image_plan
+            .get("target")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_features": image_plan
+            .get("runtime_features")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "blocked_by": image_plan
+            .get("blocked_by")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    }))
 }
 
 fn reveal_client_targets(
@@ -27789,6 +27842,10 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["path"] == "server/native-server.json"
                 && target["artifact"] == "server/app.orv-runtime.json"
                 && target["target"]["path"] == "server/app"
+                && target["runtime_image"]["path"] == "server/runtime-image.json"
+                && target["runtime_image"]["reference_image"]
+                    == "ghcr.io/orv-lang/orv-reference:latest"
+                && target["runtime_image"]["target"]["image"] == "orv-native-server:latest"
                 && target["commands"]["build"]
                     == serde_json::json!([
                         "cargo",
