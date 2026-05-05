@@ -32,6 +32,9 @@ pub const SERVER_RUNTIME_ARTIFACT_VERSION: u32 = 1;
 /// Current server launch artifact schema version.
 pub const SERVER_LAUNCH_ARTIFACT_VERSION: u32 = 1;
 
+/// Current native server plan artifact schema version.
+pub const NATIVE_SERVER_PLAN_ARTIFACT_VERSION: u32 = 1;
+
 /// Current build source bundle artifact schema version.
 pub const SOURCE_BUNDLE_ARTIFACT_VERSION: u32 = 1;
 
@@ -130,6 +133,72 @@ pub struct ServerLaunchArtifact {
     /// Source-backed listen descriptor used by the reference server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<ServerListenArtifact>,
+}
+
+/// Planned native server output descriptor.
+///
+/// This does not represent a completed native binary. It records the reference
+/// launcher package/source and the commands that bridge the current artifact to
+/// the future native server target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeServerPlanArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Artifact kind.
+    pub kind: String,
+    /// Planning status, currently `planned`.
+    pub status: String,
+    /// Runtime model used before native codegen exists.
+    pub runtime: String,
+    /// Runtime layers required by this server artifact.
+    pub runtime_features: Vec<String>,
+    /// Relative server runtime artifact path.
+    pub artifact: String,
+    /// Relative server launch artifact path.
+    pub launcher: String,
+    /// Relative generated Rust launcher source path.
+    pub source: String,
+    /// Relative generated Rust launcher package path.
+    pub package: String,
+    /// Planned final native target.
+    pub target: NativeServerTargetArtifact,
+    /// Generated reference launcher commands.
+    pub commands: NativeServerCommands,
+    /// Blockers before this can become a final zero-overhead native runtime.
+    pub blocked_by: Vec<String>,
+    /// Source-backed listen descriptor used by the reference server.
+    pub listen: Option<ServerListenArtifact>,
+    /// HTTP route descriptors reachable through this launcher.
+    pub routes: Vec<ServerRouteArtifact>,
+}
+
+/// Planned final native target descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeServerTargetArtifact {
+    /// Target kind, currently `server_binary`.
+    pub kind: String,
+    /// Planned output path.
+    pub path: String,
+    /// Transport protocol used by the target.
+    pub protocol: String,
+}
+
+/// Generated native launcher commands.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeServerCommands {
+    /// Build command argv.
+    pub build: Vec<String>,
+    /// Run command argv and environment.
+    pub run: NativeServerRunCommand,
+}
+
+/// Generated native launcher run command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeServerRunCommand {
+    /// Environment variables for the command.
+    pub env: HashMap<String, String>,
+    /// Run command argv.
+    pub command: Vec<String>,
 }
 
 /// Source snapshot embedded in the reference runtime artifact.

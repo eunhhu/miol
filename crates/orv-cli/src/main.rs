@@ -16663,43 +16663,42 @@ fn write_native_server_plan_artifact(
     native_server_package_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
-    let plan = serde_json::json!({
-        "schema_version": 1,
-        "kind": "native_server_plan",
-        "status": "planned",
-        "runtime": server_artifact.runtime.clone(),
-        "runtime_features": server_artifact.runtime_features.clone(),
-        "artifact": server_artifact_path,
-        "launcher": server_launch_path,
-        "source": native_server_source_path,
-        "package": native_server_package_path,
-        "target": {
-            "kind": "server_binary",
-            "path": NATIVE_SERVER_BINARY_PATH,
-            "protocol": "http1",
+    let plan = orv_compiler::NativeServerPlanArtifact {
+        schema_version: orv_compiler::NATIVE_SERVER_PLAN_ARTIFACT_VERSION,
+        kind: "native_server_plan".to_string(),
+        status: "planned".to_string(),
+        runtime: server_artifact.runtime.clone(),
+        runtime_features: server_artifact.runtime_features.clone(),
+        artifact: server_artifact_path.to_string(),
+        launcher: server_launch_path.to_string(),
+        source: native_server_source_path.to_string(),
+        package: native_server_package_path.to_string(),
+        target: orv_compiler::NativeServerTargetArtifact {
+            kind: "server_binary".to_string(),
+            path: NATIVE_SERVER_BINARY_PATH.to_string(),
+            protocol: "http1".to_string(),
         },
-        "commands": {
-            "build": [
-                "cargo",
-                "build",
-                "--manifest-path",
-                native_server_package_path,
-                "--release",
+        commands: orv_compiler::NativeServerCommands {
+            build: vec![
+                "cargo".to_string(),
+                "build".to_string(),
+                "--manifest-path".to_string(),
+                native_server_package_path.to_string(),
+                "--release".to_string(),
             ],
-            "run": {
-                "env": {
-                    "ORV_BUILD_DIR": ".",
-                },
-                "command": [
-                    NATIVE_SERVER_LAUNCHER_BINARY_PATH,
-                ],
+            run: orv_compiler::NativeServerRunCommand {
+                env: HashMap::from([("ORV_BUILD_DIR".to_string(), ".".to_string())]),
+                command: vec![NATIVE_SERVER_LAUNCHER_BINARY_PATH.to_string()],
             },
         },
-        "blocked_by": ["native-codegen", "native-runtime-image"],
-        "listen": server_artifact.listen.clone(),
-        "routes": server_artifact.routes.clone(),
-    });
-    write_json(&out.join(path), &plan)
+        blocked_by: vec![
+            "native-codegen".to_string(),
+            "native-runtime-image".to_string(),
+        ],
+        listen: server_artifact.listen.clone(),
+        routes: server_artifact.routes.clone(),
+    };
+    write_json(&out.join(path), &serde_json::to_value(plan)?)
 }
 
 fn write_native_server_launcher_source(
