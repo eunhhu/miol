@@ -854,6 +854,18 @@ pub fn orv_native_match_route(method: &str, path: &str) -> Option<OrvNativeRoute
         })
 }
 
+#[allow(dead_code)]
+pub fn orv_native_param_value<'a>(
+    route_match: &'a OrvNativeRouteMatch,
+    name: &str,
+) -> Option<&'a str> {
+    route_match
+        .params
+        .iter()
+        .find(|param| param.name == name)
+        .map(|param| param.value.as_str())
+}
+
 fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec<OrvNativeParam>> {
     if pattern == "*" {
         return Some(Vec::new());
@@ -2194,6 +2206,28 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("if let Some(name) = pattern_segment.strip_prefix(':')"));
         assert!(source.contains("name,"));
         assert!(source.contains("value: (*path_segment).to_string()"));
+    }
+
+    #[test]
+    fn native_server_routes_source_generates_param_lookup_helper() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:sku {
+    @respond 200 { ok: true }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact = server_runtime_artifact(&manifest, &map, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("#[allow(dead_code)]"));
+        assert!(source.contains("pub fn orv_native_param_value<'a>("));
+        assert!(source.contains("route_match: &'a OrvNativeRouteMatch"));
+        assert!(source.contains(") -> Option<&'a str>"));
+        assert!(source.contains(".find(|param| param.name == name)"));
+        assert!(source.contains(".map(|param| param.value.as_str())"));
     }
 
     #[test]

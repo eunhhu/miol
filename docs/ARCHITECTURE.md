@@ -151,7 +151,7 @@ HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.js
 
 운영 세부와 검증 항목은 [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md)의 build/deploy 섹션에 둔다. 언어 목표 모델과 구현 상태 delta는 [SPEC.md](SPEC.md) §13에 둔다.
 
-`server/runtime-image.json`은 reference runtime image, planned OCI image tag, native binary path, route/listen/runtime feature shape를 같은 schema로 고정한다. `server/native/routes.rs`는 같은 route descriptors를 Rust route table and `:param`/`:rest*`-aware matcher and param-capture source로 고정해 future native router codegen 입력을 만든다. `deploy/manifest.json`은 이를 `server.native_runtime_image_plan`과 `server.native_routes_source`로 참조하고, `orv verify-build`는 native plan, image plan, route source가 같은 server artifact를 가리키는지 검증한다.
+`server/runtime-image.json`은 reference runtime image, planned OCI image tag, native binary path, route/listen/runtime feature shape를 같은 schema로 고정한다. `server/native/routes.rs`는 같은 route descriptors를 Rust route table and `:param`/`:rest*`-aware matcher, param-capture, lookup-helper source로 고정해 future native router codegen 입력을 만든다. `deploy/manifest.json`은 이를 `server.native_runtime_image_plan`과 `server.native_routes_source`로 참조하고, `orv verify-build`는 native plan, image plan, route source가 같은 server artifact를 가리키는지 검증한다.
 
 ### 로드맵: 의미 기반 프로젝트 그래프 확장
 
