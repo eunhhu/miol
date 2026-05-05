@@ -9,7 +9,7 @@
 
 @server {
   @listen 0
-  let shopdb = @db.connect "sqlite://data/shop.sqlite"
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
 
   @route GET /health {
     @respond 200 { ok: true, service: "shopping" }

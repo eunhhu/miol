@@ -2192,6 +2192,8 @@ Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-m
 \n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
+Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to point the generated shop at a different supported DB adapter URL without editing source.\n\
+\n\
 Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints without editing source.\n\
@@ -14558,6 +14560,17 @@ fn verify_deploy_runbook_artifact(
             anyhow::bail!("deploy runbook must document persistent DB path {path}");
         }
     }
+    for env in &persistence.db_env {
+        if !runbook.contains(&env.env) {
+            let variable = &env.env;
+            anyhow::bail!("deploy runbook must document DB adapter env {variable}");
+        }
+        if let Some(default) = &env.default {
+            if !runbook.contains(default) {
+                anyhow::bail!("deploy runbook must document DB adapter env default {default}");
+            }
+        }
+    }
     for path in &persistence.record_paths {
         if !runbook.contains(path) {
             anyhow::bail!("deploy runbook must document commerce record path {path}");
@@ -17002,14 +17015,15 @@ fn validate_prod_server_listen(
 struct DeployPersistence {
     wal_paths: Vec<String>,
     db_paths: Vec<String>,
+    db_env: Vec<DeployAdapterEnv>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
-    commerce_env: Vec<DeployCommerceEnv>,
+    commerce_env: Vec<DeployAdapterEnv>,
     volumes: Vec<DeployPersistenceVolume>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct DeployCommerceEnv {
+struct DeployAdapterEnv {
     env: String,
     default: Option<String>,
 }
@@ -17018,9 +17032,10 @@ struct DeployCommerceEnv {
 struct DeployPersistenceAccumulator {
     wal_paths: Vec<String>,
     db_paths: Vec<String>,
+    db_env: Vec<DeployAdapterEnv>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
-    commerce_env: Vec<DeployCommerceEnv>,
+    commerce_env: Vec<DeployAdapterEnv>,
 }
 
 impl DeployPersistenceAccumulator {
@@ -17029,6 +17044,8 @@ impl DeployPersistenceAccumulator {
         self.wal_paths.dedup();
         self.db_paths.sort();
         self.db_paths.dedup();
+        self.db_env.sort();
+        self.db_env.dedup();
         self.record_paths.sort();
         self.record_paths.dedup();
         self.commerce_endpoints.sort();
@@ -17044,6 +17061,7 @@ impl DeployPersistenceAccumulator {
             volumes: deploy_persistence_volumes(&persistent_paths),
             wal_paths: self.wal_paths,
             db_paths: self.db_paths,
+            db_env: self.db_env,
             record_paths: self.record_paths,
             commerce_endpoints: self.commerce_endpoints,
             commerce_env: self.commerce_env,
@@ -17097,14 +17115,10 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
     serde_json::json!({
         "wal_paths": persistence.wal_paths,
         "db_paths": persistence.db_paths,
+        "db_env": deploy_adapter_env_value(&persistence.db_env),
         "record_paths": persistence.record_paths,
         "commerce_endpoints": persistence.commerce_endpoints,
-        "commerce_env": persistence.commerce_env.iter().map(|env| {
-            serde_json::json!({
-                "env": env.env,
-                "default": env.default.as_deref(),
-            })
-        }).collect::<Vec<_>>(),
+        "commerce_env": deploy_adapter_env_value(&persistence.commerce_env),
         "volumes": persistence.volumes.iter().map(|volume| {
             serde_json::json!({
                 "host": volume.host,
@@ -17113,6 +17127,17 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn deploy_adapter_env_value(envs: &[DeployAdapterEnv]) -> Vec<serde_json::Value> {
+    envs.iter()
+        .map(|env| {
+            serde_json::json!({
+                "env": env.env,
+                "default": env.default.as_deref(),
+            })
+        })
+        .collect()
 }
 
 fn deploy_persistence_volumes(wal_paths: &[String]) -> Vec<DeployPersistenceVolume> {
@@ -17164,6 +17189,7 @@ fn deploy_compose_volumes(persistence: &DeployPersistence) -> String {
 fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String {
     if persistence.wal_paths.is_empty()
         && persistence.db_paths.is_empty()
+        && persistence.db_env.is_empty()
         && persistence.record_paths.is_empty()
         && persistence.commerce_endpoints.is_empty()
         && persistence.commerce_env.is_empty()
@@ -17176,6 +17202,16 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     }
     for path in &persistence.db_paths {
         let _ = writeln!(out, "- DB: {path}");
+    }
+    for env in &persistence.db_env {
+        match &env.default {
+            Some(default) => {
+                let _ = writeln!(out, "- DB adapter env: {} default {default}", env.env);
+            }
+            None => {
+                let _ = writeln!(out, "- DB adapter env: {}", env.env);
+            }
+        }
     }
     for path in &persistence.record_paths {
         let _ = writeln!(out, "- Record log: {path}");
@@ -17268,19 +17304,8 @@ fn collect_expr_persistence_paths(expr: &orv_hir::HirExpr, out: &mut DeployPersi
                 out.wal_paths.push(path);
             }
         } else if call_name == "@db.connect" {
-            if let Some(path) = args
-                .first()
-                .and_then(hir_static_string)
-                .and_then(|url| file_adapter_path(&url))
-            {
-                out.wal_paths.push(path);
-            }
-            if let Some(path) = args
-                .first()
-                .and_then(hir_static_string)
-                .and_then(|url| sqlite_adapter_path(&url))
-            {
-                out.db_paths.push(path);
+            if let Some(arg) = args.first() {
+                collect_db_adapter_persistence_arg(arg, out);
             }
         } else if matches!(call_name.as_str(), "@payment.connect" | "@shipping.connect") {
             if let Some(arg) = args.first() {
@@ -17480,6 +17505,30 @@ fn http_adapter_endpoint(url: &str) -> Option<String> {
         .map(|_| url.to_string())
 }
 
+fn collect_db_adapter_persistence_arg(
+    arg: &orv_hir::HirExpr,
+    out: &mut DeployPersistenceAccumulator,
+) {
+    if let Some(url) = hir_static_string(arg) {
+        collect_db_adapter_url(&url, out);
+    }
+    if let Some(env) = hir_env_configured_string(arg) {
+        if let Some(default) = &env.default {
+            collect_db_adapter_url(default, out);
+        }
+        out.db_env.push(env);
+    }
+}
+
+fn collect_db_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
+    if let Some(path) = file_adapter_path(url) {
+        out.wal_paths.push(path);
+    }
+    if let Some(path) = sqlite_adapter_path(url) {
+        out.db_paths.push(path);
+    }
+}
+
 fn collect_commerce_adapter_persistence_arg(
     arg: &orv_hir::HirExpr,
     out: &mut DeployPersistenceAccumulator,
@@ -17504,7 +17553,7 @@ fn collect_commerce_adapter_url(url: &str, out: &mut DeployPersistenceAccumulato
     }
 }
 
-fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployCommerceEnv> {
+fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployAdapterEnv> {
     match &expr.kind {
         orv_hir::HirExprKind::Paren(inner) => hir_env_configured_string(inner),
         orv_hir::HirExprKind::Binary {
@@ -17513,12 +17562,12 @@ fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployCommerceEn
             rhs,
         } => {
             let env = hir_env_variable(lhs)?;
-            Some(DeployCommerceEnv {
+            Some(DeployAdapterEnv {
                 env,
                 default: hir_static_string(rhs),
             })
         }
-        _ => hir_env_variable(expr).map(|env| DeployCommerceEnv { env, default: None }),
+        _ => hir_env_variable(expr).map(|env| DeployAdapterEnv { env, default: None }),
     }
 }
 
@@ -17648,6 +17697,14 @@ fn deploy_compose_environment_lines(
     let mut lines = Vec::new();
     if let Some(port) = deploy_compose_port(listen) {
         lines.push(port.environment);
+    }
+    for env in &persistence.db_env {
+        let variable = &env.env;
+        let value = match &env.default {
+            Some(default) => format!("{variable}: \"${{{variable}:-{default}}}\""),
+            None => format!("{variable}: \"${{{variable}}}\""),
+        };
+        lines.push(value);
     }
     for env in &persistence.commerce_env {
         let variable = &env.env;
@@ -19321,7 +19378,9 @@ test "checkout failing runtime body" {
         let entry = dir.join("src").join("main.orv");
         let source = std::fs::read_to_string(&entry).expect("entry source");
         assert!(source.contains("@listen 8080"));
-        assert!(source.contains(r#"let shopdb = @db.connect "sqlite://data/shop.sqlite""#));
+        assert!(source.contains(
+            r#"let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")"#
+        ));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
         assert!(source.contains("@a href=\"/admin\" \"Admin dashboard\""));
@@ -19374,6 +19433,7 @@ test "checkout failing runtime body" {
             .contains("ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server"));
         assert!(guide.contains("The generated launcher path can infer `dist`"));
         assert!(guide.contains("Persistent database: `data/shop.sqlite`"));
+        assert!(guide.contains("SHOP_DATABASE_URL"));
         assert!(guide.contains("Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`"));
         assert!(guide.contains("PAYMENT_ADAPTER_URL"));
         assert!(guide.contains("SHIPPING_ADAPTER_URL"));
@@ -19467,6 +19527,15 @@ test "checkout failing runtime body" {
             serde_json::json!("data/shop.sqlite")
         );
         assert_eq!(
+            deploy["server"]["persistence"]["db_env"],
+            serde_json::json!([
+                {
+                    "env": "SHOP_DATABASE_URL",
+                    "default": "sqlite://data/shop.sqlite"
+                }
+            ])
+        );
+        assert_eq!(
             deploy["server"]["persistence"]["record_paths"],
             serde_json::json!(["data/payments.jsonl", "data/shipments.jsonl"])
         );
@@ -19492,6 +19561,8 @@ test "checkout failing runtime body" {
             serde_json::json!("/app/data")
         );
         assert!(compose.contains("../data:/app/data"));
+        assert!(compose
+            .contains(r#"SHOP_DATABASE_URL: "${SHOP_DATABASE_URL:-sqlite://data/shop.sqlite}""#));
         assert!(compose.contains(
             r#"PAYMENT_ADAPTER_URL: "${PAYMENT_ADAPTER_URL:-file://data/payments.jsonl}""#
         ));
@@ -19500,6 +19571,8 @@ test "checkout failing runtime body" {
         ));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
+        assert!(runbook
+            .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
         assert!(runbook.contains("- Record log: data/shipments.jsonl"));
         assert!(runbook.contains(
@@ -28536,6 +28609,61 @@ entry = "src/main.orv"
         );
         assert!(compose.contains("../data:/app/data"));
         assert!(runbook.contains("- DB: data/app.sqlite"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_records_env_configured_sqlite_db_adapter() {
+        let dir = temp_output_dir("build-prod-env-sqlite-db-connect-source");
+        std::fs::create_dir_all(&dir).expect("create env sqlite db source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let appdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/app.sqlite")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write env sqlite db source");
+        let out = temp_output_dir("build-prod-env-sqlite-db-connect");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["db_paths"],
+            serde_json::json!(["data/app.sqlite"])
+        );
+        assert_eq!(
+            deploy["server"]["persistence"]["db_env"],
+            serde_json::json!([
+                {
+                    "env": "SHOP_DATABASE_URL",
+                    "default": "sqlite://data/app.sqlite"
+                }
+            ])
+        );
+        assert_eq!(
+            container["persistence"]["db_env"],
+            deploy["server"]["persistence"]["db_env"]
+        );
+        assert!(compose.contains("../data:/app/data"));
+        assert!(compose
+            .contains(r#"SHOP_DATABASE_URL: "${SHOP_DATABASE_URL:-sqlite://data/app.sqlite}""#));
+        assert!(runbook.contains("- DB: data/app.sqlite"));
+        assert!(runbook
+            .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/app.sqlite"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
