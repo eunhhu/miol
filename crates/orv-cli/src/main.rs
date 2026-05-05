@@ -14276,6 +14276,7 @@ fn verify_deploy_server_target(
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
     let env_example = json_str(server, "env_example", "deploy server")?;
+    let commerce_adapters = json_str(server, "commerce_adapters", "deploy server")?;
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -14349,12 +14350,16 @@ fn verify_deploy_server_target(
         &persistence,
     )?;
     verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
+    verify_deploy_commerce_adapters_artifact(dir, commerce_adapters, artifact_path, &persistence)?;
     verify_deploy_runbook_artifact(
         dir,
         runbook,
-        compose,
-        env_example,
-        routes_artifact,
+        &DeployRunbookArtifacts {
+            compose,
+            env_example,
+            commerce_adapters,
+            routes: routes_artifact,
+        },
         &artifact,
         &persistence,
     )?;
@@ -14532,12 +14537,54 @@ fn verify_deploy_env_example_artifact(
     Ok(())
 }
 
+fn verify_deploy_commerce_adapters_artifact(
+    dir: &Path,
+    path: &str,
+    artifact_path: &str,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let adapters_path = dir.join(path);
+    if !adapters_path.is_file() {
+        anyhow::bail!(
+            "missing deploy commerce adapters artifact: {}",
+            adapters_path.display()
+        );
+    }
+    let adapters = read_json_value(&adapters_path)?;
+    if adapters
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy commerce adapters schema_version must be 1");
+    }
+    if json_str(&adapters, "kind", "deploy commerce adapters")? != "orv.deploy.commerce_adapters" {
+        anyhow::bail!("deploy commerce adapters kind must be orv.deploy.commerce_adapters");
+    }
+    if json_str(&adapters, "artifact", "deploy commerce adapters")? != artifact_path {
+        anyhow::bail!("deploy commerce adapters artifact must be {artifact_path}");
+    }
+    if adapters.get("adapters")
+        != Some(&serde_json::Value::Array(deploy_commerce_adapter_value(
+            &persistence.commerce_adapters,
+        )))
+    {
+        anyhow::bail!("deploy commerce adapters do not match runtime artifact persistence");
+    }
+    Ok(())
+}
+
+struct DeployRunbookArtifacts<'a> {
+    compose: &'a str,
+    env_example: &'a str,
+    commerce_adapters: &'a str,
+    routes: &'a str,
+}
+
 fn verify_deploy_runbook_artifact(
     dir: &Path,
     path: &str,
-    compose_path: &str,
-    env_example_path: &str,
-    routes_artifact: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
     artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
@@ -14547,15 +14594,21 @@ fn verify_deploy_runbook_artifact(
     }
     let runbook = std::fs::read_to_string(&runbook_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", runbook_path.display()))?;
-    let compose_command = format!("docker compose -f {compose_path} up --build");
+    let compose_command = format!("docker compose -f {} up --build", artifacts.compose);
     if !runbook.contains(&compose_command) {
         anyhow::bail!("deploy runbook must include compose launch command");
     }
-    if !runbook.contains(routes_artifact) {
+    if !runbook.contains(artifacts.routes) {
+        let routes_artifact = artifacts.routes;
         anyhow::bail!("deploy runbook must reference {routes_artifact}");
     }
-    if !runbook.contains(env_example_path) {
+    if !runbook.contains(artifacts.env_example) {
+        let env_example_path = artifacts.env_example;
         anyhow::bail!("deploy runbook must reference {env_example_path}");
+    }
+    if !runbook.contains(artifacts.commerce_adapters) {
+        let commerce_adapters_path = artifacts.commerce_adapters;
+        anyhow::bail!("deploy runbook must reference {commerce_adapters_path}");
     }
     if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document request trace capture command");
@@ -17044,6 +17097,7 @@ struct DeployPersistence {
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
     commerce_env: Vec<DeployAdapterEnv>,
+    commerce_adapters: Vec<DeployCommerceAdapter>,
     volumes: Vec<DeployPersistenceVolume>,
 }
 
@@ -17051,6 +17105,16 @@ struct DeployPersistence {
 struct DeployAdapterEnv {
     env: String,
     default: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DeployCommerceAdapter {
+    kind: String,
+    mode: String,
+    env: Option<String>,
+    default: Option<String>,
+    endpoint: Option<String>,
+    record_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -17061,6 +17125,7 @@ struct DeployPersistenceAccumulator {
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
     commerce_env: Vec<DeployAdapterEnv>,
+    commerce_adapters: Vec<DeployCommerceAdapter>,
 }
 
 impl DeployPersistenceAccumulator {
@@ -17077,6 +17142,8 @@ impl DeployPersistenceAccumulator {
         self.commerce_endpoints.dedup();
         self.commerce_env.sort();
         self.commerce_env.dedup();
+        self.commerce_adapters.sort();
+        self.commerce_adapters.dedup();
         let mut persistent_paths = self.wal_paths.clone();
         persistent_paths.extend(self.db_paths.clone());
         persistent_paths.extend(self.record_paths.clone());
@@ -17090,6 +17157,7 @@ impl DeployPersistenceAccumulator {
             record_paths: self.record_paths,
             commerce_endpoints: self.commerce_endpoints,
             commerce_env: self.commerce_env,
+            commerce_adapters: self.commerce_adapters,
         }
     }
 }
@@ -17144,6 +17212,7 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
         "record_paths": persistence.record_paths,
         "commerce_endpoints": persistence.commerce_endpoints,
         "commerce_env": deploy_adapter_env_value(&persistence.commerce_env),
+        "commerce_adapters": deploy_commerce_adapter_value(&persistence.commerce_adapters),
         "volumes": persistence.volumes.iter().map(|volume| {
             serde_json::json!({
                 "host": volume.host,
@@ -17163,6 +17232,40 @@ fn deploy_adapter_env_value(envs: &[DeployAdapterEnv]) -> Vec<serde_json::Value>
             })
         })
         .collect()
+}
+
+fn deploy_commerce_adapter_value(adapters: &[DeployCommerceAdapter]) -> Vec<serde_json::Value> {
+    adapters
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "kind": adapter.kind,
+                "mode": adapter.mode,
+                "env": adapter.env.as_deref(),
+                "default": adapter.default.as_deref(),
+                "endpoint": adapter.endpoint.as_deref(),
+                "record_path": adapter.record_path.as_deref(),
+                "request": deploy_commerce_adapter_request_value(&adapter.kind),
+            })
+        })
+        .collect()
+}
+
+fn deploy_commerce_adapter_request_value(kind: &str) -> serde_json::Value {
+    let (request_kind, payload) = match kind {
+        "payment" => ("payment.capture", "payment capture payload"),
+        "shipping" => ("shipping.booking", "shipping booking payload"),
+        _ => ("commerce.request", "commerce payload"),
+    };
+    serde_json::json!({
+        "method": "POST",
+        "content_type": "application/json",
+        "kind": request_kind,
+        "body": {
+            "kind": request_kind,
+            "payload": payload,
+        },
+    })
 }
 
 fn deploy_persistence_volumes(wal_paths: &[String]) -> Vec<DeployPersistenceVolume> {
@@ -17334,7 +17437,12 @@ fn collect_expr_persistence_paths(expr: &orv_hir::HirExpr, out: &mut DeployPersi
             }
         } else if matches!(call_name.as_str(), "@payment.connect" | "@shipping.connect") {
             if let Some(arg) = args.first() {
-                collect_commerce_adapter_persistence_arg(arg, out);
+                let kind = if call_name == "@payment.connect" {
+                    "payment"
+                } else {
+                    "shipping"
+                };
+                collect_commerce_adapter_persistence_arg(kind, arg, out);
             }
         }
     }
@@ -17555,27 +17663,64 @@ fn collect_db_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
 }
 
 fn collect_commerce_adapter_persistence_arg(
+    kind: &str,
     arg: &orv_hir::HirExpr,
     out: &mut DeployPersistenceAccumulator,
 ) {
     if let Some(url) = hir_static_string(arg) {
-        collect_commerce_adapter_url(&url, out);
+        collect_commerce_adapter_url(kind, &url, None, None, out);
     }
     if let Some(env) = hir_env_configured_string(arg) {
         if let Some(default) = &env.default {
-            collect_commerce_adapter_url(default, out);
+            collect_commerce_adapter_url(
+                kind,
+                default,
+                Some(env.env.clone()),
+                Some(default.clone()),
+                out,
+            );
+        } else {
+            out.commerce_adapters.push(DeployCommerceAdapter {
+                kind: kind.to_string(),
+                mode: "env".to_string(),
+                env: Some(env.env.clone()),
+                default: None,
+                endpoint: None,
+                record_path: None,
+            });
         }
         out.commerce_env.push(env);
     }
 }
 
-fn collect_commerce_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
+fn collect_commerce_adapter_url(
+    kind: &str,
+    url: &str,
+    env: Option<String>,
+    default: Option<String>,
+    out: &mut DeployPersistenceAccumulator,
+) {
+    let mut mode = "local".to_string();
+    let mut record_path = None;
+    let mut endpoint = None;
     if let Some(path) = file_adapter_path(url) {
+        mode = "file".to_string();
+        record_path = Some(path.clone());
         out.record_paths.push(path);
     }
-    if let Some(endpoint) = http_adapter_endpoint(url) {
-        out.commerce_endpoints.push(endpoint);
+    if let Some(http_endpoint) = http_adapter_endpoint(url) {
+        mode = "http".to_string();
+        endpoint = Some(http_endpoint.clone());
+        out.commerce_endpoints.push(http_endpoint);
     }
+    out.commerce_adapters.push(DeployCommerceAdapter {
+        kind: kind.to_string(),
+        mode,
+        env,
+        default,
+        endpoint,
+        record_path,
+    });
 }
 
 fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployAdapterEnv> {
@@ -18281,6 +18426,7 @@ fn write_prod_deploy_artifacts(
         let dockerfile = "deploy/Dockerfile";
         let compose = "deploy/compose.yaml";
         let env_example = "deploy/env.example";
+        let commerce_adapters = "deploy/commerce-adapters.json";
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -18296,10 +18442,17 @@ fn write_prod_deploy_artifacts(
         )?;
         write_prod_compose_artifact(out, dockerfile, server_artifact, &persistence)?;
         write_prod_env_example_artifact(out, env_example, server_artifact, &persistence)?;
+        write_prod_commerce_adapters_artifact(
+            out,
+            commerce_adapters,
+            targets.server_artifact,
+            &persistence,
+        )?;
         write_prod_deploy_runbook(
             out,
             compose,
             env_example,
+            commerce_adapters,
             routes_artifact,
             server_artifact,
             &persistence,
@@ -18319,6 +18472,7 @@ fn write_prod_deploy_artifacts(
             "dockerfile": dockerfile,
             "compose": compose,
             "env_example": env_example,
+            "commerce_adapters": commerce_adapters,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
@@ -18450,10 +18604,26 @@ fn write_prod_env_example_artifact(
     write_text(&out.join(path), &env_example)
 }
 
+fn write_prod_commerce_adapters_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact_path: &str,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let artifact = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.deploy.commerce_adapters",
+        "artifact": server_artifact_path,
+        "adapters": deploy_commerce_adapter_value(&persistence.commerce_adapters),
+    });
+    write_json(&out.join(path), &artifact)
+}
+
 fn write_prod_deploy_runbook(
     out: &Path,
     compose_path: &str,
     env_example_path: &str,
+    commerce_adapters_path: &str,
     routes_artifact: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
@@ -18481,6 +18651,7 @@ fn write_prod_deploy_runbook(
 
 - Compose: {compose_path}
 - Env example: {env_example_path}
+- Commerce adapters: {commerce_adapters_path}
 - Routes: {routes_artifact}
 
 ## Native Launcher
@@ -19558,6 +19729,8 @@ test "checkout failing runtime body" {
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         let env_example =
             std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
+        let commerce_adapters = read_json_value(&out.join("deploy").join("commerce-adapters.json"))
+            .expect("commerce adapters");
         let native_routes =
             std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
                 .expect("native routes source");
@@ -19632,6 +19805,10 @@ test "checkout failing runtime body" {
             serde_json::json!(["data/payments.jsonl", "data/shipments.jsonl"])
         );
         assert_eq!(
+            deploy["server"]["commerce_adapters"],
+            serde_json::json!("deploy/commerce-adapters.json")
+        );
+        assert_eq!(
             deploy["server"]["persistence"]["commerce_env"],
             serde_json::json!([
                 {
@@ -19641,6 +19818,45 @@ test "checkout failing runtime body" {
                 {
                     "env": "SHIPPING_ADAPTER_URL",
                     "default": "file://data/shipments.jsonl"
+                }
+            ])
+        );
+        assert_eq!(
+            commerce_adapters["adapters"],
+            serde_json::json!([
+                {
+                    "kind": "payment",
+                    "mode": "file",
+                    "env": "PAYMENT_ADAPTER_URL",
+                    "default": "file://data/payments.jsonl",
+                    "endpoint": null,
+                    "record_path": "data/payments.jsonl",
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "payment.capture",
+                        "body": {
+                            "kind": "payment.capture",
+                            "payload": "payment capture payload"
+                        }
+                    }
+                },
+                {
+                    "kind": "shipping",
+                    "mode": "file",
+                    "env": "SHIPPING_ADAPTER_URL",
+                    "default": "file://data/shipments.jsonl",
+                    "endpoint": null,
+                    "record_path": "data/shipments.jsonl",
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "shipping.booking",
+                        "body": {
+                            "kind": "shipping.booking",
+                            "payload": "shipping booking payload"
+                        }
+                    }
                 }
             ])
         );
@@ -19668,6 +19884,7 @@ test "checkout failing runtime body" {
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("deploy/env.example"));
+        assert!(runbook.contains("deploy/commerce-adapters.json"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
@@ -28908,9 +29125,16 @@ entry = "src/main.orv"
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
         let compose =
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let commerce_adapters_path = out.join("deploy").join("commerce-adapters.json");
+        let commerce_adapters =
+            read_json_value(&commerce_adapters_path).expect("commerce adapters");
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
 
+        assert_eq!(
+            deploy["server"]["commerce_adapters"],
+            "deploy/commerce-adapters.json"
+        );
         assert_eq!(
             deploy["server"]["persistence"]["commerce_endpoints"],
             serde_json::json!([
@@ -28941,13 +29165,90 @@ entry = "src/main.orv"
         assert!(compose.contains(
             r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-http://shipping.internal/book}""#
         ));
+        assert_eq!(commerce_adapters["schema_version"], 1);
+        assert_eq!(commerce_adapters["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(
+            commerce_adapters["adapters"],
+            serde_json::json!([
+                {
+                    "kind": "payment",
+                    "mode": "http",
+                    "env": "PAYMENT_ADAPTER_URL",
+                    "default": "http://payments.internal/capture",
+                    "endpoint": "http://payments.internal/capture",
+                    "record_path": null,
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "payment.capture",
+                        "body": {
+                            "kind": "payment.capture",
+                            "payload": "payment capture payload"
+                        }
+                    }
+                },
+                {
+                    "kind": "shipping",
+                    "mode": "http",
+                    "env": "SHIPPING_ADAPTER_URL",
+                    "default": "http://shipping.internal/book",
+                    "endpoint": "http://shipping.internal/book",
+                    "record_path": null,
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "shipping.booking",
+                        "body": {
+                            "kind": "shipping.booking",
+                            "payload": "shipping booking payload"
+                        }
+                    }
+                }
+            ])
+        );
         assert!(runbook.contains(
             "- Commerce adapter env: PAYMENT_ADAPTER_URL default http://payments.internal/capture"
         ));
         assert!(runbook.contains(
             "- Commerce adapter env: SHIPPING_ADAPTER_URL default http://shipping.internal/book"
         ));
+        assert!(runbook.contains("deploy/commerce-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_commerce_adapter_mismatch() {
+        let dir = temp_output_dir("deploy-commerce-adapters-source");
+        std::fs::create_dir_all(&dir).expect("create commerce adapter source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    @respond 200 { payment: captured.status }
+  }
+}
+"#,
+        )
+        .expect("write commerce adapter source");
+        let out = temp_output_dir("deploy-commerce-adapters-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let adapters_path = out.join("deploy").join("commerce-adapters.json");
+        let mut adapters = read_json_value(&adapters_path).expect("commerce adapters");
+        adapters["adapters"][0]["endpoint"] = serde_json::json!("http://wrong.example/capture");
+        write_json(&adapters_path, &adapters).expect("write corrupt commerce adapters");
+
+        let err = cmd_verify_build(&out).expect_err("commerce adapter mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy commerce adapters do not match runtime artifact persistence"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
