@@ -331,6 +331,9 @@ pub struct ServerResponseArtifact {
     /// Object JSON fields lowered from route params such as `{ id: @param.id }`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub body_route_params: Vec<ServerResponseRouteParamArtifact>,
+    /// Object JSON fields lowered from query params such as `{ q: @query.q }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_query_params: Vec<ServerResponseQueryParamArtifact>,
 }
 
 /// One JSON object field backed by a captured route param.
@@ -339,6 +342,15 @@ pub struct ServerResponseRouteParamArtifact {
     /// JSON field name in the response body.
     pub field: String,
     /// Captured route parameter name.
+    pub param: String,
+}
+
+/// One JSON object field backed by a captured query param.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerResponseQueryParamArtifact {
+    /// JSON field name in the response body.
+    pub field: String,
+    /// Captured query parameter name.
     pub param: String,
 }
 
@@ -880,6 +892,7 @@ fn main() -> std::process::ExitCode {{
 struct OrvNativeHttpRequest {{
     method: String,
     path: String,
+    query: Vec<routes::OrvNativeParam>,
 }}
 
 fn orv_native_serve() -> std::io::Result<()> {{
@@ -919,7 +932,8 @@ fn orv_native_handle_connection(stream: &mut std::net::TcpStream) -> std::io::Re
         ))?;
         return Ok(());
     }};
-    let dispatch = router::orv_native_dispatch(&request.method, &request.path);
+    let dispatch =
+        router::orv_native_dispatch_with_query(&request.method, &request.path, request.query);
     stream.write_all(&orv_native_http_response(dispatch))
 }}
 
@@ -942,11 +956,67 @@ fn orv_native_read_request(
     else {{
         return Ok(None);
     }};
-    let path = target.split('?').next().unwrap_or(target);
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, Vec::new()), |(path, query)| {
+            (path, orv_native_parse_query(query))
+        });
     Ok(Some(OrvNativeHttpRequest {{
         method: method.to_string(),
         path: path.to_string(),
+        query,
     }}))
+}}
+
+fn orv_native_parse_query(raw: &str) -> Vec<routes::OrvNativeParam> {{
+    raw.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {{
+            let mut parts = pair.splitn(2, '=');
+            let name = orv_native_percent_decode_form(parts.next().unwrap_or(""));
+            let value = orv_native_percent_decode_form(parts.next().unwrap_or(""));
+            routes::OrvNativeParam {{ name, value }}
+        }})
+        .collect()
+}}
+
+fn orv_native_percent_decode_form(raw: &str) -> String {{
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {{
+        match bytes[index] {{
+            b'+' => {{
+                out.push(b' ');
+                index += 1;
+            }}
+            b'%' if index + 2 < bytes.len() => {{
+                let hi = orv_native_hex_value(bytes[index + 1]);
+                let lo = orv_native_hex_value(bytes[index + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {{
+                    out.push((hi << 4) | lo);
+                    index += 3;
+                }} else {{
+                    out.push(bytes[index]);
+                    index += 1;
+                }}
+            }}
+            byte => {{
+                out.push(byte);
+                index += 1;
+            }}
+        }}
+    }}
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+}}
+
+fn orv_native_hex_value(byte: u8) -> Option<u8> {{
+    match byte {{
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }}
 }}
 
 fn orv_native_http_response(dispatch: router::OrvNativeDispatch) -> Vec<u8> {{
@@ -1114,7 +1184,8 @@ fn native_server_route_has_native_response(route: &ServerRouteArtifact) -> bool 
             .and_then(|status| u16::try_from(status).ok())
             .is_some()
             && (response.body_json.is_some()
-                || native_server_response_uses_route_params(response, &route_params))
+                || native_server_response_uses_route_params(response, &route_params)
+                || !response.body_query_params.is_empty())
     })
 }
 
@@ -1184,11 +1255,12 @@ pub struct OrvNativeRoute {
 pub struct OrvNativeRouteMatch {
     pub route: &'static OrvNativeRoute,
     pub params: Vec<OrvNativeParam>,
+    pub query: Vec<OrvNativeParam>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrvNativeParam {
-    pub name: &'static str,
+    pub name: String,
     pub value: String,
 }
 
@@ -1223,7 +1295,11 @@ pub fn orv_native_match_route(method: &str, path: &str) -> Option<OrvNativeRoute
                 return None;
             }
             orv_native_route_path_params(route.path, path)
-                .map(|params| OrvNativeRouteMatch { route, params })
+                .map(|params| OrvNativeRouteMatch {
+                    route,
+                    params,
+                    query: Vec::new(),
+                })
         })
 }
 
@@ -1234,6 +1310,18 @@ pub fn orv_native_param_value<'a>(
 ) -> Option<&'a str> {
     route_match
         .params
+        .iter()
+        .find(|param| param.name == name)
+        .map(|param| param.value.as_str())
+}
+
+#[allow(dead_code)]
+pub fn orv_native_query_value<'a>(
+    route_match: &'a OrvNativeRouteMatch,
+    name: &str,
+) -> Option<&'a str> {
+    route_match
+        .query
         .iter()
         .find(|param| param.name == name)
         .map(|param| param.value.as_str())
@@ -1262,6 +1350,7 @@ fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec
                 .zip(path_segments.iter())
             {
                 if let Some(name) = pattern_segment.strip_prefix(':') {
+                    let name = name.to_string();
                     params.push(OrvNativeParam {
                         name,
                         value: (*path_segment).to_string(),
@@ -1270,11 +1359,13 @@ fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec
                     return None;
                 }
             }
+            let name = rest_segment
+                .strip_prefix(':')
+                .and_then(|segment| segment.strip_suffix('*'))
+                .unwrap_or("")
+                .to_string();
             params.push(OrvNativeParam {
-                name: rest_segment
-                    .strip_prefix(':')
-                    .and_then(|segment| segment.strip_suffix('*'))
-                    .unwrap_or(""),
+                name,
                 value: path_segments[prefix_len..].join("/"),
             });
             return Some(params);
@@ -1286,6 +1377,7 @@ fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec
     let mut params = Vec::new();
     for (pattern_segment, path_segment) in pattern_segments.iter().zip(path_segments.iter()) {
         if let Some(name) = pattern_segment.strip_prefix(':') {
+            let name = name.to_string();
             params.push(OrvNativeParam {
                 name,
                 value: (*path_segment).to_string(),
@@ -1326,7 +1418,16 @@ pub struct OrvNativeDispatch {
 pub const ORV_NATIVE_HANDLER_COUNT: usize = handlers::ORV_NATIVE_HANDLER_COUNT;
 
 pub fn orv_native_dispatch(method: &str, path: &str) -> OrvNativeDispatch {
-    if let Some(route_match) = routes::orv_native_match_route(method, path) {
+    orv_native_dispatch_with_query(method, path, Vec::new())
+}
+
+pub fn orv_native_dispatch_with_query(
+    method: &str,
+    path: &str,
+    query: Vec<routes::OrvNativeParam>,
+) -> OrvNativeDispatch {
+    if let Some(mut route_match) = routes::orv_native_match_route(method, path) {
+        route_match.query = query;
         let response = handlers::orv_native_handle_route(&route_match);
         return OrvNativeDispatch {
             status: response.status,
@@ -1415,6 +1516,7 @@ pub fn orv_native_handle_route(
     );
     let mut native_route_count = 0usize;
     let mut uses_route_param_json = false;
+    let mut uses_query_param_json = false;
     for route in &artifact.routes {
         let Some(response) = route.responses.first() else {
             continue;
@@ -1441,6 +1543,47 @@ pub fn orv_native_handle_route(
     }}"#,
                 rust_string_literal(&route.origin_id),
                 rust_string_literal(body_json),
+                rust_string_literal(&response.origin_id)
+            );
+            continue;
+        }
+        if !response.body_query_params.is_empty() {
+            native_route_count += 1;
+            uses_query_param_json = true;
+            let _ = writeln!(
+                source,
+                "    if route_match.route.origin_id == {} {{",
+                rust_string_literal(&route.origin_id)
+            );
+            source.push_str("        let mut body = String::from(\"{\");\n");
+            for (index, field) in response.body_query_params.iter().enumerate() {
+                if index > 0 {
+                    source.push_str("        body.push(',');\n");
+                }
+                let field_prefix = format!("\"{}\":", json_escaped(&field.field));
+                let _ = writeln!(
+                    source,
+                    "        body.push_str({});",
+                    rust_string_literal(&field_prefix)
+                );
+                let _ = writeln!(
+                    source,
+                    "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
+                    rust_string_literal(&field.param)
+                );
+            }
+            let _ = writeln!(
+                source,
+                r#"        body.push('}}');
+        return OrvNativeHandlerResponse {{
+            status: {status},
+            content_type: "application/json",
+            body,
+            origin_id: Some(route_match.route.origin_id),
+            response_origin_id: Some({}),
+            params: route_match.params.clone(),
+        }};
+    }}"#,
                 rust_string_literal(&response.origin_id)
             );
             continue;
@@ -1506,7 +1649,7 @@ pub fn orv_native_handle_route(
 "#,
         );
     }
-    if uses_route_param_json {
+    if uses_route_param_json || uses_query_param_json {
         source.push_str(
             r#"
 fn orv_native_push_json_string(value: &str, out: &mut String) {
@@ -1641,6 +1784,26 @@ fn route_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseRoutePar
     }
 }
 
+fn query_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseQueryParamArtifact>> {
+    match &expr.kind {
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            let mut out = Vec::new();
+            for field in fields {
+                if field.is_spread {
+                    return None;
+                }
+                out.push(ServerResponseQueryParamArtifact {
+                    field: field.name.clone(),
+                    param: query_param_field_name(&field.value)?,
+                });
+            }
+            Some(out)
+        }
+        HirExprKind::Paren(expr) => query_param_json_payload(expr),
+        _ => None,
+    }
+}
+
 fn route_param_field_name(expr: &HirExpr) -> Option<String> {
     match &expr.kind {
         HirExprKind::Field { target, field, .. } if is_route_param_domain(target) => {
@@ -1651,10 +1814,28 @@ fn route_param_field_name(expr: &HirExpr) -> Option<String> {
     }
 }
 
+fn query_param_field_name(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::Field { target, field, .. } if is_query_param_domain(target) => {
+            Some(field.clone())
+        }
+        HirExprKind::Paren(expr) => query_param_field_name(expr),
+        _ => None,
+    }
+}
+
 fn is_route_param_domain(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Domain { name, args, .. } => name == "param" && args.is_empty(),
         HirExprKind::Paren(expr) => is_route_param_domain(expr),
+        _ => false,
+    }
+}
+
+fn is_query_param_domain(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Domain { name, args, .. } => name == "query" && args.is_empty(),
+        HirExprKind::Paren(expr) => is_query_param_domain(expr),
         _ => false,
     }
 }
@@ -1900,12 +2081,18 @@ fn collect_expr_response_artifacts(
                     .then(|| route_param_json_payload(payload))
                     .flatten()
                     .unwrap_or_default();
+                let body_query_params = (body_json.is_none() && body_route_params.is_empty())
+                    .then(|| query_param_json_payload(payload))
+                    .flatten()
+                    .unwrap_or_default();
                 let body_kind = if body_json.is_some() {
                     "static_json"
-                } else if body_route_params.is_empty() {
-                    "dynamic"
-                } else {
+                } else if !body_route_params.is_empty() {
                     "route_param_json"
+                } else if !body_query_params.is_empty() {
+                    "query_param_json"
+                } else {
+                    "dynamic"
                 };
                 out.entry(route_origin_id.to_string())
                     .or_default()
@@ -1915,6 +2102,7 @@ fn collect_expr_response_artifacts(
                         body_kind: body_kind.to_string(),
                         body_json,
                         body_route_params,
+                        body_query_params,
                     });
             }
             collect_expr_response_artifacts(status, route_origin_id, out);
@@ -3284,6 +3472,48 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn server_runtime_artifact_lowers_query_param_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /search {
+    @respond 200 { q: @query.q }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let native_route_table = native_server_routes_source(&artifact);
+        let native_router_dispatch = native_server_router_source();
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.body_kind, "query_param_json");
+        assert!(response.body_json.is_none());
+        assert_eq!(response.body_query_params[0].field, "q");
+        assert_eq!(response.body_query_params[0].param, "q");
+        assert!(native_route_table.contains("pub query: Vec<OrvNativeParam>"));
+        assert!(native_route_table.contains("pub fn orv_native_query_value<'a>("));
+        assert!(native_router_dispatch.contains("pub fn orv_native_dispatch_with_query("));
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"q\")"));
+        assert!(handlers.contains("orv_native_push_json_string("));
+        assert!(launcher.contains("query: Vec<routes::OrvNativeParam>"));
+        assert!(launcher.contains("orv_native_parse_query(query)"));
+        assert!(launcher.contains(
+            "router::orv_native_dispatch_with_query(&request.method, &request.path, request.query)"
+        ));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_routes_source_declares_typed_route_table() {
         let src = r"@server {
   @listen 8080
@@ -3494,7 +3724,9 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(source.contains("std::net::TcpListener::bind(orv_native_listen_address())"));
         assert!(source.contains("const ORV_DEFAULT_PORT: u16 = 8080;"));
-        assert!(source.contains("router::orv_native_dispatch(&request.method, &request.path)"));
+        assert!(source.contains(
+            "router::orv_native_dispatch_with_query(&request.method, &request.path, request.query)"
+        ));
         assert!(source.contains("fn orv_native_http_response("));
         assert!(!source.contains(r#"std::process::Command::new("orv")"#));
         assert!(!source.contains(r#".arg("run-artifact")"#));
@@ -3504,8 +3736,8 @@ function greet(name: string): string -> "hi {name}""#,
     fn native_server_launcher_source_uses_reference_fallback_for_dynamic_handlers() {
         let src = r"@server {
   @listen 8080
-  @route GET /search {
-    @respond 200 { q: @query.q }
+  @route POST /echo {
+    @respond 201 { received: @body }
   }
 }";
         let program = lower(src);

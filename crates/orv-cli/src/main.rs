@@ -12866,7 +12866,9 @@ fn verify_native_server_launcher_source(
         {
             anyhow::bail!("native server launcher source must serve HTTP directly");
         }
-        if !source.contains("router::orv_native_dispatch(&request.method, &request.path)") {
+        if !source.contains(
+            "router::orv_native_dispatch_with_query(&request.method, &request.path, request.query)",
+        ) {
             anyhow::bail!("native server launcher source must dispatch through generated router");
         }
         if !source.contains("fn orv_native_http_response(") {
@@ -26565,9 +26567,9 @@ entry = "src/main.orv"
         assert!(native_source.contains("artifact.is_file()"));
         assert!(native_source.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(native_source.contains("std::net::TcpListener::bind(orv_native_listen_address())"));
-        assert!(
-            native_source.contains("router::orv_native_dispatch(&request.method, &request.path)")
-        );
+        assert!(native_source.contains(
+            "router::orv_native_dispatch_with_query(&request.method, &request.path, request.query)"
+        ));
         assert!(native_source.contains("fn orv_native_http_response("));
         assert!(!native_source.contains("Command::new(\"orv\")"));
         assert!(!native_source.contains(".arg(\"run-artifact\")"));
@@ -26921,6 +26923,74 @@ entry = "src/main.orv"
         assert!(
             !stderr.contains("warning:"),
             "route param native launcher cargo check should be warning-free:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_lowers_query_param_response_into_native_handler_source() {
+        let dir = temp_output_dir("native-query-param-response-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r"@server {
+  @listen 8080
+  @route GET /search {
+    @respond 200 { q: @query.q }
+  }
+}
+",
+        )
+        .expect("write source");
+        let out = temp_output_dir("native-query-param-response-build");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let response = &server_artifact["routes"][0]["responses"][0];
+        let routes = std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
+            .expect("routes source");
+        let handlers =
+            std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
+                .expect("handlers source");
+        let launcher = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native launcher");
+
+        assert_eq!(response["status"], 200);
+        assert_eq!(response["body_kind"], "query_param_json");
+        assert_eq!(response["body_query_params"][0]["field"], "q");
+        assert_eq!(response["body_query_params"][0]["param"], "q");
+        assert!(routes.contains("pub query: Vec<OrvNativeParam>"));
+        assert!(routes.contains("pub fn orv_native_query_value<'a>("));
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"q\")"));
+        assert!(handlers.contains("orv_native_push_json_string("));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("orv_native_parse_query(query)"));
+        assert!(launcher.contains("router::orv_native_dispatch_with_query("));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+        cmd_verify_build(&out).expect("verify query param native build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check query param native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "query param native launcher cargo check failed:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("warning:"),
+            "query param native launcher cargo check should be warning-free:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -27513,7 +27583,7 @@ entry = "src/main.orv"
         let source_path = out.join("server").join("native").join("main.rs");
         let mut source = std::fs::read_to_string(&source_path).expect("native source");
         source = source.replace(
-            "router::orv_native_dispatch(&request.method, &request.path)",
+            "router::orv_native_dispatch_with_query(&request.method, &request.path, request.query)",
             "router::orv_native_dispatch(\"GET\", \"/wrong\")",
         );
         write_text(&source_path, &source).expect("write corrupt native source");
