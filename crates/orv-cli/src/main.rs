@@ -13032,6 +13032,15 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_js bundle does not verify client manifest contract");
     }
+    if !source.contains("reactivePlanUrl")
+        || !source.contains("./reactive-plan.json")
+        || !source.contains("loadReactivePlan")
+        || !source.contains("client reactive plan fetch failed")
+        || !source.contains("client reactive plan hash mismatch")
+        || !source.contains("orvReactiveSignals")
+    {
+        anyhow::bail!("client_js bundle does not verify client reactive plan contract");
+    }
     if !source.contains("loadSourceBundle")
         || !source.contains("stableJsonHash(sourceBundle)")
         || !source.contains("fnv1a64")
@@ -17203,7 +17212,9 @@ fn write_client_js_loader(
         "schemaVersion": 1,
         "runtimeFeatures": ["client_wasm"],
         "manifestUrl": "./manifest.json",
+        "reactivePlanUrl": "./reactive-plan.json",
         "wasmUrl": "./app.wasm",
+        "manifestReactivePlan": CLIENT_REACTIVE_PLAN_PATH,
         "manifestWasm": CLIENT_WASM_PATH,
         "sourceBundleUrl": "../source-bundle.json",
         "manifestSourceBundle": SOURCE_BUNDLE_PATH,
@@ -26076,6 +26087,39 @@ entry = "src/main.orv"
         );
     }
 
+    fn assert_client_loader_contract(loader: &str) {
+        for expected in [
+            "ORV_CLIENT_BOOTSTRAP",
+            "sourceBundleUrl",
+            "../source-bundle.json",
+            "sourceBundleHash",
+            "manifestUrl",
+            "loadClientManifest",
+            "client manifest hash mismatch",
+            "reactivePlanUrl",
+            "loadReactivePlan",
+            "client reactive plan hash mismatch",
+            "loadSourceBundle",
+            "stableJsonHash(sourceBundle)",
+            "fnv1a64",
+            "source bundle hash mismatch",
+            "runtimeFeatures",
+            "WebAssembly.instantiate",
+            "orv_start",
+            "orv_render_ptr",
+            "orv_render_len",
+            "TextDecoder",
+            "root.innerHTML",
+            "app.wasm",
+            "orvReactiveSignals",
+        ] {
+            assert!(
+                loader.contains(expected),
+                "missing loader snippet {expected}"
+            );
+        }
+    }
+
     #[test]
     fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
         let (src_dir, path) = prod_server_source("build-prod-source");
@@ -27644,25 +27688,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         );
         let loader =
             std::fs::read_to_string(build_out.join("client").join("app.js")).expect("client js");
-        assert!(loader.contains("ORV_CLIENT_BOOTSTRAP"));
-        assert!(loader.contains("sourceBundleUrl"));
-        assert!(loader.contains("../source-bundle.json"));
-        assert!(loader.contains("sourceBundleHash"));
-        assert!(loader.contains("manifestUrl"));
-        assert!(loader.contains("loadClientManifest"));
-        assert!(loader.contains("client manifest hash mismatch"));
-        assert!(loader.contains("loadSourceBundle"));
-        assert!(loader.contains("stableJsonHash(sourceBundle)"));
-        assert!(loader.contains("fnv1a64"));
-        assert!(loader.contains("source bundle hash mismatch"));
-        assert!(loader.contains("runtimeFeatures"));
-        assert!(loader.contains("WebAssembly.instantiate"));
-        assert!(loader.contains("orv_start"));
-        assert!(loader.contains("orv_render_ptr"));
-        assert!(loader.contains("orv_render_len"));
-        assert!(loader.contains("TextDecoder"));
-        assert!(loader.contains("root.innerHTML"));
-        assert!(loader.contains("app.wasm"));
+        assert_client_loader_contract(&loader);
         let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
             .expect("client page");
         assert!(page.contains("data-orv-client=\"wasm\""));
@@ -28119,6 +28145,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         assert!(
             err.to_string().contains("client manifest"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_js_without_reactive_plan_check() {
+        let out = temp_output_dir("verify-build-client-js-reactive-plan");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let loader_path = build_out.join("client").join("app.js");
+        let loader = std::fs::read_to_string(&loader_path)
+            .expect("client loader")
+            .replace("loadReactivePlan", "loadReactiveContract");
+        std::fs::write(&loader_path, loader).expect("rewrite loader");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
+
+        assert!(
+            err.to_string().contains("client reactive plan"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
