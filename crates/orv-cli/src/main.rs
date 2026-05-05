@@ -2172,6 +2172,8 @@ cargo build --manifest-path dist/server/native/Cargo.toml --release\n\
 ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server\n\
 ```\n\
 \n\
+The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit override.\n\
+\n\
 ## Deploy artifacts\n\
 \n\
 - `deploy/manifest.json`\n\
@@ -12533,6 +12535,13 @@ fn verify_native_server_launcher_source(
     {
         anyhow::bail!("native server launcher source must validate native server plan");
     }
+    if !source.contains("fn orv_build_dir() -> std::path::PathBuf")
+        || !source.contains(r#"std::env::var_os("ORV_BUILD_DIR")"#)
+        || !source.contains("std::env::current_exe()")
+        || !source.contains("path.parent()?.parent()?.parent()?.parent()?.parent()")
+    {
+        anyhow::bail!("native server launcher source must infer build dir from executable path");
+    }
     if !source.contains("build_dir.join(ORV_SERVER_ARTIFACT)")
         || !source.contains("artifact.is_file()")
     {
@@ -14001,6 +14010,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server") {
         anyhow::bail!("deploy runbook must document native launcher run command");
+    }
+    if !runbook.contains("ORV_BUILD_DIR is an explicit override") {
+        anyhow::bail!("deploy runbook must document native launcher build-dir inference");
     }
     if !runbook.contains("/__orv/trace/events") {
         anyhow::bail!("deploy runbook must document live trace event stream endpoint");
@@ -17425,6 +17437,8 @@ cargo build --manifest-path server/native/Cargo.toml --release
 ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server
 ```
 
+The generated launcher path can infer the build directory; ORV_BUILD_DIR is an explicit override.
+
 ## Request Trace
 
 ```sh
@@ -18397,6 +18411,7 @@ test "checkout failing runtime body" {
         );
         assert!(guide
             .contains("ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server"));
+        assert!(guide.contains("The generated launcher path can infer `dist`"));
         assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(
@@ -25821,6 +25836,8 @@ entry = "src/main.orv"
         assert!(native_source.contains("const ORV_SERVER_ARTIFACT"));
         assert!(native_source.contains("server/app.orv-runtime.json"));
         assert!(native_source.contains("build_dir.join(ORV_NATIVE_SERVER_PLAN)"));
+        assert!(native_source.contains("fn orv_build_dir() -> std::path::PathBuf"));
+        assert!(native_source.contains("std::env::current_exe()"));
         assert!(native_source.contains("native_plan.is_file()"));
         assert!(native_source.contains("build_dir.join(ORV_SERVER_ARTIFACT)"));
         assert!(native_source.contains("artifact.is_file()"));
@@ -26159,6 +26176,7 @@ entry = "src/main.orv"
         assert!(
             runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server")
         );
+        assert!(runbook.contains("ORV_BUILD_DIR is an explicit override"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));

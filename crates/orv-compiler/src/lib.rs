@@ -739,13 +739,11 @@ const ORV_NATIVE_SERVER_PLAN: &str = "{native_server_plan_path}";
 fn main() -> std::process::ExitCode {{
     let _ = routes::ORV_NATIVE_ROUTE_COUNT;
     let _ = routes::orv_native_match_route("__orv_probe__", "__orv_probe__");
-    let build_dir = std::env::var_os("ORV_BUILD_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let build_dir = orv_build_dir();
     let native_plan = build_dir.join(ORV_NATIVE_SERVER_PLAN);
     if !native_plan.is_file() {{
         eprintln!(
-            "missing orv native server plan {{}}; set ORV_BUILD_DIR to the build artifact directory",
+            "missing orv native server plan {{}}; set ORV_BUILD_DIR or run from the generated native launcher path",
             native_plan.display()
         );
         return std::process::ExitCode::FAILURE;
@@ -753,7 +751,7 @@ fn main() -> std::process::ExitCode {{
     let artifact = build_dir.join(ORV_SERVER_ARTIFACT);
     if !artifact.is_file() {{
         eprintln!(
-            "missing orv server artifact {{}}; set ORV_BUILD_DIR to the build artifact directory",
+            "missing orv server artifact {{}}; set ORV_BUILD_DIR or run from the generated native launcher path",
             artifact.display()
         );
         return std::process::ExitCode::FAILURE;
@@ -781,6 +779,16 @@ fn main() -> std::process::ExitCode {{
             std::process::ExitCode::FAILURE
         }}
     }}
+}}
+
+fn orv_build_dir() -> std::path::PathBuf {{
+    if let Some(value) = std::env::var_os("ORV_BUILD_DIR") {{
+        return std::path::PathBuf::from(value);
+    }}
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent()?.parent()?.parent()?.parent()?.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }}
 "#
     )
@@ -2029,6 +2037,10 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(source.contains("native_plan.is_file()"));
         assert!(source.contains("artifact.is_file()"));
+        assert!(source.contains("fn orv_build_dir() -> std::path::PathBuf"));
+        assert!(source.contains(r#"std::env::var_os("ORV_BUILD_DIR")"#));
+        assert!(source.contains("std::env::current_exe()"));
+        assert!(source.contains("path.parent()?.parent()?.parent()?.parent()?.parent()"));
         assert!(source.contains(r#"std::process::Command::new("orv")"#));
         assert!(source.contains(r#".arg("run-artifact")"#));
         assert!(source.contains("std::env::args_os().skip(1)"));
