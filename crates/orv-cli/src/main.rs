@@ -12858,19 +12858,35 @@ fn verify_native_server_launcher_source(
     {
         anyhow::bail!("native server launcher source must validate server artifact");
     }
-    if !source.contains("fn orv_native_serve() -> std::io::Result<()>")
-        || !source.contains("std::net::TcpListener::bind(orv_native_listen_address())")
-    {
-        anyhow::bail!("native server launcher source must serve HTTP directly");
-    }
-    if !source.contains("router::orv_native_dispatch(&request.method, &request.path)") {
-        anyhow::bail!("native server launcher source must dispatch through generated router");
-    }
-    if !source.contains("fn orv_native_http_response(") {
-        anyhow::bail!("native server launcher source must serialize native HTTP responses");
-    }
-    if source.contains(r#"Command::new("orv")"#) || source.contains(r#".arg("run-artifact")"#) {
-        anyhow::bail!("native server launcher source must not shell through `orv run-artifact`");
+    let expected =
+        orv_compiler::native_server_launcher_source(artifact_path, native_plan_path, artifact);
+    if expected.contains("fn orv_native_serve() -> std::io::Result<()>") {
+        if !source.contains("fn orv_native_serve() -> std::io::Result<()>")
+            || !source.contains("std::net::TcpListener::bind(orv_native_listen_address())")
+        {
+            anyhow::bail!("native server launcher source must serve HTTP directly");
+        }
+        if !source.contains("router::orv_native_dispatch(&request.method, &request.path)") {
+            anyhow::bail!("native server launcher source must dispatch through generated router");
+        }
+        if !source.contains("fn orv_native_http_response(") {
+            anyhow::bail!("native server launcher source must serialize native HTTP responses");
+        }
+        if source.contains(r#"Command::new("orv")"#) || source.contains(r#".arg("run-artifact")"#) {
+            anyhow::bail!(
+                "native server launcher source must not shell through `orv run-artifact`"
+            );
+        }
+    } else {
+        if !source.contains("fn orv_native_reference_bridge(")
+            || !source.contains(r#"Command::new("orv")"#)
+            || !source.contains(r#".arg("run-artifact")"#)
+        {
+            anyhow::bail!("native server launcher source must fall back to `orv run-artifact`");
+        }
+        if !source.contains("std::env::args_os().skip(1)") {
+            anyhow::bail!("native server launcher source must forward process arguments");
+        }
     }
     if !source.contains("mod routes;") || !source.contains("routes::ORV_NATIVE_ROUTE_COUNT") {
         anyhow::bail!("native server launcher source must link generated routes source");
@@ -12887,8 +12903,6 @@ fn verify_native_server_launcher_source(
     if !source.contains("mod handlers;") || !source.contains("handlers::ORV_NATIVE_HANDLER_COUNT") {
         anyhow::bail!("native server launcher source must link generated handlers source");
     }
-    let expected =
-        orv_compiler::native_server_launcher_source(artifact_path, native_plan_path, artifact);
     if source != expected {
         anyhow::bail!("native server launcher source must match generated source");
     }
@@ -26876,6 +26890,38 @@ entry = "src/main.orv"
         assert!(
             !stderr.contains("warning:"),
             "native launcher cargo check should be warning-free:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_uses_reference_native_launcher_for_dynamic_handlers() {
+        let path = workspace_path(&["fixtures", "e2e", "path_param.orv"]);
+        let out = temp_output_dir("native-server-dynamic-fallback");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let source = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
+            .expect("native source");
+        assert!(source.contains("fn orv_native_reference_bridge("));
+        assert!(source.contains(r#"std::process::Command::new("orv")"#));
+        assert!(source.contains(r#".arg("run-artifact")"#));
+        assert!(!source.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        cmd_verify_build(&out).expect("verify dynamic fallback build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check dynamic fallback native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "dynamic fallback native launcher cargo check failed:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&out);
