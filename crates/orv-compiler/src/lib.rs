@@ -1014,6 +1014,12 @@ fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usi
             ("call", "@db.connect") => {
                 features.insert("db_adapter");
             }
+            ("call", "@payment.connect") => {
+                features.insert("payment_adapter");
+            }
+            ("call", "@shipping.connect") => {
+                features.insert("shipping_adapter");
+            }
             ("domain", "html") => {
                 features.insert("html_renderer");
             }
@@ -1708,6 +1714,33 @@ function greet(name: string): string -> "hi {name}""#,
             .capabilities
             .runtime_features
             .contains(&"db_adapter".to_string()));
+    }
+
+    #[test]
+    fn build_manifest_declares_commerce_adapter_runtime_features() {
+        let program = lower(
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect("test://local")
+  let shipping = @shipping.connect("test://local")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "local", address: "Seoul" })
+    @respond 200 { payment: captured.provider, shipment: booked.provider }
+  }
+}"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+
+        assert!(manifest
+            .capabilities
+            .runtime_features
+            .contains(&"payment_adapter".to_string()));
+        assert!(manifest
+            .capabilities
+            .runtime_features
+            .contains(&"shipping_adapter".to_string()));
     }
 
     #[test]

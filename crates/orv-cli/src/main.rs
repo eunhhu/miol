@@ -18455,6 +18455,7 @@ test "checkout failing runtime body" {
         let out = dir.join("dist");
         cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
 
+        let manifest = read_json_value(&out.join("build-manifest.json")).expect("manifest");
         let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
         let runtime =
             read_json_value(&out.join("server").join("app.orv-runtime.json")).expect("runtime");
@@ -18478,6 +18479,23 @@ test "checkout failing runtime body" {
                 path
             ));
             assert!(native_routes_source_includes(&native_routes, method, path));
+        }
+        for feature in ["payment_adapter", "shipping_adapter"] {
+            assert!(manifest["capabilities"]["runtime_features"]
+                .as_array()
+                .expect("manifest runtime features")
+                .iter()
+                .any(|item| item == feature));
+            assert!(runtime["runtime_features"]
+                .as_array()
+                .expect("runtime features")
+                .iter()
+                .any(|item| item == feature));
+            assert!(deploy["server"]["runtime_features"]
+                .as_array()
+                .expect("deploy runtime features")
+                .iter()
+                .any(|item| item == feature));
         }
         assert_eq!(
             deploy["server"]["native_routes_source"],
