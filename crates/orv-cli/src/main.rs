@@ -27524,6 +27524,9 @@ entry = "src/main.orv"
   @route POST /orders/total {
     @respond 201 { total: (@body.quantity as int) * (@body.unit_price as int) }
   }
+  @route POST /orders/due {
+    @respond 201 { due: (@body.total as int) - (@body.discount as int) }
+  }
 }
 "#,
         )
@@ -27581,6 +27584,11 @@ entry = "src/main.orv"
             "/orders/total",
             r#"{"quantity":"7","unit_price":"125"}"#,
         );
+        let due_response = send_raw_http_json_post(
+            address,
+            "/orders/due",
+            r#"{"total":"875","discount":"125"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -27590,6 +27598,8 @@ entry = "src/main.orv"
         assert!(cents_response.contains(r#"{"cents":700}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":875}"#));
+        assert!(due_response.starts_with("HTTP/1.1 201"));
+        assert!(due_response.contains(r#"{"due":750}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -27781,7 +27791,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) - (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) / (@body.extra as int) }
   }
 }
 ",
