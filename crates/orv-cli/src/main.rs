@@ -13552,14 +13552,15 @@ fn client_signal_event_action_is_valid(action: Option<&serde_json::Value>) -> bo
     let Some(action) = action else {
         return false;
     };
-    matches!(
-        action.get("kind").and_then(serde_json::Value::as_str),
-        Some("assign" | "assign_add" | "assign_sub")
-    ) && action
-        .get("value")
-        .and_then(|value| value.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        .is_some()
+    match action.get("kind").and_then(serde_json::Value::as_str) {
+        Some("assign_toggle") => true,
+        Some("assign" | "assign_add" | "assign_sub") => action
+            .get("value")
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        _ => false,
+    }
 }
 
 fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
@@ -13603,6 +13604,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("bindReactiveAttrs")
         || !source.contains("bindReactiveEvents")
         || !source.contains("applySignalAction")
+        || !source.contains("assign_toggle")
         || !source.contains("setSignal")
         || !source.contains("orvReactiveSignals")
         || !source.contains("orvReactiveBindings")
@@ -17698,6 +17700,17 @@ fn client_signal_assignment_action(
     target: orv_hir::NameId,
     value: &orv_hir::HirExpr,
 ) -> serde_json::Value {
+    if let orv_hir::HirExprKind::Unary {
+        op: orv_hir::UnaryOp::Not,
+        expr,
+    } = &value.kind
+    {
+        if client_expr_is_ident(expr, target) {
+            return serde_json::json!({
+                "kind": "assign_toggle",
+            });
+        }
+    }
     if let orv_hir::HirExprKind::Binary { op, lhs, rhs } = &value.kind {
         if client_expr_is_ident(lhs, target) {
             let kind = match op {
@@ -29597,6 +29610,7 @@ entry = "src/main.orv"
             "bindReactiveAttrs",
             "bindReactiveEvents",
             "applySignalAction",
+            "assign_toggle",
             "setSignal",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
@@ -32801,6 +32815,40 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let loader =
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert_client_loader_contract(&loader);
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_event_toggle_binding_contract() {
+        let out = temp_output_dir("client-reactive-event-toggle-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig muted: bool = false\n@out @html { @body { @button onClick={muted = !muted} \"mute\" } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_event"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "muted"
+                && binding["selector"] == "button"
+                && binding["event"] == "click"
+                && binding["action"]["kind"] == "assign_toggle"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("assign_toggle"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

@@ -152,9 +152,14 @@ function validateReactiveBindings(plan, manifest) {
       typeof binding.event === "string" &&
       binding.event.length > 0 &&
       binding.action &&
-      ["assign", "assign_add", "assign_sub"].includes(binding.action.kind) &&
-      binding.action.value &&
-      typeof binding.action.value.kind === "string" &&
+      (
+        binding.action.kind === "assign_toggle" ||
+        (
+          ["assign", "assign_add", "assign_sub"].includes(binding.action.kind) &&
+          binding.action.value &&
+          typeof binding.action.value.kind === "string"
+        )
+      ) &&
       plan.signals.some((signal) =>
         binding.source === signal.origin_id &&
         binding.state_key === signal.state_key
@@ -325,14 +330,15 @@ function signalEventAttributeName(eventName) {
 }
 
 function applySignalAction(action, currentValue) {
-  const value = decodeSignalInitialValue(action.value);
   switch (action.kind) {
     case "assign":
-      return value;
+      return decodeSignalInitialValue(action.value);
     case "assign_add":
-      return currentValue + value;
+      return currentValue + decodeSignalInitialValue(action.value);
     case "assign_sub":
-      return currentValue - value;
+      return currentValue - decodeSignalInitialValue(action.value);
+    case "assign_toggle":
+      return !Boolean(currentValue);
     default:
       throw new Error(`orv client signal event action is unsupported: ${action.kind}`);
   }
