@@ -154,7 +154,12 @@ function validateReactiveBindings(plan, manifest) {
       binding.event.length > 0 &&
       binding.action &&
       (
-        ["assign_toggle", "assign_event_target_value"].includes(binding.action.kind) ||
+        [
+          "assign_toggle",
+          "assign_event_target_value",
+          "assign_event_target_value_float",
+          "assign_event_target_value_int",
+        ].includes(binding.action.kind) ||
         (
           ["assign", "assign_add", "assign_sub"].includes(binding.action.kind) &&
           binding.action.value &&
@@ -380,6 +385,10 @@ function applySignalAction(action, currentValue, event) {
       return !Boolean(currentValue);
     case "assign_event_target_value":
       return event?.target?.value ?? "";
+    case "assign_event_target_value_float":
+      return Number.parseFloat(event?.target?.value ?? "0");
+    case "assign_event_target_value_int":
+      return Number.parseInt(event?.target?.value ?? "0", 10);
     default:
       throw new Error(`orv client signal event action is unsupported: ${action.kind}`);
   }
