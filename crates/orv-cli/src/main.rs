@@ -13638,9 +13638,39 @@ fn client_signal_attr_condition_is_valid(
             .get("falsy")
             .and_then(serde_json::Value::as_str)
             .is_some()
+        && client_signal_attr_condition_comparison_is_valid(condition)
         && signals.iter().any(|signal| {
             signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
         })
+}
+
+fn client_signal_attr_condition_comparison_is_valid(condition: &serde_json::Value) -> bool {
+    match (condition.get("op"), condition.get("rhs")) {
+        (None, None) => true,
+        (Some(op), Some(rhs)) => {
+            op.as_str()
+                .is_some_and(|op| matches!(op, "eq" | "ne" | "lt" | "gt" | "le" | "ge"))
+                && client_signal_condition_operand_is_valid(rhs)
+        }
+        _ => false,
+    }
+}
+
+fn client_signal_condition_operand_is_valid(value: &serde_json::Value) -> bool {
+    let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match kind {
+        "int" | "float" | "string" => value
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "bool" => value
+            .get("value")
+            .and_then(serde_json::Value::as_bool)
+            .is_some(),
+        _ => false,
+    }
 }
 
 fn client_reactive_plan_signal_event_bindings_are_valid(
@@ -13743,6 +13773,8 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("attr_template")
         || !source.contains("renderSignalAttrCondition")
         || !source.contains("attr_condition")
+        || !source.contains("compareSignalAttrCondition")
+        || !source.contains("decodeSignalConditionOperand")
         || !source.contains("createReactiveState")
         || !source.contains("bindReactiveDom")
         || !source.contains("bindReactiveAttrs")
@@ -18162,22 +18194,146 @@ fn client_signal_attr_condition_binding(
     else {
         return None;
     };
-    let orv_hir::HirExprKind::Ident(ident) = &cond.kind else {
-        return None;
-    };
-    let signal = signals.get(&ident.id)?;
+    let (signal, mut attr_condition) = client_signal_condition_json(cond, signals)?;
     let truthy = client_plain_string_block(then)?;
     let falsy = client_plain_string_expr(else_branch.as_deref()?)?;
+    let condition = attr_condition.as_object_mut()?;
+    condition.insert("truthy".to_string(), serde_json::json!(truthy));
+    condition.insert("falsy".to_string(), serde_json::json!(falsy));
     Some(ClientSignalAttrBinding {
         origin_id: signal.origin_id.clone(),
         state_key: signal.state_key.clone(),
         attr_template: None,
-        attr_condition: Some(serde_json::json!({
-            "state_key": &signal.state_key,
-            "truthy": truthy,
-            "falsy": falsy,
-        })),
+        attr_condition: Some(attr_condition),
     })
+}
+
+fn client_signal_condition_json<'a>(
+    expr: &orv_hir::HirExpr,
+    signals: &'a HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<(&'a ClientSignalDomSource, serde_json::Value)> {
+    match &expr.kind {
+        orv_hir::HirExprKind::Ident(ident) => {
+            let signal = signals.get(&ident.id)?;
+            Some((
+                signal,
+                serde_json::json!({
+                    "state_key": &signal.state_key,
+                }),
+            ))
+        }
+        orv_hir::HirExprKind::Binary { op, lhs, rhs } => {
+            client_signal_comparison_condition_json(*op, lhs, rhs, signals)
+        }
+        orv_hir::HirExprKind::Paren(inner) => client_signal_condition_json(inner, signals),
+        _ => None,
+    }
+}
+
+fn client_signal_comparison_condition_json<'a>(
+    op: orv_hir::BinaryOp,
+    lhs: &orv_hir::HirExpr,
+    rhs: &orv_hir::HirExpr,
+    signals: &'a HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<(&'a ClientSignalDomSource, serde_json::Value)> {
+    if let Some(signal) = client_signal_condition_ident(lhs, signals) {
+        let op = client_signal_comparison_op(op)?;
+        let rhs = client_signal_condition_operand_json(rhs)?;
+        return Some((
+            signal,
+            serde_json::json!({
+                "state_key": &signal.state_key,
+                "op": op,
+                "rhs": rhs,
+            }),
+        ));
+    }
+    let signal = client_signal_condition_ident(rhs, signals)?;
+    let op = client_signal_inverted_comparison_op(op)?;
+    let rhs = client_signal_condition_operand_json(lhs)?;
+    Some((
+        signal,
+        serde_json::json!({
+            "state_key": &signal.state_key,
+            "op": op,
+            "rhs": rhs,
+        }),
+    ))
+}
+
+fn client_signal_condition_ident<'a>(
+    expr: &orv_hir::HirExpr,
+    signals: &'a HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<&'a ClientSignalDomSource> {
+    match &expr.kind {
+        orv_hir::HirExprKind::Ident(ident) => signals.get(&ident.id),
+        orv_hir::HirExprKind::Paren(inner) => client_signal_condition_ident(inner, signals),
+        _ => None,
+    }
+}
+
+fn client_signal_condition_operand_json(expr: &orv_hir::HirExpr) -> Option<serde_json::Value> {
+    match &expr.kind {
+        orv_hir::HirExprKind::Integer(value) => Some(serde_json::json!({
+            "kind": "int",
+            "value": value,
+        })),
+        orv_hir::HirExprKind::Float(value) => Some(serde_json::json!({
+            "kind": "float",
+            "value": value,
+        })),
+        orv_hir::HirExprKind::String(segments)
+            if segments
+                .iter()
+                .all(|segment| matches!(segment, orv_hir::HirStringSegment::Str(_))) =>
+        {
+            let value = segments
+                .iter()
+                .map(|segment| match segment {
+                    orv_hir::HirStringSegment::Str(value) => value.as_str(),
+                    orv_hir::HirStringSegment::Interp(_) => "",
+                })
+                .collect::<String>();
+            Some(serde_json::json!({
+                "kind": "string",
+                "value": value,
+            }))
+        }
+        orv_hir::HirExprKind::True => Some(serde_json::json!({
+            "kind": "bool",
+            "value": true,
+        })),
+        orv_hir::HirExprKind::False => Some(serde_json::json!({
+            "kind": "bool",
+            "value": false,
+        })),
+        orv_hir::HirExprKind::Paren(inner) => client_signal_condition_operand_json(inner),
+        _ => None,
+    }
+}
+
+fn client_signal_comparison_op(op: orv_hir::BinaryOp) -> Option<&'static str> {
+    match op {
+        orv_hir::BinaryOp::Eq => Some("eq"),
+        orv_hir::BinaryOp::Ne => Some("ne"),
+        orv_hir::BinaryOp::Lt => Some("lt"),
+        orv_hir::BinaryOp::Gt => Some("gt"),
+        orv_hir::BinaryOp::Le => Some("le"),
+        orv_hir::BinaryOp::Ge => Some("ge"),
+        _ => None,
+    }
+}
+
+fn client_signal_inverted_comparison_op(op: orv_hir::BinaryOp) -> Option<&'static str> {
+    match op {
+        orv_hir::BinaryOp::Eq => Some("eq"),
+        orv_hir::BinaryOp::Ne => Some("ne"),
+        orv_hir::BinaryOp::Lt => Some("gt"),
+        orv_hir::BinaryOp::Gt => Some("lt"),
+        orv_hir::BinaryOp::Le => Some("ge"),
+        orv_hir::BinaryOp::Ge => Some("le"),
+        _ => None,
+    }
 }
 
 fn client_plain_string_block(block: &orv_hir::HirBlock) -> Option<String> {
@@ -29916,6 +30072,8 @@ entry = "src/main.orv"
             "attr_template",
             "renderSignalAttrCondition",
             "attr_condition",
+            "compareSignalAttrCondition",
+            "decodeSignalConditionOperand",
             "createReactiveState",
             "bindReactiveDom",
             "bindReactiveAttrs",
@@ -33171,6 +33329,47 @@ models = { path = "../../shared/models", version = "2.0.0" }
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("renderSignalAttrCondition"));
         assert!(loader.contains("attr_condition"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_attr_comparison_condition_binding_contract() {
+        let out = temp_output_dir("client-reactive-attr-comparison-condition-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @button class={count > 0 ? "enabled" : "disabled"} "Save" } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_attr"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "count"
+                && binding["selector"] == "button"
+                && binding["attr"] == "class"
+                && binding["attr_condition"]["state_key"] == "count"
+                && binding["attr_condition"]["op"] == "gt"
+                && binding["attr_condition"]["rhs"]["kind"] == "int"
+                && binding["attr_condition"]["rhs"]["value"] == "0"
+                && binding["attr_condition"]["truthy"] == "enabled"
+                && binding["attr_condition"]["falsy"] == "disabled"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("compareSignalAttrCondition"));
+        assert!(loader.contains("decodeSignalConditionOperand"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

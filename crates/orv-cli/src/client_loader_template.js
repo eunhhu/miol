@@ -224,7 +224,33 @@ function signalAttrConditionIsValid(binding, signals) {
     binding.attr_condition.state_key === binding.state_key &&
     typeof binding.attr_condition.truthy === "string" &&
     typeof binding.attr_condition.falsy === "string" &&
+    signalAttrConditionComparisonIsValid(binding.attr_condition) &&
     signals.some((signal) => signal.state_key === binding.attr_condition.state_key);
+}
+
+function signalAttrConditionComparisonIsValid(condition) {
+  const hasOp = condition.op !== undefined;
+  const hasRhs = condition.rhs !== undefined;
+  if (!hasOp && !hasRhs) {
+    return true;
+  }
+  return hasOp &&
+    hasRhs &&
+    ["eq", "ne", "lt", "gt", "le", "ge"].includes(condition.op) &&
+    signalConditionOperandIsValid(condition.rhs);
+}
+
+function signalConditionOperandIsValid(operand) {
+  if (!operand || typeof operand.kind !== "string") {
+    return false;
+  }
+  if (["int", "float", "string"].includes(operand.kind)) {
+    return typeof operand.value === "string";
+  }
+  if (operand.kind === "bool") {
+    return typeof operand.value === "boolean";
+  }
+  return false;
 }
 
 function decodeSignalInitialValue(metadata) {
@@ -349,7 +375,45 @@ function renderSignalAttrBinding(binding, reactiveState) {
 }
 
 function renderSignalAttrCondition(condition, reactiveState) {
-  return reactiveState[condition.state_key]?.value ? condition.truthy : condition.falsy;
+  const matched = condition.op ?
+    compareSignalAttrCondition(condition, reactiveState) :
+    Boolean(reactiveState[condition.state_key]?.value);
+  return matched ? condition.truthy : condition.falsy;
+}
+
+function compareSignalAttrCondition(condition, reactiveState) {
+  const value = reactiveState[condition.state_key]?.value;
+  const rhs = decodeSignalConditionOperand(condition.rhs);
+  switch (condition.op) {
+    case "eq":
+      return value === rhs;
+    case "ne":
+      return value !== rhs;
+    case "lt":
+      return value < rhs;
+    case "gt":
+      return value > rhs;
+    case "le":
+      return value <= rhs;
+    case "ge":
+      return value >= rhs;
+    default:
+      return false;
+  }
+}
+
+function decodeSignalConditionOperand(operand) {
+  switch (operand.kind) {
+    case "int":
+    case "float":
+      return Number(operand.value);
+    case "string":
+      return String(operand.value ?? "");
+    case "bool":
+      return Boolean(operand.value);
+    default:
+      return null;
+  }
 }
 
 function bindReactiveAttrs(plan, root, reactiveState) {
