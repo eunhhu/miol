@@ -2142,7 +2142,9 @@ Browser home: http://localhost:8080/ provides product, member, order, payment, a
 \n\
 Persistent data: `data/shop.wal.jsonl`. The runtime replays this WAL on startup and appends product, member, order, payment, and shipment mutations before applying them.\n\
 \n\
-Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop WAL outside the container layer.\n\
+Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
+\n\
+Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop WAL and commerce record logs outside the container layer.\n\
 \n\
 Archive the local WAL before deploy or backup rotation:\n\
 \n\
@@ -18467,6 +18469,8 @@ test "checkout failing runtime body" {
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
+        assert!(source.contains(r#"@payment.connect("file://data/payments.jsonl")"#));
+        assert!(source.contains(r#"@shipping.connect("file://data/shipments.jsonl")"#));
         cmd_check(&dir).expect("check shop project");
         let out = dir.join("dist");
         cmd_build_with_profile(&dir, &out, BuildProfile::Production).expect("build shop project");
@@ -18501,6 +18505,7 @@ test "checkout failing runtime body" {
             .contains("ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server"));
         assert!(guide.contains("The generated launcher path can infer `dist`"));
         assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
+        assert!(guide.contains("Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(
             guide.contains("orv db archive --wal data/shop.wal.jsonl --out data/shop.archive.json")
@@ -18574,6 +18579,10 @@ test "checkout failing runtime body" {
             serde_json::json!("data/shop.wal.jsonl")
         );
         assert_eq!(
+            deploy["server"]["persistence"]["record_paths"],
+            serde_json::json!(["data/payments.jsonl", "data/shipments.jsonl"])
+        );
+        assert_eq!(
             container["persistence"]["volumes"][0]["host"],
             serde_json::json!("data")
         );
@@ -18582,6 +18591,10 @@ test "checkout failing runtime body" {
             serde_json::json!("/app/data")
         );
         assert!(compose.contains("../data:/app/data"));
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
+        assert!(runbook.contains("- Record log: data/payments.jsonl"));
+        assert!(runbook.contains("- Record log: data/shipments.jsonl"));
         cmd_verify_build(&out).expect("verify shop prod build");
         let _ = std::fs::remove_dir_all(dir);
     }

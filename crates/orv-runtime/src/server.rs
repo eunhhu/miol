@@ -2743,8 +2743,24 @@ mod tests {
                 "orv-shopping-fixture-{}-{unique}.jsonl",
                 std::process::id()
             ));
+            let payment_path = std::env::temp_dir().join(format!(
+                "orv-shopping-fixture-payments-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            let shipping_path = std::env::temp_dir().join(format!(
+                "orv-shopping-fixture-shipments-{}-{unique}.jsonl",
+                std::process::id()
+            ));
             let src = read_e2e_fixture("shopping_mall.orv")
-                .replace("data/shop.wal.jsonl", &wal_path.display().to_string());
+                .replace("data/shop.wal.jsonl", &wal_path.display().to_string())
+                .replace(
+                    "file://data/payments.jsonl",
+                    &format!("file://{}", payment_path.display()),
+                )
+                .replace(
+                    "file://data/shipments.jsonl",
+                    &format!("file://{}", shipping_path.display()),
+                );
             let ServerTestCase {
                 listen,
                 routes,
@@ -2916,7 +2932,7 @@ mod tests {
             let payment: serde_json::Value =
                 serde_json::from_slice(&payment_body).expect("payment json");
             assert_eq!(payment["payment"]["status"], serde_json::json!("captured"));
-            assert_eq!(payment["payment"]["provider"], serde_json::json!("test"));
+            assert_eq!(payment["payment"]["provider"], serde_json::json!("file"));
             assert_eq!(payment["order"]["status"], serde_json::json!("paid"));
 
             let shipment_payload = serde_json::json!({
@@ -2931,7 +2947,7 @@ mod tests {
             let shipment: serde_json::Value =
                 serde_json::from_slice(&shipment_body).expect("shipment json");
             assert_eq!(shipment["shipment"]["status"], serde_json::json!("ready"));
-            assert_eq!(shipment["shipment"]["provider"], serde_json::json!("test"));
+            assert_eq!(shipment["shipment"]["provider"], serde_json::json!("file"));
             assert_eq!(shipment["order"]["status"], serde_json::json!("shipped"));
 
             let shipment_path = format!("/shipments/{order_id}");
@@ -2958,7 +2974,17 @@ mod tests {
                 snapshot["tables"]["Shipment"]["rows"][0]["tracking"],
                 serde_json::json!("TRK-LOCAL")
             );
+            let payment_records =
+                std::fs::read_to_string(&payment_path).expect("payment record log");
+            let shipping_records =
+                std::fs::read_to_string(&shipping_path).expect("shipping record log");
+            assert!(payment_records.contains(r#""kind":"payment.capture""#));
+            assert!(payment_records.contains(&format!(r#""orderId":{order_id}"#)));
+            assert!(shipping_records.contains(r#""kind":"shipping.booking""#));
+            assert!(shipping_records.contains(r#""tracking":"TRK-LOCAL""#));
             let _ = std::fs::remove_file(wal_path);
+            let _ = std::fs::remove_file(payment_path);
+            let _ = std::fs::remove_file(shipping_path);
         })
         .await;
     }
