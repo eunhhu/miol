@@ -364,7 +364,7 @@ pub struct ServerResponseConditionArtifact {
 pub struct ServerResponseObjectFieldArtifact {
     /// JSON field name in the response body.
     pub field: String,
-    /// Field value class: `static_json`, `route_param`, `query_param`, `request_body_json`, or `request_body_field`.
+    /// Field value class: `static_json`, route/query/request captured values, or `request_body_json`.
     pub value_kind: String,
     /// Statically lowered JSON value for `static_json` fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -381,6 +381,12 @@ pub struct ServerResponseRouteParamArtifact {
     pub field: String,
     /// Captured route parameter name.
     pub param: String,
+    /// Field value class: `route_param`, `route_param_int`, or `route_param_float`.
+    #[serde(
+        default = "default_route_param_value_kind",
+        skip_serializing_if = "is_default_route_param_value_kind"
+    )]
+    pub value_kind: String,
 }
 
 /// One JSON object field backed by a captured query param.
@@ -390,6 +396,12 @@ pub struct ServerResponseQueryParamArtifact {
     pub field: String,
     /// Captured query parameter name.
     pub param: String,
+    /// Field value class: `query_param`, `query_param_int`, or `query_param_float`.
+    #[serde(
+        default = "default_query_param_value_kind",
+        skip_serializing_if = "is_default_query_param_value_kind"
+    )]
+    pub value_kind: String,
 }
 
 /// One JSON object field backed by the request body JSON value.
@@ -420,6 +432,22 @@ fn default_request_body_field_value_kind() -> String {
 
 fn is_default_request_body_field_value_kind(value: &str) -> bool {
     value == "request_body_field"
+}
+
+fn default_route_param_value_kind() -> String {
+    "route_param".to_string()
+}
+
+fn is_default_route_param_value_kind(value: &str) -> bool {
+    value == "route_param"
+}
+
+fn default_query_param_value_kind() -> String {
+    "query_param".to_string()
+}
+
+fn is_default_query_param_value_kind(value: &str) -> bool {
+    value == "query_param"
 }
 
 /// One compiled server listen descriptor.
@@ -1444,7 +1472,7 @@ fn native_server_response_is_direct(
             || response.body_json.is_some()
             || native_server_response_uses_object_fields(response, route_params)
             || native_server_response_uses_route_params(response, route_params)
-            || !response.body_query_params.is_empty()
+            || native_server_response_uses_query_params(response)
             || !response.body_request_json.is_empty()
             || !response.body_request_fields.is_empty())
 }
@@ -1469,11 +1497,13 @@ fn native_server_response_uses_object_fields(
             .iter()
             .all(|field| match field.value_kind.as_str() {
                 "static_json" => field.value_json.is_some(),
-                "route_param" => field
+                "route_param" | "route_param_int" | "route_param_float" => field
                     .name
                     .as_ref()
                     .is_some_and(|name| route_params.iter().any(|route_param| route_param == name)),
                 "query_param"
+                | "query_param_int"
+                | "query_param_float"
                 | "request_body_field"
                 | "request_body_field_int"
                 | "request_body_field_float" => field.name.is_some(),
@@ -1488,10 +1518,30 @@ fn native_server_response_uses_route_params(
 ) -> bool {
     !response.body_route_params.is_empty()
         && response.body_route_params.iter().all(|field| {
-            route_params
+            matches!(
+                field.value_kind.as_str(),
+                "route_param" | "route_param_int" | "route_param_float"
+            ) && route_params
                 .iter()
                 .any(|route_param| route_param == &field.param)
         })
+}
+
+fn native_server_response_uses_query_params(response: &ServerResponseArtifact) -> bool {
+    !response.body_query_params.is_empty()
+        && response.body_query_params.iter().all(|field| {
+            matches!(
+                field.value_kind.as_str(),
+                "query_param" | "query_param_int" | "query_param_float"
+            )
+        })
+}
+
+fn native_value_kind_uses_json_string(value_kind: &str) -> bool {
+    matches!(
+        value_kind,
+        "route_param" | "query_param" | "request_body_field"
+    )
 }
 
 fn native_server_route_param_names(path: &str) -> Vec<String> {
@@ -1955,22 +2005,26 @@ pub fn orv_native_handle_route(
                             rust_string_literal(value_json)
                         );
                     }
-                    "route_param" => {
-                        uses_route_param_json = true;
+                    "route_param" | "route_param_int" | "route_param_float" => {
+                        uses_route_param_json |=
+                            native_value_kind_uses_json_string(&field.value_kind);
                         let name = field.name.as_deref().unwrap_or_default();
-                        let _ = writeln!(
-                            source,
-                            "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                            rust_string_literal(name)
+                        let _ = push_native_route_param_json_value(
+                            &mut source,
+                            name,
+                            &field.value_kind,
+                            &response.origin_id,
                         );
                     }
-                    "query_param" => {
-                        uses_query_param_json = true;
+                    "query_param" | "query_param_int" | "query_param_float" => {
+                        uses_query_param_json |=
+                            native_value_kind_uses_json_string(&field.value_kind);
                         let name = field.name.as_deref().unwrap_or_default();
-                        let _ = writeln!(
-                            source,
-                            "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                            rust_string_literal(name)
+                        let _ = push_native_query_param_json_value(
+                            &mut source,
+                            name,
+                            &field.value_kind,
+                            &response.origin_id,
                         );
                     }
                     "request_body_json" => {
@@ -1979,7 +2033,8 @@ pub fn orv_native_handle_route(
                         );
                     }
                     "request_body_field" => {
-                        uses_request_body_field_json = true;
+                        uses_request_body_field_json |=
+                            native_value_kind_uses_json_string(&field.value_kind);
                         let name = field.name.as_deref().unwrap_or_default();
                         let _ = push_native_request_body_field_json_value(
                             &mut source,
@@ -1989,7 +2044,8 @@ pub fn orv_native_handle_route(
                         );
                     }
                     "request_body_field_int" => {
-                        uses_request_body_field_json = true;
+                        uses_request_body_field_json |=
+                            native_value_kind_uses_json_string(&field.value_kind);
                         let name = field.name.as_deref().unwrap_or_default();
                         let _ = push_native_request_body_field_json_value(
                             &mut source,
@@ -1999,7 +2055,8 @@ pub fn orv_native_handle_route(
                         );
                     }
                     "request_body_field_float" => {
-                        uses_request_body_field_json = true;
+                        uses_request_body_field_json |=
+                            native_value_kind_uses_json_string(&field.value_kind);
                         let name = field.name.as_deref().unwrap_or_default();
                         let _ = push_native_request_body_field_json_value(
                             &mut source,
@@ -2018,7 +2075,6 @@ pub fn orv_native_handle_route(
         }
         if !response.body_query_params.is_empty() {
             native_route_count += 1;
-            uses_query_param_json = true;
             let _ = writeln!(
                 source,
                 "    if route_match.route.origin_id == {} {{",
@@ -2030,10 +2086,12 @@ pub fn orv_native_handle_route(
                     source.push_str("        body.push(',');\n");
                 }
                 push_native_json_field_prefix(&mut source, &field.field);
-                let _ = writeln!(
-                    source,
-                    "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                    rust_string_literal(&field.param)
+                uses_query_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+                let _ = push_native_query_param_json_value(
+                    &mut source,
+                    &field.param,
+                    &field.value_kind,
+                    &response.origin_id,
                 );
             }
             source.push_str("        body.push('}');\n");
@@ -2065,7 +2123,6 @@ pub fn orv_native_handle_route(
         }
         if !response.body_request_fields.is_empty() {
             native_route_count += 1;
-            uses_request_body_field_json = true;
             let _ = writeln!(
                 source,
                 "    if route_match.route.origin_id == {} {{",
@@ -2077,6 +2134,8 @@ pub fn orv_native_handle_route(
                     source.push_str("        body.push(',');\n");
                 }
                 push_native_json_field_prefix(&mut source, &field.field);
+                uses_request_body_field_json |=
+                    native_value_kind_uses_json_string(&field.value_kind);
                 let _ = push_native_request_body_field_json_value(
                     &mut source,
                     &field.name,
@@ -2091,7 +2150,6 @@ pub fn orv_native_handle_route(
         }
         if !response.body_route_params.is_empty() {
             native_route_count += 1;
-            uses_route_param_json = true;
             let _ = writeln!(
                 source,
                 "    if route_match.route.origin_id == {} {{",
@@ -2103,10 +2161,12 @@ pub fn orv_native_handle_route(
                     source.push_str("        body.push(',');\n");
                 }
                 push_native_json_field_prefix(&mut source, &field.field);
-                let _ = writeln!(
-                    source,
-                    "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                    rust_string_literal(&field.param)
+                uses_route_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+                let _ = push_native_route_param_json_value(
+                    &mut source,
+                    &field.param,
+                    &field.value_kind,
+                    &response.origin_id,
                 );
             }
             source.push_str("        body.push('}');\n");
@@ -2177,45 +2237,118 @@ fn push_native_request_body_field_json_value(
     value_kind: &str,
     response_origin_id: &str,
 ) -> bool {
+    let lookup_expr = format!(
+        "routes::orv_native_body_field_value(route_match, {})",
+        rust_string_literal(name)
+    );
+    push_native_captured_json_value(
+        source,
+        &lookup_expr,
+        value_kind,
+        &NativeCapturedJsonKinds {
+            string_kind: "request_body_field",
+            int_kind: "request_body_field_int",
+            float_kind: "request_body_field_float",
+            error_prefix: "native request body",
+        },
+        response_origin_id,
+    )
+}
+
+fn push_native_route_param_json_value(
+    source: &mut String,
+    name: &str,
+    value_kind: &str,
+    response_origin_id: &str,
+) -> bool {
+    let lookup_expr = format!(
+        "routes::orv_native_param_value(route_match, {})",
+        rust_string_literal(name)
+    );
+    push_native_captured_json_value(
+        source,
+        &lookup_expr,
+        value_kind,
+        &NativeCapturedJsonKinds {
+            string_kind: "route_param",
+            int_kind: "route_param_int",
+            float_kind: "route_param_float",
+            error_prefix: "native route param",
+        },
+        response_origin_id,
+    )
+}
+
+fn push_native_query_param_json_value(
+    source: &mut String,
+    name: &str,
+    value_kind: &str,
+    response_origin_id: &str,
+) -> bool {
+    let lookup_expr = format!(
+        "routes::orv_native_query_value(route_match, {})",
+        rust_string_literal(name)
+    );
+    push_native_captured_json_value(
+        source,
+        &lookup_expr,
+        value_kind,
+        &NativeCapturedJsonKinds {
+            string_kind: "query_param",
+            int_kind: "query_param_int",
+            float_kind: "query_param_float",
+            error_prefix: "native query param",
+        },
+        response_origin_id,
+    )
+}
+
+struct NativeCapturedJsonKinds<'a> {
+    string_kind: &'a str,
+    int_kind: &'a str,
+    float_kind: &'a str,
+    error_prefix: &'a str,
+}
+
+fn push_native_captured_json_value(
+    source: &mut String,
+    lookup_expr: &str,
+    value_kind: &str,
+    kinds: &NativeCapturedJsonKinds<'_>,
+    response_origin_id: &str,
+) -> bool {
     match value_kind {
-        "request_body_field" => {
+        kind if kind == kinds.string_kind => {
             let _ = writeln!(
                 source,
-                "        orv_native_push_json_string(routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                rust_string_literal(name)
+                "        orv_native_push_json_string({lookup_expr}.unwrap_or(\"\"), &mut body);"
             );
             true
         }
-        "request_body_field_int" => {
+        kind if kind == kinds.int_kind => {
             let _ = writeln!(
                 source,
-                "        match routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\").trim().parse::<i64>() {{",
-                rust_string_literal(name)
+                "        match {lookup_expr}.unwrap_or(\"\").trim().parse::<i64>() {{"
             );
             source.push_str(
                 "            Ok(value) => body.push_str(&value.to_string()),\n            Err(_) => {\n",
             );
-            let body_expr = format!(
-                "{}.to_string()",
-                rust_string_literal(r#"{"error":"native request body int cast failed"}"#)
-            );
+            let error_body = format!(r#"{{"error":"{} int cast failed"}}"#, kinds.error_prefix);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("            },\n        }\n");
             true
         }
-        "request_body_field_float" => {
+        kind if kind == kinds.float_kind => {
             let _ = writeln!(
                 source,
-                "        match routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\").trim().parse::<f64>() {{",
-                rust_string_literal(name)
+                "        match {lookup_expr}.unwrap_or(\"\").trim().parse::<f64>() {{"
             );
             source.push_str(
                 "            Ok(value) if value.is_finite() => body.push_str(&value.to_string()),\n            _ => {\n",
             );
-            let body_expr = format!(
-                "{}.to_string()",
-                rust_string_literal(r#"{"error":"native request body float cast failed"}"#)
-            );
+            let error_body = format!(r#"{{"error":"{} float cast failed"}}"#, kinds.error_prefix);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("            },\n        }\n");
             true
@@ -2281,152 +2414,186 @@ fn push_native_response_body_return(
         return true;
     }
     if !response.body_object_fields.is_empty() {
-        source.push_str("        let mut body = String::from(\"{\");\n");
-        for (index, field) in response.body_object_fields.iter().enumerate() {
-            if index > 0 {
-                source.push_str("        body.push(',');\n");
-            }
-            push_native_json_field_prefix(source, &field.field);
-            match field.value_kind.as_str() {
-                "static_json" => {
-                    let value_json = field.value_json.as_deref().unwrap_or("null");
-                    let _ = writeln!(
-                        source,
-                        "        body.push_str({});",
-                        rust_string_literal(value_json)
-                    );
-                }
-                "route_param" => {
-                    *uses_route_param_json = true;
-                    let name = field.name.as_deref().unwrap_or_default();
-                    let _ = writeln!(
-                        source,
-                        "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                        rust_string_literal(name)
-                    );
-                }
-                "query_param" => {
-                    *uses_query_param_json = true;
-                    let name = field.name.as_deref().unwrap_or_default();
-                    let _ = writeln!(
-                        source,
-                        "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                        rust_string_literal(name)
-                    );
-                }
-                "request_body_json" => {
-                    source.push_str(
-                        "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
-                    );
-                }
-                "request_body_field" => {
-                    *uses_request_body_field_json = true;
-                    let name = field.name.as_deref().unwrap_or_default();
-                    let _ = push_native_request_body_field_json_value(
-                        source,
-                        name,
-                        "request_body_field",
-                        &response.origin_id,
-                    );
-                }
-                "request_body_field_int" => {
-                    *uses_request_body_field_json = true;
-                    let name = field.name.as_deref().unwrap_or_default();
-                    let _ = push_native_request_body_field_json_value(
-                        source,
-                        name,
-                        "request_body_field_int",
-                        &response.origin_id,
-                    );
-                }
-                "request_body_field_float" => {
-                    *uses_request_body_field_json = true;
-                    let name = field.name.as_deref().unwrap_or_default();
-                    let _ = push_native_request_body_field_json_value(
-                        source,
-                        name,
-                        "request_body_field_float",
-                        &response.origin_id,
-                    );
-                }
-                _ => return false,
-            }
+        if !push_native_object_fields_body(
+            source,
+            response,
+            uses_route_param_json,
+            uses_query_param_json,
+            uses_request_body_field_json,
+        ) {
+            return false;
         }
-        source.push_str("        body.push('}');\n");
         push_native_handler_response_return(source, status, "body", &response.origin_id);
         return true;
     }
     if !response.body_query_params.is_empty() {
-        *uses_query_param_json = true;
-        source.push_str("        let mut body = String::from(\"{\");\n");
-        for (index, field) in response.body_query_params.iter().enumerate() {
-            if index > 0 {
-                source.push_str("        body.push(',');\n");
-            }
-            push_native_json_field_prefix(source, &field.field);
-            let _ = writeln!(
-                source,
-                "        orv_native_push_json_string(routes::orv_native_query_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                rust_string_literal(&field.param)
-            );
-        }
-        source.push_str("        body.push('}');\n");
+        push_native_query_params_body(source, response, uses_query_param_json);
         push_native_handler_response_return(source, status, "body", &response.origin_id);
         return true;
     }
     if !response.body_request_json.is_empty() {
-        source.push_str("        let mut body = String::from(\"{\");\n");
-        for (index, field) in response.body_request_json.iter().enumerate() {
-            if index > 0 {
-                source.push_str("        body.push(',');\n");
-            }
-            push_native_json_field_prefix(source, &field.field);
-            source.push_str(
-                "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
-            );
-        }
-        source.push_str("        body.push('}');\n");
+        push_native_request_json_body(source, response);
         push_native_handler_response_return(source, status, "body", &response.origin_id);
         return true;
     }
     if !response.body_request_fields.is_empty() {
-        *uses_request_body_field_json = true;
-        source.push_str("        let mut body = String::from(\"{\");\n");
-        for (index, field) in response.body_request_fields.iter().enumerate() {
-            if index > 0 {
-                source.push_str("        body.push(',');\n");
-            }
-            push_native_json_field_prefix(source, &field.field);
-            let _ = push_native_request_body_field_json_value(
-                source,
-                &field.name,
-                &field.value_kind,
-                &response.origin_id,
-            );
-        }
-        source.push_str("        body.push('}');\n");
+        push_native_request_fields_body(source, response, uses_request_body_field_json);
         push_native_handler_response_return(source, status, "body", &response.origin_id);
         return true;
     }
     if !response.body_route_params.is_empty() {
-        *uses_route_param_json = true;
-        source.push_str("        let mut body = String::from(\"{\");\n");
-        for (index, field) in response.body_route_params.iter().enumerate() {
-            if index > 0 {
-                source.push_str("        body.push(',');\n");
-            }
-            push_native_json_field_prefix(source, &field.field);
-            let _ = writeln!(
-                source,
-                "        orv_native_push_json_string(routes::orv_native_param_value(route_match, {}).unwrap_or(\"\"), &mut body);",
-                rust_string_literal(&field.param)
-            );
-        }
-        source.push_str("        body.push('}');\n");
+        push_native_route_params_body(source, response, uses_route_param_json);
         push_native_handler_response_return(source, status, "body", &response.origin_id);
         return true;
     }
     false
+}
+
+fn push_native_object_fields_body(
+    source: &mut String,
+    response: &ServerResponseArtifact,
+    uses_route_param_json: &mut bool,
+    uses_query_param_json: &mut bool,
+    uses_request_body_field_json: &mut bool,
+) -> bool {
+    source.push_str("        let mut body = String::from(\"{\");\n");
+    for (index, field) in response.body_object_fields.iter().enumerate() {
+        if index > 0 {
+            source.push_str("        body.push(',');\n");
+        }
+        push_native_json_field_prefix(source, &field.field);
+        match field.value_kind.as_str() {
+            "static_json" => push_native_static_json_value(source, field),
+            "route_param" | "route_param_int" | "route_param_float" => {
+                *uses_route_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+                let name = field.name.as_deref().unwrap_or_default();
+                let _ = push_native_route_param_json_value(
+                    source,
+                    name,
+                    &field.value_kind,
+                    &response.origin_id,
+                );
+            }
+            "query_param" | "query_param_int" | "query_param_float" => {
+                *uses_query_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+                let name = field.name.as_deref().unwrap_or_default();
+                let _ = push_native_query_param_json_value(
+                    source,
+                    name,
+                    &field.value_kind,
+                    &response.origin_id,
+                );
+            }
+            "request_body_json" => {
+                source.push_str(
+                    "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
+                );
+            }
+            "request_body_field" | "request_body_field_int" | "request_body_field_float" => {
+                *uses_request_body_field_json |=
+                    native_value_kind_uses_json_string(&field.value_kind);
+                let name = field.name.as_deref().unwrap_or_default();
+                let _ = push_native_request_body_field_json_value(
+                    source,
+                    name,
+                    &field.value_kind,
+                    &response.origin_id,
+                );
+            }
+            _ => return false,
+        }
+    }
+    source.push_str("        body.push('}');\n");
+    true
+}
+
+fn push_native_static_json_value(source: &mut String, field: &ServerResponseObjectFieldArtifact) {
+    let value_json = field.value_json.as_deref().unwrap_or("null");
+    let _ = writeln!(
+        source,
+        "        body.push_str({});",
+        rust_string_literal(value_json)
+    );
+}
+
+fn push_native_query_params_body(
+    source: &mut String,
+    response: &ServerResponseArtifact,
+    uses_query_param_json: &mut bool,
+) {
+    source.push_str("        let mut body = String::from(\"{\");\n");
+    for (index, field) in response.body_query_params.iter().enumerate() {
+        if index > 0 {
+            source.push_str("        body.push(',');\n");
+        }
+        push_native_json_field_prefix(source, &field.field);
+        *uses_query_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+        let _ = push_native_query_param_json_value(
+            source,
+            &field.param,
+            &field.value_kind,
+            &response.origin_id,
+        );
+    }
+    source.push_str("        body.push('}');\n");
+}
+
+fn push_native_request_json_body(source: &mut String, response: &ServerResponseArtifact) {
+    source.push_str("        let mut body = String::from(\"{\");\n");
+    for (index, field) in response.body_request_json.iter().enumerate() {
+        if index > 0 {
+            source.push_str("        body.push(',');\n");
+        }
+        push_native_json_field_prefix(source, &field.field);
+        source.push_str(
+            "        body.push_str(routes::orv_native_body_json(route_match).unwrap_or(\"null\"));\n",
+        );
+    }
+    source.push_str("        body.push('}');\n");
+}
+
+fn push_native_request_fields_body(
+    source: &mut String,
+    response: &ServerResponseArtifact,
+    uses_request_body_field_json: &mut bool,
+) {
+    source.push_str("        let mut body = String::from(\"{\");\n");
+    for (index, field) in response.body_request_fields.iter().enumerate() {
+        if index > 0 {
+            source.push_str("        body.push(',');\n");
+        }
+        push_native_json_field_prefix(source, &field.field);
+        *uses_request_body_field_json |= native_value_kind_uses_json_string(&field.value_kind);
+        let _ = push_native_request_body_field_json_value(
+            source,
+            &field.name,
+            &field.value_kind,
+            &response.origin_id,
+        );
+    }
+    source.push_str("        body.push('}');\n");
+}
+
+fn push_native_route_params_body(
+    source: &mut String,
+    response: &ServerResponseArtifact,
+    uses_route_param_json: &mut bool,
+) {
+    source.push_str("        let mut body = String::from(\"{\");\n");
+    for (index, field) in response.body_route_params.iter().enumerate() {
+        if index > 0 {
+            source.push_str("        body.push(',');\n");
+        }
+        push_native_json_field_prefix(source, &field.field);
+        *uses_route_param_json |= native_value_kind_uses_json_string(&field.value_kind);
+        let _ = push_native_route_param_json_value(
+            source,
+            &field.param,
+            &field.value_kind,
+            &response.origin_id,
+        );
+    }
+    source.push_str("        body.push('}');\n");
 }
 
 fn rust_string_literal(value: &str) -> String {
@@ -2619,9 +2786,11 @@ fn route_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseRoutePar
                 if field.is_spread {
                     return None;
                 }
+                let (param, value_kind) = route_param_field_value(&field.value)?;
                 out.push(ServerResponseRouteParamArtifact {
                     field: field.name.clone(),
-                    param: route_param_field_name(&field.value)?,
+                    param,
+                    value_kind,
                 });
             }
             Some(out)
@@ -2639,9 +2808,11 @@ fn query_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseQueryPar
                 if field.is_spread {
                     return None;
                 }
+                let (param, value_kind) = query_param_field_value(&field.value)?;
                 out.push(ServerResponseQueryParamArtifact {
                     field: field.name.clone(),
-                    param: query_param_field_name(&field.value)?,
+                    param,
+                    value_kind,
                 });
             }
             Some(out)
@@ -2712,19 +2883,19 @@ fn mixed_object_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseObjectF
                         value_json: Some(value_json),
                         name: None,
                     }
-                } else if let Some(name) = route_param_field_name(&field.value) {
+                } else if let Some((name, value_kind)) = route_param_field_value(&field.value) {
                     has_dynamic = true;
                     ServerResponseObjectFieldArtifact {
                         field: field.name.clone(),
-                        value_kind: "route_param".to_string(),
+                        value_kind,
                         value_json: None,
                         name: Some(name),
                     }
-                } else if let Some(name) = query_param_field_name(&field.value) {
+                } else if let Some((name, value_kind)) = query_param_field_value(&field.value) {
                     has_dynamic = true;
                     ServerResponseObjectFieldArtifact {
                         field: field.name.clone(),
-                        value_kind: "query_param".to_string(),
+                        value_kind,
                         value_json: None,
                         name: Some(name),
                     }
@@ -2773,6 +2944,34 @@ fn query_param_field_name(expr: &HirExpr) -> Option<String> {
         }
         HirExprKind::Paren(expr) => query_param_field_name(expr),
         _ => None,
+    }
+}
+
+fn route_param_field_value(expr: &HirExpr) -> Option<(String, String)> {
+    match &expr.kind {
+        HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => {
+            Some((route_param_field_name(expr)?, "route_param_int".to_string()))
+        }
+        HirExprKind::Cast { expr, ty } if is_float_type_ref(ty) => Some((
+            route_param_field_name(expr)?,
+            "route_param_float".to_string(),
+        )),
+        HirExprKind::Paren(expr) => route_param_field_value(expr),
+        _ => Some((route_param_field_name(expr)?, "route_param".to_string())),
+    }
+}
+
+fn query_param_field_value(expr: &HirExpr) -> Option<(String, String)> {
+    match &expr.kind {
+        HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => {
+            Some((query_param_field_name(expr)?, "query_param_int".to_string()))
+        }
+        HirExprKind::Cast { expr, ty } if is_float_type_ref(ty) => Some((
+            query_param_field_name(expr)?,
+            "query_param_float".to_string(),
+        )),
+        HirExprKind::Paren(expr) => query_param_field_value(expr),
+        _ => Some((query_param_field_name(expr)?, "query_param".to_string())),
     }
 }
 
@@ -4830,6 +5029,79 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(".trim().parse::<f64>()"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"amount\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_route_param_int_cast_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:id {
+    @respond 200 { id: @param.id as int }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "route_param_json");
+        assert_eq!(response.body_route_params[0].field, "id");
+        assert_eq!(response.body_route_params[0].param, "id");
+        assert_eq!(response.body_route_params[0].value_kind, "route_param_int");
+        assert!(handlers.contains(".trim().parse::<i64>()"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains(
+            "orv_native_push_json_string(routes::orv_native_param_value(route_match, \"id\")"
+        ));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_query_param_float_cast_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /search {
+    @respond 200 { page: @query.page as float }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "query_param_json");
+        assert_eq!(response.body_query_params[0].field, "page");
+        assert_eq!(response.body_query_params[0].param, "page");
+        assert_eq!(
+            response.body_query_params[0].value_kind,
+            "query_param_float"
+        );
+        assert!(handlers.contains(".trim().parse::<f64>()"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains(
+            "orv_native_push_json_string(routes::orv_native_query_value(route_match, \"page\")"
+        ));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
