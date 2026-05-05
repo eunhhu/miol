@@ -112,6 +112,20 @@ function validateReactiveBindings(plan, manifest) {
   if (!hasSignalStateBindings) {
     throw new Error("orv client reactive plan signal_state binding mismatch");
   }
+  const signalTextBindingsAreValid = plan.bindings
+    .filter((binding) => binding.kind === "signal_text")
+    .every((binding) =>
+      binding.target === manifest.page &&
+      typeof binding.selector === "string" &&
+      binding.selector.length > 0 &&
+      plan.signals.some((signal) =>
+        binding.source === signal.origin_id &&
+        binding.state_key === signal.state_key
+      )
+    );
+  if (!signalTextBindingsAreValid) {
+    throw new Error("orv client reactive plan signal_text binding mismatch");
+  }
 }
 
 function decodeSignalInitialValue(metadata) {
@@ -139,6 +153,43 @@ function createReactiveState(plan) {
       initial_value: signal.initial_value,
     },
   ]));
+}
+
+function displaySignalValue(value) {
+  return value == null ? "" : String(value);
+}
+
+function bindReactiveDom(plan, root, reactiveState) {
+  const bindings = new Map();
+  if (!root) {
+    return { count: 0, update() {} };
+  }
+  const textBindings = plan.bindings.filter((binding) => binding.kind === "signal_text");
+  for (const binding of textBindings) {
+    const state = reactiveState[binding.state_key];
+    if (!state) {
+      continue;
+    }
+    const expectedText = displaySignalValue(state.value);
+    const element = Array.from(root.querySelectorAll(binding.selector))
+      .find((candidate) => candidate.textContent === expectedText);
+    if (!element) {
+      continue;
+    }
+    element.dataset.orvSignal = binding.state_key;
+    const current = bindings.get(binding.state_key) || [];
+    current.push(element);
+    bindings.set(binding.state_key, current);
+  }
+  return {
+    count: [...bindings.values()].reduce((total, items) => total + items.length, 0),
+    update(stateKey, value) {
+      const elements = bindings.get(stateKey) || [];
+      for (const element of elements) {
+        element.textContent = displaySignalValue(value);
+      }
+    },
+  };
 }
 
 async function loadSourceBundle(manifest) {
@@ -203,6 +254,18 @@ async function main() {
   if (root && initialRender) {
     root.innerHTML = initialRender;
   }
+  const reactiveDom = bindReactiveDom(reactivePlan, root, reactiveState);
+  function setSignal(stateKey, value) {
+    const state = reactiveState[stateKey];
+    if (!state) {
+      throw new Error(`orv client signal state not found: ${stateKey}`);
+    }
+    state.value = value;
+    reactiveDom.update(stateKey, value);
+    if (root) {
+      root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
+    }
+  }
   if (typeof instance.exports.orv_start === "function") {
     instance.exports.orv_start();
   }
@@ -215,9 +278,11 @@ async function main() {
     root.dataset.orvSourceCount = String(sourceBundle.files?.length ?? 0);
     root.dataset.orvReactiveSignals = String(reactivePlan.signals.length);
     root.dataset.orvReactiveBindings = String(reactivePlan.bindings.filter((binding) => binding.kind === "signal_state").length);
+    root.dataset.orvReactiveDomBindings = String(reactiveDom.count);
     root.dataset.orvReactiveStateHash = stableJsonHash(reactiveState);
   }
   globalThis.__ORV_CLIENT_REACTIVE_STATE__ = Object.freeze(reactiveState);
+  globalThis.__ORV_SET_SIGNAL__ = setSignal;
 }
 
 main().catch((error) => {

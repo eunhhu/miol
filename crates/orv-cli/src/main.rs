@@ -13358,6 +13358,9 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
     }) {
         anyhow::bail!("client_reactive_plan signal_state binding is missing");
     }
+    if !client_reactive_plan_signal_text_bindings_are_valid(signals, bindings) {
+        anyhow::bail!("client_reactive_plan signal_text binding is invalid");
+    }
     if !plan
         .get("blocked_by")
         .and_then(serde_json::Value::as_array)
@@ -13385,6 +13388,41 @@ fn verify_client_page_file(target: &Path) -> anyhow::Result<()> {
         anyhow::bail!("client_page bundle does not load client/app.js");
     }
     Ok(())
+}
+
+fn client_reactive_plan_signal_text_bindings_are_valid(
+    signals: &[serde_json::Value],
+    bindings: &[serde_json::Value],
+) -> bool {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.get("kind").and_then(serde_json::Value::as_str) == Some("signal_text")
+        })
+        .all(|binding| client_reactive_plan_signal_text_binding_is_valid(signals, binding))
+}
+
+fn client_reactive_plan_signal_text_binding_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    let origin_id = binding
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let state_key = binding
+        .get("state_key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_PAGE_PATH)
+        && binding
+            .get("selector")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|selector| !selector.is_empty())
+        && signals.iter().any(|signal| {
+            signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
+                && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
+        })
 }
 
 fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
@@ -13418,11 +13456,16 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client reactive plan hash mismatch")
         || !source.contains("client reactive plan initial_render binding mismatch")
         || !source.contains("client reactive plan signal_state binding mismatch")
+        || !source.contains("client reactive plan signal_text binding mismatch")
         || !source.contains("createReactiveState")
+        || !source.contains("bindReactiveDom")
+        || !source.contains("setSignal")
         || !source.contains("orvReactiveSignals")
         || !source.contains("orvReactiveBindings")
+        || !source.contains("orvReactiveDomBindings")
         || !source.contains("orvReactiveStateHash")
         || !source.contains("__ORV_CLIENT_REACTIVE_STATE__")
+        || !source.contains("__ORV_SET_SIGNAL__")
     {
         anyhow::bail!("client_js bundle does not verify client reactive plan contract");
     }
@@ -17132,6 +17175,7 @@ fn write_client_reactive_plan(
             "state_key": signal["state_key"].clone(),
         })
     }));
+    bindings.extend(client_reactive_dom_bindings(binding));
     let plan = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.reactive_plan",
@@ -17170,6 +17214,289 @@ fn client_reactive_plan_signals(binding: &ClientSourceBinding<'_>) -> Vec<serde_
             })
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct ClientSignalDomSource {
+    origin_id: String,
+    state_key: String,
+}
+
+fn client_reactive_dom_bindings(binding: &ClientSourceBinding<'_>) -> Vec<serde_json::Value> {
+    let signals = client_signal_dom_sources(binding.program);
+    let mut bindings = Vec::new();
+    for stmt in &binding.program.items {
+        collect_client_dom_bindings_stmt(stmt, false, &signals, &mut bindings);
+    }
+    bindings
+}
+
+fn client_signal_dom_sources(
+    program: &orv_hir::HirProgram,
+) -> HashMap<orv_hir::NameId, ClientSignalDomSource> {
+    program
+        .items
+        .iter()
+        .filter_map(|stmt| {
+            let orv_hir::HirStmt::Let(stmt) = stmt else {
+                return None;
+            };
+            (stmt.kind == orv_hir::HirLetKind::Signal).then(|| {
+                (
+                    stmt.name.id,
+                    ClientSignalDomSource {
+                        origin_id: orv_hir::origin_id("signal", &stmt.name.name, stmt.span),
+                        state_key: stmt.name.name.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn collect_client_dom_bindings_stmt(
+    stmt: &orv_hir::HirStmt,
+    inside_html: bool,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    match stmt {
+        orv_hir::HirStmt::Let(stmt) => {
+            collect_client_dom_bindings_expr(&stmt.init, inside_html, signals, out);
+        }
+        orv_hir::HirStmt::Const(stmt) => {
+            collect_client_dom_bindings_expr(&stmt.init, inside_html, signals, out);
+        }
+        orv_hir::HirStmt::Function(stmt) => {
+            collect_client_dom_bindings_function_body(&stmt.body, inside_html, signals, out);
+        }
+        orv_hir::HirStmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                collect_client_dom_bindings_expr(value, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirStmt::Expr(expr) => {
+            collect_client_dom_bindings_expr(expr, inside_html, signals, out);
+        }
+        orv_hir::HirStmt::Struct(_)
+        | orv_hir::HirStmt::Enum(_)
+        | orv_hir::HirStmt::TypeAlias(_)
+        | orv_hir::HirStmt::Import(_) => {}
+    }
+}
+
+fn collect_client_dom_bindings_function_body(
+    body: &orv_hir::HirFunctionBody,
+    inside_html: bool,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    match body {
+        orv_hir::HirFunctionBody::Block(block) => {
+            collect_client_dom_bindings_block(block, inside_html, signals, out);
+        }
+        orv_hir::HirFunctionBody::Expr(expr) => {
+            collect_client_dom_bindings_expr(expr, inside_html, signals, out);
+        }
+    }
+}
+
+fn collect_client_dom_bindings_block(
+    block: &orv_hir::HirBlock,
+    inside_html: bool,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    for stmt in &block.stmts {
+        collect_client_dom_bindings_stmt(stmt, inside_html, signals, out);
+    }
+}
+
+fn collect_client_dom_bindings_expr(
+    expr: &orv_hir::HirExpr,
+    inside_html: bool,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    match &expr.kind {
+        orv_hir::HirExprKind::Html(block) => {
+            collect_client_dom_bindings_block(block, true, signals, out);
+        }
+        orv_hir::HirExprKind::Domain { name, args, .. } => {
+            if inside_html {
+                collect_client_dom_bindings_for_tag(name, args, signals, out);
+            }
+            for arg in args {
+                collect_client_dom_bindings_expr(arg, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::Block(block) => {
+            collect_client_dom_bindings_block(block, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Out(inner)
+        | orv_hir::HirExprKind::Unary { expr: inner, .. }
+        | orv_hir::HirExprKind::Paren(inner)
+        | orv_hir::HirExprKind::Throw(inner)
+        | orv_hir::HirExprKind::Await(inner)
+        | orv_hir::HirExprKind::Cast { expr: inner, .. } => {
+            collect_client_dom_bindings_expr(inner, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Binary { lhs, rhs, .. }
+        | orv_hir::HirExprKind::Range {
+            start: lhs,
+            end: rhs,
+            ..
+        } => {
+            collect_client_dom_bindings_expr(lhs, inside_html, signals, out);
+            collect_client_dom_bindings_expr(rhs, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::String(segments) => {
+            for segment in segments {
+                if let orv_hir::HirStringSegment::Interp(expr) = segment {
+                    collect_client_dom_bindings_expr(expr, inside_html, signals, out);
+                }
+            }
+        }
+        orv_hir::HirExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => {
+            collect_client_dom_bindings_expr(cond, inside_html, signals, out);
+            collect_client_dom_bindings_block(then, inside_html, signals, out);
+            if let Some(else_branch) = else_branch {
+                collect_client_dom_bindings_expr(else_branch, inside_html, signals, out);
+            }
+        }
+        _ => collect_client_dom_bindings_nested_expr(expr, inside_html, signals, out),
+    }
+}
+
+fn collect_client_dom_bindings_nested_expr(
+    expr: &orv_hir::HirExpr,
+    inside_html: bool,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    match &expr.kind {
+        orv_hir::HirExprKind::Assign { value, .. } => {
+            collect_client_dom_bindings_expr(value, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::AssignField { object, value, .. } => {
+            collect_client_dom_bindings_expr(object, inside_html, signals, out);
+            collect_client_dom_bindings_expr(value, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => {
+            collect_client_dom_bindings_expr(object, inside_html, signals, out);
+            collect_client_dom_bindings_expr(index, inside_html, signals, out);
+            collect_client_dom_bindings_expr(value, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Call { callee, args } => {
+            collect_client_dom_bindings_expr(callee, inside_html, signals, out);
+            for arg in args {
+                collect_client_dom_bindings_expr(arg, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::For { iter, body, .. } => {
+            collect_client_dom_bindings_expr(iter, inside_html, signals, out);
+            collect_client_dom_bindings_block(body, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::While { cond, body } => {
+            collect_client_dom_bindings_expr(cond, inside_html, signals, out);
+            collect_client_dom_bindings_block(body, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Array(items) | orv_hir::HirExprKind::Tuple(items) => {
+            for item in items {
+                collect_client_dom_bindings_expr(item, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::Object(fields) | orv_hir::HirExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                collect_client_dom_bindings_expr(&field.value, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::Index { target, index } => {
+            collect_client_dom_bindings_expr(target, inside_html, signals, out);
+            collect_client_dom_bindings_expr(index, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Slice { target, start, end } => {
+            collect_client_dom_bindings_expr(target, inside_html, signals, out);
+            if let Some(start) = start {
+                collect_client_dom_bindings_expr(start, inside_html, signals, out);
+            }
+            if let Some(end) = end {
+                collect_client_dom_bindings_expr(end, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::Field { target, .. }
+        | orv_hir::HirExprKind::OptionalField { target, .. } => {
+            collect_client_dom_bindings_expr(target, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Lambda { body, .. } => {
+            collect_client_dom_bindings_function_body(body, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Try { try_block, catch } => {
+            collect_client_dom_bindings_block(try_block, inside_html, signals, out);
+            if let Some(catch) = catch {
+                collect_client_dom_bindings_block(&catch.body, inside_html, signals, out);
+            }
+        }
+        orv_hir::HirExprKind::Route { handler, .. } => {
+            collect_client_dom_bindings_block(handler, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Respond { status, payload } => {
+            collect_client_dom_bindings_expr(status, inside_html, signals, out);
+            collect_client_dom_bindings_expr(payload, inside_html, signals, out);
+        }
+        orv_hir::HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        } => {
+            if let Some(listen) = listen {
+                collect_client_dom_bindings_expr(listen, inside_html, signals, out);
+            }
+            for route in routes {
+                collect_client_dom_bindings_expr(route, inside_html, signals, out);
+            }
+            for stmt in body_stmts {
+                collect_client_dom_bindings_stmt(stmt, inside_html, signals, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_client_dom_bindings_for_tag(
+    tag: &str,
+    args: &[orv_hir::HirExpr],
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    for arg in args {
+        let orv_hir::HirExprKind::Ident(ident) = &arg.kind else {
+            continue;
+        };
+        let Some(signal) = signals.get(&ident.id) else {
+            continue;
+        };
+        out.push(serde_json::json!({
+            "kind": "signal_text",
+            "target": CLIENT_PAGE_PATH,
+            "source": &signal.origin_id,
+            "state_key": &signal.state_key,
+            "selector": tag,
+            "span": {
+                "file": arg.span.file.index(),
+                "start": arg.span.range.start,
+                "end": arg.span.range.end,
+            },
+        }));
+    }
 }
 
 fn client_signal_initial_values(
@@ -28870,7 +29197,10 @@ entry = "src/main.orv"
             "client reactive plan hash mismatch",
             "client reactive plan initial_render binding mismatch",
             "client reactive plan signal_state binding mismatch",
+            "client reactive plan signal_text binding mismatch",
             "createReactiveState",
+            "bindReactiveDom",
+            "setSignal",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
             "fnv1a64",
@@ -28888,7 +29218,9 @@ entry = "src/main.orv"
             "app.wasm",
             "orvReactiveSignals",
             "orvReactiveBindings",
+            "orvReactiveDomBindings",
             "__ORV_CLIENT_REACTIVE_STATE__",
+            "__ORV_SET_SIGNAL__",
         ] {
             assert!(
                 loader.contains(expected),
@@ -31940,6 +32272,15 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .any(|binding| binding["kind"] == "signal_state"
                 && binding["target"] == CLIENT_JS_PATH
                 && binding["state_key"] == "count"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_text"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "count"
+                && binding["selector"] == "p"
                 && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
         assert!(reactive_plan["blocked_by"]
             .as_array()
