@@ -76,7 +76,25 @@ async function loadReactivePlan(manifest) {
   if (!Array.isArray(plan.signals)) {
     throw new Error("orv client reactive plan signals mismatch");
   }
+  if (!plan.signals.every((signal) => typeof signal.name === "string" && typeof signal.origin_id === "string")) {
+    throw new Error("orv client reactive plan signal metadata mismatch");
+  }
+  validateReactiveBindings(plan, manifest);
   return plan;
+}
+
+function validateReactiveBindings(plan, manifest) {
+  if (!Array.isArray(plan.bindings)) {
+    throw new Error("orv client reactive plan bindings mismatch");
+  }
+  const hasInitialRenderBinding = plan.bindings.some((binding) =>
+    binding.kind === "initial_render" &&
+    binding.target === manifest.page &&
+    binding.source === manifest.wasm
+  );
+  if (!hasInitialRenderBinding) {
+    throw new Error("orv client reactive plan initial_render binding mismatch");
+  }
 }
 
 async function loadSourceBundle(manifest) {

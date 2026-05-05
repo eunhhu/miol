@@ -13294,6 +13294,23 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
         anyhow::bail!("client_reactive_plan signals must be an array of source-backed signals");
     }
     if !plan
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|bindings| {
+            bindings.iter().any(|binding| {
+                binding.get("kind").and_then(serde_json::Value::as_str) == Some("initial_render")
+                    && binding.get("target").and_then(serde_json::Value::as_str)
+                        == Some(CLIENT_PAGE_PATH)
+                    && binding.get("source").and_then(serde_json::Value::as_str)
+                        == Some(CLIENT_WASM_PATH)
+            })
+        })
+    {
+        anyhow::bail!(
+            "client_reactive_plan initial_render binding must target {CLIENT_PAGE_PATH} from {CLIENT_WASM_PATH}"
+        );
+    }
+    if !plan
         .get("blocked_by")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|items| items.iter().any(|item| item == "reactive-dom-diff"))
@@ -13346,8 +13363,10 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("reactivePlanUrl")
         || !source.contains("./reactive-plan.json")
         || !source.contains("loadReactivePlan")
+        || !source.contains("validateReactiveBindings")
         || !source.contains("client reactive plan fetch failed")
         || !source.contains("client reactive plan hash mismatch")
+        || !source.contains("client reactive plan initial_render binding mismatch")
         || !source.contains("orvReactiveSignals")
     {
         anyhow::bail!("client_js bundle does not verify client reactive plan contract");
@@ -28707,7 +28726,9 @@ entry = "src/main.orv"
             "client manifest hash mismatch",
             "reactivePlanUrl",
             "loadReactivePlan",
+            "validateReactiveBindings",
             "client reactive plan hash mismatch",
+            "client reactive plan initial_render binding mismatch",
             "loadSourceBundle",
             "stableJsonHash(sourceBundle)",
             "fnv1a64",
@@ -31333,6 +31354,33 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_reactive_plan_without_initial_render_binding() {
+        let out = temp_output_dir("verify-build-client-reactive-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
+        let mut plan = read_json_value(&plan_path).expect("reactive plan");
+        plan["bindings"] = serde_json::json!([]);
+        write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
+
+        assert!(
+            err.to_string().contains("initial_render binding"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_missing_static_page_output() {
         let out = temp_output_dir("verify-build-missing-static");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -31657,6 +31705,13 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && signal["origin_id"]
                     .as_str()
                     .is_some_and(|id| !id.is_empty())));
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "initial_render"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["source"] == CLIENT_WASM_PATH));
         assert!(reactive_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")
