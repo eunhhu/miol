@@ -5448,6 +5448,10 @@ fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value
     let Some(trace) = state.get("trace") else {
         return serde_json::Value::Null;
     };
+    let build_dir = trace
+        .get("build_dir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let live_refresh = trace
         .get("live_refresh")
         .cloned()
@@ -5459,12 +5463,12 @@ fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value
     serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.native_host.trace",
-        "build_dir": trace.get("build_dir").cloned().unwrap_or_else(|| serde_json::json!("")),
+        "build_dir": build_dir,
         "trace_path": trace.pointer("/trace/path").cloned().unwrap_or_else(|| serde_json::json!("")),
         "frame_count": trace.pointer("/trace/frame_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
         "status_counts": trace.pointer("/trace/status_counts").cloned().unwrap_or_else(|| serde_json::json!({})),
         "status_filters": editor_native_host_trace_status_filters_json(trace),
-        "frames": editor_native_host_trace_frames_json(trace),
+        "frames": editor_native_host_trace_frames_json(trace, build_dir),
         "live_refresh": live_refresh,
         "transport": trace.pointer("/live_refresh/transport").cloned().unwrap_or(serde_json::Value::Null),
         "stream_runner": stream_runner,
@@ -5496,7 +5500,10 @@ fn editor_native_host_trace_status_filters_json(
     .collect()
 }
 
-fn editor_native_host_trace_frames_json(trace: &serde_json::Value) -> Vec<serde_json::Value> {
+fn editor_native_host_trace_frames_json(
+    trace: &serde_json::Value,
+    build_dir: &str,
+) -> Vec<serde_json::Value> {
     trace
         .get("frames")
         .and_then(serde_json::Value::as_array)
@@ -5504,17 +5511,44 @@ fn editor_native_host_trace_frames_json(trace: &serde_json::Value) -> Vec<serde_
             frames
                 .iter()
                 .map(|frame| {
+                    let navigation = frame
+                        .get("navigation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let origin_id = frame.get("origin_id").and_then(serde_json::Value::as_str);
                     serde_json::json!({
                         "index": frame.get("index").cloned().unwrap_or(serde_json::Value::Null),
                         "origin_id": frame.get("origin_id").cloned().unwrap_or(serde_json::Value::Null),
                         "request": frame.get("request").cloned().unwrap_or_else(|| serde_json::json!({})),
                         "summary": frame.get("summary").cloned().unwrap_or_else(|| serde_json::json!({})),
-                        "navigation": frame.get("navigation").cloned().unwrap_or(serde_json::Value::Null),
+                        "source": navigation
+                            .get("source")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "production": navigation
+                            .get("production")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "reveal_command": editor_trace_frame_reveal_command_json(build_dir, origin_id),
+                        "navigation": navigation,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn editor_trace_frame_reveal_command_json(
+    build_dir: &str,
+    origin_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(origin_id) = origin_id else {
+        return serde_json::Value::Null;
+    };
+    if build_dir.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!(["orv", "editor", "reveal", build_dir, origin_id])
 }
 
 struct EditorGraphPanel {
@@ -31995,11 +32029,29 @@ define Auth() -> { @out "auth" }
         assert_eq!(frames[0]["summary"]["status_class"], "ok");
         assert_eq!(frames[0]["request"]["path"], "/ping");
         assert_eq!(frames[0]["navigation"]["focus"]["panel"], "routes");
+        assert_eq!(frames[0]["source"], frames[0]["navigation"]["source"]);
+        assert_eq!(
+            frames[0]["production"],
+            frames[0]["navigation"]["production"]
+        );
+        assert_eq!(
+            frames[0]["reveal_command"],
+            serde_json::json!([
+                "orv",
+                "editor",
+                "reveal",
+                build_out.display().to_string(),
+                route.id
+            ])
+        );
         assert!(frames[0]["navigation"]["source"]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("@route GET /ping")));
         assert_eq!(frames[1]["summary"]["status_class"], "client_error");
         assert_eq!(frames[1]["navigation"], serde_json::Value::Null);
+        assert_eq!(frames[1]["source"], serde_json::Value::Null);
+        assert_eq!(frames[1]["production"], serde_json::Value::Null);
+        assert_eq!(frames[1]["reveal_command"], serde_json::Value::Null);
         let filters = native_host["trace"]["status_filters"]
             .as_array()
             .expect("native trace status filters");

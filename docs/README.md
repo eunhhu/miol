@@ -164,7 +164,7 @@ LSP bootstrap은 `declaration`/`typeDefinition` navigation, project moniker, doc
 
 Editor DAP native control 세부: exported debug controls now include exact per-control runner commands, executable breakpoint rows include `--breakpoint <path>:<line> --control continue` runner commands and `setBreakpoints` request previews, `native-host.json` mirrors controls, breakpoint command inventory, breakpoint argument format, and `debug/session-result.json` result path, and the static shell shows the selected runner command beside the DAP request payload.
 
-Editor trace native transport 세부: when export trace state has a stable server EventSource endpoint, `native-host.json` exposes it as `trace.transport`, adds `trace.stream_runner.command` for `orv editor trace-stream <build-dir> --events trace/events.sse`, mirrors `trace.status_filters` and `trace.frames[*]` source/production navigation inventory, and the static shell renders Trace Transport plus Trace Stream Runner panes for native UI wiring.
+Editor trace native transport 세부: when export trace state has a stable server EventSource endpoint, `native-host.json` exposes it as `trace.transport`, adds `trace.stream_runner.command` for `orv editor trace-stream <build-dir> --events trace/events.sse`, mirrors `trace.status_filters` and `trace.frames[*]` source/production navigation inventory, flattens each source-backed frame's `source`, `production`, and `reveal_command` fields for native host actions, and the static shell renders Trace Transport plus Trace Stream Runner panes for native UI wiring.
 
 ## 빌드
 
