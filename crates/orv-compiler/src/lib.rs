@@ -2431,7 +2431,7 @@ fn push_native_int_success_arm(
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
             true
         }
-        (Some("add" | "sub" | "mul"), Some(operand_json), None, None) => {
+        (Some("add" | "sub" | "mul" | "div"), Some(operand_json), None, None) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
             };
@@ -2439,6 +2439,7 @@ fn push_native_int_success_arm(
                 Some("add") => "checked_add",
                 Some("sub") => "checked_sub",
                 Some("mul") => "checked_mul",
+                Some("div") => "checked_div",
                 _ => return false,
             };
             let _ = writeln!(
@@ -2454,11 +2455,17 @@ fn push_native_int_success_arm(
             source.push_str("                },\n            },\n");
             true
         }
-        (Some("add" | "sub" | "mul"), None, Some("request_body_field_int"), Some(operand_name)) => {
+        (
+            Some("add" | "sub" | "mul" | "div"),
+            None,
+            Some("request_body_field_int"),
+            Some(operand_name),
+        ) => {
             let method = match op {
                 Some("add") => "checked_add",
                 Some("sub") => "checked_sub",
                 Some("mul") => "checked_mul",
+                Some("div") => "checked_div",
                 _ => return false,
             };
             let _ = writeln!(
@@ -3164,7 +3171,10 @@ fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseVa
 fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
         HirExprKind::Binary { op, lhs, rhs }
-            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            ) =>
         {
             let mut value = request_body_field_value(lhs)?;
             if value.value_kind != "request_body_field_int" || value.op.is_some() {
@@ -3175,6 +3185,7 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                     BinaryOp::Add => "add",
                     BinaryOp::Sub => "sub",
                     BinaryOp::Mul => "mul",
+                    BinaryOp::Div => "div",
                     _ => return None,
                 }
                 .to_string(),
@@ -5146,7 +5157,7 @@ function greet(name: string): string -> "hi {name}""#,
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { quantity: (@body.quantity as int) / (@body.bonus as int) }
+    @respond 201 { quantity: (@body.quantity as int) % (@body.bonus as int) }
   }
 }"#;
         let program = lower(src);
@@ -5371,6 +5382,51 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"total\")"));
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"discount\")"));
         assert!(handlers.contains("value.checked_sub(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_div_field_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { share: (@body.total as int) / (@body.parts as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "share");
+        assert_eq!(response.body_request_fields[0].name, "total");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("div"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("parts")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"total\")"));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"parts\")"));
+        assert!(handlers.contains("value.checked_div(operand)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -5763,7 +5819,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) / (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) % (@body.extra as int) }
   }
 }";
         let program = lower(src);
