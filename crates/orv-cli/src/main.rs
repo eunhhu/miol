@@ -12946,6 +12946,15 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("sourceBundleHash") {
         anyhow::bail!("client_js bundle does not declare source bundle hash metadata");
     }
+    if !source.contains("manifestUrl")
+        || !source.contains("./manifest.json")
+        || !source.contains("loadClientManifest")
+        || !source.contains("client manifest fetch failed")
+        || !source.contains("client manifest hash mismatch")
+        || !source.contains("client manifest export mismatch")
+    {
+        anyhow::bail!("client_js bundle does not verify client manifest contract");
+    }
     if !source.contains("loadSourceBundle")
         || !source.contains("stableJsonHash(sourceBundle)")
         || !source.contains("fnv1a64")
@@ -12967,7 +12976,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_js bundle does not decode initial render from wasm");
     }
-    if !source.contains(CLIENT_WASM_START_EXPORT) {
+    if !source.contains("instance.exports.orv_start()") {
         anyhow::bail!("client_js bundle does not call {CLIENT_WASM_START_EXPORT}");
     }
     Ok(())
@@ -16833,6 +16842,8 @@ const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
 const CLIENT_WASM_RENDER_LEN_EXPORT: &str = "orv_render_len";
 const CLIENT_WASM_MEMORY_EXPORT: &str = "memory";
+const CLIENT_JS_LOADER_TEMPLATE: &str = include_str!("client_loader_template.js");
+
 fn write_client_wasm_bundle(
     path: &Path,
     source_bundle: &orv_compiler::SourceBundleArtifact,
@@ -17021,88 +17032,21 @@ fn write_client_js_loader(
     let bootstrap = serde_json::to_string_pretty(&serde_json::json!({
         "schemaVersion": 1,
         "runtimeFeatures": ["client_wasm"],
+        "manifestUrl": "./manifest.json",
         "wasmUrl": "./app.wasm",
+        "manifestWasm": CLIENT_WASM_PATH,
         "sourceBundleUrl": "../source-bundle.json",
+        "manifestSourceBundle": SOURCE_BUNDLE_PATH,
         "sourceBundleHash": source_bundle_hash,
         "entry": &source_bundle.entry,
+        "exports": {
+            "start": CLIENT_WASM_START_EXPORT,
+            "renderPtr": CLIENT_WASM_RENDER_PTR_EXPORT,
+            "renderLen": CLIENT_WASM_RENDER_LEN_EXPORT,
+            "memory": CLIENT_WASM_MEMORY_EXPORT,
+        },
     }))?;
-    let script = r#"export const ORV_CLIENT_BOOTSTRAP = Object.freeze(__ORV_BOOTSTRAP__);
-
-const wasmUrl = new URL(ORV_CLIENT_BOOTSTRAP.wasmUrl, import.meta.url);
-const sourceBundleUrl = new URL(ORV_CLIENT_BOOTSTRAP.sourceBundleUrl, import.meta.url);
-const root = document.querySelector('[data-orv-client="wasm"]');
-
-const FNV_OFFSET = 0xcbf29ce484222325n;
-const FNV_PRIME = 0x100000001b3n;
-
-function fnv1a64(bytes) {
-  let hash = FNV_OFFSET;
-  for (const byte of bytes) {
-    hash ^= BigInt(byte);
-    hash = BigInt.asUintN(64, hash * FNV_PRIME);
-  }
-  return hash.toString(16).padStart(16, "0");
-}
-
-function stableJsonHash(value) {
-  return fnv1a64(new TextEncoder().encode(JSON.stringify(value)));
-}
-
-async function loadSourceBundle() {
-  const response = await fetch(sourceBundleUrl);
-  if (!response.ok) {
-    throw new Error(`orv source bundle fetch failed: ${response.status}`);
-  }
-  const sourceBundle = await response.json();
-  const actualHash = stableJsonHash(sourceBundle);
-  if (actualHash !== ORV_CLIENT_BOOTSTRAP.sourceBundleHash) {
-    throw new Error(`orv source bundle hash mismatch: expected ${ORV_CLIENT_BOOTSTRAP.sourceBundleHash}, got ${actualHash}`);
-  }
-  return sourceBundle;
-}
-
-function readInitialRender(instance) {
-  const { memory, orv_render_ptr, orv_render_len } = instance.exports;
-  if (!(memory instanceof WebAssembly.Memory) || typeof orv_render_ptr !== "function" || typeof orv_render_len !== "function") {
-    return "";
-  }
-  const ptr = Number(orv_render_ptr());
-  const len = Number(orv_render_len());
-  if (!Number.isSafeInteger(ptr) || !Number.isSafeInteger(len) || ptr < 0 || len < 0) {
-    throw new Error("orv client render exports returned invalid bounds");
-  }
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
-}
-
-async function main() {
-  const sourceBundle = await loadSourceBundle();
-  const response = await fetch(wasmUrl);
-  const bytes = await response.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
-  const initialRender = readInitialRender(instance);
-  if (root && initialRender) {
-    root.innerHTML = initialRender;
-  }
-  if (typeof instance.exports.orv_start === "function") {
-    instance.exports.orv_start();
-  }
-  if (root) {
-    root.dataset.orvStatus = "ready";
-    root.dataset.orvSourceBundle = sourceBundleUrl.href;
-    root.dataset.orvSourceBundleHash = ORV_CLIENT_BOOTSTRAP.sourceBundleHash;
-    root.dataset.orvEntry = ORV_CLIENT_BOOTSTRAP.entry;
-    root.dataset.orvSourceCount = String(sourceBundle.files?.length ?? 0);
-  }
-}
-
-main().catch((error) => {
-  console.error("orv client bootstrap failed", error);
-  if (root) {
-    root.dataset.orvStatus = "error";
-  }
-});
-"#
-    .replace("__ORV_BOOTSTRAP__", &bootstrap);
+    let script = CLIENT_JS_LOADER_TEMPLATE.replace("__ORV_BOOTSTRAP__", &bootstrap);
     write_text(path, &script)
 }
 
@@ -27534,6 +27478,9 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(loader.contains("sourceBundleUrl"));
         assert!(loader.contains("../source-bundle.json"));
         assert!(loader.contains("sourceBundleHash"));
+        assert!(loader.contains("manifestUrl"));
+        assert!(loader.contains("loadClientManifest"));
+        assert!(loader.contains("client manifest hash mismatch"));
         assert!(loader.contains("loadSourceBundle"));
         assert!(loader.contains("stableJsonHash(sourceBundle)"));
         assert!(loader.contains("fnv1a64"));
@@ -27974,6 +27921,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         assert!(
             err.to_string().contains("source bundle hash"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_js_without_manifest_contract_check() {
+        let out = temp_output_dir("verify-build-client-js-manifest-contract");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let loader_path = build_out.join("client").join("app.js");
+        let loader = std::fs::read_to_string(&loader_path)
+            .expect("client loader")
+            .replace("loadClientManifest", "loadClientContract");
+        std::fs::write(&loader_path, loader).expect("rewrite loader");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
+
+        assert!(
+            err.to_string().contains("client manifest"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
