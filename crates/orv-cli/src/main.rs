@@ -12324,6 +12324,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
                     .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
+            "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
@@ -12358,6 +12359,112 @@ fn verify_server_launcher_target(dir: &Path, target: &Path) -> anyhow::Result<()
     }
     if launch.listen != artifact.listen {
         anyhow::bail!("server launcher listen does not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_server_plan_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
+    let plan = read_json_value(target)?;
+    let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
+    verify_native_server_plan_value(
+        dir,
+        &plan,
+        SERVER_ARTIFACT_PATH,
+        SERVER_LAUNCH_PATH,
+        &artifact,
+    )
+}
+
+fn verify_native_server_plan_artifact(
+    dir: &Path,
+    path: &str,
+    artifact_path: &str,
+    launcher_path: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let native_plan_path = dir.join(path);
+    if !native_plan_path.is_file() {
+        anyhow::bail!(
+            "missing native server plan artifact: {}",
+            native_plan_path.display()
+        );
+    }
+    let plan = read_json_value(&native_plan_path)?;
+    verify_native_server_plan_value(dir, &plan, artifact_path, launcher_path, artifact)
+}
+
+fn verify_native_server_plan_value(
+    dir: &Path,
+    plan: &serde_json::Value,
+    artifact_path: &str,
+    launcher_path: &str,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    if plan
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("native server plan schema_version must be 1");
+    }
+    if json_str(plan, "kind", "native server plan")? != "native_server_plan" {
+        anyhow::bail!("native server plan kind must be native_server_plan");
+    }
+    if json_str(plan, "status", "native server plan")? != "planned" {
+        anyhow::bail!("native server plan status must be planned");
+    }
+    if json_str(plan, "artifact", "native server plan")? != artifact_path {
+        anyhow::bail!("native server plan artifact must be {artifact_path}");
+    }
+    if json_str(plan, "launcher", "native server plan")? != launcher_path {
+        anyhow::bail!("native server plan launcher must be {launcher_path}");
+    }
+    let launch = read_server_launch_artifact(&dir.join(launcher_path))?;
+    if launch.artifact != artifact_path {
+        anyhow::bail!("native server plan launcher artifact does not match server artifact");
+    }
+    if json_str(plan, "runtime", "native server plan")? != artifact.runtime {
+        anyhow::bail!("native server plan runtime does not match runtime artifact");
+    }
+    if plan.get("runtime_features") != Some(&serde_json::to_value(&artifact.runtime_features)?) {
+        anyhow::bail!("native server plan runtime_features do not match runtime artifact");
+    }
+    let target = plan
+        .get("target")
+        .ok_or_else(|| anyhow::anyhow!("native server plan target must be an object"))?;
+    if json_str(target, "kind", "native server plan target")? != "server_binary" {
+        anyhow::bail!("native server plan target kind must be server_binary");
+    }
+    if json_str(target, "path", "native server plan target")? != NATIVE_SERVER_BINARY_PATH {
+        anyhow::bail!("native server plan target path must be {NATIVE_SERVER_BINARY_PATH}");
+    }
+    if json_str(target, "protocol", "native server plan target")? != "http1" {
+        anyhow::bail!("native server plan target protocol must be http1");
+    }
+    let blocked_by = plan
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("native server plan blocked_by must be an array"))?;
+    if !blocked_by
+        .iter()
+        .any(|item| item.as_str() == Some("native-codegen"))
+    {
+        anyhow::bail!("native server plan blocked_by must include native-codegen");
+    }
+    if !blocked_by
+        .iter()
+        .any(|item| item.as_str() == Some("native-runtime-image"))
+    {
+        anyhow::bail!("native server plan blocked_by must include native-runtime-image");
+    }
+    verify_deploy_listen_value(
+        plan.get("listen"),
+        artifact.listen.as_ref(),
+        "native server plan",
+    )?;
+    let artifact_routes = serde_json::to_value(&artifact.routes)?;
+    if plan.get("routes") != Some(&artifact_routes) {
+        anyhow::bail!("native server plan routes do not match runtime artifact");
     }
     Ok(())
 }
@@ -13344,6 +13451,7 @@ fn verify_deploy_server_target(
     let artifact_path = json_str(server, "artifact", "deploy server")?;
     let entrypoint = json_str(server, "entrypoint", "deploy server")?;
     let routes_artifact = json_str(server, "routes_artifact", "deploy server")?;
+    let native_plan = json_str(server, "native_plan", "deploy server")?;
     let container = json_str(server, "container", "deploy server")?;
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
@@ -13374,6 +13482,13 @@ fn verify_deploy_server_target(
         routes_artifact,
         artifact_path,
         artifact.runtime.as_str(),
+        &artifact,
+    )?;
+    verify_native_server_plan_artifact(
+        dir,
+        native_plan,
+        artifact_path,
+        SERVER_LAUNCH_PATH,
         &artifact,
     )?;
     verify_deploy_container_artifact(
@@ -15381,8 +15496,9 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let static_page_path = static_page
         .as_ref()
         .map(|(path, _)| normalized_artifact_path(&path.display().to_string()));
-    let server_artifact_path = "server/app.orv-runtime.json";
-    let server_launch_path = "server/launch.json";
+    let server_artifact_path = SERVER_ARTIFACT_PATH;
+    let server_launch_path = SERVER_LAUNCH_PATH;
+    let native_server_plan_path = NATIVE_SERVER_PLAN_PATH;
     let source_bundle = orv_compiler::source_bundle_artifact(
         entry.display().to_string(),
         loaded
@@ -15437,6 +15553,13 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             &out.join(server_launch_path),
             &serde_json::to_value(launch)?,
         )?;
+        write_native_server_plan_artifact(
+            out,
+            native_server_plan_path,
+            server_artifact_path,
+            server_launch_path,
+            server_artifact,
+        )?;
     }
     if let Some((path, html)) = static_page {
         write_text(&out.join(path), &html)?;
@@ -15470,6 +15593,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
                 client_js_path: client_js_path.as_deref(),
                 client_wasm_path: client_wasm_path.as_deref(),
                 server_artifact_path,
+                native_server_plan_path,
             },
         )?;
     }
@@ -16015,6 +16139,10 @@ const WASM_MODULE_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const CLIENT_WASM_CUSTOM_SECTION_NAME: &str = "orv.client";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
+const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
+const SERVER_LAUNCH_PATH: &str = "server/launch.json";
+const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
+const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
 const CLIENT_WASM_RENDER_LEN_EXPORT: &str = "orv_render_len";
@@ -16311,6 +16439,33 @@ fn write_client_page_shell(path: &Path, entry: &Path, loader_src: &str) -> anyho
     write_text(path, &html)
 }
 
+fn write_native_server_plan_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact_path: &str,
+    server_launch_path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let plan = serde_json::json!({
+        "schema_version": 1,
+        "kind": "native_server_plan",
+        "status": "planned",
+        "runtime": server_artifact.runtime.clone(),
+        "runtime_features": server_artifact.runtime_features.clone(),
+        "artifact": server_artifact_path,
+        "launcher": server_launch_path,
+        "target": {
+            "kind": "server_binary",
+            "path": NATIVE_SERVER_BINARY_PATH,
+            "protocol": "http1",
+        },
+        "blocked_by": ["native-codegen", "native-runtime-image"],
+        "listen": server_artifact.listen.clone(),
+        "routes": server_artifact.routes.clone(),
+    });
+    write_json(&out.join(path), &plan)
+}
+
 fn relative_bundle_path(from: &str, to: &str) -> String {
     let depth = from.split('/').count().saturating_sub(1);
     format!("{}{}", "../".repeat(depth), to)
@@ -16331,6 +16486,7 @@ struct ProdBuildTargets<'a> {
     client_js_path: Option<&'a str>,
     client_wasm_path: Option<&'a str>,
     server_artifact_path: &'a str,
+    native_server_plan_path: &'a str,
 }
 
 fn write_prod_deploy_artifacts(
@@ -16366,6 +16522,7 @@ fn write_prod_deploy_artifacts(
             "artifact": targets.server_artifact_path,
             "entrypoint": entrypoint,
             "routes_artifact": routes_artifact,
+            "native_plan": targets.native_server_plan_path,
             "container": container,
             "dockerfile": dockerfile,
             "compose": compose,
@@ -24620,6 +24777,7 @@ entry = "src/main.orv"
         let bundle_plan_path = out.join("bundle-plan.json");
         let server_artifact_path = out.join("server").join("app.orv-runtime.json");
         let server_launch_path = out.join("server").join("launch.json");
+        let native_server_plan_path = out.join("server").join("native-server.json");
         let graph_path = out.join("project-graph.json");
         let source_bundle_path = out.join("source-bundle.json");
         assert!(
@@ -24646,6 +24804,11 @@ entry = "src/main.orv"
             server_launch_path.is_file(),
             "missing {}",
             server_launch_path.display()
+        );
+        assert!(
+            native_server_plan_path.is_file(),
+            "missing {}",
+            native_server_plan_path.display()
         );
         assert!(graph_path.is_file(), "missing {}", graph_path.display());
         assert!(
@@ -24719,6 +24882,12 @@ entry = "src/main.orv"
             .iter()
             .any(|bundle| bundle["kind"] == "server_launcher"
                 && bundle["path"] == "server/launch.json"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "native_server_plan"
+                && bundle["path"] == "server/native-server.json"));
         let server_artifact: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&server_artifact_path).expect("server artifact"),
         )
@@ -24761,6 +24930,33 @@ entry = "src/main.orv"
             .expect("launch routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let native_plan: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&native_server_plan_path).expect("native server plan"),
+        )
+        .expect("native server plan json");
+        assert_eq!(native_plan["schema_version"], 1);
+        assert_eq!(native_plan["kind"], "native_server_plan");
+        assert_eq!(native_plan["status"], "planned");
+        assert_eq!(native_plan["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(native_plan["launcher"], "server/launch.json");
+        assert_eq!(native_plan["runtime"], "reference-interpreter");
+        assert_eq!(native_plan["target"]["kind"], "server_binary");
+        assert_eq!(native_plan["target"]["path"], "server/app");
+        assert_eq!(native_plan["target"]["protocol"], "http1");
+        assert_eq!(native_plan["listen"], server_artifact["listen"]);
+        assert!(json_routes_include(&native_plan["routes"], "GET", "/ping"));
+        assert!(native_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-codegen"));
+        assert!(native_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-runtime-image"));
+
+        cmd_verify_build(&out).expect("verify build artifacts");
 
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -24779,6 +24975,7 @@ entry = "src/main.orv"
         let deploy_runbook_path = out.join("deploy").join("README.md");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
+        let native_server_plan_path = out.join("server").join("native-server.json");
         assert!(
             deploy_manifest_path.is_file(),
             "missing {}",
@@ -24814,6 +25011,11 @@ entry = "src/main.orv"
             "missing {}",
             server_entrypoint_path.display()
         );
+        assert!(
+            native_server_plan_path.is_file(),
+            "missing {}",
+            native_server_plan_path.display()
+        );
         let deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
         assert_eq!(deploy["schema_version"], 1);
         assert_eq!(deploy["profile"], "prod");
@@ -24825,6 +25027,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["dockerfile"], "deploy/Dockerfile");
         assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
+        assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
         assert_eq!(
             deploy["server"]["runtime_image"],
             "ghcr.io/orv-lang/orv-reference:latest"
@@ -24985,6 +25188,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy container runtime_image must be"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_native_server_plan_mismatch() {
+        let (src_dir, path) = prod_server_source("native-server-plan-source");
+        let out = temp_output_dir("native-server-plan-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let native_plan_path = out.join("server").join("native-server.json");
+        let mut native_plan = read_json_value(&native_plan_path).expect("native server plan");
+        native_plan["artifact"] = serde_json::json!("server/wrong.orv-runtime.json");
+        write_json(&native_plan_path, &native_plan).expect("write corrupt native server plan");
+
+        let err = cmd_verify_build(&out).expect_err("native server plan mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("native server plan artifact must be server/app.orv-runtime.json"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }

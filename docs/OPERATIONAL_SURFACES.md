@@ -80,6 +80,7 @@ Runtime debug state comes from the reference runtime debug trace. Long-running `
 - `source-bundle.json`
 - `server/app.orv-runtime.json`
 - `server/launch.json`
+- `server/native-server.json`
 - `pages/index.html` for HTML-only zero-runtime entries
 - `client/app.js` and a source-bound `client/app.wasm` with initial-render memory exports for interactive client entries
 
@@ -92,6 +93,8 @@ Runtime debug state comes from the reference runtime debug trace. Long-running `
 - `deploy/compose.yaml`
 - `deploy/README.md`
 - `deploy/server.sh`
+
+`server/native-server.json` is a planned native server binary contract, not a compiled binary. It records the current reference artifact, launcher, route/listen/runtime feature shape, planned `server/app` HTTP/1 target, and the `native-codegen`/`native-runtime-image` blockers. `deploy/manifest.json` references it through `server.native_plan`, and `orv verify-build` checks that it still matches the server runtime artifact.
 
 When a server artifact contains static `@db.wal` paths such as `data/shop.wal.jsonl`, the deploy manifest and container contract record those WAL paths and the generated Compose file mounts the parent directory, for example `../data:/app/data`.
 

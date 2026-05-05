@@ -2,8 +2,9 @@
 //!
 //! The production code generator is still a roadmap item. This crate currently
 //! owns small compiler artifacts that can be derived from HIR without emitting a
-//! server binary or client WASM bundle. HTML-only entries can plan a static page
-//! artifact with no shipped runtime features.
+//! server binary or optimized client WASM bundle. HTML-only entries can plan a
+//! static page artifact with no shipped runtime features, and server entries
+//! declare a native server plan contract without claiming native codegen yet.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -375,6 +376,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "server_launcher".to_string(),
             path: "server/launch.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_server_plan".to_string(),
+            path: "server/native-server.json".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
     }
@@ -1391,6 +1397,28 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "server_launcher"
                 && bundle.path == "server/launch.json"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
+    }
+
+    #[test]
+    fn bundle_plan_declares_native_server_plan_contract() {
+        let program = lower(
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let plan = bundle_plan(&manifest);
+
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "native_server_plan"
+                && bundle.path == "server/native-server.json"
                 && bundle.runtime_features.contains(&"http_server".to_string())
                 && bundle.runtime_features.contains(&"router".to_string())
         }));
