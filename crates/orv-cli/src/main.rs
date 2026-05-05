@@ -12807,6 +12807,9 @@ fn verify_native_server_launcher_source(
     if !source.contains("mod routes;") || !source.contains("routes::ORV_NATIVE_ROUTE_COUNT") {
         anyhow::bail!("native server launcher source must link generated routes source");
     }
+    if !source.contains(r#"routes::orv_native_match_route("__orv_probe__", "__orv_probe__")"#) {
+        anyhow::bail!("native server launcher source must link generated route matcher");
+    }
     let expected = orv_compiler::native_server_launcher_source(artifact_path, native_plan_path);
     if source != expected {
         anyhow::bail!("native server launcher source must match generated source");
@@ -26084,6 +26087,8 @@ entry = "src/main.orv"
         assert!(native_source.contains("run-artifact"));
         assert!(native_source.contains("mod routes;"));
         assert!(native_source.contains("routes::ORV_NATIVE_ROUTE_COUNT"));
+        assert!(native_source
+            .contains(r#"routes::orv_native_match_route("__orv_probe__", "__orv_probe__")"#));
         let native_routes =
             std::fs::read_to_string(&native_server_routes_path).expect("native routes source");
         let route_origin = server_artifact["routes"][0]["origin_id"]

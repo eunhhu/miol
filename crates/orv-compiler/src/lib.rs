@@ -738,6 +738,7 @@ const ORV_NATIVE_SERVER_PLAN: &str = "{native_server_plan_path}";
 
 fn main() -> std::process::ExitCode {{
     let _ = routes::ORV_NATIVE_ROUTE_COUNT;
+    let _ = routes::orv_native_match_route("__orv_probe__", "__orv_probe__");
     let build_dir = std::env::var_os("ORV_BUILD_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -2023,6 +2024,9 @@ function greet(name: string): string -> "hi {name}""#,
             source.contains(r#"const ORV_NATIVE_SERVER_PLAN: &str = "server/native-server.json";"#)
         );
         assert!(source.contains("routes::ORV_NATIVE_ROUTE_COUNT"));
+        assert!(
+            source.contains(r#"routes::orv_native_match_route("__orv_probe__", "__orv_probe__")"#)
+        );
         assert!(source.contains("native_plan.is_file()"));
         assert!(source.contains("artifact.is_file()"));
         assert!(source.contains(r#"std::process::Command::new("orv")"#));
