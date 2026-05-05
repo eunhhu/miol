@@ -13642,8 +13642,24 @@ fn client_reactive_plan_signal_attr_binding_is_valid(
             signal.get("origin_id").and_then(serde_json::Value::as_str) == Some(origin_id)
                 && signal.get("state_key").and_then(serde_json::Value::as_str) == Some(state_key)
         })
+        && client_signal_attr_state_keys_are_valid(signals, binding)
+        && client_signal_attr_sources_are_valid(signals, binding)
         && client_signal_attr_template_is_valid(signals, binding)
         && client_signal_attr_condition_is_valid(signals, binding)
+}
+
+fn client_signal_attr_state_keys_are_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    client_signal_text_state_keys_are_valid(signals, binding)
+}
+
+fn client_signal_attr_sources_are_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    client_signal_text_sources_are_valid(signals, binding)
 }
 
 fn client_signal_attr_template_is_valid(
@@ -13656,10 +13672,9 @@ fn client_signal_attr_template_is_valid(
     let Some(segments) = template.as_array() else {
         return false;
     };
-    let binding_state_key = binding
-        .get("state_key")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let Some(state_keys) = client_signal_text_binding_state_keys(binding) else {
+        return false;
+    };
     !segments.is_empty()
         && segments.iter().all(|segment| {
             match segment.get("kind").and_then(serde_json::Value::as_str) {
@@ -13672,7 +13687,7 @@ fn client_signal_attr_template_is_valid(
                         .get("state_key")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
-                    state_key == binding_state_key
+                    state_keys.contains(&state_key)
                         && signals.iter().any(|signal| {
                             signal.get("state_key").and_then(serde_json::Value::as_str)
                                 == Some(state_key)
@@ -13842,6 +13857,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("state_keys")
         || !source.contains("renderSignalAttrBinding")
         || !source.contains("attr_template")
+        || !source.contains("signalAttrBindingStateKeys")
         || !source.contains("renderSignalAttrCondition")
         || !source.contains("attr_condition")
         || !source.contains("compareSignalAttrCondition")
@@ -17634,6 +17650,7 @@ struct ClientSignalAttrBinding {
     state_key: String,
     attr_template: Option<Vec<serde_json::Value>>,
     attr_condition: Option<serde_json::Value>,
+    signal_sources: Vec<ClientSignalDomSource>,
 }
 
 fn client_reactive_dom_bindings(binding: &ClientSourceBinding<'_>) -> Vec<serde_json::Value> {
@@ -18099,6 +18116,39 @@ fn collect_client_attr_bindings_for_tag(
                 "end": value.span.range.end,
             },
         });
+        if binding.signal_sources.len() > 1 {
+            attr_binding
+                .as_object_mut()
+                .expect("signal attr binding is an object")
+                .insert(
+                    "state_keys".to_string(),
+                    serde_json::Value::Array(
+                        binding
+                            .signal_sources
+                            .iter()
+                            .map(|source| serde_json::json!(&source.state_key))
+                            .collect(),
+                    ),
+                );
+            attr_binding
+                .as_object_mut()
+                .expect("signal attr binding is an object")
+                .insert(
+                    "sources".to_string(),
+                    serde_json::Value::Array(
+                        binding
+                            .signal_sources
+                            .iter()
+                            .map(|source| {
+                                serde_json::json!({
+                                    "source": &source.origin_id,
+                                    "state_key": &source.state_key,
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+        }
         if let Some(attr_template) = binding.attr_template {
             attr_binding
                 .as_object_mut()
@@ -18278,14 +18328,12 @@ fn client_signal_attr_binding(
     signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
 ) -> Option<ClientSignalAttrBinding> {
     if let Some(binding) = client_signal_text_binding(expr, signals) {
-        if binding.signal_sources.len() != 1 {
-            return None;
-        }
         return Some(ClientSignalAttrBinding {
             origin_id: binding.origin_id,
             state_key: binding.state_key,
             attr_template: binding.text_template,
             attr_condition: None,
+            signal_sources: binding.signal_sources,
         });
     }
     client_signal_attr_condition_binding(expr, signals)
@@ -18314,6 +18362,7 @@ fn client_signal_attr_condition_binding(
         state_key: signal.state_key.clone(),
         attr_template: None,
         attr_condition: Some(attr_condition),
+        signal_sources: vec![signal.clone()],
     })
 }
 
@@ -30181,6 +30230,7 @@ entry = "src/main.orv"
             "state_keys",
             "renderSignalAttrBinding",
             "attr_template",
+            "signalAttrBindingStateKeys",
             "renderSignalAttrCondition",
             "attr_condition",
             "compareSignalAttrCondition",
@@ -33446,6 +33496,51 @@ let sig count: int = 0
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("renderSignalAttrBinding"));
         assert!(loader.contains("attr_template"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_multi_signal_attr_template_binding_contract() {
+        let out = temp_output_dir("client-reactive-multi-signal-attr-template-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig prefix: string = "cart"
+let sig count: int = 0
+@out @html { @body { @input placeholder="{prefix}-{count}" } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_attr"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["selector"] == "input"
+                && binding["attr"] == "placeholder"
+                && binding["state_keys"] == serde_json::json!(["prefix", "count"])
+                && binding["sources"].as_array().is_some_and(|sources| {
+                    sources.iter().any(|source| source["state_key"] == "prefix")
+                        && sources.iter().any(|source| source["state_key"] == "count")
+                })
+                && binding["attr_template"]
+                    == serde_json::json!([
+                        {"kind": "signal", "state_key": "prefix"},
+                        {"kind": "text", "value": "-"},
+                        {"kind": "signal", "state_key": "count"},
+                    ])));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("signalAttrBindingStateKeys"));
+        assert!(loader.contains("state_keys"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

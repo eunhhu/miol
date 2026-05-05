@@ -141,6 +141,8 @@ function validateReactiveBindings(plan, manifest) {
         binding.source === signal.origin_id &&
         binding.state_key === signal.state_key
       ) &&
+      signalAttrBindingStateKeysAreValid(binding, plan.signals) &&
+      signalAttrSourcesAreValid(binding, plan.signals) &&
       signalAttrTemplateIsValid(binding, plan.signals) &&
       signalAttrConditionIsValid(binding, plan.signals)
     );
@@ -237,6 +239,7 @@ function signalAttrTemplateIsValid(binding, signals) {
   if (binding.attr_template === undefined) {
     return true;
   }
+  const stateKeys = signalAttrBindingStateKeys(binding);
   return Array.isArray(binding.attr_template) &&
     binding.attr_template.length > 0 &&
     binding.attr_template.every((segment) => {
@@ -245,11 +248,45 @@ function signalAttrTemplateIsValid(binding, signals) {
       }
       if (segment.kind === "signal") {
         return typeof segment.state_key === "string" &&
-          segment.state_key === binding.state_key &&
+          stateKeys.includes(segment.state_key) &&
           signals.some((signal) => signal.state_key === segment.state_key);
       }
       return false;
     });
+}
+
+function signalAttrBindingStateKeys(binding) {
+  if (Array.isArray(binding.state_keys)) {
+    return binding.state_keys;
+  }
+  return typeof binding.state_key === "string" ? [binding.state_key] : [];
+}
+
+function signalAttrBindingStateKeysAreValid(binding, signals) {
+  const stateKeys = signalAttrBindingStateKeys(binding);
+  return stateKeys.length > 0 &&
+    stateKeys.every((stateKey) => typeof stateKey === "string") &&
+    stateKeys.includes(binding.state_key) &&
+    stateKeys.every((stateKey) => signals.some((signal) => signal.state_key === stateKey));
+}
+
+function signalAttrSourcesAreValid(binding, signals) {
+  if (binding.sources === undefined) {
+    return true;
+  }
+  const stateKeys = signalAttrBindingStateKeys(binding);
+  return Array.isArray(binding.sources) &&
+    binding.sources.length > 0 &&
+    binding.sources.every((source) =>
+      source &&
+      typeof source.source === "string" &&
+      typeof source.state_key === "string" &&
+      stateKeys.includes(source.state_key) &&
+      signals.some((signal) =>
+        signal.origin_id === source.source &&
+        signal.state_key === source.state_key
+      )
+    );
 }
 
 function signalAttrConditionIsValid(binding, signals) {
@@ -460,13 +497,14 @@ function decodeSignalConditionOperand(operand) {
 
 function bindReactiveAttrs(plan, root, reactiveState) {
   const bindings = new Map();
+  const boundElements = new Set();
   if (!root) {
     return { count: 0, update() {} };
   }
   const attrBindings = plan.bindings.filter((binding) => binding.kind === "signal_attr");
   for (const binding of attrBindings) {
-    const state = reactiveState[binding.state_key];
-    if (!state) {
+    const stateKeys = signalAttrBindingStateKeys(binding);
+    if (!stateKeys.every((stateKey) => reactiveState[stateKey])) {
       continue;
     }
     const expected = displaySignalValue(renderSignalAttrBinding(binding, reactiveState));
@@ -476,12 +514,16 @@ function bindReactiveAttrs(plan, root, reactiveState) {
       continue;
     }
     element.dataset.orvSignalAttr = binding.state_key;
-    const current = bindings.get(binding.state_key) || [];
-    current.push({ element, binding });
-    bindings.set(binding.state_key, current);
+    element.dataset.orvSignalAttrKeys = stateKeys.join(",");
+    boundElements.add(element);
+    for (const stateKey of stateKeys) {
+      const current = bindings.get(stateKey) || [];
+      current.push({ element, binding });
+      bindings.set(stateKey, current);
+    }
   }
   return {
-    count: [...bindings.values()].reduce((total, items) => total + items.length, 0),
+    count: boundElements.size,
     update(stateKey) {
       const attrs = bindings.get(stateKey) || [];
       for (const item of attrs) {
