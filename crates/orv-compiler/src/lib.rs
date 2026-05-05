@@ -1550,10 +1550,28 @@ fn native_server_response_condition_is_direct(
             condition.kind.as_str(),
             "request_body_field_eq"
                 | "request_body_field_ne"
+                | "request_body_field_int_eq"
+                | "request_body_field_int_ne"
+                | "request_body_field_int_lt"
+                | "request_body_field_int_le"
+                | "request_body_field_int_gt"
+                | "request_body_field_int_ge"
                 | "route_param_eq"
                 | "route_param_ne"
+                | "route_param_int_eq"
+                | "route_param_int_ne"
+                | "route_param_int_lt"
+                | "route_param_int_le"
+                | "route_param_int_gt"
+                | "route_param_int_ge"
                 | "query_param_eq"
                 | "query_param_ne"
+                | "query_param_int_eq"
+                | "query_param_int_ne"
+                | "query_param_int_lt"
+                | "query_param_int_le"
+                | "query_param_int_gt"
+                | "query_param_int_ge"
         )
     })
 }
@@ -1563,6 +1581,16 @@ fn native_response_condition_operand_kind(kind: &str) -> &'static str {
         "route_param_eq" | "route_param_ne" => "route_param",
         "query_param_eq" | "query_param_ne" => "query_param",
         "request_body_field_eq" | "request_body_field_ne" => "request_body_field",
+        "route_param_int_eq" | "route_param_int_ne" | "route_param_int_lt"
+        | "route_param_int_le" | "route_param_int_gt" | "route_param_int_ge" => "route_param_int",
+        "query_param_int_eq" | "query_param_int_ne" | "query_param_int_lt"
+        | "query_param_int_le" | "query_param_int_gt" | "query_param_int_ge" => "query_param_int",
+        "request_body_field_int_eq"
+        | "request_body_field_int_ne"
+        | "request_body_field_int_lt"
+        | "request_body_field_int_le"
+        | "request_body_field_int_gt"
+        | "request_body_field_int_ge" => "request_body_field_int",
         _ => "",
     }
 }
@@ -1573,8 +1601,10 @@ fn native_response_condition_operand_is_direct(
     route_params: &[String],
 ) -> bool {
     match operand_kind {
-        "route_param" => route_params.iter().any(|param| param == name),
-        "query_param" | "request_body_field" => !name.is_empty(),
+        "route_param" | "route_param_int" => route_params.iter().any(|param| param == name),
+        "query_param" | "query_param_int" | "request_body_field" | "request_body_field_int" => {
+            !name.is_empty()
+        }
         _ => false,
     }
 }
@@ -2753,6 +2783,9 @@ fn push_native_response_condition(
     source: &mut String,
     condition: &ServerResponseConditionArtifact,
 ) -> bool {
+    if push_native_int_response_condition(source, condition) {
+        return true;
+    }
     let Some((lookup, operator)) = native_response_condition_lookup(condition.kind.as_str()) else {
         return false;
     };
@@ -2777,6 +2810,64 @@ fn push_native_response_condition(
         );
     }
     true
+}
+
+fn push_native_int_response_condition(
+    source: &mut String,
+    condition: &ServerResponseConditionArtifact,
+) -> bool {
+    let Some((lookup, operator)) = native_response_condition_int_lookup(condition.kind.as_str())
+    else {
+        return false;
+    };
+    if condition.operand_name.is_some() {
+        return false;
+    }
+    let Ok(value) = condition.value.parse::<i64>() else {
+        return false;
+    };
+    let _ = writeln!(
+        source,
+        "        if match {lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>() {{",
+        rust_string_literal(&condition.name)
+    );
+    source.push_str("            Ok(value) => {\n");
+    let _ = writeln!(
+        source,
+        "                if value {operator} {value} {{ true }} else {{ false }}"
+    );
+    source.push_str("            }\n            Err(_) => false,\n        } {\n");
+    true
+}
+
+fn native_response_condition_int_lookup(kind: &str) -> Option<(&'static str, &'static str)> {
+    let lookup = match kind {
+        "request_body_field_int_eq"
+        | "request_body_field_int_ne"
+        | "request_body_field_int_lt"
+        | "request_body_field_int_le"
+        | "request_body_field_int_gt"
+        | "request_body_field_int_ge" => "routes::orv_native_body_field_value",
+        "route_param_int_eq" | "route_param_int_ne" | "route_param_int_lt"
+        | "route_param_int_le" | "route_param_int_gt" | "route_param_int_ge" => {
+            "routes::orv_native_param_value"
+        }
+        "query_param_int_eq" | "query_param_int_ne" | "query_param_int_lt"
+        | "query_param_int_le" | "query_param_int_gt" | "query_param_int_ge" => {
+            "routes::orv_native_query_value"
+        }
+        _ => return None,
+    };
+    let operator = match kind {
+        "request_body_field_int_eq" | "route_param_int_eq" | "query_param_int_eq" => "==",
+        "request_body_field_int_ne" | "route_param_int_ne" | "query_param_int_ne" => "!=",
+        "request_body_field_int_lt" | "route_param_int_lt" | "query_param_int_lt" => "<",
+        "request_body_field_int_le" | "route_param_int_le" | "query_param_int_le" => "<=",
+        "request_body_field_int_gt" | "route_param_int_gt" | "query_param_int_gt" => ">",
+        "request_body_field_int_ge" | "route_param_int_ge" | "query_param_int_ge" => ">=",
+        _ => return None,
+    };
+    Some((lookup, operator))
 }
 
 fn native_response_condition_operand_lookup(operand_kind: &str) -> Option<&'static str> {
@@ -3691,10 +3782,74 @@ fn static_string_expr(expr: &HirExpr) -> Option<String> {
 
 fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionArtifact> {
     match &expr.kind {
-        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
-            native_captured_response_condition(*op, lhs, rhs)
+        HirExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) =>
+        {
+            native_captured_int_response_condition(*op, lhs, rhs).or_else(|| {
+                matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                    .then(|| native_captured_response_condition(*op, lhs, rhs))
+                    .flatten()
+            })
         }
         HirExprKind::Paren(expr) => native_response_condition(expr),
+        _ => None,
+    }
+}
+
+fn native_captured_int_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    if let Some(left) = captured_condition_int_operand(lhs) {
+        return Some(ServerResponseConditionArtifact {
+            kind: condition_kind_for_int_operand(op, left.kind)?,
+            name: left.name,
+            value: static_integer(rhs)?.to_string(),
+            operand_name: None,
+            operand_kind: None,
+        });
+    }
+    let right = captured_condition_int_operand(rhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_int_operand(reverse_comparison_op(op)?, right.kind)?,
+        name: right.name,
+        value: static_integer(lhs)?.to_string(),
+        operand_name: None,
+        operand_kind: None,
+    })
+}
+
+fn captured_condition_int_operand(expr: &HirExpr) -> Option<CapturedConditionOperand> {
+    let operand = captured_integer_operand(expr)?;
+    let kind = match operand.value_kind.as_str() {
+        "request_body_field_int" => "request_body_field_int",
+        "route_param_int" => "route_param_int",
+        "query_param_int" => "query_param_int",
+        _ => return None,
+    };
+    Some(CapturedConditionOperand {
+        kind,
+        name: operand.name,
+    })
+}
+
+const fn reverse_comparison_op(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::Eq => Some(BinaryOp::Eq),
+        BinaryOp::Ne => Some(BinaryOp::Ne),
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::Le => Some(BinaryOp::Ge),
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::Ge => Some(BinaryOp::Le),
         _ => None,
     }
 }
@@ -3769,6 +3924,31 @@ fn condition_kind_for_operand(op: BinaryOp, operand_kind: &str) -> Option<String
         ("route_param", BinaryOp::Ne) => "route_param_ne",
         ("query_param", BinaryOp::Eq) => "query_param_eq",
         ("query_param", BinaryOp::Ne) => "query_param_ne",
+        _ => return None,
+    };
+    Some(kind.to_string())
+}
+
+fn condition_kind_for_int_operand(op: BinaryOp, operand_kind: &str) -> Option<String> {
+    let kind = match (operand_kind, op) {
+        ("request_body_field_int", BinaryOp::Eq) => "request_body_field_int_eq",
+        ("request_body_field_int", BinaryOp::Ne) => "request_body_field_int_ne",
+        ("request_body_field_int", BinaryOp::Lt) => "request_body_field_int_lt",
+        ("request_body_field_int", BinaryOp::Le) => "request_body_field_int_le",
+        ("request_body_field_int", BinaryOp::Gt) => "request_body_field_int_gt",
+        ("request_body_field_int", BinaryOp::Ge) => "request_body_field_int_ge",
+        ("route_param_int", BinaryOp::Eq) => "route_param_int_eq",
+        ("route_param_int", BinaryOp::Ne) => "route_param_int_ne",
+        ("route_param_int", BinaryOp::Lt) => "route_param_int_lt",
+        ("route_param_int", BinaryOp::Le) => "route_param_int_le",
+        ("route_param_int", BinaryOp::Gt) => "route_param_int_gt",
+        ("route_param_int", BinaryOp::Ge) => "route_param_int_ge",
+        ("query_param_int", BinaryOp::Eq) => "query_param_int_eq",
+        ("query_param_int", BinaryOp::Ne) => "query_param_int_ne",
+        ("query_param_int", BinaryOp::Lt) => "query_param_int_lt",
+        ("query_param_int", BinaryOp::Le) => "query_param_int_le",
+        ("query_param_int", BinaryOp::Gt) => "query_param_int_gt",
+        ("query_param_int", BinaryOp::Ge) => "query_param_int_ge",
         _ => return None,
     };
     Some(kind.to_string())
@@ -6475,6 +6655,48 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(
             "routes::orv_native_body_field_value(route_match, \"token\") == routes::orv_native_query_value(route_match, \"token\")"
         ));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if (@body.quantity as int) > 0 {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 400 { err: "bad_quantity" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_int_gt");
+        assert_eq!(condition.name, "quantity");
+        assert_eq!(condition.value, "0");
+        assert!(condition.operand_name.is_none());
+        assert!(condition.operand_kind.is_none());
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"quantity\").unwrap_or(\"\").trim().parse::<i64>()"
+        ));
+        assert!(handlers.contains("if value > 0 {"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

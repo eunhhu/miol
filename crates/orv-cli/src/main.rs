@@ -27454,6 +27454,12 @@ entry = "src/main.orv"
     }
     @respond 401 { err: "token_mismatch" }
   }
+  @route POST /quantity {
+    if (@body.quantity as int) > 0 {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 400 { err: "bad_quantity" }
+  }
   @route GET /catalog/:kind {
     if @param.kind == "sale" {
       @respond 200 { kind: @param.kind }
@@ -27533,6 +27539,10 @@ entry = "src/main.orv"
         let session = send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"abc"}"#);
         let rejected_session =
             send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"xyz"}"#);
+        let accepted_quantity =
+            send_raw_http_json_post(address, "/quantity", r#"{"quantity":"3"}"#);
+        let rejected_quantity =
+            send_raw_http_json_post(address, "/quantity", r#"{"quantity":"0"}"#);
         let sale = send_raw_http(address, "/catalog/sale");
         let regular = send_raw_http(address, "/catalog/full");
         let expanded = send_raw_http(address, "/search?mode=expanded");
@@ -27550,6 +27560,10 @@ entry = "src/main.orv"
         assert!(session.contains(r#"{"ok":true}"#));
         assert!(rejected_session.starts_with("HTTP/1.1 401"));
         assert!(rejected_session.contains(r#"{"err":"token_mismatch"}"#));
+        assert!(accepted_quantity.starts_with("HTTP/1.1 201"));
+        assert!(accepted_quantity.contains(r#"{"accepted":true,"quantity":3}"#));
+        assert!(rejected_quantity.starts_with("HTTP/1.1 400"));
+        assert!(rejected_quantity.contains(r#"{"err":"bad_quantity"}"#));
         assert!(sale.starts_with("HTTP/1.1 200"));
         assert!(sale.contains(r#"{"kind":"sale"}"#));
         assert!(regular.starts_with("HTTP/1.1 200"));
