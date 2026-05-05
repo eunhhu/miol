@@ -2143,6 +2143,8 @@ PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
+- `server/native-server.json`\n\
+- `server/native/main.rs`\n\
 \n\
 ## Routes\n\
 \n\
@@ -12325,6 +12327,11 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
+            "native_server_launcher_source" => verify_native_server_launcher_source(
+                &target,
+                SERVER_ARTIFACT_PATH,
+                NATIVE_SERVER_PLAN_PATH,
+            )?,
             "static_page" => verify_static_page_target(bundle, &target)?,
             "client_page" => verify_client_page_target(bundle, &target)?,
             "client_js" => verify_client_js_target(&target)?,
@@ -12419,6 +12426,12 @@ fn verify_native_server_plan_value(
     if json_str(plan, "launcher", "native server plan")? != launcher_path {
         anyhow::bail!("native server plan launcher must be {launcher_path}");
     }
+    let source_path = json_str(plan, "source", "native server plan")?;
+    verify_native_server_launcher_source(
+        &dir.join(source_path),
+        artifact_path,
+        NATIVE_SERVER_PLAN_PATH,
+    )?;
     let launch = read_server_launch_artifact(&dir.join(launcher_path))?;
     if launch.artifact != artifact_path {
         anyhow::bail!("native server plan launcher artifact does not match server artifact");
@@ -12465,6 +12478,36 @@ fn verify_native_server_plan_value(
     let artifact_routes = serde_json::to_value(&artifact.routes)?;
     if plan.get("routes") != Some(&artifact_routes) {
         anyhow::bail!("native server plan routes do not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_server_launcher_source(
+    target: &Path,
+    artifact_path: &str,
+    native_plan_path: &str,
+) -> anyhow::Result<()> {
+    if !target.is_file() {
+        anyhow::bail!(
+            "missing native server launcher source: {}",
+            target.display()
+        );
+    }
+    let source = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    let artifact_line = format!(r#"const ORV_SERVER_ARTIFACT: &str = "{artifact_path}";"#);
+    if !source.contains(&artifact_line) {
+        anyhow::bail!("native server launcher source must reference {artifact_path}");
+    }
+    let plan_line = format!(r#"const ORV_NATIVE_SERVER_PLAN: &str = "{native_plan_path}";"#);
+    if !source.contains(&plan_line) {
+        anyhow::bail!("native server launcher source must reference {native_plan_path}");
+    }
+    if !source.contains(r#"Command::new("orv")"#) || !source.contains(r#".arg("run-artifact")"#) {
+        anyhow::bail!("native server launcher source must run `orv run-artifact`");
+    }
+    if !source.contains("std::env::args_os().skip(1)") {
+        anyhow::bail!("native server launcher source must forward process arguments");
     }
     Ok(())
 }
@@ -15570,6 +15613,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let server_artifact_path = SERVER_ARTIFACT_PATH;
     let server_launch_path = SERVER_LAUNCH_PATH;
     let native_server_plan_path = NATIVE_SERVER_PLAN_PATH;
+    let native_server_source_path = NATIVE_SERVER_SOURCE_PATH;
     let source_bundle = orv_compiler::source_bundle_artifact(
         entry.display().to_string(),
         loaded
@@ -15629,7 +15673,14 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             native_server_plan_path,
             server_artifact_path,
             server_launch_path,
+            native_server_source_path,
             server_artifact,
+        )?;
+        write_native_server_launcher_source(
+            out,
+            native_server_source_path,
+            server_artifact_path,
+            native_server_plan_path,
         )?;
     }
     if let Some((path, html)) = static_page {
@@ -16213,6 +16264,7 @@ const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
+const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
 const NATIVE_SERVER_BINARY_PATH: &str = "server/app";
 const CLIENT_WASM_START_EXPORT: &str = "orv_start";
 const CLIENT_WASM_RENDER_PTR_EXPORT: &str = "orv_render_ptr";
@@ -16515,6 +16567,7 @@ fn write_native_server_plan_artifact(
     path: &str,
     server_artifact_path: &str,
     server_launch_path: &str,
+    native_server_source_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
     let plan = serde_json::json!({
@@ -16525,6 +16578,7 @@ fn write_native_server_plan_artifact(
         "runtime_features": server_artifact.runtime_features.clone(),
         "artifact": server_artifact_path,
         "launcher": server_launch_path,
+        "source": native_server_source_path,
         "target": {
             "kind": "server_binary",
             "path": NATIVE_SERVER_BINARY_PATH,
@@ -16535,6 +16589,53 @@ fn write_native_server_plan_artifact(
         "routes": server_artifact.routes.clone(),
     });
     write_json(&out.join(path), &plan)
+}
+
+fn write_native_server_launcher_source(
+    out: &Path,
+    path: &str,
+    server_artifact_path: &str,
+    native_server_plan_path: &str,
+) -> anyhow::Result<()> {
+    let source = format!(
+        r#"// Generated by orv build. This is a reference launcher source, not the
+// final zero-overhead native server runtime.
+
+const ORV_SERVER_ARTIFACT: &str = "{server_artifact_path}";
+const ORV_NATIVE_SERVER_PLAN: &str = "{native_server_plan_path}";
+
+fn main() -> std::process::ExitCode {{
+    let build_dir = std::env::var_os("ORV_BUILD_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let artifact = build_dir.join(ORV_SERVER_ARTIFACT);
+    let status = std::process::Command::new("orv")
+        .arg("run-artifact")
+        .arg(artifact)
+        .args(std::env::args_os().skip(1))
+        .status();
+    match status {{
+        Ok(status) if status.success() => std::process::ExitCode::SUCCESS,
+        Ok(status) => {{
+            let code = status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1);
+            std::process::ExitCode::from(code)
+        }}
+        Err(error) => {{
+            eprintln!(
+                "failed to launch orv reference server using {{}} from {{}}: {{error}}",
+                ORV_SERVER_ARTIFACT,
+                ORV_NATIVE_SERVER_PLAN
+            );
+            std::process::ExitCode::FAILURE
+        }}
+    }}
+}}
+"#
+    );
+    write_text(&out.join(path), &source)
 }
 
 fn relative_bundle_path(from: &str, to: &str) -> String {
@@ -17708,6 +17809,8 @@ test "checkout failing runtime body" {
         assert!(guide.contains("orv verify-build dist"));
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
+        assert!(guide.contains("server/native-server.json"));
+        assert!(guide.contains("server/native/main.rs"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
         assert!(guide.contains("Persistent data: `data/shop.wal.jsonl`"));
@@ -24849,6 +24952,7 @@ entry = "src/main.orv"
         let server_artifact_path = out.join("server").join("app.orv-runtime.json");
         let server_launch_path = out.join("server").join("launch.json");
         let native_server_plan_path = out.join("server").join("native-server.json");
+        let native_server_source_path = out.join("server").join("native").join("main.rs");
         let graph_path = out.join("project-graph.json");
         let source_bundle_path = out.join("source-bundle.json");
         assert!(
@@ -24880,6 +24984,11 @@ entry = "src/main.orv"
             native_server_plan_path.is_file(),
             "missing {}",
             native_server_plan_path.display()
+        );
+        assert!(
+            native_server_source_path.is_file(),
+            "missing {}",
+            native_server_source_path.display()
         );
         assert!(graph_path.is_file(), "missing {}", graph_path.display());
         assert!(
@@ -24943,6 +25052,14 @@ entry = "src/main.orv"
             .iter()
             .any(|artifact| artifact["kind"] == "native_server_plan"
                 && artifact["path"] == "server/native-server.json"));
+        assert!(manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .any(
+                |artifact| artifact["kind"] == "native_server_launcher_source"
+                    && artifact["path"] == "server/native/main.rs"
+            ));
         let source_bundle: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&source_bundle_path).expect("source bundle"),
         )
@@ -24977,6 +25094,12 @@ entry = "src/main.orv"
             .iter()
             .any(|bundle| bundle["kind"] == "native_server_plan"
                 && bundle["path"] == "server/native-server.json"));
+        assert!(plan["bundles"]
+            .as_array()
+            .expect("bundles array")
+            .iter()
+            .any(|bundle| bundle["kind"] == "native_server_launcher_source"
+                && bundle["path"] == "server/native/main.rs"));
         let server_artifact: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&server_artifact_path).expect("server artifact"),
         )
@@ -25028,6 +25151,7 @@ entry = "src/main.orv"
         assert_eq!(native_plan["status"], "planned");
         assert_eq!(native_plan["artifact"], "server/app.orv-runtime.json");
         assert_eq!(native_plan["launcher"], "server/launch.json");
+        assert_eq!(native_plan["source"], "server/native/main.rs");
         assert_eq!(native_plan["runtime"], "reference-interpreter");
         assert_eq!(native_plan["target"]["kind"], "server_binary");
         assert_eq!(native_plan["target"]["path"], "server/app");
@@ -25044,6 +25168,12 @@ entry = "src/main.orv"
             .expect("blocked_by")
             .iter()
             .any(|item| item == "native-runtime-image"));
+        let native_source =
+            std::fs::read_to_string(&native_server_source_path).expect("native source");
+        assert!(native_source.contains("const ORV_SERVER_ARTIFACT"));
+        assert!(native_source.contains("server/app.orv-runtime.json"));
+        assert!(native_source.contains("Command::new(\"orv\")"));
+        assert!(native_source.contains("run-artifact"));
 
         cmd_verify_build(&out).expect("verify build artifacts");
 
@@ -25297,6 +25427,26 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("native server plan artifact must be server/app.orv-runtime.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_native_server_launcher_source_mismatch() {
+        let (src_dir, path) = prod_server_source("native-server-source-source");
+        let out = temp_output_dir("native-server-source-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let source_path = out.join("server").join("native").join("main.rs");
+        let mut source = std::fs::read_to_string(&source_path).expect("native source");
+        source = source.replace("run-artifact", "run");
+        write_text(&source_path, &source).expect("write corrupt native source");
+
+        let err = cmd_verify_build(&out).expect_err("native server source mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("native server launcher source must run `orv run-artifact`"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }

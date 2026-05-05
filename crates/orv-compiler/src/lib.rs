@@ -4,7 +4,8 @@
 //! owns small compiler artifacts that can be derived from HIR without emitting a
 //! server binary or optimized client WASM bundle. HTML-only entries can plan a
 //! static page artifact with no shipped runtime features, and server entries
-//! declare a native server plan contract without claiming native codegen yet.
+//! declare native server plan/source contracts without claiming final native
+//! codegen yet.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -342,6 +343,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             kind: "native_server_plan".to_string(),
             path: "server/native-server.json".to_string(),
         });
+        artifacts.push(BuildArtifact {
+            kind: "native_server_launcher_source".to_string(),
+            path: "server/native/main.rs".to_string(),
+        });
     }
     if has_static_page(has_server, &runtime_features) {
         artifacts.push(BuildArtifact {
@@ -395,6 +400,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "native_server_plan".to_string(),
             path: "server/native-server.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_server_launcher_source".to_string(),
+            path: "server/native/main.rs".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
     }
@@ -1436,6 +1446,12 @@ function greet(name: string): string -> "hi {name}""#,
                 && bundle.runtime_features.contains(&"http_server".to_string())
                 && bundle.runtime_features.contains(&"router".to_string())
         }));
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "native_server_launcher_source"
+                && bundle.path == "server/native/main.rs"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
     }
 
     #[test]
@@ -1459,6 +1475,10 @@ function greet(name: string): string -> "hi {name}""#,
         }));
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_plan" && artifact.path == "server/native-server.json"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "native_server_launcher_source"
+                && artifact.path == "server/native/main.rs"
         }));
     }
 
