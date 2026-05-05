@@ -1780,13 +1780,33 @@ fn native_captured_field_operation_is_direct(
         value_kind,
         "route_param_int" | "query_param_int" | "request_body_field_int"
     );
-    match (int_kind, op, operand_json, operand_kind, operand_name) {
-        (_, None, None, None, None) => true,
-        (true, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
+    let float_kind = matches!(
+        value_kind,
+        "route_param_float" | "query_param_float" | "request_body_field_float"
+    );
+    match (
+        int_kind,
+        float_kind,
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    ) {
+        (_, _, None, None, None, None) => true,
+        (true, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<i64>().is_ok()
         }
-        (true, Some("add" | "sub" | "mul" | "div" | "rem"), None, Some(kind), Some(name)) => {
+        (true, _, Some("add" | "sub" | "mul" | "div" | "rem"), None, Some(kind), Some(name)) => {
             native_captured_int_operand_is_direct(kind, name, route_params)
+        }
+        (_, true, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
+            operand
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|value| value.is_finite())
+        }
+        (_, true, Some("add" | "sub" | "mul" | "div" | "rem"), None, Some(kind), Some(name)) => {
+            native_captured_float_operand_is_direct(kind, name, route_params)
         }
         _ => false,
     }
@@ -1802,6 +1822,20 @@ fn native_captured_int_operand_is_direct(
             .iter()
             .any(|route_param| route_param == operand_name),
         "query_param_int" | "request_body_field_int" => !operand_name.is_empty(),
+        _ => false,
+    }
+}
+
+fn native_captured_float_operand_is_direct(
+    operand_kind: &str,
+    operand_name: &str,
+    route_params: &[String],
+) -> bool {
+    match operand_kind {
+        "route_param_float" => route_params
+            .iter()
+            .any(|route_param| route_param == operand_name),
+        "query_param_float" | "request_body_field_float" => !operand_name.is_empty(),
         _ => false,
     }
 }
@@ -2686,9 +2720,15 @@ fn push_native_captured_json_value(
                 source,
                 "        match {lookup_expr}.unwrap_or(\"\").trim().parse::<f64>() {{"
             );
-            source.push_str(
-                "            Ok(value) if value.is_finite() => body.push_str(&value.to_string()),\n            _ => {\n",
-            );
+            if !push_native_float_success_arm(
+                source,
+                operation,
+                kinds.error_prefix,
+                response_origin_id,
+            ) {
+                return false;
+            }
+            source.push_str("            _ => {\n");
             let error_body = format!(r#"{{"error":"{} float cast failed"}}"#, kinds.error_prefix);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
@@ -2697,6 +2737,113 @@ fn push_native_captured_json_value(
         }
         _ => false,
     }
+}
+
+fn push_native_float_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    match (op, operand_json, operand_kind, operand_name) {
+        (None, None, None, None) => {
+            source.push_str(
+                "            Ok(value) if value.is_finite() => body.push_str(&value.to_string()),\n",
+            );
+            true
+        }
+        (Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand_json), None, None) => {
+            let Some(operand) = static_float_operand_value(operand_json) else {
+                return false;
+            };
+            let Some(operator) = native_float_arithmetic_operator(op) else {
+                return false;
+            };
+            let _ = writeln!(
+                source,
+                "            Ok(value) if value.is_finite() => {{\n                let value = value {operator} {operand};"
+            );
+            push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
+            source.push_str("            },\n");
+            true
+        }
+        (
+            Some("add" | "sub" | "mul" | "div" | "rem"),
+            None,
+            Some(
+                operand_kind @ ("route_param_float"
+                | "query_param_float"
+                | "request_body_field_float"),
+            ),
+            Some(operand_name),
+        ) => {
+            let Some(operator) = native_float_arithmetic_operator(op) else {
+                return false;
+            };
+            let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name)
+            else {
+                return false;
+            };
+            let _ = writeln!(
+                source,
+                "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+            );
+            let _ = writeln!(
+                source,
+                "                Ok(operand) if operand.is_finite() => {{\n                    let value = value {operator} operand;"
+            );
+            push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
+            source.push_str("                },\n                _ => {\n");
+            let error_body = format!(
+                r#"{{"error":"{} float operand cast failed"}}"#,
+                error_prefix
+            );
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn push_native_float_arithmetic_result(
+    source: &mut String,
+    error_prefix: &str,
+    response_origin_id: &str,
+) {
+    source.push_str(
+        "                if value.is_finite() {\n                    body.push_str(&value.to_string());\n                } else {\n",
+    );
+    let error_body = format!(r#"{{"error":"{} float arithmetic failed"}}"#, error_prefix);
+    let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+    push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+    source.push_str("                }\n");
+}
+
+fn native_float_arithmetic_operator(op: Option<&str>) -> Option<&'static str> {
+    match op {
+        Some("add") => Some("+"),
+        Some("sub") => Some("-"),
+        Some("mul") => Some("*"),
+        Some("div") => Some("/"),
+        Some("rem") => Some("%"),
+        _ => None,
+    }
+}
+
+fn static_float_operand_value(value: &str) -> Option<&str> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|_| value)
 }
 
 fn push_native_int_success_arm(
@@ -2791,6 +2938,19 @@ fn native_int_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Opt
         "route_param_int" => "routes::orv_native_param_value",
         "query_param_int" => "routes::orv_native_query_value",
         "request_body_field_int" => "routes::orv_native_body_field_value",
+        _ => return None,
+    };
+    Some(format!(
+        "{lookup}(route_match, {})",
+        rust_string_literal(operand_name)
+    ))
+}
+
+fn native_float_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Option<String> {
+    let lookup = match operand_kind {
+        "route_param_float" => "routes::orv_native_param_value",
+        "query_param_float" => "routes::orv_native_query_value",
+        "request_body_field_float" => "routes::orv_native_body_field_value",
         _ => return None,
     };
     Some(format!(
@@ -3684,29 +3844,7 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
             ) =>
         {
-            let mut value = route_param_field_value(lhs)?;
-            if value.value_kind != "route_param_int" || value.op.is_some() {
-                return None;
-            }
-            value.op = Some(
-                match op {
-                    BinaryOp::Add => "add",
-                    BinaryOp::Sub => "sub",
-                    BinaryOp::Mul => "mul",
-                    BinaryOp::Div => "div",
-                    BinaryOp::Rem => "rem",
-                    _ => return None,
-                }
-                .to_string(),
-            );
-            if let Some(operand) = static_integer(rhs) {
-                value.operand_json = Some(operand.to_string());
-                return Some(value);
-            }
-            let operand = captured_integer_operand(rhs)?;
-            value.operand_kind = Some(operand.value_kind);
-            value.operand_name = Some(operand.name);
-            Some(value)
+            captured_numeric_response_operation(route_param_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some(captured_response_value(
             route_param_field_name(expr)?,
@@ -3732,29 +3870,7 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
             ) =>
         {
-            let mut value = query_param_field_value(lhs)?;
-            if value.value_kind != "query_param_int" || value.op.is_some() {
-                return None;
-            }
-            value.op = Some(
-                match op {
-                    BinaryOp::Add => "add",
-                    BinaryOp::Sub => "sub",
-                    BinaryOp::Mul => "mul",
-                    BinaryOp::Div => "div",
-                    BinaryOp::Rem => "rem",
-                    _ => return None,
-                }
-                .to_string(),
-            );
-            if let Some(operand) = static_integer(rhs) {
-                value.operand_json = Some(operand.to_string());
-                return Some(value);
-            }
-            let operand = captured_integer_operand(rhs)?;
-            value.operand_kind = Some(operand.value_kind);
-            value.operand_name = Some(operand.name);
-            Some(value)
+            captured_numeric_response_operation(query_param_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some(captured_response_value(
             query_param_field_name(expr)?,
@@ -3800,6 +3916,48 @@ fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseVa
         operand_kind: None,
         operand_name: None,
     }
+}
+
+fn captured_numeric_response_operation(
+    mut value: CapturedResponseValue,
+    op: BinaryOp,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some() {
+        return None;
+    }
+    value.op = Some(
+        match op {
+            BinaryOp::Add => "add",
+            BinaryOp::Sub => "sub",
+            BinaryOp::Mul => "mul",
+            BinaryOp::Div => "div",
+            BinaryOp::Rem => "rem",
+            _ => return None,
+        }
+        .to_string(),
+    );
+    if value.value_kind.ends_with("_int") {
+        if let Some(operand) = static_integer(rhs) {
+            value.operand_json = Some(operand.to_string());
+            return Some(value);
+        }
+        let operand = captured_integer_operand(rhs)?;
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        if let Some(operand) = static_float(rhs) {
+            value.operand_json = Some(operand);
+            return Some(value);
+        }
+        let operand = captured_float_operand(rhs)?;
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    None
 }
 
 struct CapturedIntegerOperand {
@@ -3912,29 +4070,7 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
             ) =>
         {
-            let mut value = request_body_field_value(lhs)?;
-            if value.value_kind != "request_body_field_int" || value.op.is_some() {
-                return None;
-            }
-            value.op = Some(
-                match op {
-                    BinaryOp::Add => "add",
-                    BinaryOp::Sub => "sub",
-                    BinaryOp::Mul => "mul",
-                    BinaryOp::Div => "div",
-                    BinaryOp::Rem => "rem",
-                    _ => return None,
-                }
-                .to_string(),
-            );
-            if let Some(operand) = static_integer(rhs) {
-                value.operand_json = Some(operand.to_string());
-                return Some(value);
-            }
-            let operand = captured_integer_operand(rhs)?;
-            value.operand_kind = Some(operand.value_kind);
-            value.operand_name = Some(operand.name);
-            Some(value)
+            captured_numeric_response_operation(request_body_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Cast { expr, ty } if is_integer_type_ref(ty) => Some(captured_response_value(
             request_body_field_name(expr)?,
@@ -6529,6 +6665,52 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(".trim().parse::<f64>()"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"amount\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_mul_field_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { total: (@body.price as float) * (@body.quantity as float) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "price");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"price\")"));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"quantity\")"));
+        assert!(handlers.contains("let value = value * operand;"));
+        assert!(handlers.contains("if value.is_finite()"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

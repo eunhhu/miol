@@ -27750,6 +27750,9 @@ entry = "src/main.orv"
   @route POST /payments {
     @respond 201 { amount: @body.amount as float }
   }
+  @route POST /payments/total {
+    @respond 201 { total: (@body.price as float) * (@body.quantity as float) }
+  }
 }
 "#,
         )
@@ -27799,9 +27802,16 @@ entry = "src/main.orv"
             .expect("native listen address");
 
         let response = send_raw_http_json_post(address, "/payments", r#"{"amount":"12.5"}"#);
+        let total_response = send_raw_http_json_post(
+            address,
+            "/payments/total",
+            r#"{"price":"12.5","quantity":"3"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"amount":12.5}"#));
+        assert!(total_response.starts_with("HTTP/1.1 201"));
+        assert!(total_response.contains(r#"{"total":37.5}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
