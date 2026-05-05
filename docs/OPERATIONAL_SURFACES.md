@@ -54,6 +54,8 @@ Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project]
 
 Editor DAP control commands are now first-class in the export contract: every exported control carries the exact `orv editor run-debug debug/session-runner.json --control <name>` runner command, `native-host.json` mirrors those commands under `debug.control_commands`, and the static shell renders the selected runner command next to the DAP request payload.
 
+Trace transport is also mirrored for native hosts: when an editor export includes trace state and the build has a stable server listen endpoint, `native-host.json` includes `trace.transport` with the `/__orv/trace/events` EventSource URL and the static shell renders the same transport in a Trace Transport pane.
+
 `orv lsp serve --stdio` currently handles:
 
 - lifecycle: `initialize`, `shutdown`, notifications, unknown-method errors

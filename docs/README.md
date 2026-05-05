@@ -163,6 +163,8 @@ LSP bootstrap은 `declaration`/`typeDefinition` navigation, project moniker, doc
 
 Editor DAP native control 세부: exported debug controls now include exact per-control runner commands, `native-host.json` mirrors them as `debug.control_commands`, and the static shell shows the selected runner command beside the DAP request payload.
 
+Editor trace native transport 세부: when export trace state has a stable server EventSource endpoint, `native-host.json` exposes it as `trace.transport` and the static shell renders a Trace Transport pane for native UI wiring.
+
 ## 빌드
 
 ```bash
