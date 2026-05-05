@@ -14839,6 +14839,8 @@ fn reveal_native_server_router_source(
         "exists": true,
         "dispatch": source.contains("pub fn orv_native_dispatch("),
         "handler_count_contract": source.contains("ORV_NATIVE_HANDLER_COUNT"),
+        "response_origin_dispatch": source.contains("pub response_origin_id: Option<&'static str>")
+            && source.contains("response_origin_id: route_match.route.response_origin_ids.first().copied()"),
     }))
 }
 
@@ -29040,6 +29042,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["router_source"]["exists"] == true
                 && target["router_source"]["dispatch"] == true
                 && target["router_source"]["handler_count_contract"] == true
+                && target["router_source"]["response_origin_dispatch"] == true
                 && target["runtime_image"]["path"] == "server/runtime-image.json"
                 && target["runtime_image"]["reference_image"]
                     == "ghcr.io/orv-lang/orv-reference:latest"
