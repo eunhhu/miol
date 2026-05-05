@@ -121,7 +121,8 @@ function validateReactiveBindings(plan, manifest) {
       plan.signals.some((signal) =>
         binding.source === signal.origin_id &&
         binding.state_key === signal.state_key
-      )
+      ) &&
+      signalTextTemplateIsValid(binding, plan.signals)
     );
   if (!signalTextBindingsAreValid) {
     throw new Error("orv client reactive plan signal_text binding mismatch");
@@ -164,6 +165,25 @@ function validateReactiveBindings(plan, manifest) {
   }
 }
 
+function signalTextTemplateIsValid(binding, signals) {
+  if (binding.text_template === undefined) {
+    return true;
+  }
+  return Array.isArray(binding.text_template) &&
+    binding.text_template.length > 0 &&
+    binding.text_template.every((segment) => {
+      if (segment.kind === "text") {
+        return typeof segment.value === "string";
+      }
+      if (segment.kind === "signal") {
+        return typeof segment.state_key === "string" &&
+          segment.state_key === binding.state_key &&
+          signals.some((signal) => signal.state_key === segment.state_key);
+      }
+      return false;
+    });
+}
+
 function decodeSignalInitialValue(metadata) {
   switch (metadata.kind) {
     case "int":
@@ -195,6 +215,21 @@ function displaySignalValue(value) {
   return value == null ? "" : String(value);
 }
 
+function renderSignalTextBinding(binding, reactiveState) {
+  if (!Array.isArray(binding.text_template)) {
+    return displaySignalValue(reactiveState[binding.state_key]?.value);
+  }
+  return binding.text_template.map((segment) => {
+    if (segment.kind === "text") {
+      return segment.value;
+    }
+    if (segment.kind === "signal") {
+      return displaySignalValue(reactiveState[segment.state_key]?.value);
+    }
+    return "";
+  }).join("");
+}
+
 function bindReactiveDom(plan, root, reactiveState) {
   const bindings = new Map();
   if (!root) {
@@ -206,7 +241,7 @@ function bindReactiveDom(plan, root, reactiveState) {
     if (!state) {
       continue;
     }
-    const expectedText = displaySignalValue(state.value);
+    const expectedText = renderSignalTextBinding(binding, reactiveState);
     const element = Array.from(root.querySelectorAll(binding.selector))
       .find((candidate) => candidate.textContent === expectedText);
     if (!element) {
@@ -214,15 +249,15 @@ function bindReactiveDom(plan, root, reactiveState) {
     }
     element.dataset.orvSignal = binding.state_key;
     const current = bindings.get(binding.state_key) || [];
-    current.push(element);
+    current.push({ element, binding });
     bindings.set(binding.state_key, current);
   }
   return {
     count: [...bindings.values()].reduce((total, items) => total + items.length, 0),
-    update(stateKey, value) {
-      const elements = bindings.get(stateKey) || [];
-      for (const element of elements) {
-        element.textContent = displaySignalValue(value);
+    update(stateKey) {
+      const items = bindings.get(stateKey) || [];
+      for (const item of items) {
+        item.element.textContent = renderSignalTextBinding(item.binding, reactiveState);
       }
     },
   };

@@ -4013,13 +4013,21 @@ impl Parser {
         if !self.looks_like_braced_prop_expr() {
             return None;
         }
+        let start = self.pos;
+        let diagnostics_len = self.diagnostics.len();
         let lbrace = self.advance();
-        let expr = self.parse_expr()?;
-        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
-        Some(Expr {
-            kind: expr.kind,
-            span: lbrace.span.join(rbrace.span),
-        })
+        if let Some(expr) = self.parse_expr() {
+            if matches!(self.peek_kind(), TokenKind::RBrace) {
+                let rbrace = self.advance();
+                return Some(Expr {
+                    kind: expr.kind,
+                    span: lbrace.span.join(rbrace.span),
+                });
+            }
+        }
+        self.pos = start;
+        self.diagnostics.truncate(diagnostics_len);
+        self.parse_block_expr()
     }
 
     fn looks_like_braced_prop_expr(&self) -> bool {
@@ -5091,6 +5099,19 @@ mod tests {
             &args[0].kind,
             ExprKind::Assign { target, value } if target.name == "value"
                 && matches!(&value.kind, ExprKind::Ident(id) if id.name == "input")
+        ));
+    }
+
+    #[test]
+    fn html_prop_braced_multistatement_value_parses_as_block() {
+        let r = parse_str(r#"@button onClick={ count += 1 if count > 0 { @out "x" } } "x""#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let (name, args) = domain_of(&r.program.items[0]);
+        assert_eq!(name.name, "button");
+        assert!(matches!(
+            &args[0].kind,
+            ExprKind::Assign { target, value } if target.name == "onClick"
+                && matches!(&value.kind, ExprKind::Block(block) if block.stmts.len() == 2)
         ));
     }
 
