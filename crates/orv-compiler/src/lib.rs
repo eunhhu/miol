@@ -2821,7 +2821,26 @@ fn push_native_int_response_condition(
         return false;
     };
     if condition.operand_name.is_some() {
-        return false;
+        let Some(operand_lookup) = condition
+            .operand_kind
+            .as_deref()
+            .and_then(native_response_condition_int_operand_lookup)
+        else {
+            return false;
+        };
+        let operand_name = condition.operand_name.as_deref().unwrap_or_default();
+        let _ = writeln!(
+            source,
+            "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
+            rust_string_literal(&condition.name),
+            rust_string_literal(operand_name)
+        );
+        let _ = writeln!(
+            source,
+            "            (Ok(value), Ok(operand)) => value {operator} operand,"
+        );
+        source.push_str("            _ => false,\n        } {\n");
+        return true;
     }
     let Ok(value) = condition.value.parse::<i64>() else {
         return false;
@@ -2868,6 +2887,15 @@ fn native_response_condition_int_lookup(kind: &str) -> Option<(&'static str, &'s
         _ => return None,
     };
     Some((lookup, operator))
+}
+
+fn native_response_condition_int_operand_lookup(operand_kind: &str) -> Option<&'static str> {
+    match operand_kind {
+        "request_body_field_int" => Some("routes::orv_native_body_field_value"),
+        "route_param_int" => Some("routes::orv_native_param_value"),
+        "query_param_int" => Some("routes::orv_native_query_value"),
+        _ => None,
+    }
 }
 
 fn native_response_condition_operand_lookup(operand_kind: &str) -> Option<&'static str> {
@@ -3810,12 +3838,22 @@ fn native_captured_int_response_condition(
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
     if let Some(left) = captured_condition_int_operand(lhs) {
+        if let Some(value) = static_integer(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_int_operand(op, left.kind)?,
+                name: left.name,
+                value: value.to_string(),
+                operand_name: None,
+                operand_kind: None,
+            });
+        }
+        let right = captured_condition_int_operand(rhs)?;
         return Some(ServerResponseConditionArtifact {
             kind: condition_kind_for_int_operand(op, left.kind)?,
             name: left.name,
-            value: static_integer(rhs)?.to_string(),
-            operand_name: None,
-            operand_kind: None,
+            value: String::new(),
+            operand_name: Some(right.name),
+            operand_kind: Some(right.kind.to_string()),
         });
     }
     let right = captured_condition_int_operand(rhs)?;
@@ -6697,6 +6735,53 @@ function greet(name: string): string -> "hi {name}""#,
             "routes::orv_native_body_field_value(route_match, \"quantity\").unwrap_or(\"\").trim().parse::<i64>()"
         ));
         assert!(handlers.contains("if value > 0 {"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_captured_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if (@body.quantity as int) <= (@body.stock as int) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "out_of_stock" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_int_le");
+        assert_eq!(condition.name, "quantity");
+        assert_eq!(condition.operand_name.as_deref(), Some("stock"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"quantity\").unwrap_or(\"\").trim().parse::<i64>()"
+        ));
+        assert!(handlers.contains(
+            "routes::orv_native_body_field_value(route_match, \"stock\").unwrap_or(\"\").trim().parse::<i64>()"
+        ));
+        assert!(handlers.contains("(Ok(value), Ok(operand)) => value <= operand"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

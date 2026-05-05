@@ -27460,6 +27460,12 @@ entry = "src/main.orv"
     }
     @respond 400 { err: "bad_quantity" }
   }
+  @route POST /inventory {
+    if (@body.quantity as int) <= (@body.stock as int) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "out_of_stock" }
+  }
   @route GET /catalog/:kind {
     if @param.kind == "sale" {
       @respond 200 { kind: @param.kind }
@@ -27543,6 +27549,10 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/quantity", r#"{"quantity":"3"}"#);
         let rejected_quantity =
             send_raw_http_json_post(address, "/quantity", r#"{"quantity":"0"}"#);
+        let accepted_inventory =
+            send_raw_http_json_post(address, "/inventory", r#"{"quantity":"3","stock":"5"}"#);
+        let rejected_inventory =
+            send_raw_http_json_post(address, "/inventory", r#"{"quantity":"7","stock":"5"}"#);
         let sale = send_raw_http(address, "/catalog/sale");
         let regular = send_raw_http(address, "/catalog/full");
         let expanded = send_raw_http(address, "/search?mode=expanded");
@@ -27564,6 +27574,10 @@ entry = "src/main.orv"
         assert!(accepted_quantity.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_quantity.starts_with("HTTP/1.1 400"));
         assert!(rejected_quantity.contains(r#"{"err":"bad_quantity"}"#));
+        assert!(accepted_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
+        assert!(rejected_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_inventory.contains(r#"{"err":"out_of_stock"}"#));
         assert!(sale.starts_with("HTTP/1.1 200"));
         assert!(sale.contains(r#"{"kind":"sale"}"#));
         assert!(regular.starts_with("HTTP/1.1 200"));
