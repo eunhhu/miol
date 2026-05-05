@@ -406,7 +406,7 @@ pub struct ServerResponseRequestBodyFieldArtifact {
     pub field: String,
     /// Request body field name.
     pub name: String,
-    /// Field value class: `request_body_field` or `request_body_field_int`.
+    /// Field value class: `request_body_field`, `request_body_field_int`, or `request_body_field_float`.
     #[serde(
         default = "default_request_body_field_value_kind",
         skip_serializing_if = "is_default_request_body_field_value_kind"
@@ -1473,9 +1473,10 @@ fn native_server_response_uses_object_fields(
                     .name
                     .as_ref()
                     .is_some_and(|name| route_params.iter().any(|route_param| route_param == name)),
-                "query_param" | "request_body_field" | "request_body_field_int" => {
-                    field.name.is_some()
-                }
+                "query_param"
+                | "request_body_field"
+                | "request_body_field_int"
+                | "request_body_field_float" => field.name.is_some(),
                 "request_body_json" => true,
                 _ => false,
             })
@@ -1997,6 +1998,16 @@ pub fn orv_native_handle_route(
                             &response.origin_id,
                         );
                     }
+                    "request_body_field_float" => {
+                        uses_request_body_field_json = true;
+                        let name = field.name.as_deref().unwrap_or_default();
+                        let _ = push_native_request_body_field_json_value(
+                            &mut source,
+                            name,
+                            "request_body_field_float",
+                            &response.origin_id,
+                        );
+                    }
                     _ => source.push_str("        body.push_str(\"null\");\n"),
                 }
             }
@@ -2192,6 +2203,23 @@ fn push_native_request_body_field_json_value(
             source.push_str("            },\n        }\n");
             true
         }
+        "request_body_field_float" => {
+            let _ = writeln!(
+                source,
+                "        match routes::orv_native_body_field_value(route_match, {}).unwrap_or(\"\").trim().parse::<f64>() {{",
+                rust_string_literal(name)
+            );
+            source.push_str(
+                "            Ok(value) if value.is_finite() => body.push_str(&value.to_string()),\n            _ => {\n",
+            );
+            let body_expr = format!(
+                "{}.to_string()",
+                rust_string_literal(r#"{"error":"native request body float cast failed"}"#)
+            );
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("            },\n        }\n");
+            true
+        }
         _ => false,
     }
 }
@@ -2308,6 +2336,16 @@ fn push_native_response_body_return(
                         source,
                         name,
                         "request_body_field_int",
+                        &response.origin_id,
+                    );
+                }
+                "request_body_field_float" => {
+                    *uses_request_body_field_json = true;
+                    let name = field.name.as_deref().unwrap_or_default();
+                    let _ = push_native_request_body_field_json_value(
+                        source,
+                        name,
+                        "request_body_field_float",
                         &response.origin_id,
                     );
                 }
@@ -2754,12 +2792,23 @@ fn request_body_field_value(expr: &HirExpr) -> Option<(String, String)> {
             request_body_field_name(expr)?,
             "request_body_field_int".to_string(),
         )),
+        HirExprKind::Cast { expr, ty } if is_float_type_ref(ty) => Some((
+            request_body_field_name(expr)?,
+            "request_body_field_float".to_string(),
+        )),
         HirExprKind::Paren(expr) => request_body_field_value(expr),
         _ => Some((
             request_body_field_name(expr)?,
             "request_body_field".to_string(),
         )),
     }
+}
+
+fn is_float_type_ref(ty: &HirTypeRef) -> bool {
+    matches!(
+        &ty.kind,
+        HirTypeRefKind::Named(name) if matches!(name.as_str(), "float" | "double")
+    )
 }
 
 fn is_integer_type_ref(ty: &HirTypeRef) -> bool {
@@ -4745,6 +4794,42 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(".trim().parse::<i64>()"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"quantity\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_cast_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { amount: @body.amount as float }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "amount");
+        assert_eq!(response.body_request_fields[0].name, "amount");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert!(handlers.contains(".trim().parse::<f64>()"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"amount\")"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
