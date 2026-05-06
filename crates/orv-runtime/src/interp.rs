@@ -18,11 +18,13 @@
 use crate::db::{
     new_db_handle, DbFilter, DbFilterOp, DbHandle, DbNear, DbOrder, DbQuery, InMemoryDb,
 };
+use hmac::{Hmac, Mac};
 use orv_hir::{
     BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt,
     HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
     HirTypeRefKind, NameId, UnaryOp,
 };
+use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
@@ -30,6 +32,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// B4 `@env` 테스트 override.
 ///
@@ -2284,7 +2288,7 @@ impl<W: Write> Interp<W> {
             {
                 self.call_stateful_object_method(&fields, method, &args)
             }
-            (Value::Object(fields), "capture" | "book")
+            (Value::Object(fields), "capture" | "book" | "verifyWebhook")
                 if object_kind(&fields)
                     .is_some_and(|kind| matches!(kind, "payment.adapter" | "shipping.adapter")) =>
             {
@@ -3887,6 +3891,14 @@ fn call_commerce_adapter_method(
             payment_capture_value(&provider, args)?;
             http_commerce_adapter_value(fields, "payment.capture", args)?
         }
+        ("payment.adapter", "verifyWebhook") if provider == "stripe" => {
+            stripe_webhook_verification_value(args)?
+        }
+        ("payment.adapter", "verifyWebhook") => {
+            return Err(RuntimeError::native(format!(
+                "payment.verifyWebhook is not implemented for provider `{provider}`"
+            )));
+        }
         ("shipping.adapter", "book") if provider == "http" => {
             shipping_booking_value(&provider, args)?;
             http_commerce_adapter_value(fields, "shipping.booking", args)?
@@ -4182,6 +4194,102 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
     Ok(Value::Object(fields))
 }
 
+fn stripe_webhook_verification_value(args: &[Value]) -> Result<Value, RuntimeError> {
+    let payload = payload_field(args, "payload")
+        .ok_or_else(|| RuntimeError::native("`payment.verifyWebhook` expects payload"))?;
+    let signature = payload_field(args, "signature")
+        .ok_or_else(|| RuntimeError::native("`payment.verifyWebhook` expects signature"))?;
+    let payload = value_to_display(&payload);
+    let signature = value_to_display(&signature);
+    let (status, webhook_secret_status) = match provider_env_value("STRIPE_WEBHOOK_SECRET") {
+        Some(secret) if stripe_signature_matches(&secret, &payload, &signature)? => {
+            ("verified", "configured")
+        }
+        Some(_) => ("invalid", "configured"),
+        None => ("missing_secret", "missing"),
+    };
+
+    Ok(Value::Object(vec![
+        (
+            "kind".to_string(),
+            Value::Str("payment.webhook".to_string()),
+        ),
+        ("provider".to_string(), Value::Str("stripe".to_string())),
+        ("status".to_string(), Value::Str(status.to_string())),
+        (
+            "signatureScheme".to_string(),
+            Value::Str("stripe-v1".to_string()),
+        ),
+        (
+            "webhookSecretStatus".to_string(),
+            Value::Str(webhook_secret_status.to_string()),
+        ),
+    ]))
+}
+
+fn stripe_signature_matches(
+    secret: &str,
+    payload: &str,
+    signature: &str,
+) -> Result<bool, RuntimeError> {
+    let mut timestamp = None;
+    let mut candidates = Vec::new();
+    for part in signature.split(',') {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        match name.trim() {
+            "t" => timestamp = Some(value.trim()),
+            "v1" => candidates.push(value.trim()),
+            _ => {}
+        }
+    }
+
+    if candidates.is_empty() {
+        let expected = hmac_sha256_hex(secret, payload)?;
+        return Ok(constant_time_ascii_eq(signature.trim(), &expected));
+    }
+
+    let signed_payload =
+        timestamp.map_or_else(|| payload.to_string(), |t| format!("{t}.{payload}"));
+    let expected = hmac_sha256_hex(secret, &signed_payload)?;
+    Ok(candidates
+        .iter()
+        .any(|candidate| constant_time_ascii_eq(candidate, &expected)))
+}
+
+fn hmac_sha256_hex(secret: &str, payload: &str) -> Result<String, RuntimeError> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|source| {
+        RuntimeError::native(format!("payment webhook HMAC setup failed: {source}"))
+    })?;
+    mac.update(payload.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    out
+}
+
+fn constant_time_ascii_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, RuntimeError> {
     let order_id = payload_field(args, "orderId")
         .ok_or_else(|| RuntimeError::native("`shipping.book` expects orderId"))?;
@@ -4239,6 +4347,10 @@ fn provider_credential_field(field: &str, env: &str) -> (String, Value) {
 }
 
 fn provider_env_configured(env: &str) -> bool {
+    provider_env_value(env).is_some()
+}
+
+fn provider_env_value(env: &str) -> Option<String> {
     let value = {
         #[cfg(test)]
         {
@@ -4252,7 +4364,10 @@ fn provider_env_configured(env: &str) -> bool {
             std::env::var(env).ok()
         }
     };
-    value.is_some_and(|value| !value.trim().is_empty())
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn call_offline_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -4728,7 +4843,7 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
                 });
             }
             if object_kind(fields).is_some_and(|kind| {
-                matches!(kind, "payment.adapter") && field == "capture"
+                matches!(kind, "payment.adapter") && matches!(field, "capture" | "verifyWebhook")
                     || matches!(kind, "shipping.adapter") && field == "book"
             }) {
                 return Ok(Value::BoundMethod {
@@ -9438,6 +9553,30 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
         assert_eq!(out, "configured\nmissing\nmissing\nconfigured\n");
         assert!(!out.contains("sk_test_never_print"));
         assert!(!out.contains("carrier_webhook_never_print"));
+    }
+
+    #[test]
+    fn stripe_provider_adapter_verifies_webhook_signature_without_exposing_secret() {
+        super::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
+        let out = run_str(
+            r#"let payments = @payment.connect("stripe://local")
+let verified = payments.verifyWebhook({
+  payload: "evt_1",
+  signature: "t=1700000000,v1=6d4aa0747f1f67084c320780929635a8fcde580f00b308ac4bfdd04ab75bf6bf"
+})
+let rejected = payments.verifyWebhook({
+  payload: "evt_1",
+  signature: "t=1700000000,v1=0000000000000000000000000000000000000000000000000000000000000000"
+})
+@out verified.status
+@out rejected.status
+@out verified.provider"#,
+        )
+        .unwrap();
+        super::test_env::clear("STRIPE_WEBHOOK_SECRET");
+
+        assert_eq!(out, "verified\ninvalid\nstripe\n");
+        assert!(!out.contains("whsec_test"));
     }
 
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {

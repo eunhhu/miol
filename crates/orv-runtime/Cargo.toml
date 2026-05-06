@@ -12,10 +12,12 @@ rust-version.workspace = true
 orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
 orv-syntax = { workspace = true }
+hmac = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 # @server HTTP 런타임 (C5b) — MVP 는 HTTP/1.1. SPEC §11 의 QUIC/HTTP3
 # 기본값은 이후 마일스톤에서 합류한다.
