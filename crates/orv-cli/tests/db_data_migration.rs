@@ -811,7 +811,13 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
         .arg("--target")
         .arg("s3://orv-backups/shop")
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH")
         .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
         .output()
         .expect("run db archive");
     std::fs::remove_file(&wal).expect("remove source wal");
@@ -822,7 +828,13 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
         .arg("--data")
         .arg(&data)
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH")
         .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
         .output()
         .expect("run db restore");
     let (wal_upload, manifest_upload, wal_download) = server.join().expect("s3 server finished");
@@ -932,9 +944,12 @@ fn db_archive_s3_target_signs_aws_sigv4_requests() {
         .arg("s3://orv-backups/shop")
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
         .env("ORV_DB_ARCHIVE_S3_AUTH", "aws-sigv4")
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH_TOKEN")
         .env("AWS_ACCESS_KEY_ID", "AKIA_TEST")
         .env("AWS_SECRET_ACCESS_KEY", "secret-test-key")
+        .env_remove("AWS_SESSION_TOKEN")
         .env("AWS_REGION", "us-west-2")
+        .env_remove("AWS_DEFAULT_REGION")
         .output()
         .expect("run db archive");
     std::fs::remove_file(&wal).expect("remove source wal");
@@ -946,9 +961,12 @@ fn db_archive_s3_target_signs_aws_sigv4_requests() {
         .arg(&data)
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
         .env("ORV_DB_ARCHIVE_S3_AUTH", "aws-sigv4")
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH_TOKEN")
         .env("AWS_ACCESS_KEY_ID", "AKIA_TEST")
         .env("AWS_SECRET_ACCESS_KEY", "secret-test-key")
+        .env_remove("AWS_SESSION_TOKEN")
         .env("AWS_REGION", "us-west-2")
+        .env_remove("AWS_DEFAULT_REGION")
         .output()
         .expect("run db restore");
     let (wal_upload, manifest_upload, wal_download) = server.join().expect("s3 server finished");
@@ -988,6 +1006,51 @@ fn db_archive_s3_target_signs_aws_sigv4_requests() {
         .expect("restored rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["email"], "sig@example.com");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn db_crash_matrix_reports_passed_recovery_scenarios() {
+    let dir = temp_dir("db-crash-matrix");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let report = dir.join("crash-matrix.json");
+
+    let output = orv()
+        .args(["db", "crash-matrix"])
+        .arg("--out")
+        .arg(&report)
+        .output()
+        .expect("run db crash matrix");
+
+    assert!(
+        output.status.success(),
+        "crash matrix failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_json = read_json(&report);
+    assert_eq!(report_json["schema_version"], 1);
+    assert_eq!(report_json["kind"], "orv.db.crash_matrix");
+    assert_eq!(report_json["status"], "passed");
+    assert_eq!(report_json["summary"]["failed"], 0);
+    assert!(report_json["summary"]["passed"].as_u64().expect("passed") >= 6);
+    let checks = report_json["checks"].as_array().expect("checks");
+    for name in [
+        "wal_replays_complete_records",
+        "wal_ignores_torn_final_record",
+        "wal_rejects_midstream_corruption",
+        "checkpoint_replay_restores_snapshot",
+        "savepoint_rollback_replay_restores_checkpoint",
+        "archive_hash_mismatch_rejected",
+    ] {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check["name"] == name && check["status"] == "passed"),
+            "missing passed check {name}: {report_json}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(dir);
 }

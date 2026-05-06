@@ -632,6 +632,12 @@ enum DbCommand {
         #[arg(long)]
         target: Option<String>,
     },
+    /// WAL crash/recovery matrix를 실행하고 JSON report를 쓴다.
+    CrashMatrix {
+        /// 쓸 crash matrix report JSON 경로.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// migration history JSON을 하나의 squashed action artifact로 압축한다.
     Squash {
         /// 읽을 migration history JSON 경로.
@@ -1030,6 +1036,13 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            DbCommand::CrashMatrix { out } => match cmd_db_crash_matrix(&out) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
             DbCommand::Squash { history, out } => match cmd_db_squash(&history, &out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -2690,6 +2703,349 @@ fn cmd_db_archive(wal: &Path, out: &Path, target: Option<&str>) -> anyhow::Resul
         wal.display()
     );
     Ok(())
+}
+
+type DbCrashMatrixCheckFn = fn(&Path) -> anyhow::Result<()>;
+
+fn cmd_db_crash_matrix(out: &Path) -> anyhow::Result<()> {
+    let scratch = db_crash_matrix_temp_dir()?;
+    let checks = [
+        (
+            "wal_replays_complete_records",
+            db_crash_matrix_wal_replays_complete_records as DbCrashMatrixCheckFn,
+        ),
+        (
+            "wal_ignores_torn_final_record",
+            db_crash_matrix_wal_ignores_torn_final_record as DbCrashMatrixCheckFn,
+        ),
+        (
+            "wal_rejects_midstream_corruption",
+            db_crash_matrix_wal_rejects_midstream_corruption as DbCrashMatrixCheckFn,
+        ),
+        (
+            "checkpoint_replay_restores_snapshot",
+            db_crash_matrix_checkpoint_replay_restores_snapshot as DbCrashMatrixCheckFn,
+        ),
+        (
+            "savepoint_rollback_replay_restores_checkpoint",
+            db_crash_matrix_savepoint_rollback_replay_restores_checkpoint as DbCrashMatrixCheckFn,
+        ),
+        (
+            "point_in_time_replay_stops_at_timestamp",
+            db_crash_matrix_point_in_time_replay_stops_at_timestamp as DbCrashMatrixCheckFn,
+        ),
+        (
+            "archive_hash_mismatch_rejected",
+            db_crash_matrix_archive_hash_mismatch_rejected as DbCrashMatrixCheckFn,
+        ),
+    ];
+    let mut results = Vec::new();
+    for (name, check) in checks {
+        let check_dir = scratch.join(dependency_cache_component(name));
+        std::fs::create_dir_all(&check_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create crash matrix dir {}: {e}",
+                check_dir.display()
+            )
+        })?;
+        results.push(db_crash_matrix_run_check(name, &check_dir, check));
+    }
+    let passed = results
+        .iter()
+        .filter(|result| result.get("status").and_then(serde_json::Value::as_str) == Some("passed"))
+        .count();
+    let failed = results.len().saturating_sub(passed);
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.db.crash_matrix",
+        "status": if failed == 0 { "passed" } else { "failed" },
+        "summary": {
+            "total": results.len(),
+            "passed": passed,
+            "failed": failed,
+        },
+        "checks": results,
+    });
+    write_json_atomic(out, &report)?;
+    let _ = std::fs::remove_dir_all(&scratch);
+    if failed > 0 {
+        anyhow::bail!(
+            "db crash matrix failed: {failed} check(s); report {}",
+            out.display()
+        );
+    }
+    println!(
+        "db crash matrix: {} written ({} passed)",
+        out.display(),
+        passed
+    );
+    Ok(())
+}
+
+fn db_crash_matrix_temp_dir() -> anyhow::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {e}"))?
+        .as_nanos();
+    Ok(std::env::temp_dir().join(format!(
+        "orv-db-crash-matrix-{}-{nanos}",
+        std::process::id()
+    )))
+}
+
+fn db_crash_matrix_run_check(
+    name: &str,
+    dir: &Path,
+    check: DbCrashMatrixCheckFn,
+) -> serde_json::Value {
+    match check(dir) {
+        Ok(()) => serde_json::json!({
+            "name": name,
+            "status": "passed",
+        }),
+        Err(err) => serde_json::json!({
+            "name": name,
+            "status": "failed",
+            "error": err.to_string(),
+        }),
+    }
+}
+
+fn db_crash_matrix_wal_replays_complete_records(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("open wal: {e}"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Ada"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Grace"))?;
+    let query = orv_runtime::db::DbQuery::from_equality(&db_crash_string_fields("name", "Ada"));
+    let empty_fields: Vec<(String, orv_runtime::Value)> = Vec::new();
+    db.update_logged(
+        "users",
+        &query,
+        &db_crash_int_fields("score", 42),
+        &empty_fields,
+    )?;
+    let delete_query =
+        orv_runtime::db::DbQuery::from_equality(&db_crash_string_fields("name", "Grace"));
+    db.delete_logged("users", &delete_query)?;
+
+    let restored = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("replay wal: {e}"))?;
+    db_crash_assert_row(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Ada".to_string()),
+    )?;
+    db_crash_assert_row(&restored, "users", "score", orv_runtime::Value::Int(42))?;
+    db_crash_assert_missing(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Grace".to_string()),
+    )
+}
+
+fn db_crash_matrix_wal_ignores_torn_final_record(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("open wal: {e}"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Ada"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .map_err(|e| anyhow::anyhow!("open torn wal {}: {e}", wal.display()))?;
+    std::io::Write::write_all(
+        &mut file,
+        br#"{"schema_version":1,"op":"create","table":"users","data":{"name":"Eve"#,
+    )
+    .and_then(|()| file.sync_data())
+    .map_err(|e| anyhow::anyhow!("write torn wal {}: {e}", wal.display()))?;
+
+    let restored = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("replay torn wal: {e}"))?;
+    db_crash_assert_row(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Ada".to_string()),
+    )?;
+    db_crash_assert_missing(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Eve".to_string()),
+    )
+}
+
+fn db_crash_matrix_wal_rejects_midstream_corruption(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    std::fs::write(
+        &wal,
+        concat!(
+            "{\"schema_version\":1,\"op\":\"create\",\"table\":\"users\",\"data\":{\"name\":\"Ada\"}}\n",
+            "{\"schema_version\":1,\"op\":\"create\",\"table\":\"users\",\"data\":{\"name\":\"Broken\"}\n",
+            "{\"schema_version\":1,\"op\":\"create\",\"table\":\"users\",\"data\":{\"name\":\"Grace\"}}\n",
+        ),
+    )
+    .map_err(|e| anyhow::anyhow!("write corrupt wal {}: {e}", wal.display()))?;
+    match orv_runtime::db::InMemoryDb::load_wal(&wal) {
+        Ok(_) => anyhow::bail!("midstream corrupt WAL replay unexpectedly succeeded"),
+        Err(_) => Ok(()),
+    }
+}
+
+fn db_crash_matrix_checkpoint_replay_restores_snapshot(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("open wal: {e}"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Ada"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Grace"))?;
+    db.checkpoint_wal()
+        .map_err(|e| anyhow::anyhow!("checkpoint wal: {e}"))?;
+
+    let mut restored = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("replay checkpoint wal: {e}"))?;
+    if db_crash_row_count(&restored, "users") != 2 {
+        anyhow::bail!("checkpoint replay did not restore 2 rows");
+    }
+    let created = restored.create("users", db_crash_string_fields("name", "Cam"));
+    db_crash_assert_object_int_field(&created, "id", 3)
+}
+
+fn db_crash_matrix_savepoint_rollback_replay_restores_checkpoint(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("open wal: {e}"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Ada"))?;
+    let savepoint = db.savepoint();
+    db.create_logged("users", db_crash_string_fields("name", "Eve"))?;
+    db.restore_savepoint(&savepoint)
+        .map_err(|e| anyhow::anyhow!("restore savepoint: {e}"))?;
+
+    let restored = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("replay savepoint rollback wal: {e}"))?;
+    db_crash_assert_row(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Ada".to_string()),
+    )?;
+    db_crash_assert_missing(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Eve".to_string()),
+    )
+}
+
+fn db_crash_matrix_point_in_time_replay_stops_at_timestamp(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    std::fs::write(
+        &wal,
+        concat!(
+            "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":1000,\"table\":\"users\",\"data\":{\"name\":\"Ada\"}}\n",
+            "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":2000,\"table\":\"users\",\"data\":{\"name\":\"Grace\"}}\n",
+            "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":3000,\"table\":\"users\",\"data\":{\"name\":\"Eve\"}}\n",
+        ),
+    )
+    .map_err(|e| anyhow::anyhow!("write PITR wal {}: {e}", wal.display()))?;
+    let restored = orv_runtime::db::InMemoryDb::load_wal_until_unix_ms(&wal, Some(2000))
+        .map_err(|e| anyhow::anyhow!("replay PITR wal: {e}"))?;
+    if db_crash_row_count(&restored, "users") != 2 {
+        anyhow::bail!("point-in-time replay did not stop at 2 rows");
+    }
+    db_crash_assert_missing(
+        &restored,
+        "users",
+        "name",
+        orv_runtime::Value::Str("Eve".to_string()),
+    )
+}
+
+fn db_crash_matrix_archive_hash_mismatch_rejected(dir: &Path) -> anyhow::Result<()> {
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let mut db = orv_runtime::db::InMemoryDb::load_wal(&wal)
+        .map_err(|e| anyhow::anyhow!("open wal: {e}"))?;
+    db.create_logged("users", db_crash_string_fields("name", "Ada"))?;
+    let manifest = db_wal_archive_manifest(&wal)?;
+    write_json_atomic(&archive, &manifest)?;
+    let tampered = std::fs::read_to_string(&wal)
+        .map_err(|e| anyhow::anyhow!("read WAL {}: {e}", wal.display()))?
+        .replace("Ada", "Eve");
+    std::fs::write(&wal, tampered)
+        .map_err(|e| anyhow::anyhow!("tamper WAL {}: {e}", wal.display()))?;
+
+    match db_archive_manifest_wal_path(&archive) {
+        Ok(_) => anyhow::bail!("archive hash mismatch validation unexpectedly succeeded"),
+        Err(err) if err.to_string().contains("db archive WAL hash mismatch") => Ok(()),
+        Err(err) => Err(anyhow::anyhow!("unexpected archive mismatch error: {err}")),
+    }
+}
+
+fn db_crash_string_fields(key: &str, value: &str) -> Vec<(String, orv_runtime::Value)> {
+    vec![(key.to_string(), orv_runtime::Value::Str(value.to_string()))]
+}
+
+fn db_crash_int_fields(key: &str, value: i64) -> Vec<(String, orv_runtime::Value)> {
+    vec![(key.to_string(), orv_runtime::Value::Int(value))]
+}
+
+fn db_crash_row_count(db: &orv_runtime::db::InMemoryDb, table: &str) -> usize {
+    match db.find_all(table, &[]) {
+        orv_runtime::Value::Array(rows) => rows.len(),
+        _ => 0,
+    }
+}
+
+fn db_crash_assert_row(
+    db: &orv_runtime::db::InMemoryDb,
+    table: &str,
+    field: &str,
+    value: orv_runtime::Value,
+) -> anyhow::Result<()> {
+    if matches!(
+        db.find_one(table, &[(field.to_string(), value.clone())]),
+        orv_runtime::Value::Object(_)
+    ) {
+        Ok(())
+    } else {
+        anyhow::bail!("missing row {table}.{field}={value}");
+    }
+}
+
+fn db_crash_assert_missing(
+    db: &orv_runtime::db::InMemoryDb,
+    table: &str,
+    field: &str,
+    value: orv_runtime::Value,
+) -> anyhow::Result<()> {
+    if matches!(
+        db.find_one(table, &[(field.to_string(), value.clone())]),
+        orv_runtime::Value::Void
+    ) {
+        Ok(())
+    } else {
+        anyhow::bail!("unexpected row {table}.{field}={value}");
+    }
+}
+
+fn db_crash_assert_object_int_field(
+    value: &orv_runtime::Value,
+    field: &str,
+    expected: i64,
+) -> anyhow::Result<()> {
+    let orv_runtime::Value::Object(fields) = value else {
+        anyhow::bail!("expected object value, got {value}");
+    };
+    if fields.iter().any(|(key, value)| {
+        key == field && matches!(value, orv_runtime::Value::Int(n) if *n == expected)
+    }) {
+        Ok(())
+    } else {
+        anyhow::bail!("object field {field} did not equal {expected}: {value}");
+    }
 }
 
 fn db_wal_archive_manifest(wal: &Path) -> anyhow::Result<serde_json::Value> {

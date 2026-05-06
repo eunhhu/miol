@@ -3,12 +3,11 @@
 //! # 범위
 //! - 테이블 = `String → Vec<Value::Object>` 맵. row 는 자동 `id` 필드를 받는다.
 //! - `create/find/update/delete` 와 equality/range/contains filter.
-//! - 명시적 JSON snapshot save/load, JSONL WAL replay/checkpoint, `SQLite`
-//!   reference adapter storage.
+//! - 명시적 JSON snapshot save/load, JSONL WAL replay/checkpoint, WAL-backed
+//!   savepoint rollback preservation, `SQLite` reference adapter storage.
 //!
 //! # 범위 밖
 //! - 인덱스 (linear scan).
-//! - 트랜잭션/savepoint — WAL 은 단일 파일 append+fsync replay/checkpoint v1 만 지원한다.
 //! - 외부 DB query planner.
 //! - 마이그레이션/스키마 diff, PostgreSQL/MySQL 어댑터.
 //! - async/await — 호출 측이 `await` 를 쓰더라도 현재 인터프리터는 sync.
