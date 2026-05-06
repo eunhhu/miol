@@ -6993,6 +6993,11 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .unwrap_or_default();
     let breakpoint_commands = editor_native_host_breakpoint_commands_json(debug);
     let trace_enabled = state.get("trace").is_some();
+    let production = state
+        .get("production")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let production_adapters = production_adapter_count(&production) > 0;
     serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.native_host",
@@ -7036,14 +7041,21 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .cloned()
                 .unwrap_or(serde_json::json!(true)),
         },
+        "production": production,
         "trace": editor_native_host_trace_json(state),
         "capabilities": {
             "project_graph": true,
             "runtime_inspection": true,
             "dap_controls": controls > 0,
+            "production_adapters": production_adapters,
             "trace_navigation": trace_enabled,
         },
     })
+}
+
+fn production_adapter_count(production: &serde_json::Value) -> usize {
+    json_array_count(production.get("db_adapters"))
+        + json_array_count(production.get("commerce_adapters"))
 }
 
 fn editor_native_host_breakpoint_commands_json(
@@ -38105,6 +38117,16 @@ define Auth() -> { @out "auth" }
             state["production"]["commerce_adapters"][0]["path"],
             "deploy/commerce-adapters.json"
         );
+        let native_host = editor_native_host_manifest_json(&path, &state);
+        assert_eq!(
+            native_host["production"]["db_adapters"][0]["path"],
+            "deploy/db-adapters.json"
+        );
+        assert_eq!(
+            native_host["production"]["commerce_adapters"][0]["path"],
+            "deploy/commerce-adapters.json"
+        );
+        assert_eq!(native_host["capabilities"]["production_adapters"], true);
         assert!(html.contains("Production"));
         assert!(html.contains("DB Adapters"));
         assert!(html.contains("Commerce Adapters"));

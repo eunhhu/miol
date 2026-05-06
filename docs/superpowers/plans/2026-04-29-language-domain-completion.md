@@ -134,7 +134,7 @@
 
 **Editor trace native frame inventory delta (2026-05-06):** Trace-enabled editor exports now mirror `trace.status_filters` and `trace.frames[*]` into `native-host.json`, including request summary, origin id, and source/production navigation payloads, so native editor hosts can render trace lists without reparsing the full `state.json`. Trace frames now also flatten `source`, `production`, and `reveal_command` for source-backed frames, giving native hosts a direct `orv editor reveal <build-dir> <origin-id>` action for captured production requests.
 
-**Editor production adapter panel delta (2026-05-06):** `orv editor export <file> --out <dir> --build <build-dir>` now embeds `state.production` with checked DB and commerce adapter contract targets, and the static editor shell renders a Production panel with adapter counts and artifact paths.
+**Editor production adapter panel delta (2026-05-06):** `orv editor export <file> --out <dir> --build <build-dir>` now embeds `state.production` and `native-host.json` `production` with checked DB and commerce adapter contract targets, sets `capabilities.production_adapters`, and the static editor shell renders a Production panel with adapter counts and artifact paths.
 
 ---
 
