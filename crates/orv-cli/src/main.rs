@@ -48,6 +48,7 @@ const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 const DB_ARCHIVE_S3_ENDPOINT_ENV: &str = "ORV_DB_ARCHIVE_S3_ENDPOINT";
+const DB_ARCHIVE_S3_AUTH_TOKEN_ENV: &str = "ORV_DB_ARCHIVE_S3_AUTH_TOKEN";
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -2782,7 +2783,13 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
     if target_kind == Some("s3") {
         if let Some(target_path) = target_wal_path {
             let url = db_archive_s3_http_url(target_path)?;
-            return download_db_archive_wal_to_cache(archive, &manifest, &url);
+            let authorization = db_archive_s3_authorization_header()?;
+            return download_db_archive_wal_to_cache_with_auth(
+                archive,
+                &manifest,
+                &url,
+                authorization.as_deref(),
+            );
         }
     }
     verify_db_archive_wal(&manifest, &wal_path)?;
@@ -2835,7 +2842,16 @@ fn download_db_archive_wal_to_cache(
     manifest: &serde_json::Value,
     url: &str,
 ) -> anyhow::Result<PathBuf> {
-    let bytes = http_get_bytes(url, "db archive WAL download")?;
+    download_db_archive_wal_to_cache_with_auth(archive, manifest, url, None)
+}
+
+fn download_db_archive_wal_to_cache_with_auth(
+    archive: &Path,
+    manifest: &serde_json::Value,
+    url: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let bytes = http_get_bytes_with_auth(url, "db archive WAL download", authorization)?;
     verify_db_archive_wal_bytes(manifest, &bytes, url)?;
     let cache_path = db_archive_http_cache_path(archive, manifest, url)?;
     if let Some(parent) = cache_path.parent() {
@@ -3024,6 +3040,7 @@ fn db_archive_s3_target_json(target: &DbArchiveS3Target) -> serde_json::Value {
         "kind": "s3",
         "uri": target.uri.clone(),
         "endpoint_env": DB_ARCHIVE_S3_ENDPOINT_ENV,
+        "auth_token_env": DB_ARCHIVE_S3_AUTH_TOKEN_ENV,
         "bucket": target.bucket.clone(),
         "prefix": target.prefix.clone(),
         "wal": {
@@ -3114,13 +3131,15 @@ fn upload_db_archive_to_s3_target(
     manifest: &Path,
     target: &DbArchiveS3Target,
 ) -> anyhow::Result<()> {
+    let authorization = db_archive_s3_authorization_header()?;
     let wal_body = std::fs::read(wal)
         .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
-    http_put_bytes(
+    http_put_bytes_with_auth(
         &target.wal_url,
         "application/x-jsonlines; charset=utf-8",
         &wal_body,
         "db archive S3 WAL upload",
+        authorization.as_deref(),
     )?;
     let manifest_body = std::fs::read(manifest).map_err(|e| {
         anyhow::anyhow!(
@@ -3128,11 +3147,12 @@ fn upload_db_archive_to_s3_target(
             manifest.display()
         )
     })?;
-    http_put_bytes(
+    http_put_bytes_with_auth(
         &target.manifest_url,
         "application/json; charset=utf-8",
         &manifest_body,
         "db archive S3 manifest upload",
+        authorization.as_deref(),
     )
 }
 
@@ -3183,17 +3203,62 @@ fn db_archive_s3_http_url(uri: &str) -> anyhow::Result<String> {
     let location = parse_db_archive_s3_uri(uri)?;
     let endpoint = std::env::var(DB_ARCHIVE_S3_ENDPOINT_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "db archive S3 target requires {DB_ARCHIVE_S3_ENDPOINT_ENV}=http://host[:port]"
+            "db archive S3 target requires {DB_ARCHIVE_S3_ENDPOINT_ENV}=http://host[:port] or https://host"
         )
     })?;
     let endpoint = endpoint.trim_end_matches('/');
-    let _ = parse_http_url(endpoint)?;
+    validate_db_archive_s3_endpoint(endpoint)?;
     let mut url = format!("{endpoint}/{}", location.bucket);
     if !location.prefix.is_empty() {
         url.push('/');
         url.push_str(&location.prefix);
     }
     Ok(url)
+}
+
+fn validate_db_archive_s3_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    if endpoint.contains('\r') || endpoint.contains('\n') {
+        anyhow::bail!("db archive S3 endpoint must not contain newlines");
+    }
+    if endpoint.starts_with("http://") {
+        let _ = parse_http_url(endpoint)?;
+        return Ok(());
+    }
+    if let Some(rest) = endpoint.strip_prefix("https://") {
+        let authority = rest
+            .split_once('/')
+            .map_or(rest, |(authority, _)| authority);
+        if authority.is_empty() {
+            anyhow::bail!("db archive S3 endpoint host must not be empty");
+        }
+        return Ok(());
+    }
+    anyhow::bail!(
+        "db archive S3 endpoint must start with http:// or https:// via {DB_ARCHIVE_S3_ENDPOINT_ENV}"
+    );
+}
+
+fn db_archive_s3_authorization_header() -> anyhow::Result<Option<String>> {
+    let token = match std::env::var(DB_ARCHIVE_S3_AUTH_TOKEN_ENV) {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(source) => {
+            return Err(anyhow::anyhow!(
+                "db archive S3 auth token env {DB_ARCHIVE_S3_AUTH_TOKEN_ENV} is invalid: {source}"
+            ));
+        }
+    };
+    if token.trim().is_empty() {
+        anyhow::bail!(
+            "db archive S3 auth token env {DB_ARCHIVE_S3_AUTH_TOKEN_ENV} must not be empty"
+        );
+    }
+    if token.chars().any(char::is_whitespace) {
+        anyhow::bail!(
+            "db archive S3 auth token env {DB_ARCHIVE_S3_AUTH_TOKEN_ENV} must not contain whitespace"
+        );
+    }
+    Ok(Some(format!("Bearer {token}")))
 }
 
 fn http_post_bytes(
@@ -3205,8 +3270,14 @@ fn http_post_bytes(
     http_send_bytes("POST", url, content_type, body, context)
 }
 
-fn http_put_bytes(url: &str, content_type: &str, body: &[u8], context: &str) -> anyhow::Result<()> {
-    http_send_bytes("PUT", url, content_type, body, context)
+fn http_put_bytes_with_auth(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<()> {
+    http_send_bytes_with_auth("PUT", url, content_type, body, context, authorization)
 }
 
 fn http_send_bytes(
@@ -3216,6 +3287,20 @@ fn http_send_bytes(
     body: &[u8],
     context: &str,
 ) -> anyhow::Result<()> {
+    http_send_bytes_with_auth(method, url, content_type, body, context, None)
+}
+
+fn http_send_bytes_with_auth(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<()> {
+    if url.starts_with("https://") {
+        return https_send_bytes_with_auth(method, url, content_type, body, context, authorization);
+    }
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = std::net::TcpStream::connect((host.as_str(), port))
         .map_err(|e| anyhow::anyhow!("{context} failed to connect {host}:{port}: {e}"))?;
@@ -3226,14 +3311,20 @@ fn http_send_bytes(
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| anyhow::anyhow!("{context} failed to configure write timeout: {e}"))?;
     let host_header = if port == 80 {
-        host.clone()
+        host
     } else {
         format!("{host}:{port}")
     };
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
         body.len()
     );
+    if let Some(authorization) = authorization {
+        request.push_str("Authorization: ");
+        request.push_str(authorization);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
     std::io::Write::write_all(&mut stream, request.as_bytes())
         .map_err(|e| anyhow::anyhow!("{context} failed to write request {url}: {e}"))?;
     std::io::Write::write_all(&mut stream, body)
@@ -3255,7 +3346,51 @@ fn http_send_bytes(
     Ok(())
 }
 
-fn http_get_bytes(url: &str, context: &str) -> anyhow::Result<Vec<u8>> {
+fn https_send_bytes_with_auth(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut request = match method {
+        "POST" => ureq::post(url),
+        "PUT" => ureq::put(url),
+        other => anyhow::bail!("{context} unsupported HTTPS method {other}"),
+    }
+    .content_type(content_type);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let mut response = request
+        .send(body)
+        .map_err(|e| anyhow::anyhow!("{context} {url} failed: {e}"))?;
+    response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| anyhow::anyhow!("{context} failed to read response {url}: {e}"))?;
+    Ok(())
+}
+
+fn http_get_bytes_with_auth(
+    url: &str,
+    context: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    if url.starts_with("https://") {
+        let mut request = ureq::get(url);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", authorization);
+        }
+        let mut response = request
+            .call()
+            .map_err(|e| anyhow::anyhow!("{context} {url} failed: {e}"))?;
+        return response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| anyhow::anyhow!("{context} failed to read response {url}: {e}"));
+    }
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = std::net::TcpStream::connect((host.as_str(), port))
         .map_err(|e| anyhow::anyhow!("{context} failed to connect {host}:{port}: {e}"))?;
@@ -3266,12 +3401,17 @@ fn http_get_bytes(url: &str, context: &str) -> anyhow::Result<Vec<u8>> {
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| anyhow::anyhow!("{context} failed to configure write timeout: {e}"))?;
     let host_header = if port == 80 {
-        host.clone()
+        host
     } else {
         format!("{host}:{port}")
     };
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\n");
+    if let Some(authorization) = authorization {
+        request.push_str("Authorization: ");
+        request.push_str(authorization);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
     std::io::Write::write_all(&mut stream, request.as_bytes())
         .map_err(|e| anyhow::anyhow!("{context} failed to write request {url}: {e}"))?;
     let mut response = Vec::new();

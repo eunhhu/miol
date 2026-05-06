@@ -28,6 +28,13 @@ fn read_http_request(mut stream: TcpStream) -> (String, Vec<u8>) {
 }
 
 fn read_http_request_parts(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+    let (method, path, _, body) = read_http_request_parts_with_headers(stream);
+    (method, path, body)
+}
+
+fn read_http_request_parts_with_headers(
+    stream: &mut TcpStream,
+) -> (String, String, String, Vec<u8>) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -48,13 +55,14 @@ fn read_http_request_parts(stream: &mut TcpStream) -> (String, String, Vec<u8>) 
     let content_length = headers
         .lines()
         .find_map(|line| line.strip_prefix("Content-Length: "))
-        .map(|value| value.parse::<usize>().expect("content length number"))
-        .unwrap_or(0);
+        .map_or(0, |value| {
+            value.parse::<usize>().expect("content length number")
+        });
     let mut body = vec![0_u8; content_length];
     if content_length > 0 {
         stream.read_exact(&mut body).expect("read request body");
     }
-    (request_method, request_path, body)
+    (request_method, request_path, headers, body)
 }
 
 fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
@@ -73,11 +81,11 @@ fn accept_http_request_until(
     status: &str,
     content_type: &str,
     response_body: &[u8],
-) -> Option<(String, String, Vec<u8>)> {
+) -> Option<(String, String, String, Vec<u8>)> {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let request = read_http_request_parts(&mut stream);
+                let request = read_http_request_parts_with_headers(&mut stream);
                 write_http_response(&mut stream, status, content_type, response_body);
                 return Some(request);
             }
@@ -742,6 +750,7 @@ fn db_restore_archive_http_target_downloads_wal_when_source_is_missing() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn db_archive_s3_target_uploads_and_restores_wal() {
     let dir = temp_dir("db-archive-s3-target");
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -788,6 +797,7 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
         .arg("--target")
         .arg("s3://orv-backups/shop")
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
         .output()
         .expect("run db archive");
     std::fs::remove_file(&wal).expect("remove source wal");
@@ -798,6 +808,7 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
         .arg("--data")
         .arg(&data)
         .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
         .output()
         .expect("run db restore");
     let (wal_upload, manifest_upload, wal_download) = server.join().expect("s3 server finished");
@@ -816,21 +827,49 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
     );
     assert_eq!(wal_upload.0, "PUT");
     assert_eq!(wal_upload.1, "/orv-backups/shop/db.wal.jsonl");
+    assert!(
+        wal_upload
+            .2
+            .lines()
+            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
+        "{}",
+        wal_upload.2
+    );
     assert_eq!(
-        String::from_utf8(wal_upload.2).expect("uploaded wal utf-8"),
+        String::from_utf8(wal_upload.3).expect("uploaded wal utf-8"),
         wal_body
     );
     assert_eq!(manifest_upload.0, "PUT");
     assert_eq!(manifest_upload.1, "/orv-backups/shop/archive.json");
+    assert!(
+        manifest_upload
+            .2
+            .lines()
+            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
+        "{}",
+        manifest_upload.2
+    );
     let uploaded_manifest: serde_json::Value =
-        serde_json::from_slice(&manifest_upload.2).expect("uploaded manifest json");
+        serde_json::from_slice(&manifest_upload.3).expect("uploaded manifest json");
     assert_eq!(uploaded_manifest["target"]["kind"], "s3");
+    assert_eq!(
+        uploaded_manifest["target"]["auth_token_env"],
+        "ORV_DB_ARCHIVE_S3_AUTH_TOKEN"
+    );
     assert_eq!(
         uploaded_manifest["target"]["wal"]["path"],
         "s3://orv-backups/shop/db.wal.jsonl"
     );
     assert_eq!(wal_download.0, "GET");
     assert_eq!(wal_download.1, "/orv-backups/shop/db.wal.jsonl");
+    assert!(
+        wal_download
+            .2
+            .lines()
+            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
+        "{}",
+        wal_download.2
+    );
     let restored = read_json(&data);
     let rows = restored["tables"]["User"]["rows"]
         .as_array()
