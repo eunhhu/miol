@@ -12,6 +12,7 @@
 //! `orv fetch [dir-or-orv.toml]`는 lockfile dependency source-bundle cache 를 생성한다.
 //! `orv add/remove`은 `orv.toml` dependency section 과 lockfile 을 함께 갱신한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
+//! `orv deploy-env-check <dir>`은 production deploy credential env 를 검증한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
 //! `orv check-build <dir>`은 build source bundle 을 재분석하며,
@@ -118,6 +119,11 @@ enum Command {
     /// build artifact 디렉터리의 manifest/plan 산출물을 검증한다.
     VerifyBuild {
         /// 검증할 build artifact 디렉터리.
+        dir: PathBuf,
+    },
+    /// production deploy artifact의 provider credential env 설정을 검사한다.
+    DeployEnvCheck {
+        /// 검사할 build artifact 디렉터리.
         dir: PathBuf,
     },
     /// server runtime artifact를 검증한다.
@@ -732,6 +738,13 @@ fn main() -> ExitCode {
             }
         }
         Command::VerifyBuild { dir } => match cmd_verify_build(&dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::DeployEnvCheck { dir } => match cmd_deploy_env_check(&dir) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -2207,6 +2220,7 @@ Generated ORV shop starter.\n\
 orv check .\n\
 orv build . --prod --out dist\n\
 orv verify-build dist\n\
+orv deploy-env-check dist\n\
 ```\n\
 \n\
 ## Run\n\
@@ -13830,6 +13844,12 @@ fn cmd_verify_build(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_deploy_env_check(dir: &Path) -> anyhow::Result<()> {
+    deploy_env_check_with_lookup(dir, |env| std::env::var(env).ok())?;
+    println!("deploy env: {} verified", dir.display());
+    Ok(())
+}
+
 fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let manifest = read_json_value(&dir.join("build-manifest.json"))?;
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
@@ -16385,6 +16405,79 @@ fn verify_deploy_commerce_adapters_artifact(
     Ok(())
 }
 
+fn deploy_env_check_with_lookup<F>(dir: &Path, mut lookup: F) -> anyhow::Result<()>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let adapters_path = dir.join("deploy").join("commerce-adapters.json");
+    if !adapters_path.is_file() {
+        anyhow::bail!(
+            "missing deploy commerce adapters artifact: {}",
+            adapters_path.display()
+        );
+    }
+    let adapters = read_json_value(&adapters_path)?;
+    if adapters
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy commerce adapters schema_version must be 1");
+    }
+    if json_str(&adapters, "kind", "deploy commerce adapters")? != "orv.deploy.commerce_adapters" {
+        anyhow::bail!("deploy commerce adapters kind must be orv.deploy.commerce_adapters");
+    }
+    let mut missing = Vec::new();
+    let mut optional_missing = Vec::new();
+    for adapter in adapters
+        .get("adapters")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy commerce adapters must include adapters array"))?
+    {
+        let kind = adapter
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("commerce");
+        let provider = adapter
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("provider");
+        let Some(envs) = adapter
+            .get("provider_env")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for env in envs {
+            let variable = json_str(env, "env", "provider env")?;
+            let required = env
+                .get("required")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let configured = lookup(variable)
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if configured {
+                continue;
+            }
+            let label = format!("{kind} {provider} {variable}");
+            if required {
+                missing.push(label);
+            } else {
+                optional_missing.push(label);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "missing required provider env: {}; optional missing: {}",
+            missing.join(", "),
+            optional_missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 struct DeployRunbookArtifacts<'a> {
     compose: &'a str,
     env_example: &'a str,
@@ -16426,6 +16519,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document editor trace navigation command");
+    }
+    if !runbook.contains("orv deploy-env-check .") {
+        anyhow::bail!("deploy runbook must document deploy env preflight command");
     }
     if !runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release") {
         anyhow::bail!("deploy runbook must document native launcher build command");
@@ -21654,6 +21750,12 @@ curl -N {trace_events_url}
 orv editor trace . --trace deploy/request-trace.json
 ```
 
+## Deploy Preflight
+
+```sh
+orv deploy-env-check .
+```
+
 {persistence_section}
 ## Routes
 
@@ -22671,6 +22773,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("orv check ."));
         assert!(guide.contains("orv build . --prod --out dist"));
         assert!(guide.contains("orv verify-build dist"));
+        assert!(guide.contains("orv deploy-env-check dist"));
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("deploy/env.example"));
@@ -29963,6 +30066,14 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn deploy_env_check_subcommand_is_accepted() {
+        let parsed = Cli::try_parse_from(["orv", "deploy-env-check", "target/orv-build-test"]);
+        if let Err(err) = parsed {
+            panic!("{}", err.render());
+        }
+    }
+
+    #[test]
     fn build_prod_subcommand_flag_is_accepted() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -32408,7 +32519,48 @@ entry = "src/main.orv"
         assert!(runbook.contains(
             "- Commerce provider env: shipping carrier CARRIER_WEBHOOK_SECRET optional webhook_signature"
         ));
+        assert!(runbook.contains("orv deploy-env-check ."));
         cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn deploy_env_check_reports_missing_required_provider_credentials() {
+        let dir = temp_output_dir("deploy-env-check-provider-source");
+        std::fs::create_dir_all(&dir).expect("create provider commerce source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "stripe://local")
+  let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "carrier://local")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "post", address: "Seoul" })
+    @respond 200 { payment: captured.status, shipment: booked.status }
+  }
+}
+"#,
+        )
+        .expect("write provider commerce source");
+        let out = temp_output_dir("deploy-env-check-provider");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let err =
+            deploy_env_check_with_lookup(&out, |_| None).expect_err("required envs are missing");
+        let message = err.to_string();
+        assert!(message.contains("STRIPE_SECRET_KEY"), "{message}");
+        assert!(message.contains("CARRIER_API_KEY"), "{message}");
+
+        deploy_env_check_with_lookup(&out, |env| match env {
+            "STRIPE_SECRET_KEY" => Some("sk_test".to_string()),
+            "CARRIER_API_KEY" => Some("carrier_key".to_string()),
+            _ => None,
+        })
+        .expect("optional webhook envs may be absent");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
