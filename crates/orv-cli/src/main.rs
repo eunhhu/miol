@@ -2280,6 +2280,7 @@ docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n
 - `deploy/Dockerfile`\n\
 - `deploy/compose.yaml`\n\
 - `deploy/env.example`\n\
+- `deploy/db-adapters.json`\n\
 - `deploy/commerce-adapters.json`\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
@@ -23495,6 +23496,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("deploy/env.example"));
+        assert!(guide.contains("deploy/db-adapters.json"));
         assert!(guide.contains("deploy/commerce-adapters.json"));
         assert!(guide.contains("server/native-server.json"));
         assert!(guide.contains("server/native/Cargo.toml"));
