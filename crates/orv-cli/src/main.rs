@@ -16719,6 +16719,11 @@ fn verify_deploy_runbook_artifact(
             anyhow::bail!("deploy runbook must document persistent DB path {path}");
         }
     }
+    for endpoint in &persistence.db_endpoints {
+        if !runbook.contains(endpoint) {
+            anyhow::bail!("deploy runbook must document DB endpoint {endpoint}");
+        }
+    }
     for env in &persistence.db_env {
         if !runbook.contains(&env.env) {
             let variable = &env.env;
@@ -20217,6 +20222,7 @@ fn validate_prod_server_listen(
 struct DeployPersistence {
     wal_paths: Vec<String>,
     db_paths: Vec<String>,
+    db_endpoints: Vec<String>,
     db_env: Vec<DeployAdapterEnv>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
@@ -20254,6 +20260,7 @@ struct DeployProviderEnv {
 struct DeployPersistenceAccumulator {
     wal_paths: Vec<String>,
     db_paths: Vec<String>,
+    db_endpoints: Vec<String>,
     db_env: Vec<DeployAdapterEnv>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
@@ -20267,6 +20274,8 @@ impl DeployPersistenceAccumulator {
         self.wal_paths.dedup();
         self.db_paths.sort();
         self.db_paths.dedup();
+        self.db_endpoints.sort();
+        self.db_endpoints.dedup();
         self.db_env.sort();
         self.db_env.dedup();
         self.record_paths.sort();
@@ -20286,6 +20295,7 @@ impl DeployPersistenceAccumulator {
             volumes: deploy_persistence_volumes(&persistent_paths),
             wal_paths: self.wal_paths,
             db_paths: self.db_paths,
+            db_endpoints: self.db_endpoints,
             db_env: self.db_env,
             record_paths: self.record_paths,
             commerce_endpoints: self.commerce_endpoints,
@@ -20341,6 +20351,7 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
     serde_json::json!({
         "wal_paths": persistence.wal_paths,
         "db_paths": persistence.db_paths,
+        "db_endpoints": persistence.db_endpoints,
         "db_env": deploy_adapter_env_value(&persistence.db_env),
         "record_paths": persistence.record_paths,
         "commerce_endpoints": persistence.commerce_endpoints,
@@ -20485,6 +20496,7 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
         .any(|adapter| !adapter.provider_env.is_empty());
     if persistence.wal_paths.is_empty()
         && persistence.db_paths.is_empty()
+        && persistence.db_endpoints.is_empty()
         && persistence.db_env.is_empty()
         && persistence.record_paths.is_empty()
         && persistence.commerce_endpoints.is_empty()
@@ -20499,6 +20511,9 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
     }
     for path in &persistence.db_paths {
         let _ = writeln!(out, "- DB: {path}");
+    }
+    for endpoint in &persistence.db_endpoints {
+        let _ = writeln!(out, "- DB endpoint: {endpoint}");
     }
     for env in &persistence.db_env {
         match &env.default {
@@ -20842,6 +20857,15 @@ fn collect_db_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
     if let Some(path) = sqlite_adapter_path(url) {
         out.db_paths.push(path);
     }
+    if external_db_adapter_endpoint(url).is_some() {
+        out.db_endpoints.push(url.to_string());
+    }
+}
+
+fn external_db_adapter_endpoint(url: &str) -> Option<&str> {
+    url.strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("mysql://"))
+        .filter(|target| !target.is_empty())
 }
 
 fn collect_commerce_adapter_persistence_arg(
@@ -32469,6 +32493,60 @@ entry = "src/main.orv"
         assert!(runbook.contains("- DB: data/app.sqlite"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/app.sqlite"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_records_external_db_adapter_endpoints_without_volumes() {
+        let dir = temp_output_dir("build-prod-external-db-connect-source");
+        std::fs::create_dir_all(&dir).expect("create external db source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let analytics = @db.connect "postgres://db.internal/shop"
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "mysql://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write external db source");
+        let out = temp_output_dir("build-prod-external-db-connect");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let env_example =
+            std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["db_endpoints"],
+            serde_json::json!(["mysql://db.internal/shop", "postgres://db.internal/shop"])
+        );
+        assert!(container["persistence"]["volumes"]
+            .as_array()
+            .expect("volumes")
+            .is_empty());
+        assert_eq!(
+            container["persistence"]["db_endpoints"],
+            deploy["server"]["persistence"]["db_endpoints"]
+        );
+        assert!(compose
+            .contains(r#"SHOP_DATABASE_URL: "${SHOP_DATABASE_URL:-mysql://db.internal/shop}""#));
+        assert!(env_example.contains("SHOP_DATABASE_URL=mysql://db.internal/shop"));
+        assert!(runbook.contains("- DB endpoint: mysql://db.internal/shop"));
+        assert!(runbook.contains("- DB endpoint: postgres://db.internal/shop"));
+        assert!(runbook
+            .contains("- DB adapter env: SHOP_DATABASE_URL default mysql://db.internal/shop"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);

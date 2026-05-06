@@ -45,9 +45,14 @@ type HmacSha256 = Hmac<Sha256>;
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     pub(super) static ENV_OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn guard() -> MutexGuard<'static, ()> {
+        ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     pub(crate) fn set(key: &str, value: &str) {
         let lock = ENV_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -9654,6 +9659,7 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
 
     #[test]
     fn provider_adapters_report_credential_status_without_secret_values() {
+        let _env_guard = super::test_env::guard();
         super::test_env::set("STRIPE_SECRET_KEY", "sk_test_never_print");
         super::test_env::set("STRIPE_WEBHOOK_SECRET", "");
         super::test_env::set("CARRIER_API_KEY", "");
@@ -9681,6 +9687,7 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
 
     #[test]
     fn provider_adapters_call_configured_provider_endpoints_without_exposing_secrets() {
+        let _env_guard = super::test_env::guard();
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider test server");
         let address = listener.local_addr().expect("provider test server address");
@@ -9748,6 +9755,7 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
 
     #[test]
     fn stripe_provider_adapter_verifies_webhook_signature_without_exposing_secret() {
+        let _env_guard = super::test_env::guard();
         super::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
         let out = run_str(
             r#"let payments = @payment.connect("stripe://local")
