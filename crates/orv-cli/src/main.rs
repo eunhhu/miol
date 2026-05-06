@@ -2289,6 +2289,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 \n\
 - `GET /`\n\
 - `GET /catalog`\n\
+- `GET /cart`\n\
 - `GET /account/sessions`\n\
 - `GET /admin`\n\
 - `GET /admin/catalog`\n\
@@ -2307,6 +2308,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `POST /orders`\n\
 - `GET /orders/:customer`\n\
 - `POST /checkout`\n\
+- `POST /cart/items`\n\
 - `POST /payments`\n\
 - `POST /webhooks/stripe`\n\
 - `POST /shipments`\n\
@@ -22893,6 +22895,10 @@ test "checkout failing runtime body" {
         assert!(source.contains("@a href=\"/catalog\" \"Shop catalog\""));
         assert!(source.contains("@route GET /catalog"));
         assert!(source.contains("Shop Catalog"));
+        assert!(source.contains("@a href=\"/cart\" \"Cart\""));
+        assert!(source.contains("@form action=\"/cart/items\" method=post"));
+        assert!(source.contains("@route GET /cart"));
+        assert!(source.contains("@route POST /cart/items"));
         assert!(source.contains("@a href=\"/account/sessions\" \"My sessions\""));
         assert!(source.contains("@route GET /account/sessions"));
         assert!(source.contains("Account Sessions"));
@@ -23005,6 +23011,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /catalog"));
+        assert!(guide.contains("GET /cart"));
         assert!(guide.contains("GET /account/sessions"));
         assert!(guide.contains("GET /admin"));
         assert!(guide.contains("GET /admin/catalog"));
@@ -23016,6 +23023,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /members/login"));
         assert!(guide.contains("POST /checkout"));
+        assert!(guide.contains("POST /cart/items"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /webhooks/stripe"));
         assert!(guide.contains("Stripe webhook"));
@@ -23049,6 +23057,7 @@ test "checkout failing runtime body" {
         for (method, path) in [
             ("GET", "/"),
             ("GET", "/catalog"),
+            ("GET", "/cart"),
             ("GET", "/account/sessions"),
             ("GET", "/admin"),
             ("GET", "/admin/catalog"),
@@ -23061,6 +23070,7 @@ test "checkout failing runtime body" {
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),
             ("POST", "/checkout"),
+            ("POST", "/cart/items"),
             ("POST", "/members"),
             ("POST", "/members/login"),
             ("POST", "/payments"),

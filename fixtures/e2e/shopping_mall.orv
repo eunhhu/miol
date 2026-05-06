@@ -22,6 +22,7 @@
         @p "Catalog, member signup, payment capture, and shipment booking are ready."
         @nav {
           @a href="/catalog" "Shop catalog"
+          @a href="/cart" "Cart"
           @a href="/account/sessions" "My sessions"
           @a href="/admin" "Admin dashboard"
         }
@@ -88,6 +89,16 @@
             @input type=text name=address required
             @button type=submit "Checkout"
           }
+          @form action="/cart/items" method=post {
+            @h3 "Add to cart"
+            @label "Member handle"
+            @input type=text name=handle required
+            @label "SKU"
+            @input type=text name=sku required
+            @label "Quantity"
+            @input type=number name=quantity required
+            @button type=submit "Add item"
+          }
           @form action="/payments" method=post {
             @h3 "Capture payment"
             @label "Order ID"
@@ -121,6 +132,7 @@
           @li "POST /members/login"
           @li "POST /orders"
           @li "POST /checkout"
+          @li "POST /cart/items"
           @li "POST /payments"
           @li "POST /webhooks/stripe"
           @li "POST /shipments"
@@ -217,6 +229,20 @@
         @ul {
           for session in sessions {
             @li "{session.handle} / {session.status}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /cart {
+    let items = await shopdb.findAll("CartItem", {})
+    @serve @html {
+      @body {
+        @h1 "Cart"
+        @ul {
+          for item in items {
+            @li "{item.handle} / {item.sku} / quantity {item.quantity}"
           }
         }
       }
@@ -325,6 +351,29 @@
       status: "active"
     })
     @respond 201 { session: session, member: member }
+  }
+
+  @route POST /cart/items {
+    let quantity: int = @body.quantity as int
+    let member = await shopdb.find("Member", { handle: @body.handle })
+    if member == void {
+      @respond 404 { err: "member_not_found", handle: @body.handle }
+    }
+    let product = await shopdb.find("Product", { sku: @body.sku })
+    if product == void {
+      @respond 404 { err: "product_not_found", sku: @body.sku }
+    }
+    if product.stock < quantity {
+      @respond 409 { err: "out_of_stock", sku: @body.sku, stock: product.stock }
+    }
+    let cartItem = await shopdb.create("CartItem", {
+      memberId: member.id,
+      handle: member.handle,
+      sku: @body.sku,
+      quantity: quantity,
+      status: "active"
+    })
+    @respond 201 { cartItem: cartItem, member: member, product: product }
   }
 
   @route POST /orders {

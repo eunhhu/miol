@@ -2848,8 +2848,10 @@ mod tests {
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
+            assert!(home_html.contains("<form action=\"/cart/items\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("<a href=\"/catalog\">Shop catalog</a>"));
+            assert!(home_html.contains("<a href=\"/cart\">Cart</a>"));
             assert!(home_html.contains("<a href=\"/account/sessions\">My sessions</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /webhooks/stripe"));
@@ -3037,6 +3039,30 @@ mod tests {
             let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
             assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
             assert_eq!(login["session"]["status"], serde_json::json!("active"));
+
+            let cart_payload = serde_json::json!({
+                "handle": "ada",
+                "sku": "mug",
+                "quantity": 1
+            })
+            .to_string();
+            let (cart_item_status, _, cart_item_body) =
+                send_request(addr, "POST", "/cart/items", Some(cart_payload)).await;
+            assert_eq!(cart_item_status, 201);
+            let cart_item: serde_json::Value =
+                serde_json::from_slice(&cart_item_body).expect("cart item json");
+            assert_eq!(cart_item["cartItem"]["handle"], serde_json::json!("ada"));
+            assert_eq!(cart_item["cartItem"]["sku"], serde_json::json!("mug"));
+            assert_eq!(cart_item["cartItem"]["quantity"], serde_json::json!(1));
+
+            let (cart_status, cart_ct, cart_body) = send_request(addr, "GET", "/cart", None).await;
+            assert_eq!(cart_status, 200);
+            assert_eq!(cart_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let cart_html = String::from_utf8(cart_body).expect("cart html");
+            assert!(cart_html.contains("<h1>Cart</h1>"));
+            assert!(cart_html.contains("ada"));
+            assert!(cart_html.contains("mug"));
+            assert!(cart_html.contains("quantity 1"));
 
             let (sessions_status, sessions_ct, sessions_body) =
                 send_request(addr, "GET", "/account/sessions", None).await;
