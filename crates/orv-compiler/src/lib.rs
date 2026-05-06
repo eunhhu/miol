@@ -139,18 +139,18 @@ pub struct ServerLaunchArtifact {
     pub listen: Option<ServerListenArtifact>,
 }
 
-/// Planned native server output descriptor.
+/// Native server output descriptor.
 ///
-/// This does not represent a completed native binary. It records the reference
-/// launcher package/source and the commands that bridge the current artifact to
-/// the future native server target.
+/// Direct-lowered HTTP artifacts can use the generated native launcher now;
+/// other artifacts record the reference launcher package/source and blockers
+/// before the final native server target is complete.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeServerPlanArtifact {
     /// Schema version.
     pub schema_version: u32,
     /// Artifact kind.
     pub kind: String,
-    /// Planning status, currently `planned`.
+    /// Planning status, for example `direct_http` or `planned`.
     pub status: String,
     /// Runtime model used before native codegen exists.
     pub runtime: String,
@@ -1487,7 +1487,8 @@ fn orv_build_dir() -> std::path::PathBuf {{
     source.replace("__ORV_NATIVE_SERVER_PLAN__", native_server_plan_path)
 }
 
-fn native_server_direct_http_capable(artifact: &ServerRuntimeArtifact) -> bool {
+#[must_use]
+pub fn native_server_direct_http_capable(artifact: &ServerRuntimeArtifact) -> bool {
     artifact
         .routes
         .iter()

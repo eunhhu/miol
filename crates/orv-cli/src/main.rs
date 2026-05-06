@@ -14201,8 +14201,10 @@ fn verify_native_server_plan_value(
     if json_str(plan, "kind", "native server plan")? != "native_server_plan" {
         anyhow::bail!("native server plan kind must be native_server_plan");
     }
-    if json_str(plan, "status", "native server plan")? != "planned" {
-        anyhow::bail!("native server plan status must be planned");
+    let direct_http = orv_compiler::native_server_direct_http_capable(artifact);
+    let expected_status = native_server_plan_status(direct_http);
+    if json_str(plan, "status", "native server plan")? != expected_status {
+        anyhow::bail!("native server plan status must be {expected_status}");
     }
     if json_str(plan, "artifact", "native server plan")? != artifact_path {
         anyhow::bail!("native server plan artifact must be {artifact_path}");
@@ -14267,9 +14269,17 @@ fn verify_native_server_plan_value(
         .get("blocked_by")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("native server plan blocked_by must be an array"))?;
-    if !blocked_by
-        .iter()
-        .any(|item| item.as_str() == Some("native-codegen"))
+    if direct_http
+        && blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-codegen"))
+    {
+        anyhow::bail!("native server plan direct_http must not be blocked by native-codegen");
+    }
+    if !direct_http
+        && !blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-codegen"))
     {
         anyhow::bail!("native server plan blocked_by must include native-codegen");
     }
@@ -14363,8 +14373,10 @@ fn verify_native_runtime_image_plan_value(
     if json_str(plan, "kind", "native runtime image plan")? != "native_runtime_image_plan" {
         anyhow::bail!("native runtime image plan kind must be native_runtime_image_plan");
     }
-    if json_str(plan, "status", "native runtime image plan")? != "planned" {
-        anyhow::bail!("native runtime image plan status must be planned");
+    let direct_http = orv_compiler::native_server_direct_http_capable(artifact);
+    let expected_status = native_runtime_image_plan_status(direct_http);
+    if json_str(plan, "status", "native runtime image plan")? != expected_status {
+        anyhow::bail!("native runtime image plan status must be {expected_status}");
     }
     if json_str(plan, "artifact", "native runtime image plan")? != artifact_path {
         anyhow::bail!("native runtime image plan artifact must be {artifact_path}");
@@ -14407,9 +14419,19 @@ fn verify_native_runtime_image_plan_value(
         .get("blocked_by")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("native runtime image plan blocked_by must be an array"))?;
-    if !blocked_by
-        .iter()
-        .any(|item| item.as_str() == Some("native-codegen"))
+    if direct_http
+        && blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-codegen"))
+    {
+        anyhow::bail!(
+            "native runtime image plan direct_http must not be blocked by native-codegen"
+        );
+    }
+    if !direct_http
+        && !blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-codegen"))
     {
         anyhow::bail!("native runtime image plan blocked_by must include native-codegen");
     }
@@ -21501,10 +21523,11 @@ fn write_native_server_plan_artifact(
     paths: &NativeServerPlanPaths<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
+    let direct_http = orv_compiler::native_server_direct_http_capable(server_artifact);
     let plan = orv_compiler::NativeServerPlanArtifact {
         schema_version: orv_compiler::NATIVE_SERVER_PLAN_ARTIFACT_VERSION,
         kind: "native_server_plan".to_string(),
-        status: "planned".to_string(),
+        status: native_server_plan_status(direct_http).to_string(),
         runtime: server_artifact.runtime.clone(),
         runtime_features: server_artifact.runtime_features.clone(),
         artifact: paths.artifact.to_string(),
@@ -21533,10 +21556,7 @@ fn write_native_server_plan_artifact(
                 command: vec![NATIVE_SERVER_LAUNCHER_BINARY_PATH.to_string()],
             },
         },
-        blocked_by: vec![
-            "native-codegen".to_string(),
-            "native-runtime-image".to_string(),
-        ],
+        blocked_by: native_server_plan_blockers(direct_http),
         listen: server_artifact.listen.clone(),
         routes: server_artifact.routes.clone(),
     };
@@ -21550,10 +21570,11 @@ fn write_native_runtime_image_plan_artifact(
     native_server_plan_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
 ) -> anyhow::Result<()> {
+    let direct_http = orv_compiler::native_server_direct_http_capable(server_artifact);
     let plan = orv_compiler::NativeRuntimeImagePlanArtifact {
         schema_version: orv_compiler::NATIVE_RUNTIME_IMAGE_PLAN_ARTIFACT_VERSION,
         kind: "native_runtime_image_plan".to_string(),
-        status: "planned".to_string(),
+        status: native_runtime_image_plan_status(direct_http).to_string(),
         runtime: server_artifact.runtime.clone(),
         runtime_features: server_artifact.runtime_features.clone(),
         artifact: server_artifact_path.to_string(),
@@ -21565,14 +21586,38 @@ fn write_native_runtime_image_plan_artifact(
             binary: NATIVE_SERVER_BINARY_PATH.to_string(),
             protocol: "http1".to_string(),
         },
-        blocked_by: vec![
-            "native-codegen".to_string(),
-            "native-runtime-image".to_string(),
-        ],
+        blocked_by: native_server_plan_blockers(direct_http),
         listen: server_artifact.listen.clone(),
         routes: server_artifact.routes.clone(),
     };
     write_json(&out.join(path), &serde_json::to_value(plan)?)
+}
+
+fn native_server_plan_status(direct_http: bool) -> &'static str {
+    if direct_http {
+        "direct_http"
+    } else {
+        "planned"
+    }
+}
+
+fn native_runtime_image_plan_status(direct_http: bool) -> &'static str {
+    if direct_http {
+        "image_planned"
+    } else {
+        "planned"
+    }
+}
+
+fn native_server_plan_blockers(direct_http: bool) -> Vec<String> {
+    if direct_http {
+        vec!["native-runtime-image".to_string()]
+    } else {
+        vec![
+            "native-codegen".to_string(),
+            "native-runtime-image".to_string(),
+        ]
+    }
 }
 
 fn write_native_server_launcher_source(
@@ -30630,7 +30675,7 @@ entry = "src/main.orv"
         .expect("native server plan json");
         assert_eq!(native_plan["schema_version"], 1);
         assert_eq!(native_plan["kind"], "native_server_plan");
-        assert_eq!(native_plan["status"], "planned");
+        assert_eq!(native_plan["status"], "direct_http");
         assert_eq!(native_plan["artifact"], "server/app.orv-runtime.json");
         assert_eq!(native_plan["launcher"], "server/launch.json");
         assert_eq!(native_plan["source"], "server/native/main.rs");
@@ -30659,7 +30704,7 @@ entry = "src/main.orv"
         );
         assert_eq!(native_plan["listen"], server_artifact["listen"]);
         assert!(json_routes_include(&native_plan["routes"], "GET", "/ping"));
-        assert!(native_plan["blocked_by"]
+        assert!(!native_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")
             .iter()
@@ -30795,7 +30840,7 @@ entry = "src/main.orv"
             "server/runtime-image.json"
         );
         assert_eq!(image_plan["kind"], "native_runtime_image_plan");
-        assert_eq!(image_plan["status"], "planned");
+        assert_eq!(image_plan["status"], "image_planned");
         assert_eq!(image_plan["artifact"], SERVER_ARTIFACT_PATH);
         assert_eq!(image_plan["native_plan"], NATIVE_SERVER_PLAN_PATH);
         assert_eq!(image_plan["runtime"], server_artifact["runtime"]);
@@ -30806,6 +30851,16 @@ entry = "src/main.orv"
         assert_eq!(image_plan["target"]["kind"], "oci_image");
         assert_eq!(image_plan["target"]["binary"], NATIVE_SERVER_BINARY_PATH);
         assert_eq!(image_plan["routes"], server_artifact["routes"]);
+        assert!(!image_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-codegen"));
+        assert!(image_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-runtime-image"));
 
         cmd_verify_build(&out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
@@ -31970,6 +32025,21 @@ entry = "src/main.orv"
 
         let source = std::fs::read_to_string(out.join("server").join("native").join("main.rs"))
             .expect("native source");
+        let native_plan = read_json_value(&out.join(NATIVE_SERVER_PLAN_PATH)).expect("native plan");
+        let image_plan =
+            read_json_value(&out.join(NATIVE_RUNTIME_IMAGE_PLAN_PATH)).expect("image plan");
+        assert_eq!(native_plan["status"], "planned");
+        assert!(native_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-codegen"));
+        assert_eq!(image_plan["status"], "planned");
+        assert!(image_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "native-codegen"));
         assert!(source.contains("fn orv_native_reference_bridge("));
         assert!(source.contains(r#"std::process::Command::new("orv")"#));
         assert!(source.contains(r#".arg("run-artifact")"#));
@@ -35053,6 +35123,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(native_server.iter().any(|target| {
             target["kind"] == "native_server_plan"
                 && target["path"] == "server/native-server.json"
+                && target["status"] == "direct_http"
                 && target["artifact"] == "server/app.orv-runtime.json"
                 && target["target"]["path"] == "server/app"
                 && target["routes_source"]["path"] == "server/native/routes.rs"
@@ -35092,7 +35163,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
                     .as_array()
                     .expect("blocked_by")
                     .iter()
-                    .any(|item| item == "native-codegen")
+                    .all(|item| item != "native-codegen")
         }));
         let _ = std::fs::remove_dir_all(&out);
     }
