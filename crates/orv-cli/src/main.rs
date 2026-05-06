@@ -16451,6 +16451,7 @@ fn verify_deploy_server_target(
     let dockerfile = json_str(server, "dockerfile", "deploy server")?;
     let compose = json_str(server, "compose", "deploy server")?;
     let env_example = json_str(server, "env_example", "deploy server")?;
+    let db_adapters = json_str(server, "db_adapters", "deploy server")?;
     let commerce_adapters = json_str(server, "commerce_adapters", "deploy server")?;
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
@@ -16525,6 +16526,7 @@ fn verify_deploy_server_target(
         &persistence,
     )?;
     verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
+    verify_deploy_db_adapters_artifact(dir, db_adapters, artifact_path, &persistence)?;
     verify_deploy_commerce_adapters_artifact(dir, commerce_adapters, artifact_path, &persistence)?;
     verify_deploy_runbook_artifact(
         dir,
@@ -16532,6 +16534,7 @@ fn verify_deploy_server_target(
         &DeployRunbookArtifacts {
             compose,
             env_example,
+            db_adapters,
             commerce_adapters,
             routes: routes_artifact,
         },
@@ -16749,6 +16752,43 @@ fn verify_deploy_commerce_adapters_artifact(
     Ok(())
 }
 
+fn verify_deploy_db_adapters_artifact(
+    dir: &Path,
+    path: &str,
+    artifact_path: &str,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let adapters_path = dir.join(path);
+    if !adapters_path.is_file() {
+        anyhow::bail!(
+            "missing deploy DB adapters artifact: {}",
+            adapters_path.display()
+        );
+    }
+    let adapters = read_json_value(&adapters_path)?;
+    if adapters
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy DB adapters schema_version must be 1");
+    }
+    if json_str(&adapters, "kind", "deploy DB adapters")? != "orv.deploy.db_adapters" {
+        anyhow::bail!("deploy DB adapters kind must be orv.deploy.db_adapters");
+    }
+    if json_str(&adapters, "artifact", "deploy DB adapters")? != artifact_path {
+        anyhow::bail!("deploy DB adapters artifact must be {artifact_path}");
+    }
+    if adapters.get("adapters")
+        != Some(&serde_json::Value::Array(deploy_db_adapter_value(
+            &persistence.db_adapters,
+        )))
+    {
+        anyhow::bail!("deploy DB adapters do not match runtime artifact persistence");
+    }
+    Ok(())
+}
+
 fn deploy_env_check_with_lookup<F>(dir: &Path, mut lookup: F) -> anyhow::Result<()>
 where
     F: FnMut(&str) -> Option<String>,
@@ -16825,6 +16865,7 @@ where
 struct DeployRunbookArtifacts<'a> {
     compose: &'a str,
     env_example: &'a str,
+    db_adapters: &'a str,
     commerce_adapters: &'a str,
     routes: &'a str,
 }
@@ -16853,6 +16894,10 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains(artifacts.env_example) {
         let env_example_path = artifacts.env_example;
         anyhow::bail!("deploy runbook must reference {env_example_path}");
+    }
+    if !runbook.contains(artifacts.db_adapters) {
+        let db_adapters_path = artifacts.db_adapters;
+        anyhow::bail!("deploy runbook must reference {db_adapters_path}");
     }
     if !runbook.contains(artifacts.commerce_adapters) {
         let commerce_adapters_path = artifacts.commerce_adapters;
@@ -20400,6 +20445,7 @@ struct DeployPersistence {
     db_paths: Vec<String>,
     db_endpoints: Vec<String>,
     db_env: Vec<DeployAdapterEnv>,
+    db_adapters: Vec<DeployDbAdapter>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
     commerce_env: Vec<DeployAdapterEnv>,
@@ -20411,6 +20457,16 @@ struct DeployPersistence {
 struct DeployAdapterEnv {
     env: String,
     default: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DeployDbAdapter {
+    mode: String,
+    provider: String,
+    env: Option<String>,
+    default: Option<String>,
+    endpoint: Option<String>,
+    adapter_status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -20438,6 +20494,7 @@ struct DeployPersistenceAccumulator {
     db_paths: Vec<String>,
     db_endpoints: Vec<String>,
     db_env: Vec<DeployAdapterEnv>,
+    db_adapters: Vec<DeployDbAdapter>,
     record_paths: Vec<String>,
     commerce_endpoints: Vec<String>,
     commerce_env: Vec<DeployAdapterEnv>,
@@ -20454,6 +20511,8 @@ impl DeployPersistenceAccumulator {
         self.db_endpoints.dedup();
         self.db_env.sort();
         self.db_env.dedup();
+        self.db_adapters.sort();
+        self.db_adapters.dedup();
         self.record_paths.sort();
         self.record_paths.dedup();
         self.commerce_endpoints.sort();
@@ -20473,6 +20532,7 @@ impl DeployPersistenceAccumulator {
             db_paths: self.db_paths,
             db_endpoints: self.db_endpoints,
             db_env: self.db_env,
+            db_adapters: self.db_adapters,
             record_paths: self.record_paths,
             commerce_endpoints: self.commerce_endpoints,
             commerce_env: self.commerce_env,
@@ -20529,6 +20589,7 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
         "db_paths": persistence.db_paths,
         "db_endpoints": persistence.db_endpoints,
         "db_env": deploy_adapter_env_value(&persistence.db_env),
+        "db_adapters": deploy_db_adapter_value(&persistence.db_adapters),
         "record_paths": persistence.record_paths,
         "commerce_endpoints": persistence.commerce_endpoints,
         "commerce_env": deploy_adapter_env_value(&persistence.commerce_env),
@@ -20541,6 +20602,27 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn deploy_db_adapter_value(adapters: &[DeployDbAdapter]) -> Vec<serde_json::Value> {
+    adapters
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "kind": "db",
+                "mode": adapter.mode,
+                "provider": adapter.provider,
+                "env": adapter.env.as_deref(),
+                "default": adapter.default.as_deref(),
+                "endpoint": adapter.endpoint.as_deref(),
+                "adapter_status": adapter.adapter_status,
+                "runtime": {
+                    "status": adapter.adapter_status,
+                    "query_methods": ["create", "find", "update", "delete", "transaction"],
+                },
+            })
+        })
+        .collect()
 }
 
 fn deploy_adapter_env_value(envs: &[DeployAdapterEnv]) -> Vec<serde_json::Value> {
@@ -21016,32 +21098,64 @@ fn collect_db_adapter_persistence_arg(
     out: &mut DeployPersistenceAccumulator,
 ) {
     if let Some(url) = hir_static_string(arg) {
-        collect_db_adapter_url(&url, out);
+        collect_db_adapter_url(&url, None, None, out);
     }
     if let Some(env) = hir_env_configured_string(arg) {
         if let Some(default) = &env.default {
-            collect_db_adapter_url(default, out);
+            collect_db_adapter_url(default, Some(env.env.clone()), Some(default.clone()), out);
+        } else {
+            out.db_adapters.push(DeployDbAdapter {
+                mode: "env".to_string(),
+                provider: "unknown".to_string(),
+                env: Some(env.env.clone()),
+                default: None,
+                endpoint: None,
+                adapter_status: "env_required".to_string(),
+            });
         }
         out.db_env.push(env);
     }
 }
 
-fn collect_db_adapter_url(url: &str, out: &mut DeployPersistenceAccumulator) {
+fn collect_db_adapter_url(
+    url: &str,
+    env: Option<String>,
+    default: Option<String>,
+    out: &mut DeployPersistenceAccumulator,
+) {
     if let Some(path) = file_adapter_path(url) {
         out.wal_paths.push(path);
     }
     if let Some(path) = sqlite_adapter_path(url) {
         out.db_paths.push(path);
     }
-    if external_db_adapter_endpoint(url).is_some() {
+    if let Some(provider) = external_db_adapter_provider(url) {
         out.db_endpoints.push(url.to_string());
+        out.db_adapters.push(DeployDbAdapter {
+            mode: "external".to_string(),
+            provider: provider.to_string(),
+            env,
+            default,
+            endpoint: Some(url.to_string()),
+            adapter_status: "unsupported_runtime".to_string(),
+        });
     }
 }
 
-fn external_db_adapter_endpoint(url: &str) -> Option<&str> {
-    url.strip_prefix("postgres://")
-        .or_else(|| url.strip_prefix("mysql://"))
-        .filter(|target| !target.is_empty())
+fn external_db_adapter_provider(url: &str) -> Option<&'static str> {
+    if url
+        .strip_prefix("postgres://")
+        .is_some_and(|target| !target.is_empty())
+    {
+        return Some("postgres");
+    }
+    if url
+        .strip_prefix("mysql://")
+        .is_some_and(|target| !target.is_empty())
+    {
+        return Some("mysql");
+    }
+    None
 }
 
 fn collect_commerce_adapter_persistence_arg(
@@ -21956,6 +22070,7 @@ fn write_prod_deploy_artifacts(
         let dockerfile = "deploy/Dockerfile";
         let compose = "deploy/compose.yaml";
         let env_example = "deploy/env.example";
+        let db_adapters = "deploy/db-adapters.json";
         let commerce_adapters = "deploy/commerce-adapters.json";
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
@@ -21972,6 +22087,7 @@ fn write_prod_deploy_artifacts(
         )?;
         write_prod_compose_artifact(out, dockerfile, server_artifact, &persistence)?;
         write_prod_env_example_artifact(out, env_example, server_artifact, &persistence)?;
+        write_prod_db_adapters_artifact(out, db_adapters, targets.server_artifact, &persistence)?;
         write_prod_commerce_adapters_artifact(
             out,
             commerce_adapters,
@@ -21980,10 +22096,13 @@ fn write_prod_deploy_artifacts(
         )?;
         write_prod_deploy_runbook(
             out,
-            compose,
-            env_example,
-            commerce_adapters,
-            routes_artifact,
+            &DeployRunbookArtifacts {
+                compose,
+                env_example,
+                db_adapters,
+                commerce_adapters,
+                routes: routes_artifact,
+            },
             server_artifact,
             &persistence,
         )?;
@@ -22002,6 +22121,7 @@ fn write_prod_deploy_artifacts(
             "dockerfile": dockerfile,
             "compose": compose,
             "env_example": env_example,
+            "db_adapters": db_adapters,
             "commerce_adapters": commerce_adapters,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
@@ -22149,15 +22269,32 @@ fn write_prod_commerce_adapters_artifact(
     write_json(&out.join(path), &artifact)
 }
 
+fn write_prod_db_adapters_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact_path: &str,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    let artifact = serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.deploy.db_adapters",
+        "artifact": server_artifact_path,
+        "adapters": deploy_db_adapter_value(&persistence.db_adapters),
+    });
+    write_json(&out.join(path), &artifact)
+}
+
 fn write_prod_deploy_runbook(
     out: &Path,
-    compose_path: &str,
-    env_example_path: &str,
-    commerce_adapters_path: &str,
-    routes_artifact: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
 ) -> anyhow::Result<()> {
+    let compose_path = artifacts.compose;
+    let env_example_path = artifacts.env_example;
+    let db_adapters_path = artifacts.db_adapters;
+    let commerce_adapters_path = artifacts.commerce_adapters;
+    let routes_artifact = artifacts.routes;
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
         .unwrap_or_default();
@@ -22181,6 +22318,7 @@ fn write_prod_deploy_runbook(
 
 - Compose: {compose_path}
 - Env example: {env_example_path}
+- DB adapters: {db_adapters_path}
 - Commerce adapters: {commerce_adapters_path}
 - Routes: {routes_artifact}
 
@@ -32783,6 +32921,8 @@ entry = "src/main.orv"
         let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
         let container =
             read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let db_adapters_path = out.join("deploy").join("db-adapters.json");
+        let db_adapters = read_json_value(&db_adapters_path).expect("db adapters");
         let compose =
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         let env_example =
@@ -32793,6 +32933,40 @@ entry = "src/main.orv"
         assert_eq!(
             deploy["server"]["persistence"]["db_endpoints"],
             serde_json::json!(["mysql://db.internal/shop", "postgres://db.internal/shop"])
+        );
+        assert_eq!(deploy["server"]["db_adapters"], "deploy/db-adapters.json");
+        assert_eq!(db_adapters["schema_version"], 1);
+        assert_eq!(db_adapters["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(
+            db_adapters["adapters"],
+            serde_json::json!([
+                {
+                    "kind": "db",
+                    "mode": "external",
+                    "provider": "mysql",
+                    "env": "SHOP_DATABASE_URL",
+                    "default": "mysql://db.internal/shop",
+                    "endpoint": "mysql://db.internal/shop",
+                    "adapter_status": "unsupported_runtime",
+                    "runtime": {
+                        "status": "unsupported_runtime",
+                        "query_methods": ["create", "find", "update", "delete", "transaction"]
+                    }
+                },
+                {
+                    "kind": "db",
+                    "mode": "external",
+                    "provider": "postgres",
+                    "env": null,
+                    "default": null,
+                    "endpoint": "postgres://db.internal/shop",
+                    "adapter_status": "unsupported_runtime",
+                    "runtime": {
+                        "status": "unsupported_runtime",
+                        "query_methods": ["create", "find", "update", "delete", "transaction"]
+                    }
+                }
+            ])
         );
         assert!(container["persistence"]["volumes"]
             .as_array()
@@ -32809,6 +32983,7 @@ entry = "src/main.orv"
         assert!(runbook.contains("- DB endpoint: postgres://db.internal/shop"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default mysql://db.internal/shop"));
+        assert!(runbook.contains("deploy/db-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
@@ -33276,6 +33451,38 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy commerce adapters do not match runtime artifact persistence"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_db_adapter_mismatch() {
+        let dir = temp_output_dir("deploy-db-adapters-source");
+        std::fs::create_dir_all(&dir).expect("create db adapter source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db adapter source");
+        let out = temp_output_dir("deploy-db-adapters-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let adapters_path = out.join("deploy").join("db-adapters.json");
+        let mut adapters = read_json_value(&adapters_path).expect("db adapters");
+        adapters["adapters"][0]["endpoint"] = serde_json::json!("postgres://wrong.example/shop");
+        write_json(&adapters_path, &adapters).expect("write corrupt db adapters");
+
+        let err = cmd_verify_build(&out).expect_err("db adapter mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy DB adapters do not match runtime artifact persistence"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
