@@ -28,7 +28,7 @@
 
 Source-entry commands accept a single `.orv` file, an `orv.toml` with `[project].entry`, or a project directory containing `orv.toml`.
 
-`orv init <dir> --template shop` writes the reference shop starter with `GET /` browser checkout forms, a `GET /admin` operations dashboard for catalog/order/shipment read models and persistence paths, an env-overridable `SHOP_DATABASE_URL` DB adapter that defaults to SQLite-backed `data/shop.sqlite`, env-overridable payment/shipping adapters that default to file-backed commerce record logs under `data/`, and generated build/deploy/native launcher guidance.
+`orv init <dir> --template shop` writes the reference shop starter with `GET /` browser checkout forms, a `GET /admin` operations dashboard for catalog/order/shipment read models and persistence paths, a browser `GET /admin/catalog` catalog read model, an env-overridable `SHOP_DATABASE_URL` DB adapter that defaults to SQLite-backed `data/shop.sqlite`, env-overridable payment/shipping adapters that default to file-backed commerce record logs under `data/`, and generated build/deploy/native launcher guidance.
 
 `orv graph <file> --view --out <dir>` writes `graph.json` and a static `index.html` ProjectGraph view with source/semantic depth stats, node/edge visualization, node search/kind filtering, and origin rows.
 

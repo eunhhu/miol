@@ -129,8 +129,9 @@
           class="admin-dashboard"
           @h2 "Read models"
           @ul {
-            @li { @a href="/products" "Catalog API" }
+            @li { @a href="/admin/catalog" "Catalog read model" }
             @li { @a href="/admin/summary" "Operations summary" }
+            @li { @a href="/products" "Catalog API" }
             @li { @a href="/orders/demo" "Orders by customer" }
             @li { @a href="/shipments/1" "Shipment lookup" }
           }
@@ -160,6 +161,20 @@
       orders: orders,
       payments: payments,
       shipments: shipments
+    }
+  }
+
+  @route GET /admin/catalog {
+    let products = await shopdb.findAll("Product", {})
+    @serve @html {
+      @body {
+        @h1 "Catalog"
+        @ul {
+          for product in products {
+            @li "{product.sku}: {product.name} / stock {product.stock}"
+          }
+        }
+      }
     }
   }
 

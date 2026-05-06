@@ -2801,6 +2801,7 @@ mod tests {
             let admin_html = String::from_utf8(admin_body).expect("admin html");
             assert!(admin_html.contains("<h1>Miol Shop Admin</h1>"));
             assert!(admin_html.contains("Operations dashboard"));
+            assert!(admin_html.contains("<a href=\"/admin/catalog\">Catalog read model</a>"));
             assert!(admin_html.contains("<a href=\"/admin/summary\">Operations summary</a>"));
             assert!(admin_html.contains("data/shop.sqlite"));
 
@@ -2847,6 +2848,19 @@ mod tests {
             let list: serde_json::Value = serde_json::from_slice(&list_body).expect("list json");
             assert_eq!(list["products"].as_array().map(Vec::len), Some(2));
             assert_eq!(list["products"][0]["name"], serde_json::json!("Kettle"));
+
+            let (admin_catalog_status, admin_catalog_ct, admin_catalog_body) =
+                send_request(addr, "GET", "/admin/catalog", None).await;
+            assert_eq!(admin_catalog_status, 200);
+            assert_eq!(
+                admin_catalog_ct.as_deref(),
+                Some("text/html; charset=utf-8")
+            );
+            let admin_catalog_html =
+                String::from_utf8(admin_catalog_body).expect("admin catalog html");
+            assert!(admin_catalog_html.contains("<h1>Catalog</h1>"));
+            assert!(admin_catalog_html.contains("kettle: Kettle / stock 2"));
+            assert!(admin_catalog_html.contains("mug: Mug / stock 3"));
 
             let (form_order_status, _, form_order_body) = send_request_with_content_type(
                 addr,

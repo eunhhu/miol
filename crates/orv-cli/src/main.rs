@@ -2242,6 +2242,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 \n\
 - `GET /`\n\
 - `GET /admin`\n\
+- `GET /admin/catalog`\n\
 - `GET /admin/summary`\n\
 - `GET /health`\n\
 - `POST /products`\n\
@@ -21254,6 +21255,8 @@ test "checkout failing runtime body" {
         assert!(source.contains("Operations dashboard"));
         assert!(source.contains("@a href=\"/admin/summary\" \"Operations summary\""));
         assert!(source.contains("@route GET /admin/summary"));
+        assert!(source.contains("@a href=\"/admin/catalog\" \"Catalog read model\""));
+        assert!(source.contains("@route GET /admin/catalog"));
         assert!(source.contains(r#"shopdb.count("Product", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
@@ -21324,6 +21327,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /admin"));
+        assert!(guide.contains("GET /admin/catalog"));
         assert!(guide.contains("GET /admin/summary"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /members/login"));
@@ -21359,6 +21363,7 @@ test "checkout failing runtime body" {
         for (method, path) in [
             ("GET", "/"),
             ("GET", "/admin"),
+            ("GET", "/admin/catalog"),
             ("GET", "/admin/summary"),
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
