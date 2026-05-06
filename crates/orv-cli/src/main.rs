@@ -303,9 +303,13 @@ enum InitTemplate {
 enum EditorDebugControl {
     Continue,
     Pause,
+    ReverseContinue,
     Next,
+    StepBack,
     StepIn,
+    StepInTargets,
     StepOut,
+    RestartFrame,
     Restart,
     Disconnect,
 }
@@ -315,9 +319,13 @@ impl EditorDebugControl {
         match self {
             Self::Continue => "Continue",
             Self::Pause => "Pause",
+            Self::ReverseContinue => "Reverse Continue",
             Self::Next => "Next",
+            Self::StepBack => "Step Back",
             Self::StepIn => "Step In",
+            Self::StepInTargets => "Step In Targets",
             Self::StepOut => "Step Out",
+            Self::RestartFrame => "Restart Frame",
             Self::Restart => "Restart",
             Self::Disconnect => "Disconnect",
         }
@@ -327,9 +335,13 @@ impl EditorDebugControl {
         match self {
             Self::Continue => "continue",
             Self::Pause => "pause",
+            Self::ReverseContinue => "reverse-continue",
             Self::Next => "next",
+            Self::StepBack => "step-back",
             Self::StepIn => "step-in",
+            Self::StepInTargets => "step-in-targets",
             Self::StepOut => "step-out",
+            Self::RestartFrame => "restart-frame",
             Self::Restart => "restart",
             Self::Disconnect => "disconnect",
         }
@@ -345,17 +357,33 @@ impl EditorDebugControl {
                 "command": "pause",
                 "arguments": {"threadId": 1},
             }),
+            Self::ReverseContinue => serde_json::json!({
+                "command": "reverseContinue",
+                "arguments": {"threadId": 1},
+            }),
             Self::Next => serde_json::json!({
                 "command": "next",
+                "arguments": {"threadId": 1},
+            }),
+            Self::StepBack => serde_json::json!({
+                "command": "stepBack",
                 "arguments": {"threadId": 1},
             }),
             Self::StepIn => serde_json::json!({
                 "command": "stepIn",
                 "arguments": {"threadId": 1},
             }),
+            Self::StepInTargets => serde_json::json!({
+                "command": "stepInTargets",
+                "arguments": {"frameId": 1},
+            }),
             Self::StepOut => serde_json::json!({
                 "command": "stepOut",
                 "arguments": {"threadId": 1},
+            }),
+            Self::RestartFrame => serde_json::json!({
+                "command": "restartFrame",
+                "arguments": {"frameId": 1},
             }),
             Self::Restart => serde_json::json!({
                 "command": "restart",
@@ -6175,6 +6203,7 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "schema_version": 1,
         "adapter": editor_debug_adapter_json(),
+        "capabilities": editor_debug_capabilities_json(),
         "session_runner": editor_debug_session_runner_json(path),
         "result_artifact": editor_debug_result_artifact_json(),
         "configurations": editor_debug_configurations_json(path),
@@ -6715,6 +6744,45 @@ fn editor_debug_adapter_json() -> serde_json::Value {
     })
 }
 
+fn editor_debug_capabilities_json() -> serde_json::Value {
+    serde_json::json!({
+        "supportsConfigurationDoneRequest": true,
+        "supportsBreakpointLocationsRequest": true,
+        "supportsConditionalBreakpoints": true,
+        "supportsHitConditionalBreakpoints": true,
+        "supportsFunctionBreakpoints": true,
+        "supportsDataBreakpoints": true,
+        "supportsExceptionInfoRequest": true,
+        "supportsRestartRequest": true,
+        "supportsSetVariable": true,
+        "supportsSetExpression": true,
+        "supportsModulesRequest": true,
+        "supportsGotoTargetsRequest": true,
+        "supportsStepBack": true,
+        "supportsStepInTargetsRequest": true,
+        "supportsRestartFrame": true,
+        "supportsPauseRequest": true,
+        "supportsCancelRequest": true,
+        "supportsInstructionBreakpoints": true,
+        "supportsDisassembleRequest": true,
+        "supportsReadMemoryRequest": true,
+        "supportsOrvRuntimeAttach": true,
+        "supportsOrvRuntimeTracePath": true,
+        "exceptionBreakpointFilters": [
+            {
+                "filter": "orv.diagnostics",
+                "label": "ORV diagnostics",
+                "default": true,
+            },
+            {
+                "filter": "orv.runtime",
+                "label": "ORV runtime errors",
+                "default": true,
+            },
+        ],
+    })
+}
+
 fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
     let program = path.display().to_string();
     serde_json::json!({
@@ -6739,13 +6807,17 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
     })
 }
 
-const fn editor_debug_control_order() -> [EditorDebugControl; 7] {
+const fn editor_debug_control_order() -> [EditorDebugControl; 11] {
     [
         EditorDebugControl::Continue,
         EditorDebugControl::Pause,
+        EditorDebugControl::ReverseContinue,
         EditorDebugControl::Next,
+        EditorDebugControl::StepBack,
         EditorDebugControl::StepIn,
+        EditorDebugControl::StepInTargets,
         EditorDebugControl::StepOut,
+        EditorDebugControl::RestartFrame,
         EditorDebugControl::Restart,
         EditorDebugControl::Disconnect,
     ]
@@ -6948,6 +7020,10 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
 fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> serde_json::Value {
     let debug = state.get("debug").unwrap_or(&serde_json::Value::Null);
     let adapter = debug.get("adapter").unwrap_or(&serde_json::Value::Null);
+    let capabilities = debug
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(editor_debug_capabilities_json);
     let runner = debug
         .get("session_runner")
         .unwrap_or(&serde_json::Value::Null);
@@ -7012,6 +7088,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         "debug": {
             "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
             "adapter_command": adapter.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "dap", "serve", "--stdio"])),
+            "capabilities": capabilities,
             "runner_command": runner.get("command").cloned().unwrap_or_else(|| editor_debug_control_runner_command(EditorDebugControl::Next)),
             "configurations": configurations,
             "configuration_count": configuration_count,
@@ -7259,6 +7336,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let runtime_frame_count = json_array_count(state.pointer("/runtime/frames"));
     let debug_config_count = json_array_count(state.pointer("/debug/configurations"));
     let debug_control_count = json_array_count(state.pointer("/debug/controls"));
+    let debug_capability_count = editor_debug_capability_count_from_state(state);
     let debug_breakpoint_count = editor_debug_breakpoint_count_from_state(state);
     let production_db_adapter_count = json_array_count(state.pointer("/production/db_adapters"));
     let production_commerce_adapter_count =
@@ -7309,6 +7387,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     )?;
     write!(
         &mut html,
+        "<span>DAP Caps<b>{debug_capability_count}</b></span>"
+    )?;
+    write!(
+        &mut html,
         "<span>Production<b>{}</b></span>",
         production_db_adapter_count + production_commerce_adapter_count
     )?;
@@ -7344,6 +7426,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(
         &mut html,
         "<section class=\"panel\"><h2>Debug Controls</h2><div class=\"metric\">{debug_control_count}</div><p class=\"muted\">DAP live-control request payloads.</p><ul id=\"debug-control-list\" class=\"list\"></ul></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>DAP Capabilities</h2><div class=\"metric\">{debug_capability_count}</div><p class=\"muted\">Adapter features exposed to native hosts.</p><ul id=\"debug-capability-list\" class=\"list\"></ul></section>"
     )?;
     write!(
         &mut html,
@@ -7386,7 +7472,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         "<script>\nfunction renderTraceDetail(frame){\n  const target = document.getElementById('trace-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No trace frame selected.';\n    return;\n  }\n  const request = frame.request || {};\n  const summary = frame.summary || {};\n  const navigation = frame.navigation || {};\n  const source = navigation.source || {};\n  const location = source.location || {};\n  const params = request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '';\n  const query = request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '';\n  const body = request.body ? `body ${request.body}` : '';\n  const lines = [\n    summary.label || `${request.method || ''} ${request.path || ''}`.trim(),\n    summary.route ? `route ${summary.route}` : '',\n    summary.status_class ? `status ${summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    params,\n    query,\n    body,\n    source.path || location.uri || '',\n    source.snippet || ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderRuntimeDetail(frame){\n  const target = document.getElementById('runtime-frame-detail');\n  if (!target) return;\n  if (!frame) {\n    target.textContent = 'No runtime frame selected.';\n    return;\n  }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const output = frame.output ? `output ${String(frame.output).trimEnd()}` : '';\n  const lines = [\n    `frame #${(frame.index ?? 0) + 1}`,\n    source.path ? `source ${source.path}:${frame.line || ''}` : (frame.line ? `line ${frame.line}` : ''),\n    output,\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  target.textContent = lines.join('\\n');\n}\nfunction renderDebugDetail(value){\n  const target = document.getElementById('debug-detail');\n  if (!target) return;\n  if (!value) {\n    target.textContent = 'No debug item selected.';\n    return;\n  }\n  target.textContent = JSON.stringify(value, null, 2);\n}\nfunction renderDebugRunner(runner){\n  const target = document.getElementById('debug-runner-detail');\n  if (!target) return;\n  target.textContent = runner ? JSON.stringify(runner, null, 2) : 'No debug runner.';\n}\nfunction renderDebugResultArtifact(result){\n  const target = document.getElementById('debug-result-detail');\n  if (!target) return;\n  if (!result) {\n    target.textContent = 'No debug result artifact.';\n    return;\n  }\n  const panels = Array.isArray(result.panels) ? result.panels.join(', ') : '';\n  target.textContent = [result.kind, result.path, result.media_type, panels ? `panels ${panels}` : ''].filter(Boolean).join('\\n');\n}\nfunction debugBreakpointRows(state){\n  const rows = [];\n  for (const group of state.debug?.breakpoint_sources || []) {\n    const breakpoints = group.breakpoints || (group.lines || []).map(line => ({line}));\n    for (const breakpoint of breakpoints) {\n      rows.push({...breakpoint, source: group.source || {}, line: breakpoint.line});\n    }\n  }\n  return rows;\n}\nfunction filterTraceFrames(frames, filter){\n  if (filter === 'all') return frames;\n  return frames.filter(frame => frame.summary?.status_class === filter);\n}\nfunction renderTraceTransport(state){\n  const target = document.getElementById('trace-transport-detail');\n  if (!target) return;\n  const transport = state.trace?.live_refresh?.transport;\n  if (!transport) {\n    target.textContent = 'No trace transport.';\n    return;\n  }\n  target.textContent = [transport.kind, transport.event, transport.url].filter(Boolean).join('\\n');\n}\nfunction renderTraceStreamRunner(state){\n  const target = document.getElementById('trace-stream-runner-detail');\n  if (!target) return;\n  const runner = state.trace?.stream_runner;\n  if (!runner) {\n    target.textContent = 'No trace stream runner.';\n    return;\n  }\n  const command = Array.isArray(runner.command) ? runner.command.join(' ') : '';\n  target.textContent = [runner.kind, runner.event_stream, command].filter(Boolean).join('\\n');\n}\nfunction renderEditorState(){\n  const state = JSON.parse(document.getElementById('orv-editor-state').textContent);\n  const put = (id, items, label, onPick) => {\n    const target = document.getElementById(id);\n    if (!target) return;\n    target.textContent = '';\n    for (const item of items || []) {\n      const row = document.createElement('li');\n      row.textContent = label(item);\n      if (onPick) {\n        row.tabIndex = 0;\n        row.addEventListener('click', () => onPick(item));\n        row.addEventListener('keydown', event => {\n          if (event.key === 'Enter' || event.key === ' ') {\n            event.preventDefault();\n            onPick(item);\n          }\n        });\n      }\n      target.appendChild(row);\n    }\n  };\n  put('routes-list', state.snapshot?.panels?.routes, item => `${item.method || ''} ${item.path || item.name || ''}`.trim() || item.origin_id || 'route');\n  put('schema-list', state.snapshot?.panels?.schema, item => item.name || item.kind || 'schema');\n  put('domains-list', state.snapshot?.panels?.domains, item => item.name || item.kind || 'domain');\n  const debugConfigs = state.debug?.configurations || [];\n  put('debug-config-list', debugConfigs, item => item.name || item.request || 'debug', renderDebugDetail);\n  const debugBreakpoints = debugBreakpointRows(state);\n  put('debug-breakpoint-list', debugBreakpoints, breakpoint => {\n    const source = breakpoint.source || {};\n    return `${source.name || source.path || 'source'}:${breakpoint.line}`;\n  }, breakpoint => {\n    const request = breakpoint.request || {\n      command: 'setBreakpoints',\n      arguments: {source: breakpoint.source, breakpoints: [{line: breakpoint.line}]}\n    };\n    renderDebugControlCommand({runner_command: breakpoint.runner_command || []});\n    renderDebugDetail({request, runner_command: breakpoint.runner_command || []});\n  });\n  renderDebugRunner(state.debug?.session_runner);\n  renderDebugResultArtifact(state.debug?.result_artifact || state.debug?.session_runner?.result);\n  renderDebugDetail(debugConfigs[0]);\n  const runtimeFrames = state.runtime?.frames || [];\n  put('runtime-frame-list', runtimeFrames, frame => {\n    const source = frame.source || {};\n    const label = source.name || source.path || 'frame';\n    const line = frame.line ? `:${frame.line}` : '';\n    return `#${(frame.index ?? 0) + 1} ${label}${line}`;\n  }, renderRuntimeDetail);\n  renderRuntimeDetail(runtimeFrames[0]);\n  const traceFrames = state.trace?.frames || [];\n  const traceButtons = Array.from(document.querySelectorAll('[data-trace-filter]'));\n  const renderTraceList = filter => {\n    const frames = filterTraceFrames(traceFrames, filter);\n    put('trace-list', frames, frame => frame.summary?.label || frame.origin_id || 'request', renderTraceDetail);\n    renderTraceDetail(frames[0]);\n  };\n  for (const button of traceButtons) {\n    button.addEventListener('click', () => {\n      for (const item of traceButtons) item.setAttribute('aria-pressed', 'false');\n      button.setAttribute('aria-pressed', 'true');\n      renderTraceList(button.dataset.traceFilter || 'all');\n    });\n  }\n  renderTraceList('all');\n  renderTraceTransport(state);\n  renderTraceStreamRunner(state);\n}\nrenderEditorState();\n</script>\n",
     );
     html.push_str(
-        "<script>\nfunction renderDebugControlCommand(control){\n  const target = document.getElementById('debug-control-command');\n  if (!target) return;\n  const command = control?.runner_command || control?.command || [];\n  target.textContent = Array.isArray(command) ? command.join(' ') : JSON.stringify(command, null, 2);\n}\nfunction renderDebugControls(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-control-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  const controls = state.debug?.controls || [];\n  for (const control of controls) {\n    const row = document.createElement('li');\n    row.textContent = control.name || control.request?.command || 'control';\n    row.tabIndex = 0;\n    const show = () => {\n      renderDebugControlCommand(control);\n      renderDebugDetail(control.request || control);\n    };\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n  if (controls.length) renderDebugControlCommand(controls[0]);\n}\nrenderDebugControls();\n</script>\n</body>\n</html>\n",
+        "<script>\nfunction renderDebugControlCommand(control){\n  const target = document.getElementById('debug-control-command');\n  if (!target) return;\n  const command = control?.runner_command || control?.command || [];\n  target.textContent = Array.isArray(command) ? command.join(' ') : JSON.stringify(command, null, 2);\n}\nfunction renderDebugControls(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-control-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  const controls = state.debug?.controls || [];\n  for (const control of controls) {\n    const row = document.createElement('li');\n    row.textContent = control.name || control.request?.command || 'control';\n    row.tabIndex = 0;\n    const show = () => {\n      renderDebugControlCommand(control);\n      renderDebugDetail(control.request || control);\n    };\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n  if (controls.length) renderDebugControlCommand(controls[0]);\n}\nrenderDebugControls();\n</script>\n",
+    );
+    html.push_str(
+        "<script>\nfunction renderDebugCapabilities(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-capability-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  for (const [name, value] of Object.entries(state.debug?.capabilities || {})) {\n    if (value !== true && !Array.isArray(value)) continue;\n    const row = document.createElement('li');\n    row.textContent = Array.isArray(value) ? `${name} (${value.length})` : name;\n    row.tabIndex = 0;\n    const show = () => renderDebugDetail({name, value});\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n}\nrenderDebugCapabilities();\n</script>\n</body>\n</html>\n",
     );
     Ok(html)
 }
@@ -7436,6 +7525,18 @@ fn editor_debug_breakpoint_count_from_state(state: &serde_json::Value) -> usize 
                 .iter()
                 .map(|source| json_array_count(source.get("lines")))
                 .sum()
+        })
+}
+
+fn editor_debug_capability_count_from_state(state: &serde_json::Value) -> usize {
+    state
+        .pointer("/debug/capabilities")
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, |capabilities| {
+            capabilities
+                .values()
+                .filter(|value| value.as_bool() == Some(true) || value.is_array())
+                .count()
         })
 }
 
@@ -37426,6 +37527,18 @@ define Auth() -> { @out "auth" }
             serde_json::json!(["orv", "dap", "serve", "--stdio"])
         );
         assert_eq!(
+            state["debug"]["capabilities"]["supportsStepBack"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            state["debug"]["capabilities"]["supportsStepInTargetsRequest"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            state["debug"]["capabilities"]["supportsRestartFrame"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
             state["debug"]["session_runner"]["kind"],
             "orv.editor.debug.runner"
         );
@@ -37507,6 +37620,10 @@ define Auth() -> { @out "auth" }
             serde_json::json!(["orv", "dap", "serve", "--stdio"])
         );
         assert_eq!(
+            native_host["debug"]["capabilities"],
+            state["debug"]["capabilities"]
+        );
+        assert_eq!(
             native_host["debug"]["runner_command"],
             state["debug"]["session_runner"]["command"]
         );
@@ -37553,6 +37670,26 @@ define Auth() -> { @out "auth" }
                         "--control",
                         "next"
                     ])
+        }));
+        assert!(control_commands.iter().any(|command| {
+            command["name"] == "Step Back"
+                && command["request"]
+                    == serde_json::json!({"command": "stepBack", "arguments": {"threadId": 1}})
+        }));
+        assert!(control_commands.iter().any(|command| {
+            command["name"] == "Reverse Continue"
+                && command["request"]
+                    == serde_json::json!({"command": "reverseContinue", "arguments": {"threadId": 1}})
+        }));
+        assert!(control_commands.iter().any(|command| {
+            command["name"] == "Restart Frame"
+                && command["request"]
+                    == serde_json::json!({"command": "restartFrame", "arguments": {"frameId": 1}})
+        }));
+        assert!(control_commands.iter().any(|command| {
+            command["name"] == "Step In Targets"
+                && command["request"]
+                    == serde_json::json!({"command": "stepInTargets", "arguments": {"frameId": 1}})
         }));
         let breakpoint_commands = native_host["debug"]["breakpoint_commands"]
             .as_array()
@@ -37625,10 +37762,20 @@ define Auth() -> { @out "auth" }
         );
         assert_editor_debug_control(
             controls,
+            "Reverse Continue",
+            &serde_json::json!({"command": "reverseContinue", "arguments": {"threadId": 1}}),
+        );
+        assert_editor_debug_control(
+            controls,
             "Next",
             &serde_json::json!({"command": "next", "arguments": {"threadId": 1}}),
         );
         assert_editor_debug_control_runner_command(controls, "Next", "next");
+        assert_editor_debug_control(
+            controls,
+            "Step Back",
+            &serde_json::json!({"command": "stepBack", "arguments": {"threadId": 1}}),
+        );
         assert_editor_debug_control(
             controls,
             "Step In",
@@ -37636,8 +37783,18 @@ define Auth() -> { @out "auth" }
         );
         assert_editor_debug_control(
             controls,
+            "Step In Targets",
+            &serde_json::json!({"command": "stepInTargets", "arguments": {"frameId": 1}}),
+        );
+        assert_editor_debug_control(
+            controls,
             "Step Out",
             &serde_json::json!({"command": "stepOut", "arguments": {"threadId": 1}}),
+        );
+        assert_editor_debug_control(
+            controls,
+            "Restart Frame",
+            &serde_json::json!({"command": "restartFrame", "arguments": {"frameId": 1}}),
         );
         assert_editor_debug_control(
             controls,
@@ -37655,11 +37812,14 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("id=\"debug-config-list\""));
         assert!(html.contains("id=\"debug-control-list\""));
         assert!(html.contains("Debug Controls"));
+        assert!(html.contains("DAP Capabilities"));
         assert!(html.contains("id=\"debug-breakpoint-list\""));
+        assert!(html.contains("id=\"debug-capability-list\""));
         assert!(html.contains("id=\"debug-runner-detail\""));
         assert!(html.contains("id=\"debug-result-detail\""));
         assert!(html.contains("Runner Command"));
         assert!(html.contains("renderDebugRunner"));
+        assert!(html.contains("renderDebugCapabilities"));
         assert!(html.contains("renderDebugResultArtifact"));
         assert!(html.contains("renderDebugDetail"));
         assert!(html.contains("renderDebugControlCommand"));
