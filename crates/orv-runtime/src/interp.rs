@@ -4088,6 +4088,40 @@ fn http_post_json_with_headers(
     Ok(response_body)
 }
 
+fn provider_http_post_json(
+    url: &str,
+    body: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<String, RuntimeError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match http_post_json_with_headers(url, body, extra_headers) {
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < 2 && provider_http_error_is_retryable(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| RuntimeError::native("provider request failed")))
+}
+
+fn provider_http_error_is_retryable(error: &RuntimeError) -> bool {
+    let message = &error.message;
+    message.contains(" returned 5")
+        || message.contains("failed to connect")
+        || message.contains("failed to read response")
+        || message.contains("timed out")
+}
+
+fn provider_idempotency_key(kind: &str, args: &[Value]) -> String {
+    let order = payload_field(args, "orderId")
+        .map(|value| value_to_display(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{kind}:{order}")
+}
+
 fn parse_http_adapter_url(url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
     let Some(rest) = url.strip_prefix("http://") else {
         return Err(RuntimeError::native(format!(
@@ -4272,10 +4306,16 @@ fn stripe_provider_capture_value(args: &[Value]) -> Result<Value, RuntimeError> 
         "payload": runtime_value_json(&payload),
     })
     .to_string();
-    let response = http_post_json_with_headers(
+    let response = provider_http_post_json(
         &endpoint,
         &request,
-        &[("authorization", format!("Bearer {secret}"))],
+        &[
+            ("authorization", format!("Bearer {secret}")),
+            (
+                "idempotency-key",
+                provider_idempotency_key("stripe.payment_intent.create", args),
+            ),
+        ],
     )?;
     let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
         RuntimeError::native(format!("stripe provider response was not JSON: {source}"))
@@ -4419,10 +4459,16 @@ fn carrier_provider_booking_value(args: &[Value]) -> Result<Value, RuntimeError>
         "payload": runtime_value_json(&payload),
     })
     .to_string();
-    let response = http_post_json_with_headers(
+    let response = provider_http_post_json(
         &endpoint,
         &request,
-        &[("authorization", format!("Bearer {api_key}"))],
+        &[
+            ("authorization", format!("Bearer {api_key}")),
+            (
+                "idempotency-key",
+                provider_idempotency_key("carrier.shipment.create", args),
+            ),
+        ],
     )?;
     let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
         RuntimeError::native(format!("carrier provider response was not JSON: {source}"))
@@ -9851,6 +9897,73 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
     }
 
     #[test]
+    fn provider_adapters_retry_transient_endpoint_errors_with_idempotency_keys() {
+        let _env_guard = super::test_env::guard();
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider retry test server");
+        let address = listener
+            .local_addr()
+            .expect("provider retry test server address");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept provider retry request");
+                let request = read_test_http_request(&mut stream);
+                server_requests.lock().unwrap().push(request);
+                if index == 0 {
+                    write_test_http_response(
+                        &mut stream,
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 17\r\nconnection: close\r\n\r\ntransient failure",
+                    );
+                } else if index == 1 {
+                    write_test_http_json_response(
+                        &mut stream,
+                        r#"{"id":"pi_retry","status":"succeeded"}"#,
+                    );
+                } else {
+                    write_test_http_json_response(
+                        &mut stream,
+                        r#"{"id":"ship_retry","status":"booked_provider"}"#,
+                    );
+                }
+            }
+        });
+        super::test_env::set(
+            "STRIPE_API_ENDPOINT",
+            &format!("http://{address}/stripe/payment_intents"),
+        );
+        super::test_env::set("STRIPE_SECRET_KEY", "sk_test_never_print");
+        super::test_env::set(
+            "CARRIER_API_ENDPOINT",
+            &format!("http://{address}/carrier/shipments"),
+        );
+        super::test_env::set("CARRIER_API_KEY", "carrier_key_never_print");
+
+        let out = run_str(
+            r#"let payments = @payment.connect("stripe://local")
+let captured = payments.capture({ orderId: "o_retry", amount: 25000, method: "card" })
+let shipping = @shipping.connect("carrier://local")
+let booking = shipping.book({ orderId: "o_retry", carrier: "post", address: "Seoul" })
+@out captured.id
+@out booking.id"#,
+        )
+        .unwrap();
+        super::test_env::clear("STRIPE_API_ENDPOINT");
+        super::test_env::clear("STRIPE_SECRET_KEY");
+        super::test_env::clear("CARRIER_API_ENDPOINT");
+        super::test_env::clear("CARRIER_API_KEY");
+        server.join().expect("provider retry test server finished");
+
+        assert_eq!(out, "pi_retry\nship_retry\n");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("idempotency-key: stripe.payment_intent.create:o_retry"));
+        assert!(requests[1].contains("idempotency-key: stripe.payment_intent.create:o_retry"));
+        assert!(requests[2].contains("idempotency-key: carrier.shipment.create:o_retry"));
+    }
+
+    #[test]
     fn stripe_provider_adapter_verifies_webhook_signature_without_exposing_secret() {
         let _env_guard = super::test_env::guard();
         super::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
@@ -9917,6 +10030,14 @@ let rejected = payments.verifyWebhook({
         stream
             .write_all(response.as_bytes())
             .expect("write adapter response");
+    }
+
+    fn write_test_http_response(stream: &mut std::net::TcpStream, response: &str) {
+        use std::io::Write as _;
+
+        stream
+            .write_all(response.as_bytes())
+            .expect("write raw adapter response");
     }
 
     #[test]
