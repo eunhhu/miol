@@ -5718,6 +5718,10 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                             "adapterStatus".to_string(),
                             Value::Str("unsupported_runtime".to_string()),
                         ),
+                        (
+                            "runtime".to_string(),
+                            external_db_adapter_runtime_contract_value(),
+                        ),
                     ]));
                 }
                 return Err(RuntimeError::native(format!(
@@ -5935,6 +5939,24 @@ fn external_db_adapter_provider(url: &str) -> Option<&str> {
         return Some("mysql");
     }
     None
+}
+
+fn external_db_adapter_runtime_contract_value() -> Value {
+    Value::Object(vec![
+        (
+            "status".to_string(),
+            Value::Str("unsupported_runtime".to_string()),
+        ),
+        (
+            "queryMethods".to_string(),
+            Value::Array(
+                ["create", "find", "update", "delete", "transaction"]
+                    .into_iter()
+                    .map(|method| Value::Str(method.to_string()))
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 fn db_vector(value: &Value, what: &str) -> Result<Vec<f64>, RuntimeError> {
@@ -9126,12 +9148,15 @@ let all = external.findAll("User", {{}})
 @out external.adapterStatus
 @out external.url
 let err = external.analyze()
-@out err.adapterStatus"#,
+@out err.adapterStatus
+@out external.runtime.status
+@out external.runtime.queryMethods[0]
+@out external.runtime.queryMethods.length"#,
         )
         .expect("external adapter status");
         assert_eq!(
             out,
-            "postgres\nunsupported_runtime\npostgres://localhost/shop\nunsupported_runtime\n"
+            "postgres\nunsupported_runtime\npostgres://localhost/shop\nunsupported_runtime\nunsupported_runtime\ncreate\n5\n"
         );
 
         let err = run_str(
