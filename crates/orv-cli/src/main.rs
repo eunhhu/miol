@@ -2241,7 +2241,7 @@ Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default loc
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
-Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification; real provider API calls are still future work.\n\
+Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification and duplicate event handling; real provider API calls are still future work.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -22763,6 +22763,9 @@ test "checkout failing runtime body" {
         assert!(source.contains("@route POST /webhooks/stripe"));
         assert!(source.contains(r#"@header["stripe-signature"]"#));
         assert!(source.contains("payments.verifyWebhook"));
+        assert!(source.contains("let eventId = @body.id"));
+        assert!(source.contains(r#"shopdb.find("WebhookEvent""#));
+        assert!(source.contains("duplicate: true"));
         assert!(source.contains(r#"shopdb.create("WebhookEvent""#));
         assert!(source.contains("@route POST /shipments"));
         assert!(source.contains(

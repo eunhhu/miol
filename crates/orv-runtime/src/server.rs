@@ -3051,32 +3051,44 @@ mod tests {
 
             crate::interp::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
             let webhook_payload = r#"{"id":"evt_1"}"#.to_string();
+            let webhook_signature =
+                "t=1700000000,v1=c89214b5b5da833daed6f0b8c5bb6bd58cea9022bd80ccc78230f3942d632925";
             let (webhook_status, _, webhook_body) = send_request_with_headers(
                 addr,
                 "POST",
                 "/webhooks/stripe",
-                Some(webhook_payload),
-                &[(
-                    "stripe-signature",
-                    "t=1700000000,v1=c89214b5b5da833daed6f0b8c5bb6bd58cea9022bd80ccc78230f3942d632925",
-                )],
+                Some(webhook_payload.clone()),
+                &[("stripe-signature", webhook_signature)],
             )
             .await;
-            crate::interp::test_env::clear("STRIPE_WEBHOOK_SECRET");
             assert_eq!(webhook_status, 202);
             let webhook: serde_json::Value =
                 serde_json::from_slice(&webhook_body).expect("webhook json");
+            assert_eq!(webhook["duplicate"], serde_json::json!(false));
             assert_eq!(
                 webhook["verification"]["status"],
                 serde_json::json!("verified")
             );
+            assert_eq!(webhook["webhook"]["provider"], serde_json::json!("stripe"));
+            assert_eq!(webhook["webhook"]["status"], serde_json::json!("verified"));
+            assert_eq!(webhook["webhook"]["eventId"], serde_json::json!("evt_1"));
+
+            let (duplicate_webhook_status, _, duplicate_webhook_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/webhooks/stripe",
+                Some(webhook_payload),
+                &[("stripe-signature", webhook_signature)],
+            )
+            .await;
+            crate::interp::test_env::clear("STRIPE_WEBHOOK_SECRET");
+            assert_eq!(duplicate_webhook_status, 200);
+            let duplicate_webhook: serde_json::Value =
+                serde_json::from_slice(&duplicate_webhook_body).expect("duplicate webhook json");
+            assert_eq!(duplicate_webhook["duplicate"], serde_json::json!(true));
             assert_eq!(
-                webhook["webhook"]["provider"],
-                serde_json::json!("stripe")
-            );
-            assert_eq!(
-                webhook["webhook"]["status"],
-                serde_json::json!("verified")
+                duplicate_webhook["webhook"]["eventId"],
+                serde_json::json!("evt_1")
             );
 
             let checkout_payload = serde_json::json!({
@@ -3142,6 +3154,16 @@ mod tests {
             assert_eq!(
                 snapshot["tables"]["Shipment"]["rows"][0]["tracking"],
                 serde_json::json!("TRK-LOCAL")
+            );
+            assert_eq!(
+                snapshot["tables"]["WebhookEvent"]["rows"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+            assert_eq!(
+                snapshot["tables"]["WebhookEvent"]["rows"][0]["eventId"],
+                serde_json::json!("evt_1")
             );
             let payment_records =
                 std::fs::read_to_string(&payment_path).expect("payment record log");

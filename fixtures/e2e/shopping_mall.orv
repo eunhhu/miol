@@ -368,15 +368,35 @@
       payload: @request.rawBody,
       signature: @header["stripe-signature"]
     })
+    let eventId = @body.id
+    if verification.status == "verified" {
+      if eventId == void {
+        let missingIdEvent = await shopdb.create("WebhookEvent", {
+          eventId: eventId,
+          provider: verification.provider,
+          status: "missing_event_id",
+          signatureScheme: verification.signatureScheme
+        })
+        @respond 400 { webhook: missingIdEvent, verification: verification, err: "webhook_event_id_missing" }
+      }
+      let existing = await shopdb.find("WebhookEvent", {
+        provider: verification.provider,
+        eventId: eventId
+      })
+      if existing != void {
+        @respond 200 { webhook: existing, verification: verification, duplicate: true }
+      }
+    }
     let event = await shopdb.create("WebhookEvent", {
+      eventId: eventId,
       provider: verification.provider,
       status: verification.status,
       signatureScheme: verification.signatureScheme
     })
     if verification.status != "verified" {
-      @respond 400 { webhook: event, verification: verification }
+      @respond 400 { webhook: event, verification: verification, duplicate: false }
     }
-    @respond 202 { webhook: event, verification: verification }
+    @respond 202 { webhook: event, verification: verification, duplicate: false }
   }
 
   @route POST /shipments {
