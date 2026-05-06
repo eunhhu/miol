@@ -2267,6 +2267,12 @@ ORV_BUILD_DIR=dist ./dist/server/native/target/release/orv-native-server\n\
 \n\
 The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit override.\n\
 \n\
+## Native Runtime Image\n\
+\n\
+```sh\n\
+docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n\
+```\n\
+\n\
 ## Deploy artifacts\n\
 \n\
 - `deploy/manifest.json`\n\
@@ -2279,6 +2285,8 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
 - `server/native-server.json`\n\
+- `server/runtime-image.json`\n\
+- `server/native/Dockerfile`\n\
 - `server/native/Cargo.toml`\n\
 - `server/native/main.rs`\n\
 - `server/native/routes.rs`\n\
@@ -14159,6 +14167,7 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
             "native_runtime_image_plan" => verify_native_runtime_image_plan_target(dir, &target)?,
+            "native_runtime_image_dockerfile" => verify_native_runtime_image_dockerfile(&target)?,
             "native_server_launcher_source" => {
                 let artifact = read_server_artifact(&dir.join(SERVER_ARTIFACT_PATH))?;
                 verify_native_server_launcher_source(
@@ -14382,9 +14391,17 @@ fn verify_native_server_plan_value(
     {
         anyhow::bail!("native server plan blocked_by must include native-codegen");
     }
-    if !blocked_by
-        .iter()
-        .any(|item| item.as_str() == Some("native-runtime-image"))
+    if direct_http
+        && blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-runtime-image"))
+    {
+        anyhow::bail!("native server plan direct_http must not be blocked by native-runtime-image");
+    }
+    if !direct_http
+        && !blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-runtime-image"))
     {
         anyhow::bail!("native server plan blocked_by must include native-runtime-image");
     }
@@ -14534,11 +14551,41 @@ fn verify_native_runtime_image_plan_value(
     {
         anyhow::bail!("native runtime image plan blocked_by must include native-codegen");
     }
-    if !blocked_by
-        .iter()
-        .any(|item| item.as_str() == Some("native-runtime-image"))
+    if direct_http
+        && blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-runtime-image"))
+    {
+        anyhow::bail!(
+            "native runtime image plan direct_http must not be blocked by native-runtime-image"
+        );
+    }
+    if !direct_http
+        && !blocked_by
+            .iter()
+            .any(|item| item.as_str() == Some("native-runtime-image"))
     {
         anyhow::bail!("native runtime image plan blocked_by must include native-runtime-image");
+    }
+    if json_str(plan, "dockerfile", "native runtime image plan")?
+        != NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH
+    {
+        anyhow::bail!(
+            "native runtime image plan dockerfile must be {NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH}"
+        );
+    }
+    if plan.pointer("/commands/build")
+        != Some(&serde_json::json!([
+            "docker",
+            "build",
+            "-f",
+            NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH,
+            "-t",
+            NATIVE_RUNTIME_IMAGE_NAME,
+            "."
+        ]))
+    {
+        anyhow::bail!("native runtime image plan build command must match generated Dockerfile");
     }
     verify_deploy_listen_value(
         plan.get("listen"),
@@ -14548,6 +14595,30 @@ fn verify_native_runtime_image_plan_value(
     let artifact_routes = serde_json::to_value(&artifact.routes)?;
     if plan.get("routes") != Some(&artifact_routes) {
         anyhow::bail!("native runtime image plan routes do not match runtime artifact");
+    }
+    Ok(())
+}
+
+fn verify_native_runtime_image_dockerfile(target: &Path) -> anyhow::Result<()> {
+    if !target.is_file() {
+        anyhow::bail!(
+            "missing native runtime image Dockerfile: {}",
+            target.display()
+        );
+    }
+    let source = std::fs::read_to_string(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    for expected in [
+        "FROM rust:",
+        "cargo build --manifest-path /work/server/native/Cargo.toml --release",
+        "COPY . /app",
+        "COPY --from=build /work/server/native/target/release/orv-native-server /app/server/app",
+        "ENV ORV_BUILD_DIR=/app",
+        "ENTRYPOINT [\"/app/server/app\"]",
+    ] {
+        if !source.contains(expected) {
+            anyhow::bail!("native runtime image Dockerfile must contain {expected}");
+        }
     }
     Ok(())
 }
@@ -16802,6 +16873,9 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server") {
         anyhow::bail!("deploy runbook must document native launcher run command");
     }
+    if !runbook.contains("docker build -f server/native/Dockerfile -t orv-native-server:latest .") {
+        anyhow::bail!("deploy runbook must document native runtime image build command");
+    }
     if !runbook.contains("ORV_BUILD_DIR is an explicit override") {
         anyhow::bail!("deploy runbook must document native launcher build-dir inference");
     }
@@ -19026,6 +19100,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
     let server_launch_path = SERVER_LAUNCH_PATH;
     let native_server_plan_path = NATIVE_SERVER_PLAN_PATH;
     let native_runtime_image_plan_path = NATIVE_RUNTIME_IMAGE_PLAN_PATH;
+    let native_runtime_image_dockerfile_path = NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH;
     let native_server_source_path = NATIVE_SERVER_SOURCE_PATH;
     let native_server_routes_source_path = NATIVE_SERVER_ROUTES_SOURCE_PATH;
     let native_server_router_source_path = NATIVE_SERVER_ROUTER_SOURCE_PATH;
@@ -19101,10 +19176,12 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
         write_native_runtime_image_plan_artifact(
             out,
             native_runtime_image_plan_path,
+            native_runtime_image_dockerfile_path,
             server_artifact_path,
             native_server_plan_path,
             server_artifact,
         )?;
+        write_native_runtime_image_dockerfile(out, native_runtime_image_dockerfile_path)?;
         write_native_server_launcher_source(
             out,
             native_server_source_path,
@@ -21388,6 +21465,7 @@ const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
 const NATIVE_RUNTIME_IMAGE_PLAN_PATH: &str = "server/runtime-image.json";
+const NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH: &str = "server/native/Dockerfile";
 const NATIVE_SERVER_SOURCE_PATH: &str = "server/native/main.rs";
 const NATIVE_SERVER_ROUTES_SOURCE_PATH: &str = "server/native/routes.rs";
 const NATIVE_SERVER_ROUTER_SOURCE_PATH: &str = "server/native/router.rs";
@@ -21689,6 +21767,7 @@ fn write_native_server_plan_artifact(
 fn write_native_runtime_image_plan_artifact(
     out: &Path,
     path: &str,
+    dockerfile_path: &str,
     server_artifact_path: &str,
     native_server_plan_path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
@@ -21709,7 +21788,19 @@ fn write_native_runtime_image_plan_artifact(
             binary: NATIVE_SERVER_BINARY_PATH.to_string(),
             protocol: "http1".to_string(),
         },
-        blocked_by: native_server_plan_blockers(direct_http),
+        dockerfile: dockerfile_path.to_string(),
+        commands: orv_compiler::NativeRuntimeImageCommands {
+            build: vec![
+                "docker".to_string(),
+                "build".to_string(),
+                "-f".to_string(),
+                dockerfile_path.to_string(),
+                "-t".to_string(),
+                NATIVE_RUNTIME_IMAGE_NAME.to_string(),
+                ".".to_string(),
+            ],
+        },
+        blocked_by: native_runtime_image_plan_blockers(direct_http),
         listen: server_artifact.listen.clone(),
         routes: server_artifact.routes.clone(),
     };
@@ -21734,13 +21825,40 @@ fn native_runtime_image_plan_status(direct_http: bool) -> &'static str {
 
 fn native_server_plan_blockers(direct_http: bool) -> Vec<String> {
     if direct_http {
-        vec!["native-runtime-image".to_string()]
+        Vec::new()
     } else {
         vec![
             "native-codegen".to_string(),
             "native-runtime-image".to_string(),
         ]
     }
+}
+
+fn native_runtime_image_plan_blockers(direct_http: bool) -> Vec<String> {
+    if direct_http {
+        Vec::new()
+    } else {
+        vec![
+            "native-codegen".to_string(),
+            "native-runtime-image".to_string(),
+        ]
+    }
+}
+
+fn write_native_runtime_image_dockerfile(out: &Path, path: &str) -> anyhow::Result<()> {
+    let dockerfile = r#"FROM rust:1-bookworm AS build
+WORKDIR /work
+COPY server/native /work/server/native
+RUN cargo build --manifest-path /work/server/native/Cargo.toml --release
+
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY . /app
+COPY --from=build /work/server/native/target/release/orv-native-server /app/server/app
+ENV ORV_BUILD_DIR=/app
+ENTRYPOINT ["/app/server/app"]
+"#;
+    write_text(&out.join(path), dockerfile)
 }
 
 fn write_native_server_launcher_source(
@@ -22074,6 +22192,12 @@ ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server
 ```
 
 The generated launcher path can infer the build directory; ORV_BUILD_DIR is an explicit override.
+
+## Native Runtime Image
+
+```sh
+docker build -f server/native/Dockerfile -t orv-native-server:latest .
+```
 
 ## Request Trace
 
@@ -30832,7 +30956,7 @@ entry = "src/main.orv"
             .expect("blocked_by")
             .iter()
             .any(|item| item == "native-codegen"));
-        assert!(native_plan["blocked_by"]
+        assert!(!native_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")
             .iter()
@@ -30958,6 +31082,16 @@ entry = "src/main.orv"
             "native_runtime_image_plan",
             "server/runtime-image.json",
         );
+        assert_manifest_artifact(
+            &out.join("build-manifest.json"),
+            "native_runtime_image_dockerfile",
+            NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH,
+        );
+        assert_bundle_target(
+            &out.join("bundle-plan.json"),
+            "native_runtime_image_dockerfile",
+            NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH,
+        );
         assert_eq!(
             native_plan["runtime_image_plan"],
             "server/runtime-image.json"
@@ -30973,17 +31107,44 @@ entry = "src/main.orv"
         );
         assert_eq!(image_plan["target"]["kind"], "oci_image");
         assert_eq!(image_plan["target"]["binary"], NATIVE_SERVER_BINARY_PATH);
+        assert_eq!(
+            image_plan["dockerfile"],
+            NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH
+        );
+        assert_eq!(
+            image_plan["commands"]["build"],
+            serde_json::json!([
+                "docker",
+                "build",
+                "-f",
+                NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH,
+                "-t",
+                NATIVE_RUNTIME_IMAGE_NAME,
+                "."
+            ])
+        );
         assert_eq!(image_plan["routes"], server_artifact["routes"]);
         assert!(!image_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")
             .iter()
             .any(|item| item == "native-codegen"));
-        assert!(image_plan["blocked_by"]
+        assert!(!image_plan["blocked_by"]
             .as_array()
             .expect("blocked_by")
             .iter()
             .any(|item| item == "native-runtime-image"));
+        let dockerfile = std::fs::read_to_string(out.join(NATIVE_RUNTIME_IMAGE_DOCKERFILE_PATH))
+            .expect("native runtime image Dockerfile");
+        assert!(dockerfile.contains("FROM rust:"));
+        assert!(dockerfile
+            .contains("cargo build --manifest-path /work/server/native/Cargo.toml --release"));
+        assert!(dockerfile.contains("COPY . /app"));
+        assert!(dockerfile.contains(
+            "COPY --from=build /work/server/native/target/release/orv-native-server /app/server/app"
+        ));
+        assert!(dockerfile.contains("ENV ORV_BUILD_DIR=/app"));
+        assert!(dockerfile.contains("ENTRYPOINT [\"/app/server/app\"]"));
 
         cmd_verify_build(&out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
@@ -32422,6 +32583,8 @@ entry = "src/main.orv"
         assert!(
             runbook.contains("ORV_BUILD_DIR=. ./server/native/target/release/orv-native-server")
         );
+        assert!(runbook
+            .contains("docker build -f server/native/Dockerfile -t orv-native-server:latest ."));
         assert!(runbook.contains("ORV_BUILD_DIR is an explicit override"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("/__orv/trace/events"));

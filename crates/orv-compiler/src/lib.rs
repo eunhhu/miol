@@ -213,10 +213,10 @@ pub struct NativeServerRunCommand {
     pub command: Vec<String>,
 }
 
-/// Planned native runtime image output descriptor.
+/// Native runtime image output descriptor.
 ///
-/// This records the current reference runtime image and the future native OCI
-/// image target without claiming that the final image exists yet.
+/// Direct-lowered HTTP artifacts can use the generated native Dockerfile now;
+/// dynamic artifacts keep blockers until native codegen can lower them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeRuntimeImagePlanArtifact {
     /// Schema version.
@@ -237,6 +237,10 @@ pub struct NativeRuntimeImagePlanArtifact {
     pub reference_image: String,
     /// Planned final native runtime image target.
     pub target: NativeRuntimeImageTargetArtifact,
+    /// Generated Dockerfile for the native image target.
+    pub dockerfile: String,
+    /// Generated native runtime image build command.
+    pub commands: NativeRuntimeImageCommands,
     /// Blockers before this can become a final native runtime image.
     pub blocked_by: Vec<String>,
     /// Source-backed listen descriptor used by the reference server.
@@ -256,6 +260,13 @@ pub struct NativeRuntimeImageTargetArtifact {
     pub binary: String,
     /// Transport protocol used by the image.
     pub protocol: String,
+}
+
+/// Generated native runtime image commands.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeRuntimeImageCommands {
+    /// Build command argv.
+    pub build: Vec<String>,
 }
 
 /// Source snapshot embedded in the reference runtime artifact.
@@ -669,6 +680,10 @@ pub fn build_manifest(entry: impl Into<String>, origin_map: &OriginMap) -> Build
             path: "server/runtime-image.json".to_string(),
         });
         artifacts.push(BuildArtifact {
+            kind: "native_runtime_image_dockerfile".to_string(),
+            path: "server/native/Dockerfile".to_string(),
+        });
+        artifacts.push(BuildArtifact {
             kind: "native_server_launcher_source".to_string(),
             path: "server/native/main.rs".to_string(),
         });
@@ -754,6 +769,11 @@ pub fn bundle_plan(manifest: &BuildManifest) -> BundlePlan {
         bundles.push(BundleTarget {
             kind: "native_runtime_image_plan".to_string(),
             path: "server/runtime-image.json".to_string(),
+            runtime_features: manifest.capabilities.runtime_features.clone(),
+        });
+        bundles.push(BundleTarget {
+            kind: "native_runtime_image_dockerfile".to_string(),
+            path: "server/native/Dockerfile".to_string(),
             runtime_features: manifest.capabilities.runtime_features.clone(),
         });
         bundles.push(BundleTarget {
@@ -5733,6 +5753,12 @@ function greet(name: string): string -> "hi {name}""#,
                 && bundle.runtime_features.contains(&"router".to_string())
         }));
         assert!(plan.bundles.iter().any(|bundle| {
+            bundle.kind == "native_runtime_image_dockerfile"
+                && bundle.path == "server/native/Dockerfile"
+                && bundle.runtime_features.contains(&"http_server".to_string())
+                && bundle.runtime_features.contains(&"router".to_string())
+        }));
+        assert!(plan.bundles.iter().any(|bundle| {
             bundle.kind == "native_server_routes_source"
                 && bundle.path == "server/native/routes.rs"
                 && bundle.runtime_features.contains(&"http_server".to_string())
@@ -5777,6 +5803,10 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_launcher_source"
                 && artifact.path == "server/native/main.rs"
+        }));
+        assert!(manifest.artifacts.iter().any(|artifact| {
+            artifact.kind == "native_runtime_image_dockerfile"
+                && artifact.path == "server/native/Dockerfile"
         }));
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.kind == "native_server_routes_source"
