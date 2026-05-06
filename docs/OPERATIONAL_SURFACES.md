@@ -124,4 +124,4 @@ Runtime commerce adapters currently provide local reference handles: `@payment.c
 
 The shop `POST /checkout` route composes member lookup, stock reservation, payment capture, shipment booking, and final order status update in one browser/API path while preserving the separate member/order/payment/shipment routes for explicit operations.
 
-CLI DB commands provide schema/data dry-run, drift verification, apply/migrate with history, rollback, local backup/restore, hash-verified WAL recovery, archive manifest generation, manifest-relative source WAL resolution, raw-WAL/archive point-in-time restore, and history squash.
+CLI DB commands provide schema/data dry-run, drift verification, apply/migrate with history, rollback, local backup/restore, hash-verified WAL recovery, archive manifest generation, `file://` archive target copies, HTTP `POST` archive target uploads, manifest-relative source WAL resolution, raw-WAL/archive point-in-time restore, and history squash.

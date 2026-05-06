@@ -2127,6 +2127,8 @@ await @db.transaction @hint isolation=serializable {
 
 `@server` boot body에서 실행한 `@db.wal(path)`/`@db.load(path)` 설정 또는 `let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")` 같은 adapter handle은 route handler에 전달된다. 따라서 shop scaffold는 env-overridable SQLite-backed `shopdb` handle을 route에서 캡처해 서버 시작 시 row JSON을 reload하고 이후 상품/회원 가입/로그인 세션/주문/결제/배송 mutation을 같은 SQLite 파일에 기록한다. `POST /checkout`은 회원 조회, 재고 차감, 주문 생성, 결제 capture, 배송 booking, 주문 상태 갱신을 한 route에서 실행하고, `GET /admin/catalog`는 Product row를 browser catalog read model로 렌더링하며, `GET /admin/summary`는 같은 handle의 `count` 집계를 사용해 상품/회원/주문/결제/배송 row count를 운영 API로 노출한다.
 
+2026-05-06 보충: HTTP archive target upload는 구현되어 `orv db archive --target http://host/archive`가 WAL과 manifest를 HTTP `POST`로 업로드하고 local manifest에 remote WAL/manifest URL을 기록한다. S3/object-store target과 remote-target restore/discovery는 여전히 로드맵이다.
+
 **로드맵 보장:**
 - Write-Ahead Log (WAL) + fsync로 내구성 보장
 - 실패 시 자동 롤백
@@ -2152,7 +2154,7 @@ await @db.transaction @hint isolation=serializable {
 - `orv db restore --backup backup.json --data data.json` — 현재 구현: local backup artifact에서 JSON snapshot 복원
 - `orv db recover --wal db.wal.jsonl --out data.json --until-record 128`, `--archive archive.json`, `--until-unix-ms 1770000000000`, 또는 `--until-time 2026-05-02T12:00:00Z` — 현재 구현: JSONL WAL 또는 hash-verified archive manifest WAL을 record count, unix ms timestamp, 또는 RFC3339 timestamp 경계까지 재생해 `@db.save` 호환 snapshot 복구
 - `orv db restore --wal db.wal.jsonl --data data.json --at 2026-05-02T12:00:00Z`, `--archive archive.json` — 현재 구현: raw WAL 또는 hash-verified archive manifest WAL을 지정 시점까지 재생해 snapshot 복원
-- `orv db archive --wal db.wal.jsonl --out archive.json [--target file:///archive]` — 현재 구현: WAL record/timestamp/hash manifest artifact 생성 및 file archive target 복사. manifest 안의 relative WAL path는 archive manifest 디렉터리 기준으로 복구된다.
+- `orv db archive --wal db.wal.jsonl --out archive.json [--target file:///archive|http://host/archive]` — 현재 구현: WAL record/timestamp/hash manifest artifact 생성, file archive target 복사, HTTP archive target WAL/manifest `POST` 업로드. manifest 안의 relative WAL path는 archive manifest 디렉터리 기준으로 복구된다.
 - `orv db backup --target s3://bucket/path` — 로드맵: 포인트-인-타임 백업 (WAL 아카이브)
 - `orv db restore --at "2026-04-17T12:00Z" --target s3://bucket/path` — 로드맵: 원격 archive target 기반 PITR
 - `@db.connect "memory://local"` — 현재 구현: reference in-memory handle 반환. `@db.connect "file://data/app.wal.jsonl"`은 local WAL-backed handle을 반환하고, `@db.connect "sqlite://data/app.sqlite"`는 실제 SQLite 파일에 ORV row JSON을 지속한다. `postgres://`/`mysql://` 외부 DB 어댑터는 로드맵이며 현재는 명시적으로 실패한다. 기존 자산 이전/상호운용용이며, 프로덕션 기본 경로로는 비권장
@@ -2180,7 +2182,7 @@ Applying 0003_add_user_avatar.orv... OK
 | `orv db rollback` | 최근 schema/data snapshot 백업 복원 (가능한 경우) |
 | `orv db restore` | local backup artifact, raw WAL, 또는 hash-verified archive manifest WAL에서 data snapshot 복원 |
 | `orv db recover` | JSONL WAL 또는 hash-verified archive manifest WAL을 record count, unix ms timestamp, 또는 RFC3339 timestamp 경계까지 재생해 data snapshot 복구 |
-| `orv db archive` | JSONL WAL record/timestamp/hash manifest 생성 및 `file://` archive target 복사 |
+| `orv db archive` | JSONL WAL record/timestamp/hash manifest 생성 및 `file://` 복사/`http://` POST archive target 업로드 |
 | `orv db squash` | 여러 migration history action을 하나로 압축 (초기 빌드용) |
 
 **생성 규칙:**

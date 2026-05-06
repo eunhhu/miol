@@ -2662,14 +2662,14 @@ fn cmd_db_recover_from_inputs(
 fn cmd_db_archive(wal: &Path, out: &Path, target: Option<&str>) -> anyhow::Result<()> {
     let mut manifest = db_wal_archive_manifest(wal)?;
     let archive_target = target
-        .map(|target| db_archive_file_target(target, wal, out))
+        .map(|target| db_archive_target(target, wal, out))
         .transpose()?;
     if let Some(target) = &archive_target {
-        manifest["target"] = db_archive_file_target_json(target);
+        manifest["target"] = db_archive_target_json(target);
     }
     write_json_atomic(out, &manifest)?;
     if let Some(target) = &archive_target {
-        copy_db_archive_to_file_target(wal, out, target)?;
+        copy_db_archive_to_target(wal, out, target)?;
     }
     println!(
         "db archive: {} written from {}",
@@ -2749,13 +2749,20 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
     if manifest.get("kind").and_then(serde_json::Value::as_str) != Some("orv.db.wal_archive") {
         anyhow::bail!("db archive kind must be orv.db.wal_archive");
     }
+    let target_kind = manifest
+        .pointer("/target/kind")
+        .and_then(serde_json::Value::as_str);
     if let Some(target_path) = manifest
         .pointer("/target/wal/path")
         .and_then(serde_json::Value::as_str)
     {
-        let wal_path = lsp_file_uri_path(target_path)?;
-        verify_db_archive_wal(&manifest, &wal_path)?;
-        return Ok(wal_path);
+        if target_kind == Some("file")
+            || (target_kind.is_none() && target_path.starts_with("file://"))
+        {
+            let wal_path = lsp_file_uri_path(target_path)?;
+            verify_db_archive_wal(&manifest, &wal_path)?;
+            return Ok(wal_path);
+        }
     }
     let wal_path = manifest
         .pointer("/wal/path")
@@ -2805,14 +2812,32 @@ struct DbArchiveFileTarget {
     manifest_path: PathBuf,
 }
 
+struct DbArchiveHttpTarget {
+    uri: String,
+    wal_url: String,
+    manifest_url: String,
+}
+
+enum DbArchiveTarget {
+    File(DbArchiveFileTarget),
+    Http(DbArchiveHttpTarget),
+}
+
+fn db_archive_target(target: &str, wal: &Path, manifest: &Path) -> anyhow::Result<DbArchiveTarget> {
+    if target.starts_with("file://") {
+        return db_archive_file_target(target, wal, manifest).map(DbArchiveTarget::File);
+    }
+    if target.starts_with("http://") {
+        return db_archive_http_target(target, wal, manifest).map(DbArchiveTarget::Http);
+    }
+    anyhow::bail!("unsupported db archive target `{target}`");
+}
+
 fn db_archive_file_target(
     target: &str,
     wal: &Path,
     manifest: &Path,
 ) -> anyhow::Result<DbArchiveFileTarget> {
-    if !target.starts_with("file://") {
-        anyhow::bail!("unsupported db archive target `{target}`");
-    }
     let target_dir = lsp_file_uri_path(target)?;
     let wal_name = wal
         .file_name()
@@ -2840,6 +2865,71 @@ fn db_archive_file_target_json(target: &DbArchiveFileTarget) -> serde_json::Valu
     })
 }
 
+fn db_archive_http_target(
+    target: &str,
+    wal: &Path,
+    manifest: &Path,
+) -> anyhow::Result<DbArchiveHttpTarget> {
+    let _ = parse_http_url(target)?;
+    let wal_name = db_archive_target_file_name(wal, "WAL path")?;
+    let manifest_name = db_archive_target_file_name(manifest, "archive manifest path")?;
+    let base = target.trim_end_matches('/');
+    Ok(DbArchiveHttpTarget {
+        uri: target.to_string(),
+        wal_url: format!("{base}/{wal_name}"),
+        manifest_url: format!("{base}/{manifest_name}"),
+    })
+}
+
+fn db_archive_target_file_name(path: &Path, label: &str) -> anyhow::Result<String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{label} must include a file name"))?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} file name must be UTF-8"))?;
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|ch| matches!(ch, '/' | '\\' | '?' | '#' | '\r' | '\n'))
+    {
+        anyhow::bail!("{label} file name contains characters unsupported by archive targets");
+    }
+    Ok(name.to_string())
+}
+
+fn db_archive_http_target_json(target: &DbArchiveHttpTarget) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "http",
+        "uri": target.uri.clone(),
+        "wal": {
+            "method": "POST",
+            "path": target.wal_url.clone(),
+        },
+        "manifest": {
+            "method": "POST",
+            "path": target.manifest_url.clone(),
+        },
+    })
+}
+
+fn db_archive_target_json(target: &DbArchiveTarget) -> serde_json::Value {
+    match target {
+        DbArchiveTarget::File(target) => db_archive_file_target_json(target),
+        DbArchiveTarget::Http(target) => db_archive_http_target_json(target),
+    }
+}
+
+fn copy_db_archive_to_target(
+    wal: &Path,
+    manifest: &Path,
+    target: &DbArchiveTarget,
+) -> anyhow::Result<()> {
+    match target {
+        DbArchiveTarget::File(target) => copy_db_archive_to_file_target(wal, manifest, target),
+        DbArchiveTarget::Http(target) => upload_db_archive_to_http_target(wal, manifest, target),
+    }
+}
+
 fn copy_db_archive_to_file_target(
     wal: &Path,
     manifest: &Path,
@@ -2863,6 +2953,82 @@ fn copy_db_archive_to_file_target(
         )
     })?;
     Ok(())
+}
+
+fn upload_db_archive_to_http_target(
+    wal: &Path,
+    manifest: &Path,
+    target: &DbArchiveHttpTarget,
+) -> anyhow::Result<()> {
+    let wal_body = std::fs::read(wal)
+        .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
+    http_post_bytes(
+        &target.wal_url,
+        "application/x-jsonlines; charset=utf-8",
+        &wal_body,
+        "db archive WAL upload",
+    )?;
+    let manifest_body = std::fs::read(manifest).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read archive manifest {}: {e}",
+            manifest.display()
+        )
+    })?;
+    http_post_bytes(
+        &target.manifest_url,
+        "application/json; charset=utf-8",
+        &manifest_body,
+        "db archive manifest upload",
+    )
+}
+
+fn http_post_bytes(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+) -> anyhow::Result<()> {
+    let (host, port, path) = parse_http_url(url)?;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| anyhow::anyhow!("{context} failed to connect {host}:{port}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| anyhow::anyhow!("{context} failed to configure read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| anyhow::anyhow!("{context} failed to configure write timeout: {e}"))?;
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|e| anyhow::anyhow!("{context} failed to write request {url}: {e}"))?;
+    std::io::Write::write_all(&mut stream, body)
+        .map_err(|e| anyhow::anyhow!("{context} failed to write body {url}: {e}"))?;
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response)
+        .map_err(|e| anyhow::anyhow!("{context} failed to read response {url}: {e}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("{context} response missing HTTP header terminator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|e| anyhow::anyhow!("{context} response headers are not UTF-8: {e}"))?;
+    let status = headers.lines().next().unwrap_or_default();
+    if !http_status_is_success(status) {
+        let response_body = String::from_utf8_lossy(&response[header_end + 4..]);
+        anyhow::bail!("{context} {url} failed with {status}: {response_body}");
+    }
+    Ok(())
+}
+
+fn http_status_is_success(status: &str) -> bool {
+    status.starts_with("HTTP/1.1 2") || status.starts_with("HTTP/1.0 2")
 }
 
 fn parse_db_recover_time_unix_ms(input: &str) -> anyhow::Result<u64> {

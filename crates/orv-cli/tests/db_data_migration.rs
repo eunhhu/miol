@@ -1,6 +1,8 @@
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -17,6 +19,42 @@ fn orv() -> Command {
 fn read_json(path: &Path) -> serde_json::Value {
     let source = std::fs::read_to_string(path).expect("read json");
     serde_json::from_str(&source).expect("parse json")
+}
+
+fn read_http_request(mut stream: TcpStream) -> (String, Vec<u8>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read request header");
+        headers.push(byte[0]);
+    }
+    let headers = String::from_utf8(headers).expect("request headers utf-8");
+    let request_path = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("request path")
+        .to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .expect("content length")
+        .parse::<usize>()
+        .expect("content length number");
+    let mut body = vec![0_u8; content_length];
+    stream.read_exact(&mut body).expect("read request body");
+    let response_body = "{}";
+    write!(
+        stream,
+        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    )
+    .expect("write response");
+    (request_path, body)
 }
 
 #[test]
@@ -508,6 +546,73 @@ fn db_archive_file_target_copies_wal_and_manifest() {
     );
     let uploaded = read_json(&uploaded_manifest);
     assert_eq!(uploaded["target"], manifest["target"]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn db_archive_http_target_uploads_wal_and_manifest() {
+    let dir = temp_dir("db-archive-http-target");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    std::fs::write(
+        &wal,
+        r#"{"schema_version":1,"op":"create","ts_unix_ms":1000,"table":"User","data":{"email":"a@example.com"}}
+"#,
+    )
+    .expect("write wal");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind archive target");
+    let address = listener.local_addr().expect("archive target address");
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().expect("accept archive upload");
+            requests.push(read_http_request(stream));
+        }
+        requests
+    });
+
+    let target = format!("http://{address}/archive");
+    let output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg(&target)
+        .output()
+        .expect("run db archive");
+
+    assert!(
+        output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().expect("archive server finished");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "/archive/db.wal.jsonl");
+    assert_eq!(
+        String::from_utf8(requests[0].1.clone()).expect("uploaded wal utf-8"),
+        std::fs::read_to_string(&wal).expect("source wal")
+    );
+    assert_eq!(requests[1].0, "/archive/archive.json");
+    let manifest = read_json(&archive);
+    assert_eq!(manifest["target"]["kind"], "http");
+    assert_eq!(manifest["target"]["uri"], target);
+    assert_eq!(
+        manifest["target"]["wal"]["path"],
+        format!("{target}/db.wal.jsonl")
+    );
+    assert_eq!(
+        manifest["target"]["manifest"]["path"],
+        format!("{target}/archive.json")
+    );
+    let uploaded_manifest: serde_json::Value =
+        serde_json::from_slice(&requests[1].1).expect("uploaded manifest json");
+    assert_eq!(uploaded_manifest["target"], manifest["target"]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
