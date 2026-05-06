@@ -16793,27 +16793,75 @@ fn deploy_env_check_with_lookup<F>(dir: &Path, mut lookup: F) -> anyhow::Result<
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let adapters_path = dir.join("deploy").join("commerce-adapters.json");
-    if !adapters_path.is_file() {
+    let db_adapters_path = dir.join("deploy").join("db-adapters.json");
+    if !db_adapters_path.is_file() {
         anyhow::bail!(
-            "missing deploy commerce adapters artifact: {}",
-            adapters_path.display()
+            "missing deploy DB adapters artifact: {}",
+            db_adapters_path.display()
         );
     }
-    let adapters = read_json_value(&adapters_path)?;
-    if adapters
+    let db_adapters = read_json_value(&db_adapters_path)?;
+    if db_adapters
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy DB adapters schema_version must be 1");
+    }
+    if json_str(&db_adapters, "kind", "deploy DB adapters")? != "orv.deploy.db_adapters" {
+        anyhow::bail!("deploy DB adapters kind must be orv.deploy.db_adapters");
+    }
+
+    let commerce_adapters_path = dir.join("deploy").join("commerce-adapters.json");
+    if !commerce_adapters_path.is_file() {
+        anyhow::bail!(
+            "missing deploy commerce adapters artifact: {}",
+            commerce_adapters_path.display()
+        );
+    }
+    let commerce_adapters = read_json_value(&commerce_adapters_path)?;
+    if commerce_adapters
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         != Some(1)
     {
         anyhow::bail!("deploy commerce adapters schema_version must be 1");
     }
-    if json_str(&adapters, "kind", "deploy commerce adapters")? != "orv.deploy.commerce_adapters" {
+    if json_str(&commerce_adapters, "kind", "deploy commerce adapters")?
+        != "orv.deploy.commerce_adapters"
+    {
         anyhow::bail!("deploy commerce adapters kind must be orv.deploy.commerce_adapters");
     }
     let mut missing = Vec::new();
     let mut optional_missing = Vec::new();
-    for adapter in adapters
+    for adapter in db_adapters
+        .get("adapters")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy DB adapters must include adapters array"))?
+    {
+        let Some(variable) = adapter.get("env").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if adapter
+            .get("default")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|default| !default.trim().is_empty())
+        {
+            continue;
+        }
+        if lookup(variable)
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            continue;
+        }
+        let provider = adapter
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("db");
+        missing.push(format!("db {provider} {variable}"));
+    }
+    for adapter in commerce_adapters
         .get("adapters")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("deploy commerce adapters must include adapters array"))?
@@ -33416,6 +33464,39 @@ entry = "src/main.orv"
             _ => None,
         })
         .expect("optional webhook envs may be absent");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn deploy_env_check_reports_missing_required_db_adapter_env() {
+        let dir = temp_output_dir("deploy-env-check-db-source");
+        std::fs::create_dir_all(&dir).expect("create db adapter source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL)
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db adapter source");
+        let out = temp_output_dir("deploy-env-check-db");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let err =
+            deploy_env_check_with_lookup(&out, |_| None).expect_err("required DB env missing");
+        let message = err.to_string();
+        assert!(message.contains("SHOP_DATABASE_URL"), "{message}");
+
+        deploy_env_check_with_lookup(&out, |env| match env {
+            "SHOP_DATABASE_URL" => Some("postgres://db.internal/shop".to_string()),
+            _ => None,
+        })
+        .expect("configured DB env passes");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
