@@ -2849,6 +2849,7 @@ mod tests {
             assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
+            assert!(home_html.contains("<a href=\"/catalog\">Shop catalog</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /webhooks/stripe"));
             assert!(home_html.contains("POST /shipments"));
@@ -2912,6 +2913,16 @@ mod tests {
             let list: serde_json::Value = serde_json::from_slice(&list_body).expect("list json");
             assert_eq!(list["products"].as_array().map(Vec::len), Some(2));
             assert_eq!(list["products"][0]["name"], serde_json::json!("Kettle"));
+
+            let (catalog_status, catalog_ct, catalog_body) =
+                send_request(addr, "GET", "/catalog", None).await;
+            assert_eq!(catalog_status, 200);
+            assert_eq!(catalog_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let catalog_html = String::from_utf8(catalog_body).expect("catalog html");
+            assert!(catalog_html.contains("<h1>Shop Catalog</h1>"));
+            assert!(catalog_html.contains("Kettle"));
+            assert!(catalog_html.contains("Mug"));
+            assert!(catalog_html.contains("stock 3"));
 
             let (admin_catalog_status, admin_catalog_ct, admin_catalog_body) =
                 send_request(addr, "GET", "/admin/catalog", None).await;

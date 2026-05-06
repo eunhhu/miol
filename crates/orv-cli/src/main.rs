@@ -2286,6 +2286,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 ## Routes\n\
 \n\
 - `GET /`\n\
+- `GET /catalog`\n\
 - `GET /admin`\n\
 - `GET /admin/catalog`\n\
 - `GET /admin/summary`\n\
@@ -22745,6 +22746,9 @@ test "checkout failing runtime body" {
         ));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
+        assert!(source.contains("@a href=\"/catalog\" \"Shop catalog\""));
+        assert!(source.contains("@route GET /catalog"));
+        assert!(source.contains("Shop Catalog"));
         assert!(source.contains("@a href=\"/admin\" \"Admin dashboard\""));
         assert!(source.contains("@route GET /admin"));
         assert!(source.contains("Operations dashboard"));
@@ -22853,6 +22857,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("GET /"));
+        assert!(guide.contains("GET /catalog"));
         assert!(guide.contains("GET /admin"));
         assert!(guide.contains("GET /admin/catalog"));
         assert!(guide.contains("GET /admin/summary"));
@@ -22895,6 +22900,7 @@ test "checkout failing runtime body" {
                 .expect("native routes source");
         for (method, path) in [
             ("GET", "/"),
+            ("GET", "/catalog"),
             ("GET", "/admin"),
             ("GET", "/admin/catalog"),
             ("GET", "/admin/summary"),

@@ -21,6 +21,7 @@
         @h1 "Miol Shop"
         @p "Catalog, member signup, payment capture, and shipment booking are ready."
         @nav {
+          @a href="/catalog" "Shop catalog"
           @a href="/admin" "Admin dashboard"
         }
         @section {
@@ -187,6 +188,20 @@
         @ul {
           for product in products {
             @li "{product.sku}: {product.name} / stock {product.stock}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /catalog {
+    let products = await shopdb.findAll("Product", {})
+    @serve @html {
+      @body {
+        @h1 "Shop Catalog"
+        @ul {
+          for product in products {
+            @li "{product.name} ({product.sku}) / price {product.price} / stock {product.stock}"
           }
         }
       }
