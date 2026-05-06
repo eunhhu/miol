@@ -47,6 +47,7 @@ const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
 const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
+const DB_ARCHIVE_S3_ENDPOINT_ENV: &str = "ORV_DB_ARCHIVE_S3_ENDPOINT";
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -2778,6 +2779,12 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
             return download_db_archive_wal_to_cache(archive, &manifest, target_path);
         }
     }
+    if target_kind == Some("s3") {
+        if let Some(target_path) = target_wal_path {
+            let url = db_archive_s3_http_url(target_path)?;
+            return download_db_archive_wal_to_cache(archive, &manifest, &url);
+        }
+    }
     verify_db_archive_wal(&manifest, &wal_path)?;
     Ok(wal_path)
 }
@@ -2883,9 +2890,20 @@ struct DbArchiveHttpTarget {
     manifest_url: String,
 }
 
+struct DbArchiveS3Target {
+    uri: String,
+    bucket: String,
+    prefix: String,
+    wal_uri: String,
+    manifest_uri: String,
+    wal_url: String,
+    manifest_url: String,
+}
+
 enum DbArchiveTarget {
     File(DbArchiveFileTarget),
     Http(DbArchiveHttpTarget),
+    S3(DbArchiveS3Target),
 }
 
 fn db_archive_target(target: &str, wal: &Path, manifest: &Path) -> anyhow::Result<DbArchiveTarget> {
@@ -2894,6 +2912,9 @@ fn db_archive_target(target: &str, wal: &Path, manifest: &Path) -> anyhow::Resul
     }
     if target.starts_with("http://") {
         return db_archive_http_target(target, wal, manifest).map(DbArchiveTarget::Http);
+    }
+    if target.starts_with("s3://") {
+        return db_archive_s3_target(target, wal, manifest).map(DbArchiveTarget::S3);
     }
     anyhow::bail!("unsupported db archive target `{target}`");
 }
@@ -2977,10 +2998,50 @@ fn db_archive_http_target_json(target: &DbArchiveHttpTarget) -> serde_json::Valu
     })
 }
 
+fn db_archive_s3_target(
+    target: &str,
+    wal: &Path,
+    manifest: &Path,
+) -> anyhow::Result<DbArchiveS3Target> {
+    let location = parse_db_archive_s3_uri(target)?;
+    let wal_name = db_archive_target_file_name(wal, "WAL path")?;
+    let manifest_name = db_archive_target_file_name(manifest, "archive manifest path")?;
+    let wal_uri = db_archive_s3_child_uri(&location, &wal_name);
+    let manifest_uri = db_archive_s3_child_uri(&location, &manifest_name);
+    Ok(DbArchiveS3Target {
+        uri: target.to_string(),
+        bucket: location.bucket,
+        prefix: location.prefix,
+        wal_url: db_archive_s3_http_url(&wal_uri)?,
+        manifest_url: db_archive_s3_http_url(&manifest_uri)?,
+        wal_uri,
+        manifest_uri,
+    })
+}
+
+fn db_archive_s3_target_json(target: &DbArchiveS3Target) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "s3",
+        "uri": target.uri.clone(),
+        "endpoint_env": DB_ARCHIVE_S3_ENDPOINT_ENV,
+        "bucket": target.bucket.clone(),
+        "prefix": target.prefix.clone(),
+        "wal": {
+            "method": "PUT",
+            "path": target.wal_uri.clone(),
+        },
+        "manifest": {
+            "method": "PUT",
+            "path": target.manifest_uri.clone(),
+        },
+    })
+}
+
 fn db_archive_target_json(target: &DbArchiveTarget) -> serde_json::Value {
     match target {
         DbArchiveTarget::File(target) => db_archive_file_target_json(target),
         DbArchiveTarget::Http(target) => db_archive_http_target_json(target),
+        DbArchiveTarget::S3(target) => db_archive_s3_target_json(target),
     }
 }
 
@@ -2992,6 +3053,7 @@ fn copy_db_archive_to_target(
     match target {
         DbArchiveTarget::File(target) => copy_db_archive_to_file_target(wal, manifest, target),
         DbArchiveTarget::Http(target) => upload_db_archive_to_http_target(wal, manifest, target),
+        DbArchiveTarget::S3(target) => upload_db_archive_to_s3_target(wal, manifest, target),
     }
 }
 
@@ -3047,7 +3109,108 @@ fn upload_db_archive_to_http_target(
     )
 }
 
+fn upload_db_archive_to_s3_target(
+    wal: &Path,
+    manifest: &Path,
+    target: &DbArchiveS3Target,
+) -> anyhow::Result<()> {
+    let wal_body = std::fs::read(wal)
+        .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
+    http_put_bytes(
+        &target.wal_url,
+        "application/x-jsonlines; charset=utf-8",
+        &wal_body,
+        "db archive S3 WAL upload",
+    )?;
+    let manifest_body = std::fs::read(manifest).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read archive manifest {}: {e}",
+            manifest.display()
+        )
+    })?;
+    http_put_bytes(
+        &target.manifest_url,
+        "application/json; charset=utf-8",
+        &manifest_body,
+        "db archive S3 manifest upload",
+    )
+}
+
+struct DbArchiveS3Location {
+    bucket: String,
+    prefix: String,
+}
+
+fn parse_db_archive_s3_uri(uri: &str) -> anyhow::Result<DbArchiveS3Location> {
+    let rest = uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("db archive S3 target must start with s3://"))?;
+    let (bucket, prefix) = rest.split_once('/').map_or((rest, ""), |(bucket, prefix)| {
+        (bucket, prefix.trim_matches('/'))
+    });
+    if bucket.trim().is_empty() {
+        anyhow::bail!("db archive S3 target bucket must not be empty");
+    }
+    if bucket.contains('?')
+        || bucket.contains('#')
+        || bucket.contains('\r')
+        || bucket.contains('\n')
+    {
+        anyhow::bail!("db archive S3 target bucket contains unsupported characters");
+    }
+    if prefix.contains('?')
+        || prefix.contains('#')
+        || prefix.contains('\r')
+        || prefix.contains('\n')
+    {
+        anyhow::bail!("db archive S3 target prefix contains unsupported characters");
+    }
+    Ok(DbArchiveS3Location {
+        bucket: bucket.to_string(),
+        prefix: prefix.to_string(),
+    })
+}
+
+fn db_archive_s3_child_uri(location: &DbArchiveS3Location, name: &str) -> String {
+    if location.prefix.is_empty() {
+        format!("s3://{}/{}", location.bucket, name)
+    } else {
+        format!("s3://{}/{}/{}", location.bucket, location.prefix, name)
+    }
+}
+
+fn db_archive_s3_http_url(uri: &str) -> anyhow::Result<String> {
+    let location = parse_db_archive_s3_uri(uri)?;
+    let endpoint = std::env::var(DB_ARCHIVE_S3_ENDPOINT_ENV).map_err(|_| {
+        anyhow::anyhow!(
+            "db archive S3 target requires {DB_ARCHIVE_S3_ENDPOINT_ENV}=http://host[:port]"
+        )
+    })?;
+    let endpoint = endpoint.trim_end_matches('/');
+    let _ = parse_http_url(endpoint)?;
+    let mut url = format!("{endpoint}/{}", location.bucket);
+    if !location.prefix.is_empty() {
+        url.push('/');
+        url.push_str(&location.prefix);
+    }
+    Ok(url)
+}
+
 fn http_post_bytes(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+) -> anyhow::Result<()> {
+    http_send_bytes("POST", url, content_type, body, context)
+}
+
+fn http_put_bytes(url: &str, content_type: &str, body: &[u8], context: &str) -> anyhow::Result<()> {
+    http_send_bytes("PUT", url, content_type, body, context)
+}
+
+fn http_send_bytes(
+    method: &str,
     url: &str,
     content_type: &str,
     body: &[u8],
@@ -3068,7 +3231,7 @@ fn http_post_bytes(
         format!("{host}:{port}")
     };
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     std::io::Write::write_all(&mut stream, request.as_bytes())
