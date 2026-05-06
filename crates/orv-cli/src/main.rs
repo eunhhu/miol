@@ -2227,6 +2227,8 @@ Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default loc
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
+Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`; real provider API calls and webhooks are still future work.\n\
+\n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
 Back up `data/shop.sqlite` and commerce record logs with the mounted `data/` volume before deploy or backup rotation.\n\
@@ -16481,6 +16483,21 @@ fn verify_deploy_runbook_artifact(
             }
         }
     }
+    for adapter in &persistence.commerce_adapters {
+        let Some(provider) = &adapter.provider else {
+            continue;
+        };
+        for env in &adapter.provider_env {
+            let required = if env.required { "required" } else { "optional" };
+            let line = format!(
+                "- Commerce provider env: {} {provider} {} {required} {}",
+                adapter.kind, env.env, env.purpose
+            );
+            if !runbook.contains(&line) {
+                anyhow::bail!("deploy runbook must document {line}");
+            }
+        }
+    }
     for volume in &persistence.volumes {
         if !runbook.contains(&volume.compose_mount) {
             let mount = &volume.compose_mount;
@@ -19953,6 +19970,14 @@ struct DeployCommerceAdapter {
     default: Option<String>,
     endpoint: Option<String>,
     record_path: Option<String>,
+    provider_env: Vec<DeployProviderEnv>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DeployProviderEnv {
+    env: String,
+    required: bool,
+    purpose: String,
 }
 
 #[derive(Default)]
@@ -20094,7 +20119,28 @@ fn deploy_commerce_adapter_value(adapters: &[DeployCommerceAdapter]) -> Vec<serd
                         serde_json::Value::String(provider.clone()),
                     );
             }
+            if !adapter.provider_env.is_empty() {
+                value
+                    .as_object_mut()
+                    .expect("commerce adapter value is an object")
+                    .insert(
+                        "provider_env".to_string(),
+                        serde_json::Value::Array(deploy_provider_env_value(&adapter.provider_env)),
+                    );
+            }
             value
+        })
+        .collect()
+}
+
+fn deploy_provider_env_value(envs: &[DeployProviderEnv]) -> Vec<serde_json::Value> {
+    envs.iter()
+        .map(|env| {
+            serde_json::json!({
+                "env": env.env,
+                "required": env.required,
+                "purpose": env.purpose,
+            })
         })
         .collect()
 }
@@ -20163,12 +20209,17 @@ fn deploy_compose_volumes(persistence: &DeployPersistence) -> String {
 }
 
 fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String {
+    let has_provider_env = persistence
+        .commerce_adapters
+        .iter()
+        .any(|adapter| !adapter.provider_env.is_empty());
     if persistence.wal_paths.is_empty()
         && persistence.db_paths.is_empty()
         && persistence.db_env.is_empty()
         && persistence.record_paths.is_empty()
         && persistence.commerce_endpoints.is_empty()
         && persistence.commerce_env.is_empty()
+        && !has_provider_env
     {
         return String::new();
     }
@@ -20203,6 +20254,19 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
             None => {
                 let _ = writeln!(out, "- Commerce adapter env: {}", env.env);
             }
+        }
+    }
+    for adapter in &persistence.commerce_adapters {
+        let Some(provider) = &adapter.provider else {
+            continue;
+        };
+        for env in &adapter.provider_env {
+            let required = if env.required { "required" } else { "optional" };
+            let _ = writeln!(
+                out,
+                "- Commerce provider env: {} {provider} {} {required} {}",
+                adapter.kind, env.env, env.purpose
+            );
         }
     }
     for volume in &persistence.volumes {
@@ -20536,6 +20600,7 @@ fn collect_commerce_adapter_persistence_arg(
                 default: None,
                 endpoint: None,
                 record_path: None,
+                provider_env: Vec::new(),
             });
         }
         out.commerce_env.push(env);
@@ -20568,6 +20633,10 @@ fn collect_commerce_adapter_url(
     if provider.is_some() {
         mode = "provider".to_string();
     }
+    let provider_env = provider
+        .as_deref()
+        .map(commerce_provider_env)
+        .unwrap_or_default();
     out.commerce_adapters.push(DeployCommerceAdapter {
         kind: kind.to_string(),
         mode,
@@ -20576,6 +20645,7 @@ fn collect_commerce_adapter_url(
         default,
         endpoint,
         record_path,
+        provider_env,
     });
 }
 
@@ -20588,6 +20658,28 @@ fn commerce_provider(url: &str, kind: &str) -> Option<String> {
         ("payment", "stripe") => Some("stripe".to_string()),
         ("shipping", "carrier") => Some("carrier".to_string()),
         _ => None,
+    }
+}
+
+fn commerce_provider_env(provider: &str) -> Vec<DeployProviderEnv> {
+    match provider {
+        "stripe" => vec![
+            deploy_provider_env("STRIPE_SECRET_KEY", true, "api_secret"),
+            deploy_provider_env("STRIPE_WEBHOOK_SECRET", false, "webhook_signature"),
+        ],
+        "carrier" => vec![
+            deploy_provider_env("CARRIER_API_KEY", true, "api_key"),
+            deploy_provider_env("CARRIER_WEBHOOK_SECRET", false, "webhook_signature"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn deploy_provider_env(env: &str, required: bool, purpose: &str) -> DeployProviderEnv {
+    DeployProviderEnv {
+        env: env.to_string(),
+        required,
+        purpose: purpose.to_string(),
     }
 }
 
@@ -20752,6 +20844,10 @@ fn deploy_compose_environment_lines(
         };
         lines.push(value);
     }
+    for env in deploy_commerce_provider_envs(persistence) {
+        let variable = &env.env;
+        lines.push(format!("{variable}: \"${{{variable}}}\""));
+    }
     lines
 }
 
@@ -20785,6 +20881,11 @@ fn deploy_env_example_assignments(
             .iter()
             .map(deploy_adapter_env_assignment),
     );
+    assignments.extend(
+        deploy_commerce_provider_envs(persistence)
+            .iter()
+            .map(deploy_provider_env_assignment),
+    );
     assignments
 }
 
@@ -20808,6 +20909,20 @@ fn deploy_adapter_env_assignment(env: &DeployAdapterEnv) -> String {
         Some(default) => format!("{}={default}", env.env),
         None => format!("{}=", env.env),
     }
+}
+
+fn deploy_provider_env_assignment(env: &DeployProviderEnv) -> String {
+    format!("{}=", env.env)
+}
+
+fn deploy_commerce_provider_envs(persistence: &DeployPersistence) -> Vec<DeployProviderEnv> {
+    let mut envs = BTreeSet::new();
+    for adapter in &persistence.commerce_adapters {
+        for env in &adapter.provider_env {
+            envs.insert(env.clone());
+        }
+    }
+    envs.into_iter().collect()
 }
 
 fn deploy_runbook_port_assignment(
@@ -22582,6 +22697,10 @@ test "checkout failing runtime body" {
         assert!(guide.contains("provider-mode adapters"));
         assert!(guide.contains("stripe://"));
         assert!(guide.contains("carrier://"));
+        assert!(guide.contains("STRIPE_SECRET_KEY"));
+        assert!(guide.contains("STRIPE_WEBHOOK_SECRET"));
+        assert!(guide.contains("CARRIER_API_KEY"));
+        assert!(guide.contains("CARRIER_WEBHOOK_SECRET"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
@@ -32180,6 +32299,8 @@ entry = "src/main.orv"
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         let commerce_adapters = read_json_value(&out.join("deploy").join("commerce-adapters.json"))
             .expect("commerce adapters");
+        let env_example =
+            std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
 
@@ -32197,6 +32318,10 @@ entry = "src/main.orv"
         assert!(
             compose.contains(r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-carrier://local}""#)
         );
+        assert!(compose.contains(r#"STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY}""#));
+        assert!(compose.contains(r#"STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET}""#));
+        assert!(compose.contains(r#"CARRIER_API_KEY: "${CARRIER_API_KEY}""#));
+        assert!(compose.contains(r#"CARRIER_WEBHOOK_SECRET: "${CARRIER_WEBHOOK_SECRET}""#));
         assert_eq!(
             commerce_adapters["adapters"],
             serde_json::json!([
@@ -32208,6 +32333,18 @@ entry = "src/main.orv"
                     "default": "stripe://local",
                     "endpoint": null,
                     "record_path": null,
+                    "provider_env": [
+                        {
+                            "env": "STRIPE_SECRET_KEY",
+                            "required": true,
+                            "purpose": "api_secret"
+                        },
+                        {
+                            "env": "STRIPE_WEBHOOK_SECRET",
+                            "required": false,
+                            "purpose": "webhook_signature"
+                        }
+                    ],
                     "request": {
                         "method": "POST",
                         "content_type": "application/json",
@@ -32226,6 +32363,18 @@ entry = "src/main.orv"
                     "default": "carrier://local",
                     "endpoint": null,
                     "record_path": null,
+                    "provider_env": [
+                        {
+                            "env": "CARRIER_API_KEY",
+                            "required": true,
+                            "purpose": "api_key"
+                        },
+                        {
+                            "env": "CARRIER_WEBHOOK_SECRET",
+                            "required": false,
+                            "purpose": "webhook_signature"
+                        }
+                    ],
                     "request": {
                         "method": "POST",
                         "content_type": "application/json",
@@ -32238,11 +32387,27 @@ entry = "src/main.orv"
                 }
             ])
         );
+        assert!(env_example.contains("STRIPE_SECRET_KEY="));
+        assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
+        assert!(env_example.contains("CARRIER_API_KEY="));
+        assert!(env_example.contains("CARRIER_WEBHOOK_SECRET="));
         assert!(
             runbook.contains("- Commerce adapter env: PAYMENT_ADAPTER_URL default stripe://local")
         );
         assert!(runbook
             .contains("- Commerce adapter env: SHIPPING_ADAPTER_URL default carrier://local"));
+        assert!(runbook.contains(
+            "- Commerce provider env: payment stripe STRIPE_SECRET_KEY required api_secret"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: payment stripe STRIPE_WEBHOOK_SECRET optional webhook_signature"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: shipping carrier CARRIER_API_KEY required api_key"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: shipping carrier CARRIER_WEBHOOK_SECRET optional webhook_signature"
+        ));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
