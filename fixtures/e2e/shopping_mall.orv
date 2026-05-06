@@ -138,6 +138,10 @@
           @ul {
             @li { @a href="/admin/catalog" "Catalog read model" }
             @li { @a href="/admin/summary" "Operations summary" }
+            @li { @a href="/admin/orders" "Order read model" }
+            @li { @a href="/admin/payments" "Payment read model" }
+            @li { @a href="/admin/shipments" "Shipment read model" }
+            @li { @a href="/admin/webhooks" "Webhook read model" }
             @li { @a href="/products" "Catalog API" }
             @li { @a href="/orders/demo" "Orders by customer" }
             @li { @a href="/shipments/1" "Shipment lookup" }
@@ -183,6 +187,62 @@
         @ul {
           for product in products {
             @li "{product.sku}: {product.name} / stock {product.stock}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /admin/orders {
+    let orders = await shopdb.findAll("Order", {})
+    @serve @html {
+      @body {
+        @h1 "Orders"
+        @ul {
+          for order in orders {
+            @li "#{order.id}: {order.customer} / {order.sku} x {order.quantity} / {order.status}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /admin/payments {
+    let payments = await shopdb.findAll("Payment", {})
+    @serve @html {
+      @body {
+        @h1 "Payments"
+        @ul {
+          for payment in payments {
+            @li "#{payment.id}: order {payment.orderId} / {payment.status} / {payment.provider}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /admin/shipments {
+    let shipments = await shopdb.findAll("Shipment", {})
+    @serve @html {
+      @body {
+        @h1 "Shipments"
+        @ul {
+          for shipment in shipments {
+            @li "#{shipment.id}: order {shipment.orderId} / {shipment.status} / {shipment.tracking}"
+          }
+        }
+      }
+    }
+  }
+
+  @route GET /admin/webhooks {
+    let webhooks = await shopdb.findAll("WebhookEvent", {})
+    @serve @html {
+      @body {
+        @h1 "Webhooks"
+        @ul {
+          for webhook in webhooks {
+            @li "#{webhook.id}: {webhook.provider} / {webhook.eventId} / {webhook.status}"
           }
         }
       }

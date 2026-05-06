@@ -2848,6 +2848,10 @@ mod tests {
             assert!(admin_html.contains("Operations dashboard"));
             assert!(admin_html.contains("<a href=\"/admin/catalog\">Catalog read model</a>"));
             assert!(admin_html.contains("<a href=\"/admin/summary\">Operations summary</a>"));
+            assert!(admin_html.contains("<a href=\"/admin/orders\">Order read model</a>"));
+            assert!(admin_html.contains("<a href=\"/admin/payments\">Payment read model</a>"));
+            assert!(admin_html.contains("<a href=\"/admin/shipments\">Shipment read model</a>"));
+            assert!(admin_html.contains("<a href=\"/admin/webhooks\">Webhook read model</a>"));
             assert!(admin_html.contains("Stripe webhook events: POST /webhooks/stripe"));
             assert!(admin_html.contains("data/shop.sqlite"));
 
@@ -3113,6 +3117,36 @@ mod tests {
                 checkout["shipment"]["tracking"],
                 serde_json::json!("TRK-LOCAL")
             );
+
+            let (admin_orders_status, _, admin_orders_body) =
+                send_request(addr, "GET", "/admin/orders", None).await;
+            assert_eq!(admin_orders_status, 200);
+            let admin_orders_html = String::from_utf8(admin_orders_body).expect("orders html utf8");
+            assert!(admin_orders_html.contains("ada"));
+            assert!(admin_orders_html.contains("shipped"));
+
+            let (admin_payments_status, _, admin_payments_body) =
+                send_request(addr, "GET", "/admin/payments", None).await;
+            assert_eq!(admin_payments_status, 200);
+            let admin_payments_html =
+                String::from_utf8(admin_payments_body).expect("payments html utf8");
+            assert!(admin_payments_html.contains("captured"));
+            assert!(admin_payments_html.contains("file"));
+
+            let (admin_shipments_status, _, admin_shipments_body) =
+                send_request(addr, "GET", "/admin/shipments", None).await;
+            assert_eq!(admin_shipments_status, 200);
+            let admin_shipments_html =
+                String::from_utf8(admin_shipments_body).expect("shipments html utf8");
+            assert!(admin_shipments_html.contains("TRK-LOCAL"));
+
+            let (admin_webhooks_status, _, admin_webhooks_body) =
+                send_request(addr, "GET", "/admin/webhooks", None).await;
+            assert_eq!(admin_webhooks_status, 200);
+            let admin_webhooks_html =
+                String::from_utf8(admin_webhooks_body).expect("webhooks html utf8");
+            assert!(admin_webhooks_html.contains("evt_1"));
+            assert!(admin_webhooks_html.contains("verified"));
 
             let (summary_status, _, summary_body) =
                 send_request(addr, "GET", "/admin/summary", None).await;

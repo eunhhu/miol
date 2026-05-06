@@ -2231,7 +2231,7 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
-Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links, operations summary, and persistent storage paths.\n\
+Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook read-model links, operations summary, and persistent storage paths.\n\
 \n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
 \n\
@@ -2289,6 +2289,10 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `GET /admin`\n\
 - `GET /admin/catalog`\n\
 - `GET /admin/summary`\n\
+- `GET /admin/orders`\n\
+- `GET /admin/payments`\n\
+- `GET /admin/shipments`\n\
+- `GET /admin/webhooks`\n\
 - `GET /health`\n\
 - `POST /products`\n\
 - `GET /products`\n\
@@ -22748,8 +22752,20 @@ test "checkout failing runtime body" {
         assert!(source.contains("@route GET /admin/summary"));
         assert!(source.contains("@a href=\"/admin/catalog\" \"Catalog read model\""));
         assert!(source.contains("@route GET /admin/catalog"));
+        assert!(source.contains("@a href=\"/admin/orders\" \"Order read model\""));
+        assert!(source.contains("@route GET /admin/orders"));
+        assert!(source.contains("@a href=\"/admin/payments\" \"Payment read model\""));
+        assert!(source.contains("@route GET /admin/payments"));
+        assert!(source.contains("@a href=\"/admin/shipments\" \"Shipment read model\""));
+        assert!(source.contains("@route GET /admin/shipments"));
+        assert!(source.contains("@a href=\"/admin/webhooks\" \"Webhook read model\""));
+        assert!(source.contains("@route GET /admin/webhooks"));
         assert!(source.contains(r#"shopdb.count("Product", {})"#));
         assert!(source.contains(r#"shopdb.count("WebhookEvent", {})"#));
+        assert!(source.contains(r#"shopdb.findAll("Order", {})"#));
+        assert!(source.contains(r#"shopdb.findAll("Payment", {})"#));
+        assert!(source.contains(r#"shopdb.findAll("Shipment", {})"#));
+        assert!(source.contains(r#"shopdb.findAll("WebhookEvent", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
@@ -22833,6 +22849,10 @@ test "checkout failing runtime body" {
         assert!(guide.contains("GET /admin"));
         assert!(guide.contains("GET /admin/catalog"));
         assert!(guide.contains("GET /admin/summary"));
+        assert!(guide.contains("GET /admin/orders"));
+        assert!(guide.contains("GET /admin/payments"));
+        assert!(guide.contains("GET /admin/shipments"));
+        assert!(guide.contains("GET /admin/webhooks"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /members/login"));
         assert!(guide.contains("POST /checkout"));
@@ -22871,6 +22891,10 @@ test "checkout failing runtime body" {
             ("GET", "/admin"),
             ("GET", "/admin/catalog"),
             ("GET", "/admin/summary"),
+            ("GET", "/admin/orders"),
+            ("GET", "/admin/payments"),
+            ("GET", "/admin/shipments"),
+            ("GET", "/admin/webhooks"),
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),
