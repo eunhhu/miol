@@ -2788,6 +2788,7 @@ mod tests {
             assert!(home_html.contains("<form action=\"/products\" method=\"post\">"));
             assert!(home_html.contains("<input type=\"number\" name=\"stock\" required>"));
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
+            assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /shipments"));
@@ -2933,6 +2934,18 @@ mod tests {
                 found_member["member"]["email"],
                 serde_json::json!("ada@example.test")
             );
+
+            let login_payload = serde_json::json!({
+                "handle": "ada",
+                "email": "ada@example.test"
+            })
+            .to_string();
+            let (login_status, _, login_body) =
+                send_request(addr, "POST", "/members/login", Some(login_payload)).await;
+            assert_eq!(login_status, 201);
+            let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
+            assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
+            assert_eq!(login["session"]["status"], serde_json::json!("active"));
 
             let payment_payload = serde_json::json!({
                 "orderId": order_id,

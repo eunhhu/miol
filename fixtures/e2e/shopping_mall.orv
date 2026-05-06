@@ -48,6 +48,14 @@
             @input type=email name=email required
             @button type=submit "Create member"
           }
+          @form action="/members/login" method=post {
+            @h3 "Member login"
+            @label "Handle"
+            @input type=text name=handle required
+            @label "Email"
+            @input type=email name=email required
+            @button type=submit "Create session"
+          }
           @form action="/orders" method=post {
             @h3 "Reserve order"
             @label "Customer"
@@ -84,6 +92,7 @@
         @ul {
           @li "POST /products"
           @li "POST /members"
+          @li "POST /members/login"
           @li "POST /orders"
           @li "POST /payments"
           @li "POST /shipments"
@@ -165,6 +174,22 @@
   @route GET /members/:handle {
     let member = await shopdb.find("Member", { handle: @param.handle })
     @respond 200 { member: member }
+  }
+
+  @route POST /members/login {
+    let member = await shopdb.find("Member", { handle: @body.handle })
+    if member == void {
+      @respond 404 { err: "member_not_found", handle: @body.handle }
+    }
+    if member.email != @body.email {
+      @respond 401 { err: "invalid_member_login", handle: @body.handle }
+    }
+    let session = await shopdb.create("Session", {
+      memberId: member.id,
+      handle: member.handle,
+      status: "active"
+    })
+    @respond 201 { session: session, member: member }
   }
 
   @route POST /orders {

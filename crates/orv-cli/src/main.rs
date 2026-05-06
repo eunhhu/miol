@@ -2186,7 +2186,7 @@ orv verify-build dist\n\
 orv run-build dist\n\
 ```\n\
 \n\
-Browser home: http://localhost:8080/ provides product, member, order, payment, and shipment forms.\n\
+Browser home: http://localhost:8080/ provides product, member signup/login, order, payment, and shipment forms.\n\
 \n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links, operations summary, and persistent storage paths.\n\
 \n\
@@ -2248,6 +2248,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `GET /products`\n\
 - `GET /products/:sku`\n\
 - `POST /members`\n\
+- `POST /members/login`\n\
 - `GET /members/:handle`\n\
 - `POST /orders`\n\
 - `GET /orders/:customer`\n\
@@ -21225,6 +21226,9 @@ test "checkout failing runtime body" {
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@route POST /members"));
+        assert!(source.contains("@form action=\"/members/login\" method=post"));
+        assert!(source.contains("@route POST /members/login"));
+        assert!(source.contains(r#"shopdb.create("Session""#));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /shipments"));
         assert!(source.contains(
@@ -21284,6 +21288,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("GET /admin"));
         assert!(guide.contains("GET /admin/summary"));
         assert!(guide.contains("POST /members"));
+        assert!(guide.contains("POST /members/login"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
         let _ = std::fs::remove_dir_all(dir);
@@ -21320,6 +21325,7 @@ test "checkout failing runtime body" {
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),
             ("POST", "/members"),
+            ("POST", "/members/login"),
             ("POST", "/payments"),
             ("POST", "/shipments"),
             ("GET", "/shipments/:orderId"),
