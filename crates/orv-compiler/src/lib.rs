@@ -3747,92 +3747,121 @@ fn mixed_object_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseObjectF
             let mut out = Vec::new();
             let mut has_static = false;
             let mut has_dynamic = false;
+            let mut first_source: Option<ResponseObjectFieldSource> = None;
+            let mut has_mixed_source = false;
             for field in fields {
                 if field.is_spread {
                     return None;
                 }
-                out.push(mixed_response_object_field(
-                    field,
-                    &mut has_static,
-                    &mut has_dynamic,
-                )?);
+                let (artifact, source) =
+                    mixed_response_object_field(field, &mut has_static, &mut has_dynamic)?;
+                if let Some(first_source) = first_source {
+                    has_mixed_source |= first_source != source;
+                } else {
+                    first_source = Some(source);
+                }
+                out.push(artifact);
             }
-            (has_static && has_dynamic).then_some(out)
+            ((has_static && has_dynamic) || (has_dynamic && has_mixed_source)).then_some(out)
         }
         HirExprKind::Paren(expr) => mixed_object_json_payload(expr),
         _ => None,
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseObjectFieldSource {
+    Static,
+    RouteParam,
+    QueryParam,
+    RequestBody,
+    RequestBodyField,
+}
+
 fn mixed_response_object_field(
     field: &HirObjectField,
     has_static: &mut bool,
     has_dynamic: &mut bool,
-) -> Option<ServerResponseObjectFieldArtifact> {
+) -> Option<(ServerResponseObjectFieldArtifact, ResponseObjectFieldSource)> {
     if let Some(value_json) = static_json_payload(&field.value) {
         *has_static = true;
-        return Some(ServerResponseObjectFieldArtifact {
-            field: field.name.clone(),
-            value_kind: "static_json".to_string(),
-            value_json: Some(value_json),
-            name: None,
-            op: None,
-            operand_json: None,
-            operand_kind: None,
-            operand_name: None,
-        });
+        return Some((
+            ServerResponseObjectFieldArtifact {
+                field: field.name.clone(),
+                value_kind: "static_json".to_string(),
+                value_json: Some(value_json),
+                name: None,
+                op: None,
+                operand_json: None,
+                operand_kind: None,
+                operand_name: None,
+            },
+            ResponseObjectFieldSource::Static,
+        ));
     }
     if let Some(value) = route_param_field_value(&field.value) {
         *has_dynamic = true;
-        return Some(ServerResponseObjectFieldArtifact {
-            field: field.name.clone(),
-            value_kind: value.value_kind,
-            value_json: None,
-            name: Some(value.name),
-            op: value.op,
-            operand_json: value.operand_json,
-            operand_kind: value.operand_kind,
-            operand_name: value.operand_name,
-        });
+        return Some((
+            ServerResponseObjectFieldArtifact {
+                field: field.name.clone(),
+                value_kind: value.value_kind,
+                value_json: None,
+                name: Some(value.name),
+                op: value.op,
+                operand_json: value.operand_json,
+                operand_kind: value.operand_kind,
+                operand_name: value.operand_name,
+            },
+            ResponseObjectFieldSource::RouteParam,
+        ));
     }
     if let Some(value) = query_param_field_value(&field.value) {
         *has_dynamic = true;
-        return Some(ServerResponseObjectFieldArtifact {
-            field: field.name.clone(),
-            value_kind: value.value_kind,
-            value_json: None,
-            name: Some(value.name),
-            op: value.op,
-            operand_json: value.operand_json,
-            operand_kind: value.operand_kind,
-            operand_name: value.operand_name,
-        });
+        return Some((
+            ServerResponseObjectFieldArtifact {
+                field: field.name.clone(),
+                value_kind: value.value_kind,
+                value_json: None,
+                name: Some(value.name),
+                op: value.op,
+                operand_json: value.operand_json,
+                operand_kind: value.operand_kind,
+                operand_name: value.operand_name,
+            },
+            ResponseObjectFieldSource::QueryParam,
+        ));
     }
     if is_request_body_domain(&field.value) {
         *has_dynamic = true;
-        return Some(ServerResponseObjectFieldArtifact {
-            field: field.name.clone(),
-            value_kind: "request_body_json".to_string(),
-            value_json: None,
-            name: None,
-            op: None,
-            operand_json: None,
-            operand_kind: None,
-            operand_name: None,
-        });
+        return Some((
+            ServerResponseObjectFieldArtifact {
+                field: field.name.clone(),
+                value_kind: "request_body_json".to_string(),
+                value_json: None,
+                name: None,
+                op: None,
+                operand_json: None,
+                operand_kind: None,
+                operand_name: None,
+            },
+            ResponseObjectFieldSource::RequestBody,
+        ));
     }
     if let Some(value) = request_body_field_value(&field.value) {
         *has_dynamic = true;
-        return Some(ServerResponseObjectFieldArtifact {
-            field: field.name.clone(),
-            value_kind: value.value_kind,
-            value_json: None,
-            name: Some(value.name),
-            op: value.op,
-            operand_json: value.operand_json,
-            operand_kind: value.operand_kind,
-            operand_name: value.operand_name,
-        });
+        return Some((
+            ServerResponseObjectFieldArtifact {
+                field: field.name.clone(),
+                value_kind: value.value_kind,
+                value_json: None,
+                name: Some(value.name),
+                op: value.op,
+                operand_json: value.operand_json,
+                operand_kind: value.operand_kind,
+                operand_name: value.operand_name,
+            },
+            ResponseObjectFieldSource::RequestBodyField,
+        ));
     }
     None
 }
@@ -6281,6 +6310,49 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("body.push_str(\"\\\"err\\\":\");"));
         assert!(handlers.contains("body.push_str(\"\\\"product_not_found\\\"\");"));
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
+        assert!(handlers.contains("orv_native_push_json_string("));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_mixed_dynamic_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { sku: @body.sku, coupon: @query.coupon }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "mixed_json");
+        assert_eq!(response.body_object_fields.len(), 2);
+        assert_eq!(response.body_object_fields[0].field, "sku");
+        assert_eq!(
+            response.body_object_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(response.body_object_fields[0].name.as_deref(), Some("sku"));
+        assert_eq!(response.body_object_fields[1].field, "coupon");
+        assert_eq!(response.body_object_fields[1].value_kind, "query_param");
+        assert_eq!(
+            response.body_object_fields[1].name.as_deref(),
+            Some("coupon")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"coupon\")"));
         assert!(handlers.contains("orv_native_push_json_string("));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
