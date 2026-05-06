@@ -85,6 +85,9 @@ fn accept_http_request_until(
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted stream blocking");
                 let request = read_http_request_parts_with_headers(&mut stream);
                 write_http_response(&mut stream, status, content_type, response_body);
                 return Some(request);
@@ -893,6 +896,134 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["email"], "a@example.com");
     assert_eq!(rows[1]["email"], "b@example.com");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn db_archive_s3_target_retries_transient_failures() {
+    let dir = temp_dir("db-archive-s3-retry");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let data = dir.join("data.json");
+    let wal_body =
+        "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":1000,\"table\":\"User\",\"data\":{\"email\":\"retry@example.com\"}}\n";
+    std::fs::write(&wal, wal_body).expect("write wal");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind s3 archive endpoint");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking listener");
+    let address = listener.local_addr().expect("s3 archive endpoint address");
+    let server_wal_body = wal_body.as_bytes().to_vec();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let wal_upload_503 = accept_http_request_until(
+            &listener,
+            deadline,
+            "503 Service Unavailable",
+            "text/plain",
+            b"retry wal upload",
+        )
+        .expect("s3 wal upload first attempt");
+        let wal_upload_200 =
+            accept_http_request_until(&listener, deadline, "200 OK", "application/json", b"{}")
+                .expect("s3 wal upload retry");
+        let manifest_upload =
+            accept_http_request_until(&listener, deadline, "200 OK", "application/json", b"{}")
+                .expect("s3 manifest upload");
+        let wal_download_503 = accept_http_request_until(
+            &listener,
+            deadline,
+            "503 Service Unavailable",
+            "text/plain",
+            b"retry wal download",
+        )
+        .expect("s3 wal download first attempt");
+        let wal_download_200 = accept_http_request_until(
+            &listener,
+            deadline,
+            "200 OK",
+            "application/x-jsonlines",
+            &server_wal_body,
+        )
+        .expect("s3 wal download retry");
+        (
+            wal_upload_503,
+            wal_upload_200,
+            manifest_upload,
+            wal_download_503,
+            wal_download_200,
+        )
+    });
+
+    let endpoint = format!("http://{address}");
+    let archive_output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg("s3://orv-backups/retry")
+        .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH")
+        .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .output()
+        .expect("run db archive");
+    std::fs::remove_file(&wal).expect("remove source wal");
+    let restore = orv()
+        .args(["db", "restore"])
+        .arg("--archive")
+        .arg(&archive)
+        .arg("--data")
+        .arg(&data)
+        .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env_remove("ORV_DB_ARCHIVE_S3_AUTH")
+        .env("ORV_DB_ARCHIVE_S3_AUTH_TOKEN", "orv-s3-test-token")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .output()
+        .expect("run db restore");
+    let (wal_upload_503, wal_upload_200, manifest_upload, wal_download_503, wal_download_200) =
+        server.join().expect("s3 server finished");
+
+    assert!(
+        archive_output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&archive_output.stdout),
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+    assert!(
+        restore.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(wal_upload_503.0, "PUT");
+    assert_eq!(wal_upload_503.1, "/orv-backups/retry/db.wal.jsonl");
+    assert_eq!(wal_upload_200.0, "PUT");
+    assert_eq!(wal_upload_200.1, "/orv-backups/retry/db.wal.jsonl");
+    assert_eq!(manifest_upload.0, "PUT");
+    assert_eq!(manifest_upload.1, "/orv-backups/retry/archive.json");
+    assert_eq!(wal_download_503.0, "GET");
+    assert_eq!(wal_download_503.1, "/orv-backups/retry/db.wal.jsonl");
+    assert_eq!(wal_download_200.0, "GET");
+    assert_eq!(wal_download_200.1, "/orv-backups/retry/db.wal.jsonl");
+    let restored = read_json(&data);
+    assert_eq!(
+        restored["tables"]["User"]["rows"][0]["email"],
+        "retry@example.com"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -60,6 +60,9 @@ const DB_ARCHIVE_S3_AWS_SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
 const DB_ARCHIVE_S3_AWS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
 const DB_ARCHIVE_S3_AWS_REGION_ENV: &str = "AWS_REGION";
 const DB_ARCHIVE_S3_AWS_DEFAULT_REGION_ENV: &str = "AWS_DEFAULT_REGION";
+const DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV: &str = "ORV_DB_ARCHIVE_HTTP_RETRY_ATTEMPTS";
+const DB_ARCHIVE_HTTP_RETRY_DEFAULT_ATTEMPTS: usize = 3;
+const DB_ARCHIVE_HTTP_RETRY_MAX_ATTEMPTS: usize = 8;
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -3367,6 +3370,7 @@ fn db_archive_http_target_json(target: &DbArchiveHttpTarget) -> serde_json::Valu
     serde_json::json!({
         "kind": "http",
         "uri": target.uri.clone(),
+        "retry_attempts_env": DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV,
         "wal": {
             "method": "POST",
             "path": target.wal_url.clone(),
@@ -3406,6 +3410,7 @@ fn db_archive_s3_target_json(target: &DbArchiveS3Target) -> serde_json::Value {
         "endpoint_env": DB_ARCHIVE_S3_ENDPOINT_ENV,
         "auth_mode_env": DB_ARCHIVE_S3_AUTH_ENV,
         "auth_token_env": DB_ARCHIVE_S3_AUTH_TOKEN_ENV,
+        "retry_attempts_env": DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV,
         "aws_sigv4": {
             "access_key_env": DB_ARCHIVE_S3_AWS_ACCESS_KEY_ENV,
             "secret_key_env": DB_ARCHIVE_S3_AWS_SECRET_KEY_ENV,
@@ -3905,6 +3910,19 @@ fn http_send_bytes_with_headers(
     context: &str,
     headers: &[(String, String)],
 ) -> anyhow::Result<()> {
+    db_archive_http_retry(context, || {
+        http_send_bytes_with_headers_once(method, url, content_type, body, context, headers)
+    })
+}
+
+fn http_send_bytes_with_headers_once(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    context: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<()> {
     if url.starts_with("https://") {
         return https_send_bytes_with_headers(method, url, content_type, body, context, headers);
     }
@@ -3986,6 +4004,16 @@ fn http_get_bytes_with_headers(
     context: &str,
     headers: &[(String, String)],
 ) -> anyhow::Result<Vec<u8>> {
+    db_archive_http_retry(context, || {
+        http_get_bytes_with_headers_once(url, context, headers)
+    })
+}
+
+fn http_get_bytes_with_headers_once(
+    url: &str,
+    context: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<Vec<u8>> {
     if url.starts_with("https://") {
         let mut request = ureq::get(url);
         for (name, value) in headers {
@@ -4038,6 +4066,61 @@ fn http_get_bytes_with_headers(
         anyhow::bail!("{context} {url} failed with {status}: {response_body}");
     }
     Ok(response[header_end + 4..].to_vec())
+}
+
+fn db_archive_http_retry<T>(
+    context: &str,
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let attempts = db_archive_http_retry_attempts()?;
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < attempts && db_archive_http_error_is_retryable(&err) => {
+                last_error = Some(err);
+                std::thread::sleep(db_archive_http_retry_delay(attempt));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("{context} failed without recording an error")))
+}
+
+fn db_archive_http_retry_attempts() -> anyhow::Result<usize> {
+    match std::env::var(DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV) {
+        Ok(value) => {
+            let attempts = value.parse::<usize>().map_err(|e| {
+                anyhow::anyhow!(
+                    "{DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV} must be a positive integer: {e}"
+                )
+            })?;
+            if attempts == 0 || attempts > DB_ARCHIVE_HTTP_RETRY_MAX_ATTEMPTS {
+                anyhow::bail!(
+                    "{DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV} must be between 1 and {DB_ARCHIVE_HTTP_RETRY_MAX_ATTEMPTS}"
+                );
+            }
+            Ok(attempts)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DB_ARCHIVE_HTTP_RETRY_DEFAULT_ATTEMPTS),
+        Err(source) => Err(anyhow::anyhow!(
+            "{DB_ARCHIVE_HTTP_RETRY_ATTEMPTS_ENV} is invalid: {source}"
+        )),
+    }
+}
+
+fn db_archive_http_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(u64::try_from(attempt).unwrap_or(u64::MAX).min(5) * 25)
+}
+
+fn db_archive_http_error_is_retryable(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    !(message.contains(" failed with HTTP/1.1 4")
+        || message.contains(" failed with HTTP/1.0 4")
+        || message.contains("unsupported HTTPS method")
+        || message.contains("must start with http://")
+        || message.contains("must start with http:// or https://"))
 }
 
 fn http_status_is_success(status: &str) -> bool {
