@@ -51,6 +51,7 @@ type ArchiveHttpHeaders = Vec<(String, String)>;
 
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
 const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
+const EDITOR_DEBUG_SESSION_RESULT_HTML_PATH: &str = "debug/session-result.html";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 const DB_ARCHIVE_S3_ENDPOINT_ENV: &str = "ORV_DB_ARCHIVE_S3_ENDPOINT";
@@ -1456,6 +1457,7 @@ fn cmd_editor_run_debug(
 ) -> anyhow::Result<()> {
     let value = editor_debug_runner_session_json(state, controls, breakpoints)?;
     write_editor_debug_runner_result_if_configured(state, &value)?;
+    write_editor_debug_runner_result_html_if_configured(state, &value)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -6332,6 +6334,7 @@ fn editor_debug_event_frames(
 fn editor_debug_result_artifact_json() -> serde_json::Value {
     serde_json::json!({
         "path": EDITOR_DEBUG_SESSION_RESULT_PATH,
+        "html_path": EDITOR_DEBUG_SESSION_RESULT_HTML_PATH,
         "kind": "orv.editor.debug.runner.result",
         "media_type": "application/json",
         "panels": ["debug"],
@@ -6353,6 +6356,145 @@ fn write_editor_debug_runner_result_if_configured(
         &resolve_editor_debug_runner_result_path(state_path, result_path),
         value,
     )
+}
+
+fn write_editor_debug_runner_result_html_if_configured(
+    state_path: &Path,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let html_path = value
+        .pointer("/runner/result/html_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(EDITOR_DEBUG_SESSION_RESULT_HTML_PATH);
+    let path = resolve_editor_debug_runner_result_path(state_path, html_path);
+    write_text(&path, &editor_debug_runner_result_html(value)?)
+}
+
+fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<String> {
+    let selected_frame = value
+        .pointer("/panels/debug/selected_frame")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let stack_frames = value
+        .pointer("/panels/debug/stack_frames")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let stopped_events = value
+        .pointer("/panels/debug/stopped_events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let output_events = value
+        .pointer("/panels/debug/output_events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let control_count = value
+        .pointer("/panels/debug/control_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let breakpoint_count = value
+        .pointer("/panels/debug/breakpoint_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut html = String::new();
+    html.push_str("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    html.push_str("<title>orv debug result</title>\n");
+    html.push_str("<style>body{margin:0;background:#f7f8fb;color:#18202f;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}.shell{padding:20px;display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))}.panel{border:1px solid #d7dce5;background:#fff;border-radius:8px;padding:14px}.wide{grid-column:1/-1}h1{font-size:18px;margin:0}.metric{font-size:26px;font-weight:700}.muted{color:#687386}pre{white-space:pre-wrap;word-break:break-word;margin:0;max-height:320px;overflow:auto;background:#f1f5f9;border:1px solid #d7dce5;padding:10px}.list{list-style:none;margin:0;padding:0;display:grid;gap:6px}.list li{border-top:1px solid #d7dce5;padding-top:6px;color:#475569}@media(max-width:760px){.shell{grid-template-columns:1fr}}</style>\n");
+    html.push_str("</head><body><main id=\"orv-debug-result\" class=\"shell\">\n");
+    write!(
+        &mut html,
+        "<section class=\"panel wide\"><h1>Debug Result</h1><p class=\"muted\">DAP runner result rendered for native editor hosts.</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Controls</h2><div class=\"metric\">{control_count}</div><p class=\"muted\">executed controls</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Breakpoints</h2><div class=\"metric\">{breakpoint_count}</div><p class=\"muted\">requested breakpoints</p></section>"
+    )?;
+    html.push_str("<section class=\"panel\"><h2>Selected Frame</h2><pre>");
+    html.push_str(&html_escape_text(&editor_debug_frame_summary(
+        &selected_frame,
+    )));
+    html.push_str("</pre></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Stack Frames</h2><ul class=\"list\">");
+    for frame in stack_frames {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_frame_summary(&frame))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Stopped Events</h2><ul class=\"list\">");
+    for event in stopped_events {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_event_summary(&event))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Output Events</h2><ul class=\"list\">");
+    for event in output_events {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_event_summary(&event))
+        )?;
+    }
+    html.push_str("</ul></section>\n</main></body></html>\n");
+    Ok(html)
+}
+
+fn editor_debug_frame_summary(frame: &serde_json::Value) -> String {
+    let name = frame
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("frame");
+    let line = frame
+        .get("line")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "line ?".to_string(), |line| format!("line {line}"));
+    let source = frame
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            frame
+                .pointer("/source/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+    [name.to_string(), line, source.to_string()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn editor_debug_event_summary(event: &serde_json::Value) -> String {
+    let name = event
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("event");
+    let reason = event
+        .pointer("/body/reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let thread = event
+        .pointer("/body/threadId")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(String::new, |thread| format!("thread {thread}"));
+    [name.to_string(), reason.to_string(), thread]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn resolve_editor_debug_runner_result_path(state_path: &Path, result_path: &str) -> PathBuf {
@@ -6730,6 +6872,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "state": "state.json",
             "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
             "debug_session_result": EDITOR_DEBUG_SESSION_RESULT_PATH,
+            "debug_session_result_html": EDITOR_DEBUG_SESSION_RESULT_HTML_PATH,
         },
         "debug": {
             "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
@@ -36303,6 +36446,10 @@ define Auth() -> { @out "auth" }
             EDITOR_DEBUG_SESSION_RESULT_PATH
         );
         assert_eq!(
+            native_host["artifacts"]["debug_session_result_html"],
+            EDITOR_DEBUG_SESSION_RESULT_HTML_PATH
+        );
+        assert_eq!(
             native_host["debug"]["adapter_command"],
             serde_json::json!(["orv", "dap", "serve", "--stdio"])
         );
@@ -36672,7 +36819,9 @@ define Auth() -> { @out "auth" }
         let out = dir.join("editor");
         cmd_editor_export(&path, &out).expect("editor export");
         let result_path = out.join(EDITOR_DEBUG_SESSION_RESULT_PATH);
+        let result_html_path = out.join(EDITOR_DEBUG_SESSION_RESULT_HTML_PATH);
         assert!(!result_path.exists());
+        assert!(!result_html_path.exists());
 
         cmd_editor_run_debug(
             &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
@@ -36688,6 +36837,13 @@ define Auth() -> { @out "auth" }
             result["runner"]["result"]["path"],
             EDITOR_DEBUG_SESSION_RESULT_PATH
         );
+        let result_html =
+            std::fs::read_to_string(result_html_path).expect("debug result html artifact");
+        assert!(result_html.contains("id=\"orv-debug-result\""));
+        assert!(result_html.contains("Selected Frame"));
+        assert!(result_html.contains("Stack Frames"));
+        assert!(result_html.contains("Stopped Events"));
+        assert!(result_html.contains("line 3"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -94,6 +94,8 @@
 
 **Editor DAP native-host configuration delta (2026-05-06):** `orv editor export` now mirrors launch/live/attach debug configurations into `native-host.json` under `debug.configurations` with `configuration_count`, matching the existing control and breakpoint command inventories so native editor hosts can wire DAP launch surfaces without reparsing `state.json`.
 
+**Editor DAP result panel delta (2026-05-06):** `orv editor run-debug` now writes a rendered `debug/session-result.html` companion beside `debug/session-result.json`, and `native-host.json` exposes that path under `artifacts.debug_session_result_html`. The panel renders selected frame, stack frames, stopped events, and output events from the same `panels.debug` JSON so native editor hosts can open a checked debug result view without hand-building one.
+
 **LSP signature help delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/signatureHelp`, returning function parameter labels, return type, and active parameter index for in-call cursor positions.
 
 **LSP inlay hint delta (2026-05-03):** `orv lsp serve --stdio` now advertises and handles `textDocument/inlayHint`, emitting parameter-name hints for direct function calls.
