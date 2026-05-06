@@ -42,6 +42,8 @@ toml = "1.1"
 regex = "1"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+hmac = "0.12"
+sha2 = "0.10"
 
 # Error handling
 thiserror = "2"

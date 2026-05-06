@@ -98,6 +98,20 @@ fn accept_http_request_until(
     }
 }
 
+fn assert_http_header(headers: &str, expected: &str) {
+    assert!(headers.lines().any(|line| line == expected), "{headers}");
+}
+
+fn assert_http_header_prefix(headers: &str, name: &str, prefix: &str) {
+    let expected_prefix = format!("{name}: {prefix}");
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.starts_with(&expected_prefix)),
+        "{headers}"
+    );
+}
+
 #[test]
 fn db_migrate_applies_data_snapshot_and_rollback() {
     let dir = temp_dir("db-data-migrate");
@@ -827,27 +841,16 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
     );
     assert_eq!(wal_upload.0, "PUT");
     assert_eq!(wal_upload.1, "/orv-backups/shop/db.wal.jsonl");
-    assert!(
-        wal_upload
-            .2
-            .lines()
-            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
-        "{}",
-        wal_upload.2
-    );
+    assert_http_header(&wal_upload.2, "Authorization: Bearer orv-s3-test-token");
     assert_eq!(
         String::from_utf8(wal_upload.3).expect("uploaded wal utf-8"),
         wal_body
     );
     assert_eq!(manifest_upload.0, "PUT");
     assert_eq!(manifest_upload.1, "/orv-backups/shop/archive.json");
-    assert!(
-        manifest_upload
-            .2
-            .lines()
-            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
-        "{}",
-        manifest_upload.2
+    assert_http_header(
+        &manifest_upload.2,
+        "Authorization: Bearer orv-s3-test-token",
     );
     let uploaded_manifest: serde_json::Value =
         serde_json::from_slice(&manifest_upload.3).expect("uploaded manifest json");
@@ -857,19 +860,20 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
         "ORV_DB_ARCHIVE_S3_AUTH_TOKEN"
     );
     assert_eq!(
+        uploaded_manifest["target"]["auth_mode_env"],
+        "ORV_DB_ARCHIVE_S3_AUTH"
+    );
+    assert_eq!(
+        uploaded_manifest["target"]["aws_sigv4"]["access_key_env"],
+        "AWS_ACCESS_KEY_ID"
+    );
+    assert_eq!(
         uploaded_manifest["target"]["wal"]["path"],
         "s3://orv-backups/shop/db.wal.jsonl"
     );
     assert_eq!(wal_download.0, "GET");
     assert_eq!(wal_download.1, "/orv-backups/shop/db.wal.jsonl");
-    assert!(
-        wal_download
-            .2
-            .lines()
-            .any(|line| line == "Authorization: Bearer orv-s3-test-token"),
-        "{}",
-        wal_download.2
-    );
+    assert_http_header(&wal_download.2, "Authorization: Bearer orv-s3-test-token");
     let restored = read_json(&data);
     let rows = restored["tables"]["User"]["rows"]
         .as_array()
@@ -877,6 +881,113 @@ fn db_archive_s3_target_uploads_and_restores_wal() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["email"], "a@example.com");
     assert_eq!(rows[1]["email"], "b@example.com");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn db_archive_s3_target_signs_aws_sigv4_requests() {
+    let dir = temp_dir("db-archive-s3-sigv4");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let data = dir.join("data.json");
+    let wal_body =
+        "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":1000,\"table\":\"User\",\"data\":{\"email\":\"sig@example.com\"}}\n";
+    std::fs::write(&wal, wal_body).expect("write wal");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind s3 archive endpoint");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking listener");
+    let address = listener.local_addr().expect("s3 archive endpoint address");
+    let server_wal_body = wal_body.as_bytes().to_vec();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wal_upload =
+            accept_http_request_until(&listener, deadline, "200 OK", "application/json", b"{}")
+                .expect("s3 wal upload");
+        let manifest_upload =
+            accept_http_request_until(&listener, deadline, "200 OK", "application/json", b"{}")
+                .expect("s3 manifest upload");
+        let wal_download = accept_http_request_until(
+            &listener,
+            deadline,
+            "200 OK",
+            "application/x-jsonlines",
+            &server_wal_body,
+        )
+        .expect("s3 wal download");
+        (wal_upload, manifest_upload, wal_download)
+    });
+
+    let endpoint = format!("http://{address}");
+    let archive_output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg("s3://orv-backups/shop")
+        .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env("ORV_DB_ARCHIVE_S3_AUTH", "aws-sigv4")
+        .env("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+        .env("AWS_SECRET_ACCESS_KEY", "secret-test-key")
+        .env("AWS_REGION", "us-west-2")
+        .output()
+        .expect("run db archive");
+    std::fs::remove_file(&wal).expect("remove source wal");
+    let restore = orv()
+        .args(["db", "restore"])
+        .arg("--archive")
+        .arg(&archive)
+        .arg("--data")
+        .arg(&data)
+        .env("ORV_DB_ARCHIVE_S3_ENDPOINT", &endpoint)
+        .env("ORV_DB_ARCHIVE_S3_AUTH", "aws-sigv4")
+        .env("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+        .env("AWS_SECRET_ACCESS_KEY", "secret-test-key")
+        .env("AWS_REGION", "us-west-2")
+        .output()
+        .expect("run db restore");
+    let (wal_upload, manifest_upload, wal_download) = server.join().expect("s3 server finished");
+
+    assert!(
+        archive_output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&archive_output.stdout),
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+    assert!(
+        restore.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_http_header_prefix(
+        &wal_upload.2,
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIA_TEST/",
+    );
+    assert_http_header_prefix(&wal_upload.2, "x-amz-date", "");
+    assert_http_header_prefix(&wal_upload.2, "x-amz-content-sha256", "");
+    assert_http_header_prefix(
+        &manifest_upload.2,
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIA_TEST/",
+    );
+    assert_http_header_prefix(
+        &wal_download.2,
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIA_TEST/",
+    );
+    let restored = read_json(&data);
+    let rows = restored["tables"]["User"]["rows"]
+        .as_array()
+        .expect("restored rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["email"], "sig@example.com");
 
     let _ = std::fs::remove_dir_all(dir);
 }

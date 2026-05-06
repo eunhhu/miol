@@ -36,19 +36,30 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term::termcolor::WriteColor;
+use hmac::{Hmac, Mac};
 use orv_diagnostics::{ByteRange, FileId, Span};
 use orv_project::{ProjectEdgeKind, ProjectGraph, ProjectNodeId, ProjectNodeKind, SourceFile};
 use orv_syntax::ast::{
     Block, ConstraintValue, Expr, ExprKind, FunctionBody, FunctionStmt, Program, Stmt,
     TypeConstraint, TypeRef, TypeRefKind,
 };
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
+type ArchiveHttpHeaders = Vec<(String, String)>;
 
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
 const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 const DB_ARCHIVE_S3_ENDPOINT_ENV: &str = "ORV_DB_ARCHIVE_S3_ENDPOINT";
+const DB_ARCHIVE_S3_AUTH_ENV: &str = "ORV_DB_ARCHIVE_S3_AUTH";
 const DB_ARCHIVE_S3_AUTH_TOKEN_ENV: &str = "ORV_DB_ARCHIVE_S3_AUTH_TOKEN";
+const DB_ARCHIVE_S3_AWS_ACCESS_KEY_ENV: &str = "AWS_ACCESS_KEY_ID";
+const DB_ARCHIVE_S3_AWS_SECRET_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
+const DB_ARCHIVE_S3_AWS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
+const DB_ARCHIVE_S3_AWS_REGION_ENV: &str = "AWS_REGION";
+const DB_ARCHIVE_S3_AWS_DEFAULT_REGION_ENV: &str = "AWS_DEFAULT_REGION";
 
 #[derive(Parser)]
 #[command(name = "orv", about = "orv language toolchain", version)]
@@ -2783,12 +2794,9 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
     if target_kind == Some("s3") {
         if let Some(target_path) = target_wal_path {
             let url = db_archive_s3_http_url(target_path)?;
-            let authorization = db_archive_s3_authorization_header()?;
-            return download_db_archive_wal_to_cache_with_auth(
-                archive,
-                &manifest,
-                &url,
-                authorization.as_deref(),
+            let headers = db_archive_s3_request_headers("GET", &url, &[])?;
+            return download_db_archive_wal_to_cache_with_headers(
+                archive, &manifest, &url, &headers,
             );
         }
     }
@@ -2842,16 +2850,16 @@ fn download_db_archive_wal_to_cache(
     manifest: &serde_json::Value,
     url: &str,
 ) -> anyhow::Result<PathBuf> {
-    download_db_archive_wal_to_cache_with_auth(archive, manifest, url, None)
+    download_db_archive_wal_to_cache_with_headers(archive, manifest, url, &[])
 }
 
-fn download_db_archive_wal_to_cache_with_auth(
+fn download_db_archive_wal_to_cache_with_headers(
     archive: &Path,
     manifest: &serde_json::Value,
     url: &str,
-    authorization: Option<&str>,
+    headers: &[(String, String)],
 ) -> anyhow::Result<PathBuf> {
-    let bytes = http_get_bytes_with_auth(url, "db archive WAL download", authorization)?;
+    let bytes = http_get_bytes_with_headers(url, "db archive WAL download", headers)?;
     verify_db_archive_wal_bytes(manifest, &bytes, url)?;
     let cache_path = db_archive_http_cache_path(archive, manifest, url)?;
     if let Some(parent) = cache_path.parent() {
@@ -3040,7 +3048,15 @@ fn db_archive_s3_target_json(target: &DbArchiveS3Target) -> serde_json::Value {
         "kind": "s3",
         "uri": target.uri.clone(),
         "endpoint_env": DB_ARCHIVE_S3_ENDPOINT_ENV,
+        "auth_mode_env": DB_ARCHIVE_S3_AUTH_ENV,
         "auth_token_env": DB_ARCHIVE_S3_AUTH_TOKEN_ENV,
+        "aws_sigv4": {
+            "access_key_env": DB_ARCHIVE_S3_AWS_ACCESS_KEY_ENV,
+            "secret_key_env": DB_ARCHIVE_S3_AWS_SECRET_KEY_ENV,
+            "session_token_env": DB_ARCHIVE_S3_AWS_SESSION_TOKEN_ENV,
+            "region_env": DB_ARCHIVE_S3_AWS_REGION_ENV,
+            "default_region_env": DB_ARCHIVE_S3_AWS_DEFAULT_REGION_ENV,
+        },
         "bucket": target.bucket.clone(),
         "prefix": target.prefix.clone(),
         "wal": {
@@ -3131,15 +3147,15 @@ fn upload_db_archive_to_s3_target(
     manifest: &Path,
     target: &DbArchiveS3Target,
 ) -> anyhow::Result<()> {
-    let authorization = db_archive_s3_authorization_header()?;
     let wal_body = std::fs::read(wal)
         .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
-    http_put_bytes_with_auth(
+    let wal_headers = db_archive_s3_request_headers("PUT", &target.wal_url, &wal_body)?;
+    http_put_bytes_with_headers(
         &target.wal_url,
         "application/x-jsonlines; charset=utf-8",
         &wal_body,
         "db archive S3 WAL upload",
-        authorization.as_deref(),
+        &wal_headers,
     )?;
     let manifest_body = std::fs::read(manifest).map_err(|e| {
         anyhow::anyhow!(
@@ -3147,12 +3163,14 @@ fn upload_db_archive_to_s3_target(
             manifest.display()
         )
     })?;
-    http_put_bytes_with_auth(
+    let manifest_headers =
+        db_archive_s3_request_headers("PUT", &target.manifest_url, &manifest_body)?;
+    http_put_bytes_with_headers(
         &target.manifest_url,
         "application/json; charset=utf-8",
         &manifest_body,
         "db archive S3 manifest upload",
-        authorization.as_deref(),
+        &manifest_headers,
     )
 }
 
@@ -3238,10 +3256,36 @@ fn validate_db_archive_s3_endpoint(endpoint: &str) -> anyhow::Result<()> {
     );
 }
 
-fn db_archive_s3_authorization_header() -> anyhow::Result<Option<String>> {
+fn db_archive_s3_request_headers(
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> anyhow::Result<ArchiveHttpHeaders> {
+    match std::env::var(DB_ARCHIVE_S3_AUTH_ENV) {
+        Ok(mode) if mode == "aws-sigv4" => {
+            db_archive_s3_sigv4_headers(method, url, body, db_archive_s3_sigv4_config()?)
+        }
+        Ok(mode) if mode == "bearer" => db_archive_s3_bearer_headers(true),
+        Ok(mode) if mode == "none" => Ok(Vec::new()),
+        Ok(mode) => anyhow::bail!(
+            "db archive S3 auth mode `{mode}` is unsupported; use `none`, `bearer`, or `aws-sigv4`"
+        ),
+        Err(std::env::VarError::NotPresent) => db_archive_s3_bearer_headers(false),
+        Err(source) => Err(anyhow::anyhow!(
+            "db archive S3 auth mode env {DB_ARCHIVE_S3_AUTH_ENV} is invalid: {source}"
+        )),
+    }
+}
+
+fn db_archive_s3_bearer_headers(required: bool) -> anyhow::Result<ArchiveHttpHeaders> {
     let token = match std::env::var(DB_ARCHIVE_S3_AUTH_TOKEN_ENV) {
         Ok(token) => token,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotPresent) if required => {
+            anyhow::bail!(
+                "db archive S3 auth mode `bearer` requires {DB_ARCHIVE_S3_AUTH_TOKEN_ENV}"
+            );
+        }
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
         Err(source) => {
             return Err(anyhow::anyhow!(
                 "db archive S3 auth token env {DB_ARCHIVE_S3_AUTH_TOKEN_ENV} is invalid: {source}"
@@ -3258,7 +3302,214 @@ fn db_archive_s3_authorization_header() -> anyhow::Result<Option<String>> {
             "db archive S3 auth token env {DB_ARCHIVE_S3_AUTH_TOKEN_ENV} must not contain whitespace"
         );
     }
-    Ok(Some(format!("Bearer {token}")))
+    Ok(vec![(
+        "Authorization".to_string(),
+        format!("Bearer {token}"),
+    )])
+}
+
+struct AwsSigV4Config {
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    region: String,
+    date_stamp: String,
+    amz_datetime: String,
+}
+
+fn db_archive_s3_sigv4_config() -> anyhow::Result<AwsSigV4Config> {
+    let access_key = required_env_clean(DB_ARCHIVE_S3_AWS_ACCESS_KEY_ENV, "AWS access key")?;
+    let secret_key = required_env_clean(DB_ARCHIVE_S3_AWS_SECRET_KEY_ENV, "AWS secret key")?;
+    let session_token = optional_env_clean(DB_ARCHIVE_S3_AWS_SESSION_TOKEN_ENV)?;
+    let region = match optional_env_clean(DB_ARCHIVE_S3_AWS_REGION_ENV)? {
+        Some(region) => Some(region),
+        None => optional_env_clean(DB_ARCHIVE_S3_AWS_DEFAULT_REGION_ENV)?,
+    };
+    let Some(region) = region else {
+        anyhow::bail!(
+            "db archive S3 aws-sigv4 auth requires {DB_ARCHIVE_S3_AWS_REGION_ENV} or {DB_ARCHIVE_S3_AWS_DEFAULT_REGION_ENV}"
+        );
+    };
+    let (date_stamp, amz_datetime) = aws_sigv4_now()?;
+    Ok(AwsSigV4Config {
+        access_key,
+        secret_key,
+        session_token,
+        region,
+        date_stamp,
+        amz_datetime,
+    })
+}
+
+fn required_env_clean(name: &str, label: &str) -> anyhow::Result<String> {
+    let value = std::env::var(name)
+        .map_err(|_| anyhow::anyhow!("db archive S3 aws-sigv4 auth requires {name} ({label})"))?;
+    validate_env_header_value(name, &value)?;
+    Ok(value)
+}
+
+fn optional_env_clean(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => {
+            validate_env_header_value(name, &value)?;
+            Ok(Some(value))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(source) => Err(anyhow::anyhow!(
+            "db archive S3 environment variable {name} is invalid: {source}"
+        )),
+    }
+}
+
+fn validate_env_header_value(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("db archive S3 environment variable {name} must not be empty");
+    }
+    if value.contains('\r') || value.contains('\n') {
+        anyhow::bail!("db archive S3 environment variable {name} must not contain newlines");
+    }
+    Ok(())
+}
+
+fn db_archive_s3_sigv4_headers(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    config: AwsSigV4Config,
+) -> anyhow::Result<ArchiveHttpHeaders> {
+    let (host, canonical_uri) = parse_http_or_https_authority_path(url)?;
+    let payload_hash = sha256_hex(body);
+    let credential_scope = format!("{}/{}/s3/aws4_request", config.date_stamp, config.region);
+    let mut canonical_headers = format!(
+        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{}\n",
+        config.amz_datetime
+    );
+    let mut signed_headers = "host;x-amz-content-sha256;x-amz-date".to_string();
+    if let Some(session_token) = &config.session_token {
+        canonical_headers.push_str("x-amz-security-token:");
+        canonical_headers.push_str(session_token);
+        canonical_headers.push('\n');
+        signed_headers.push_str(";x-amz-security-token");
+    }
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{credential_scope}\n{}",
+        config.amz_datetime,
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = aws_sigv4_signing_key(&config.secret_key, &config.date_stamp, &config.region);
+    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let mut headers = vec![
+        ("x-amz-content-sha256".to_string(), payload_hash),
+        ("x-amz-date".to_string(), config.amz_datetime),
+    ];
+    if let Some(session_token) = config.session_token {
+        headers.push(("x-amz-security-token".to_string(), session_token));
+    }
+    headers.push((
+        "Authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            config.access_key
+        ),
+    ));
+    Ok(headers)
+}
+
+fn parse_http_or_https_authority_path(url: &str) -> anyhow::Result<(String, String)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| anyhow::anyhow!("S3 signed URL must start with http:// or https://"))?;
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, "/"), |(authority, path)| {
+            (authority, path.strip_prefix('/').unwrap_or(path))
+        });
+    if authority.is_empty() {
+        anyhow::bail!("S3 signed URL host must not be empty");
+    }
+    if authority.contains('@') {
+        anyhow::bail!("S3 signed URL must not include userinfo");
+    }
+    Ok((
+        authority.to_string(),
+        format!("/{}", path.trim_start_matches('/')),
+    ))
+}
+
+fn aws_sigv4_signing_key(secret_key: &str, date_stamp: &str, region: &str) -> Vec<u8> {
+    let date_key = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let date_region_key = hmac_sha256(&date_key, region.as_bytes());
+    let date_region_service_key = hmac_sha256(&date_region_key, b"s3");
+    hmac_sha256(&date_region_service_key, b"aws4_request")
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn aws_sigv4_now() -> anyhow::Result<(String, String)> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {e}"))?
+        .as_secs();
+    Ok(aws_sigv4_timestamp_from_unix_secs(seconds))
+}
+
+fn aws_sigv4_timestamp_from_unix_secs(seconds: u64) -> (String, String) {
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let second_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    let date_stamp = format!("{year:04}{month:02}{day:02}");
+    let amz_datetime = format!("{date_stamp}T{hour:02}{minute:02}{second:02}Z");
+    (date_stamp, amz_datetime)
+}
+
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (
+        year,
+        u32::try_from(month).unwrap_or(u32::MAX),
+        u32::try_from(day).unwrap_or(u32::MAX),
+    )
 }
 
 fn http_post_bytes(
@@ -3270,14 +3521,14 @@ fn http_post_bytes(
     http_send_bytes("POST", url, content_type, body, context)
 }
 
-fn http_put_bytes_with_auth(
+fn http_put_bytes_with_headers(
     url: &str,
     content_type: &str,
     body: &[u8],
     context: &str,
-    authorization: Option<&str>,
+    headers: &[(String, String)],
 ) -> anyhow::Result<()> {
-    http_send_bytes_with_auth("PUT", url, content_type, body, context, authorization)
+    http_send_bytes_with_headers("PUT", url, content_type, body, context, headers)
 }
 
 fn http_send_bytes(
@@ -3287,19 +3538,19 @@ fn http_send_bytes(
     body: &[u8],
     context: &str,
 ) -> anyhow::Result<()> {
-    http_send_bytes_with_auth(method, url, content_type, body, context, None)
+    http_send_bytes_with_headers(method, url, content_type, body, context, &[])
 }
 
-fn http_send_bytes_with_auth(
+fn http_send_bytes_with_headers(
     method: &str,
     url: &str,
     content_type: &str,
     body: &[u8],
     context: &str,
-    authorization: Option<&str>,
+    headers: &[(String, String)],
 ) -> anyhow::Result<()> {
     if url.starts_with("https://") {
-        return https_send_bytes_with_auth(method, url, content_type, body, context, authorization);
+        return https_send_bytes_with_headers(method, url, content_type, body, context, headers);
     }
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = std::net::TcpStream::connect((host.as_str(), port))
@@ -3319,9 +3570,10 @@ fn http_send_bytes_with_auth(
         "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
         body.len()
     );
-    if let Some(authorization) = authorization {
-        request.push_str("Authorization: ");
-        request.push_str(authorization);
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
         request.push_str("\r\n");
     }
     request.push_str("Connection: close\r\n\r\n");
@@ -3346,13 +3598,13 @@ fn http_send_bytes_with_auth(
     Ok(())
 }
 
-fn https_send_bytes_with_auth(
+fn https_send_bytes_with_headers(
     method: &str,
     url: &str,
     content_type: &str,
     body: &[u8],
     context: &str,
-    authorization: Option<&str>,
+    headers: &[(String, String)],
 ) -> anyhow::Result<()> {
     let mut request = match method {
         "POST" => ureq::post(url),
@@ -3360,8 +3612,8 @@ fn https_send_bytes_with_auth(
         other => anyhow::bail!("{context} unsupported HTTPS method {other}"),
     }
     .content_type(content_type);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
     }
     let mut response = request
         .send(body)
@@ -3373,15 +3625,15 @@ fn https_send_bytes_with_auth(
     Ok(())
 }
 
-fn http_get_bytes_with_auth(
+fn http_get_bytes_with_headers(
     url: &str,
     context: &str,
-    authorization: Option<&str>,
+    headers: &[(String, String)],
 ) -> anyhow::Result<Vec<u8>> {
     if url.starts_with("https://") {
         let mut request = ureq::get(url);
-        if let Some(authorization) = authorization {
-            request = request.header("Authorization", authorization);
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
         }
         let mut response = request
             .call()
@@ -3406,9 +3658,10 @@ fn http_get_bytes_with_auth(
         format!("{host}:{port}")
     };
     let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\n");
-    if let Some(authorization) = authorization {
-        request.push_str("Authorization: ");
-        request.push_str(authorization);
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
         request.push_str("\r\n");
     }
     request.push_str("Connection: close\r\n\r\n");
