@@ -2313,6 +2313,13 @@ impl<W: Write> Interp<W> {
             {
                 call_commerce_adapter_method(&fields, method, &args)
             }
+            (
+                Value::Object(fields),
+                m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
+                | "count" | "sum" | "transaction" | "schema" | "analyze"),
+            ) if object_kind(&fields).is_some_and(|kind| kind == "db.adapter") => {
+                call_external_db_adapter_method(&fields, m)
+            }
             // ── C_db 메서드 ──
             //
             // 시그니처 (MVP):
@@ -3941,6 +3948,22 @@ fn call_commerce_adapter_method(
     Ok(result)
 }
 
+fn call_external_db_adapter_method(
+    fields: &[(String, Value)],
+    method: &str,
+) -> Result<Value, RuntimeError> {
+    match method {
+        "analyze" | "schema" => Ok(Value::Object(fields.to_vec())),
+        _ => {
+            let provider =
+                object_string_field(fields, "provider").unwrap_or_else(|| "external".to_string());
+            Err(RuntimeError::native(format!(
+                "external db adapter {provider} is not implemented in the reference runtime"
+            )))
+        }
+    }
+}
+
 fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeError> {
     let Some((scheme, _target)) = url.split_once("://") else {
         return Err(RuntimeError::native(format!(
@@ -4958,6 +4981,29 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
                     method: field.to_string(),
                 });
             }
+            if object_kind(fields).is_some_and(|kind| {
+                kind == "db.adapter"
+                    && matches!(
+                        field,
+                        "create"
+                            | "find"
+                            | "findAll"
+                            | "update"
+                            | "delete"
+                            | "upsert"
+                            | "search"
+                            | "count"
+                            | "sum"
+                            | "transaction"
+                            | "schema"
+                            | "analyze"
+                    )
+            }) {
+                return Ok(Value::BoundMethod {
+                    receiver: Box::new(t),
+                    method: field.to_string(),
+                });
+            }
             if missing_object_is_void {
                 Ok(Value::Void)
             } else {
@@ -5617,6 +5663,17 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                     })?;
                     return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
                 }
+                if let Some(provider) = external_db_adapter_provider(&url) {
+                    return Ok(Value::Object(vec![
+                        ("kind".to_string(), Value::Str("db.adapter".to_string())),
+                        ("provider".to_string(), Value::Str(provider.to_string())),
+                        ("url".to_string(), Value::Str(url)),
+                        (
+                            "adapterStatus".to_string(),
+                            Value::Str("unsupported_runtime".to_string()),
+                        ),
+                    ]));
+                }
                 return Err(RuntimeError::native(format!(
                     "external db adapters are not implemented for `{url}`; supported schemes are memory://, file://, and sqlite://"
                 )));
@@ -5809,6 +5866,29 @@ fn object_field<'a>(fields: &'a [(String, Value)], name: &str) -> Option<&'a Val
         .iter()
         .find(|(field, _)| field == name)
         .map(|(_, value)| value)
+}
+
+fn object_string_field(fields: &[(String, Value)], name: &str) -> Option<String> {
+    match object_field(fields, name) {
+        Some(Value::Str(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn external_db_adapter_provider(url: &str) -> Option<&str> {
+    if url
+        .strip_prefix("postgres://")
+        .is_some_and(|tail| !tail.is_empty())
+    {
+        return Some("postgres");
+    }
+    if url
+        .strip_prefix("mysql://")
+        .is_some_and(|tail| !tail.is_empty())
+    {
+        return Some("mysql");
+    }
+    None
 }
 
 fn db_vector(value: &Value, what: &str) -> Result<Vec<f64>, RuntimeError> {
@@ -8993,13 +9073,30 @@ let all = external.findAll("User", {{}})
     }
 
     #[test]
-    fn db_connect_rejects_unimplemented_external_adapter_urls() {
-        let err = run_str(r#"let external = @db.connect "postgres://localhost/shop""#)
-            .expect_err("external adapter must fail until implemented");
+    fn db_connect_external_adapter_reports_status_and_rejects_queries() {
+        let out = run_str(
+            r#"let external = @db.connect "postgres://localhost/shop"
+@out external.provider
+@out external.adapterStatus
+@out external.url
+let err = external.analyze()
+@out err.adapterStatus"#,
+        )
+        .expect("external adapter status");
+        assert_eq!(
+            out,
+            "postgres\nunsupported_runtime\npostgres://localhost/shop\nunsupported_runtime\n"
+        );
+
+        let err = run_str(
+            r#"let external = @db.connect "mysql://localhost/shop"
+external.create("User", { name: "Ada" })"#,
+        )
+        .expect_err("external adapter query must fail until implemented");
 
         assert!(err
             .to_string()
-            .contains("external db adapters are not implemented"));
+            .contains("external db adapter mysql is not implemented"));
     }
 
     #[test]
