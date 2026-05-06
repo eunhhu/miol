@@ -3909,11 +3909,14 @@ fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeEr
             "`@{kind}.connect` expects adapter url"
         )));
     };
-    if matches!(scheme, "test" | "local" | "file" | "http") {
+    if matches!(scheme, "test" | "local" | "file" | "http")
+        || (kind == "payment" && scheme == "stripe")
+        || (kind == "shipping" && scheme == "carrier")
+    {
         Ok(scheme.to_string())
     } else {
         Err(RuntimeError::native(format!(
-            "external {kind} adapters are not implemented for `{url}`; supported schemes are test://, local://, file://, and http://"
+            "external {kind} adapters are not implemented for `{url}`; supported schemes are test://, local://, file://, http://, stripe:// for payment, and carrier:// for shipping"
         )))
     }
 }
@@ -4158,6 +4161,11 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
     let amount = payload_field(args, "amount")
         .ok_or_else(|| RuntimeError::native("`payment.capture` expects amount"))?;
     let method = payload_field(args, "method").unwrap_or_else(|| Value::Str("card".to_string()));
+    let id = if provider == "stripe" {
+        "STRIPE-PAY-LOCAL"
+    } else {
+        "PAY-LOCAL"
+    };
     Ok(Value::Object(vec![
         (
             "kind".to_string(),
@@ -4165,7 +4173,7 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
         ),
         ("provider".to_string(), Value::Str(provider.to_string())),
         ("status".to_string(), Value::Str("captured".to_string())),
-        ("id".to_string(), Value::Str("PAY-LOCAL".to_string())),
+        ("id".to_string(), Value::Str(id.to_string())),
         ("orderId".to_string(), order_id),
         ("amount".to_string(), amount),
         ("method".to_string(), method),
@@ -4177,6 +4185,11 @@ fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, Runti
         .ok_or_else(|| RuntimeError::native("`shipping.book` expects orderId"))?;
     let carrier = payload_field(args, "carrier").unwrap_or_else(|| Value::Str("post".to_string()));
     let address = payload_field(args, "address").unwrap_or_else(|| Value::Str(String::new()));
+    let (id, tracking) = if provider == "carrier" {
+        ("CARRIER-SHIP-LOCAL", "TRK-CARRIER-LOCAL")
+    } else {
+        ("SHIP-LOCAL", "TRK-LOCAL")
+    };
     Ok(Value::Object(vec![
         (
             "kind".to_string(),
@@ -4184,11 +4197,11 @@ fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, Runti
         ),
         ("provider".to_string(), Value::Str(provider.to_string())),
         ("status".to_string(), Value::Str("ready".to_string())),
-        ("id".to_string(), Value::Str("SHIP-LOCAL".to_string())),
+        ("id".to_string(), Value::Str(id.to_string())),
         ("orderId".to_string(), order_id),
         ("carrier".to_string(), carrier),
         ("address".to_string(), address),
-        ("tracking".to_string(), Value::Str("TRK-LOCAL".to_string())),
+        ("tracking".to_string(), Value::Str(tracking.to_string())),
     ]))
 }
 
@@ -9329,25 +9342,24 @@ let booking = shipping.book({{ orderId: 7, carrier: "post", address: "Seoul" }})
     }
 
     #[test]
-    fn payment_and_shipping_external_adapters_fail_until_implemented() {
-        let payment_err = run_str(r#"let payments = @payment.connect("stripe://live")"#)
-            .expect_err("external payment adapter must fail until implemented");
-        assert!(
-            payment_err
-                .message
-                .contains("external payment adapters are not implemented"),
-            "{}",
-            payment_err.message
-        );
+    fn payment_and_shipping_provider_adapters_support_shop_flow() {
+        let out = run_str(
+            r#"let payments = @payment.connect("stripe://local")
+let captured = payments.capture({ orderId: 7, amount: 25000, method: "card" })
+let shipping = @shipping.connect("carrier://local")
+let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
+@out payments.provider
+@out captured.status
+@out captured.id
+@out shipping.provider
+@out booking.status
+@out booking.tracking"#,
+        )
+        .unwrap();
 
-        let shipping_err = run_str(r#"let shipping = @shipping.connect("carrier://live")"#)
-            .expect_err("external shipping adapter must fail until implemented");
-        assert!(
-            shipping_err
-                .message
-                .contains("external shipping adapters are not implemented"),
-            "{}",
-            shipping_err.message
+        assert_eq!(
+            out,
+            "stripe\ncaptured\nSTRIPE-PAY-LOCAL\ncarrier\nready\nTRK-CARRIER-LOCAL\n"
         );
     }
 

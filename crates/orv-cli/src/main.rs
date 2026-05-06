@@ -2196,7 +2196,7 @@ Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to poin
 \n\
 Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default local payment and shipping adapters append capture and booking records before the DB rows are persisted.\n\
 \n\
-Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints without editing source.\n\
+Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -18685,6 +18685,7 @@ struct DeployAdapterEnv {
 struct DeployCommerceAdapter {
     kind: String,
     mode: String,
+    provider: Option<String>,
     env: Option<String>,
     default: Option<String>,
     endpoint: Option<String>,
@@ -18812,7 +18813,7 @@ fn deploy_commerce_adapter_value(adapters: &[DeployCommerceAdapter]) -> Vec<serd
     adapters
         .iter()
         .map(|adapter| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "kind": adapter.kind,
                 "mode": adapter.mode,
                 "env": adapter.env.as_deref(),
@@ -18820,7 +18821,17 @@ fn deploy_commerce_adapter_value(adapters: &[DeployCommerceAdapter]) -> Vec<serd
                 "endpoint": adapter.endpoint.as_deref(),
                 "record_path": adapter.record_path.as_deref(),
                 "request": deploy_commerce_adapter_request_value(&adapter.kind),
-            })
+            });
+            if let Some(provider) = &adapter.provider {
+                value
+                    .as_object_mut()
+                    .expect("commerce adapter value is an object")
+                    .insert(
+                        "provider".to_string(),
+                        serde_json::Value::String(provider.clone()),
+                    );
+            }
+            value
         })
         .collect()
 }
@@ -19257,6 +19268,7 @@ fn collect_commerce_adapter_persistence_arg(
             out.commerce_adapters.push(DeployCommerceAdapter {
                 kind: kind.to_string(),
                 mode: "env".to_string(),
+                provider: None,
                 env: Some(env.env.clone()),
                 default: None,
                 endpoint: None,
@@ -19275,26 +19287,45 @@ fn collect_commerce_adapter_url(
     out: &mut DeployPersistenceAccumulator,
 ) {
     let mut mode = "local".to_string();
+    let mut provider = commerce_provider(url, kind);
     let mut record_path = None;
     let mut endpoint = None;
     if let Some(path) = file_adapter_path(url) {
         mode = "file".to_string();
+        provider = None;
         record_path = Some(path.clone());
         out.record_paths.push(path);
     }
     if let Some(http_endpoint) = http_adapter_endpoint(url) {
         mode = "http".to_string();
+        provider = None;
         endpoint = Some(http_endpoint.clone());
         out.commerce_endpoints.push(http_endpoint);
+    }
+    if provider.is_some() {
+        mode = "provider".to_string();
     }
     out.commerce_adapters.push(DeployCommerceAdapter {
         kind: kind.to_string(),
         mode,
+        provider,
         env,
         default,
         endpoint,
         record_path,
     });
+}
+
+fn commerce_provider(url: &str, kind: &str) -> Option<String> {
+    let (scheme, target) = url.split_once("://")?;
+    if target.is_empty() {
+        return None;
+    }
+    match (kind, scheme) {
+        ("payment", "stripe") => Some("stripe".to_string()),
+        ("shipping", "carrier") => Some("carrier".to_string()),
+        _ => None,
+    }
 }
 
 fn hir_env_configured_string(expr: &orv_hir::HirExpr) -> Option<DeployAdapterEnv> {
@@ -21283,6 +21314,9 @@ test "checkout failing runtime body" {
         assert!(guide.contains("Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`"));
         assert!(guide.contains("PAYMENT_ADAPTER_URL"));
         assert!(guide.contains("SHIPPING_ADAPTER_URL"));
+        assert!(guide.contains("provider-mode adapters"));
+        assert!(guide.contains("stripe://"));
+        assert!(guide.contains("carrier://"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
         assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
@@ -30843,6 +30877,105 @@ entry = "src/main.orv"
             "- Commerce adapter env: SHIPPING_ADAPTER_URL default http://shipping.internal/book"
         ));
         assert!(runbook.contains("deploy/commerce-adapters.json"));
+        cmd_verify_build(&out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_records_provider_commerce_adapters() {
+        let dir = temp_output_dir("build-prod-provider-commerce-source");
+        std::fs::create_dir_all(&dir).expect("create provider commerce source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "stripe://local")
+  let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "carrier://local")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "post", address: "Seoul" })
+    @respond 200 { payment: captured.status, shipment: booked.status }
+  }
+}
+"#,
+        )
+        .expect("write provider commerce source");
+        let out = temp_output_dir("build-prod-provider-commerce");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let deploy = read_json_value(&out.join("deploy").join("manifest.json")).expect("deploy");
+        let container =
+            read_json_value(&out.join("deploy").join("container.json")).expect("container");
+        let compose =
+            std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
+        let commerce_adapters = read_json_value(&out.join("deploy").join("commerce-adapters.json"))
+            .expect("commerce adapters");
+        let runbook =
+            std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
+
+        assert_eq!(
+            deploy["server"]["persistence"]["commerce_endpoints"],
+            serde_json::json!([])
+        );
+        assert!(container["persistence"]["volumes"]
+            .as_array()
+            .expect("volumes")
+            .is_empty());
+        assert!(
+            compose.contains(r#"PAYMENT_ADAPTER_URL: "${PAYMENT_ADAPTER_URL:-stripe://local}""#)
+        );
+        assert!(
+            compose.contains(r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-carrier://local}""#)
+        );
+        assert_eq!(
+            commerce_adapters["adapters"],
+            serde_json::json!([
+                {
+                    "kind": "payment",
+                    "mode": "provider",
+                    "provider": "stripe",
+                    "env": "PAYMENT_ADAPTER_URL",
+                    "default": "stripe://local",
+                    "endpoint": null,
+                    "record_path": null,
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "payment.capture",
+                        "body": {
+                            "kind": "payment.capture",
+                            "payload": "payment capture payload"
+                        }
+                    }
+                },
+                {
+                    "kind": "shipping",
+                    "mode": "provider",
+                    "provider": "carrier",
+                    "env": "SHIPPING_ADAPTER_URL",
+                    "default": "carrier://local",
+                    "endpoint": null,
+                    "record_path": null,
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "shipping.booking",
+                        "body": {
+                            "kind": "shipping.booking",
+                            "payload": "shipping booking payload"
+                        }
+                    }
+                }
+            ])
+        );
+        assert!(
+            runbook.contains("- Commerce adapter env: PAYMENT_ADAPTER_URL default stripe://local")
+        );
+        assert!(runbook
+            .contains("- Commerce adapter env: SHIPPING_ADAPTER_URL default carrier://local"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
