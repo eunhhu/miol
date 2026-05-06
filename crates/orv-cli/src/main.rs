@@ -15847,6 +15847,9 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_wasm bundle must export initial render pointer and length");
     }
+    if !client_wasm_exports_memory(&bytes, CLIENT_WASM_MEMORY_EXPORT)? {
+        anyhow::bail!("client_wasm bundle must export initial render memory");
+    }
     verify_client_wasm_initial_render_data(&bytes, initial_render)?;
     Ok(())
 }
@@ -16267,10 +16270,22 @@ fn verify_dev_watch_set(
 }
 
 fn client_wasm_exports_function(bytes: &[u8], name: &str) -> anyhow::Result<bool> {
-    Ok(client_wasm_export_function_index(bytes, name)?.is_some())
+    Ok(client_wasm_export_index(bytes, name, 0)?.is_some())
 }
 
 fn client_wasm_export_function_index(bytes: &[u8], name: &str) -> anyhow::Result<Option<u32>> {
+    client_wasm_export_index(bytes, name, 0)
+}
+
+fn client_wasm_exports_memory(bytes: &[u8], name: &str) -> anyhow::Result<bool> {
+    Ok(client_wasm_export_index(bytes, name, 2)?.is_some())
+}
+
+fn client_wasm_export_index(
+    bytes: &[u8],
+    name: &str,
+    expected_kind: u8,
+) -> anyhow::Result<Option<u32>> {
     let mut offset = WASM_MODULE_HEADER.len();
     while offset < bytes.len() {
         let section_id = bytes[offset];
@@ -16283,18 +16298,19 @@ fn client_wasm_export_function_index(bytes: &[u8], name: &str) -> anyhow::Result
             anyhow::bail!("client_wasm bundle has invalid WASM section length");
         }
         if section_id == 7 {
-            return wasm_export_section_function_index(bytes, offset, section_end, name);
+            return wasm_export_section_index(bytes, offset, section_end, name, expected_kind);
         }
         offset = section_end;
     }
     Ok(None)
 }
 
-fn wasm_export_section_function_index(
+fn wasm_export_section_index(
     bytes: &[u8],
     mut offset: usize,
     section_end: usize,
     name: &str,
+    expected_kind: u8,
 ) -> anyhow::Result<Option<u32>> {
     let export_count = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
     for _ in 0..export_count {
@@ -16313,7 +16329,7 @@ fn wasm_export_section_function_index(
         let kind = bytes[offset];
         offset += 1;
         let index = read_wasm_u32_leb(bytes, &mut offset, section_end)?;
-        if export_name_matches && kind == 0 {
+        if export_name_matches && kind == expected_kind {
             return Ok(Some(index));
         }
     }
@@ -35728,6 +35744,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_wasm_without_memory_export() {
+        let out = temp_output_dir("verify-build-client-wasm-memory-export");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let wasm_path = build_out.join("client").join("app.wasm");
+        let mut wasm = std::fs::read(&wasm_path).expect("client wasm");
+        corrupt_generated_memory_export_kind(&mut wasm, 0);
+        std::fs::write(&wasm_path, wasm).expect("rewrite wasm");
+        refresh_client_manifest_wasm_hash(&build_out);
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client wasm memory export");
+
+        assert!(
+            err.to_string().contains("memory"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_client_wasm_initial_render_data_mismatch() {
         let out = temp_output_dir("verify-build-client-wasm-render-data");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -35848,6 +35892,18 @@ models = { path = "../../shared/models", version = "2.0.0" }
             offset = section_end;
         }
         panic!("render_len function body not found");
+    }
+
+    fn corrupt_generated_memory_export_kind(wasm: &mut [u8], replacement: u8) {
+        let Some(position) = wasm
+            .windows(CLIENT_WASM_MEMORY_EXPORT.len())
+            .rposition(|window| window == CLIENT_WASM_MEMORY_EXPORT.as_bytes())
+        else {
+            panic!("memory export name not found");
+        };
+        let kind_offset = position + CLIENT_WASM_MEMORY_EXPORT.len();
+        assert_eq!(wasm[kind_offset], 2);
+        wasm[kind_offset] = replacement;
     }
 
     fn refresh_client_manifest_wasm_hash(build_out: &Path) {
