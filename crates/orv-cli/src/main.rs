@@ -2243,7 +2243,7 @@ Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default loc
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
-Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification, duplicate event handling, and Payment/Order status reconciliation from webhook payloads; real provider API calls are still future work.\n\
+Provider-mode deploy artifacts expose endpoint and credential env placeholders such as `STRIPE_API_ENDPOINT`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_ENDPOINT`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. When `STRIPE_API_ENDPOINT` or `CARRIER_API_ENDPOINT` is configured, provider-mode capture/booking calls POST checked JSON to that endpoint with bearer credentials and merge the provider JSON response without exposing secret values. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification, duplicate event handling, and Payment/Order status reconciliation from webhook payloads; production provider SDK hardening remains future work.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -20912,10 +20912,12 @@ fn commerce_provider(url: &str, kind: &str) -> Option<String> {
 fn commerce_provider_env(provider: &str) -> Vec<DeployProviderEnv> {
     match provider {
         "stripe" => vec![
+            deploy_provider_env("STRIPE_API_ENDPOINT", false, "api_endpoint"),
             deploy_provider_env("STRIPE_SECRET_KEY", true, "api_secret"),
             deploy_provider_env("STRIPE_WEBHOOK_SECRET", false, "webhook_signature"),
         ],
         "carrier" => vec![
+            deploy_provider_env("CARRIER_API_ENDPOINT", false, "api_endpoint"),
             deploy_provider_env("CARRIER_API_KEY", true, "api_key"),
             deploy_provider_env("CARRIER_WEBHOOK_SECRET", false, "webhook_signature"),
         ],
@@ -32678,8 +32680,10 @@ entry = "src/main.orv"
             compose.contains(r#"SHIPPING_ADAPTER_URL: "${SHIPPING_ADAPTER_URL:-carrier://local}""#)
         );
         assert!(compose.contains(r#"STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY}""#));
+        assert!(compose.contains(r#"STRIPE_API_ENDPOINT: "${STRIPE_API_ENDPOINT}""#));
         assert!(compose.contains(r#"STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET}""#));
         assert!(compose.contains(r#"CARRIER_API_KEY: "${CARRIER_API_KEY}""#));
+        assert!(compose.contains(r#"CARRIER_API_ENDPOINT: "${CARRIER_API_ENDPOINT}""#));
         assert!(compose.contains(r#"CARRIER_WEBHOOK_SECRET: "${CARRIER_WEBHOOK_SECRET}""#));
         assert_eq!(
             commerce_adapters["adapters"],
@@ -32693,6 +32697,11 @@ entry = "src/main.orv"
                     "endpoint": null,
                     "record_path": null,
                     "provider_env": [
+                        {
+                            "env": "STRIPE_API_ENDPOINT",
+                            "required": false,
+                            "purpose": "api_endpoint"
+                        },
                         {
                             "env": "STRIPE_SECRET_KEY",
                             "required": true,
@@ -32724,6 +32733,11 @@ entry = "src/main.orv"
                     "record_path": null,
                     "provider_env": [
                         {
+                            "env": "CARRIER_API_ENDPOINT",
+                            "required": false,
+                            "purpose": "api_endpoint"
+                        },
+                        {
                             "env": "CARRIER_API_KEY",
                             "required": true,
                             "purpose": "api_key"
@@ -32746,8 +32760,10 @@ entry = "src/main.orv"
                 }
             ])
         );
+        assert!(env_example.contains("STRIPE_API_ENDPOINT="));
         assert!(env_example.contains("STRIPE_SECRET_KEY="));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
+        assert!(env_example.contains("CARRIER_API_ENDPOINT="));
         assert!(env_example.contains("CARRIER_API_KEY="));
         assert!(env_example.contains("CARRIER_WEBHOOK_SECRET="));
         assert!(
@@ -32756,10 +32772,16 @@ entry = "src/main.orv"
         assert!(runbook
             .contains("- Commerce adapter env: SHIPPING_ADAPTER_URL default carrier://local"));
         assert!(runbook.contains(
+            "- Commerce provider env: payment stripe STRIPE_API_ENDPOINT optional api_endpoint"
+        ));
+        assert!(runbook.contains(
             "- Commerce provider env: payment stripe STRIPE_SECRET_KEY required api_secret"
         ));
         assert!(runbook.contains(
             "- Commerce provider env: payment stripe STRIPE_WEBHOOK_SECRET optional webhook_signature"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: shipping carrier CARRIER_API_ENDPOINT optional api_endpoint"
         ));
         assert!(runbook.contains(
             "- Commerce provider env: shipping carrier CARRIER_API_KEY required api_key"

@@ -3918,6 +3918,12 @@ fn call_commerce_adapter_method(
             shipping_booking_value(&provider, args)?;
             http_commerce_adapter_value(fields, "shipping.booking", args)?
         }
+        ("payment.adapter", "capture") if provider == "stripe" => {
+            stripe_provider_capture_value(args)?
+        }
+        ("shipping.adapter", "book") if provider == "carrier" => {
+            carrier_provider_booking_value(args)?
+        }
         ("payment.adapter", "capture") => payment_capture_value(&provider, args)?,
         ("shipping.adapter", "book") => shipping_booking_value(&provider, args)?,
         (kind, _) => {
@@ -3979,6 +3985,14 @@ struct HttpAdapterUrl {
 }
 
 fn http_post_json(url: &str, body: &str) -> Result<String, RuntimeError> {
+    http_post_json_with_headers(url, body, &[])
+}
+
+fn http_post_json_with_headers(
+    url: &str,
+    body: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<String, RuntimeError> {
     let parsed = parse_http_adapter_url(url)?;
     let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|source| {
         RuntimeError::native(format!(
@@ -3996,13 +4010,21 @@ fn http_post_json(url: &str, body: &str) -> Result<String, RuntimeError> {
             "http commerce adapter failed to set write timeout: {source}"
         ))
     })?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\ncontent-type: application/json\r\naccept: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        parsed.path,
-        parsed.host_header,
+    let mut request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\ncontent-type: application/json\r\naccept: application/json\r\n",
+        parsed.path, parsed.host_header
+    );
+    for (name, value) in extra_headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str(&format!(
+        "content-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
-    );
+    ));
     stream.write_all(request.as_bytes()).map_err(|source| {
         RuntimeError::native(format!(
             "http commerce adapter failed to write request: {source}"
@@ -4209,6 +4231,30 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
     Ok(Value::Object(fields))
 }
 
+fn stripe_provider_capture_value(args: &[Value]) -> Result<Value, RuntimeError> {
+    let base = payment_capture_value("stripe", args)?;
+    let Some(endpoint) = provider_env_value("STRIPE_API_ENDPOINT") else {
+        return Ok(base);
+    };
+    let secret = provider_env_value("STRIPE_SECRET_KEY")
+        .ok_or_else(|| RuntimeError::native("stripe provider capture expects STRIPE_SECRET_KEY"))?;
+    let payload = args.first().cloned().unwrap_or(Value::Void);
+    let request = serde_json::json!({
+        "kind": "stripe.payment_intent.create",
+        "payload": runtime_value_json(&payload),
+    })
+    .to_string();
+    let response = http_post_json_with_headers(
+        &endpoint,
+        &request,
+        &[("authorization", format!("Bearer {secret}"))],
+    )?;
+    let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
+        RuntimeError::native(format!("stripe provider response was not JSON: {source}"))
+    })?;
+    merge_provider_response(base, remote)
+}
+
 fn stripe_webhook_verification_value(args: &[Value]) -> Result<Value, RuntimeError> {
     let payload = payload_field(args, "payload")
         .ok_or_else(|| RuntimeError::native("`payment.verifyWebhook` expects payload"))?;
@@ -4329,6 +4375,47 @@ fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, Runti
         ("tracking".to_string(), Value::Str(tracking.to_string())),
     ];
     fields.extend(shipping_provider_credential_fields(provider));
+    Ok(Value::Object(fields))
+}
+
+fn carrier_provider_booking_value(args: &[Value]) -> Result<Value, RuntimeError> {
+    let base = shipping_booking_value("carrier", args)?;
+    let Some(endpoint) = provider_env_value("CARRIER_API_ENDPOINT") else {
+        return Ok(base);
+    };
+    let api_key = provider_env_value("CARRIER_API_KEY")
+        .ok_or_else(|| RuntimeError::native("carrier provider booking expects CARRIER_API_KEY"))?;
+    let payload = args.first().cloned().unwrap_or(Value::Void);
+    let request = serde_json::json!({
+        "kind": "carrier.shipment.create",
+        "payload": runtime_value_json(&payload),
+    })
+    .to_string();
+    let response = http_post_json_with_headers(
+        &endpoint,
+        &request,
+        &[("authorization", format!("Bearer {api_key}"))],
+    )?;
+    let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
+        RuntimeError::native(format!("carrier provider response was not JSON: {source}"))
+    })?;
+    merge_provider_response(base, remote)
+}
+
+fn merge_provider_response(base: Value, remote: serde_json::Value) -> Result<Value, RuntimeError> {
+    let Value::Object(mut fields) = base else {
+        return Ok(runtime_value_from_json(remote));
+    };
+    let serde_json::Value::Object(remote_fields) = remote else {
+        return Ok(Value::Object(fields));
+    };
+    for (key, value) in remote_fields {
+        if let Some((_, existing)) = fields.iter_mut().find(|(field, _)| field == &key) {
+            *existing = runtime_value_from_json(value);
+        } else {
+            fields.push((key, runtime_value_from_json(value)));
+        }
+    }
     Ok(Value::Object(fields))
 }
 
@@ -9590,6 +9677,73 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
         assert_eq!(out, "configured\nmissing\nmissing\nconfigured\n");
         assert!(!out.contains("sk_test_never_print"));
         assert!(!out.contains("carrier_webhook_never_print"));
+    }
+
+    #[test]
+    fn provider_adapters_call_configured_provider_endpoints_without_exposing_secrets() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider test server");
+        let address = listener.local_addr().expect("provider test server address");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept provider request");
+                let request = read_test_http_request(&mut stream);
+                let response = if request.starts_with("POST /stripe/payment_intents ") {
+                    r#"{"id":"pi_test_123","status":"succeeded","providerStatus":"captured_provider"}"#
+                } else if request.starts_with("POST /carrier/shipments ") {
+                    r#"{"id":"ship_test_123","status":"booked_provider","tracking":"TRK-PROVIDER"}"#
+                } else {
+                    r#"{"error":"unexpected path"}"#
+                };
+                server_requests.lock().unwrap().push(request);
+                write_test_http_json_response(&mut stream, response);
+            }
+        });
+        super::test_env::set(
+            "STRIPE_API_ENDPOINT",
+            &format!("http://{address}/stripe/payment_intents"),
+        );
+        super::test_env::set("STRIPE_SECRET_KEY", "sk_test_never_print");
+        super::test_env::set(
+            "CARRIER_API_ENDPOINT",
+            &format!("http://{address}/carrier/shipments"),
+        );
+        super::test_env::set("CARRIER_API_KEY", "carrier_key_never_print");
+
+        let out = run_str(
+            r#"let payments = @payment.connect("stripe://local")
+let captured = payments.capture({ orderId: 7, amount: 25000, method: "card" })
+let shipping = @shipping.connect("carrier://local")
+let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
+@out captured.id
+@out captured.status
+@out captured.providerStatus
+@out booking.id
+@out booking.status
+@out booking.tracking"#,
+        )
+        .unwrap();
+        super::test_env::clear("STRIPE_API_ENDPOINT");
+        super::test_env::clear("STRIPE_SECRET_KEY");
+        super::test_env::clear("CARRIER_API_ENDPOINT");
+        super::test_env::clear("CARRIER_API_KEY");
+        server.join().expect("provider test server finished");
+
+        assert_eq!(
+            out,
+            "pi_test_123\nsucceeded\ncaptured_provider\nship_test_123\nbooked_provider\nTRK-PROVIDER\n"
+        );
+        assert!(!out.contains("sk_test_never_print"));
+        assert!(!out.contains("carrier_key_never_print"));
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].contains(r#""kind":"stripe.payment_intent.create""#));
+        assert!(requests[0].contains(r#""amount":25000"#));
+        assert!(requests[0].contains("authorization: Bearer sk_test_never_print"));
+        assert!(requests[1].contains(r#""kind":"carrier.shipment.create""#));
+        assert!(requests[1].contains(r#""carrier":"post""#));
+        assert!(requests[1].contains("authorization: Bearer carrier_key_never_print"));
     }
 
     #[test]
