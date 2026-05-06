@@ -1421,6 +1421,7 @@ fn json_to_value(j: serde_json::Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, Mac};
     use hyper::client::conn::http1 as client_http1;
     use hyper_util::rt::TokioIo;
     use orv_analyzer::lower;
@@ -1428,6 +1429,7 @@ mod tests {
     use orv_hir::{HirExpr, HirExprKind, HirProgram, HirStmt};
     use orv_resolve::resolve;
     use orv_syntax::{lex, parse};
+    use sha2::Sha256;
     use tokio::net::TcpStream;
 
     // --- 단위: match_route / parse_query / value_to_json ---
@@ -1779,6 +1781,18 @@ mod tests {
     }
 
     const TEST_ORIGIN_HEADER: &str = "x-orv-origin-id";
+
+    fn stripe_test_signature(secret: &str, timestamp: &str, payload: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+        mac.update(format!("{timestamp}.{payload}").as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut hex, "{byte:02x}").expect("write hex");
+        }
+        format!("t={timestamp},v1={hex}")
+    }
 
     fn expected_origin_id(kind: &str, name: &str, span: Span) -> String {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -3117,13 +3131,45 @@ mod tests {
                 checkout["shipment"]["tracking"],
                 serde_json::json!("TRK-LOCAL")
             );
+            let checkout_order_id = checkout["order"]["id"].as_i64().expect("checkout order id");
+
+            crate::interp::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
+            let reconciliation_payload = serde_json::json!({
+                "id": "evt_checkout_paid",
+                "orderId": checkout_order_id,
+                "paymentStatus": "provider_paid",
+                "orderStatus": "provider_reconciled"
+            })
+            .to_string();
+            let reconciliation_signature =
+                stripe_test_signature("whsec_test", "1700000001", &reconciliation_payload);
+            let (reconciliation_status, _, reconciliation_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/webhooks/stripe",
+                Some(reconciliation_payload),
+                &[("stripe-signature", &reconciliation_signature)],
+            )
+            .await;
+            crate::interp::test_env::clear("STRIPE_WEBHOOK_SECRET");
+            assert_eq!(reconciliation_status, 202);
+            let reconciliation: serde_json::Value =
+                serde_json::from_slice(&reconciliation_body).expect("reconciliation json");
+            assert_eq!(
+                reconciliation["reconciledPayment"]["status"],
+                serde_json::json!("provider_paid")
+            );
+            assert_eq!(
+                reconciliation["reconciledOrder"]["status"],
+                serde_json::json!("provider_reconciled")
+            );
 
             let (admin_orders_status, _, admin_orders_body) =
                 send_request(addr, "GET", "/admin/orders", None).await;
             assert_eq!(admin_orders_status, 200);
             let admin_orders_html = String::from_utf8(admin_orders_body).expect("orders html utf8");
             assert!(admin_orders_html.contains("ada"));
-            assert!(admin_orders_html.contains("shipped"));
+            assert!(admin_orders_html.contains("provider_reconciled"));
 
             let (admin_payments_status, _, admin_payments_body) =
                 send_request(addr, "GET", "/admin/payments", None).await;
@@ -3131,6 +3177,7 @@ mod tests {
             let admin_payments_html =
                 String::from_utf8(admin_payments_body).expect("payments html utf8");
             assert!(admin_payments_html.contains("captured"));
+            assert!(admin_payments_html.contains("provider_paid"));
             assert!(admin_payments_html.contains("file"));
 
             let (admin_shipments_status, _, admin_shipments_body) =
@@ -3146,6 +3193,7 @@ mod tests {
             let admin_webhooks_html =
                 String::from_utf8(admin_webhooks_body).expect("webhooks html utf8");
             assert!(admin_webhooks_html.contains("evt_1"));
+            assert!(admin_webhooks_html.contains("evt_checkout_paid"));
             assert!(admin_webhooks_html.contains("verified"));
 
             let (summary_status, _, summary_body) =
@@ -3158,7 +3206,7 @@ mod tests {
             assert_eq!(summary["orders"], serde_json::json!(3));
             assert_eq!(summary["payments"], serde_json::json!(2));
             assert_eq!(summary["shipments"], serde_json::json!(2));
-            assert_eq!(summary["webhookEvents"], serde_json::json!(1));
+            assert_eq!(summary["webhookEvents"], serde_json::json!(2));
 
             handle.abort();
 
@@ -3193,7 +3241,7 @@ mod tests {
                 snapshot["tables"]["WebhookEvent"]["rows"]
                     .as_array()
                     .map(Vec::len),
-                Some(1)
+                Some(2)
             );
             assert_eq!(
                 snapshot["tables"]["WebhookEvent"]["rows"][0]["eventId"],

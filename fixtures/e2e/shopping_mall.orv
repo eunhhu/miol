@@ -429,6 +429,8 @@
       signature: @header["stripe-signature"]
     })
     let eventId = @body.id
+    let mut reconciledPayment = void
+    let mut reconciledOrder = void
     if verification.status == "verified" {
       if eventId == void {
         let missingIdEvent = await shopdb.create("WebhookEvent", {
@@ -456,7 +458,27 @@
     if verification.status != "verified" {
       @respond 400 { webhook: event, verification: verification, duplicate: false }
     }
-    @respond 202 { webhook: event, verification: verification, duplicate: false }
+    let reconcileOrderId = @body["orderId"]
+    let reconcilePaymentStatus = @body["paymentStatus"]
+    let reconcileOrderStatus = @body["orderStatus"]
+    if reconcileOrderId != void {
+      let reconciledOrderId: int = reconcileOrderId as int
+      if reconcilePaymentStatus != void {
+        await shopdb.update("Payment", { orderId: reconciledOrderId }, { status: reconcilePaymentStatus })
+        reconciledPayment = await shopdb.find("Payment", { orderId: reconciledOrderId })
+      }
+      if reconcileOrderStatus != void {
+        await shopdb.update("Order", { id: reconciledOrderId }, { status: reconcileOrderStatus })
+        reconciledOrder = await shopdb.find("Order", { id: reconciledOrderId })
+      }
+    }
+    @respond 202 {
+      webhook: event,
+      verification: verification,
+      duplicate: false,
+      reconciledPayment: reconciledPayment,
+      reconciledOrder: reconciledOrder
+    }
   }
 
   @route POST /shipments {
