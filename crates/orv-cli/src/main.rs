@@ -2752,10 +2752,10 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
     let target_kind = manifest
         .pointer("/target/kind")
         .and_then(serde_json::Value::as_str);
-    if let Some(target_path) = manifest
+    let target_wal_path = manifest
         .pointer("/target/wal/path")
-        .and_then(serde_json::Value::as_str)
-    {
+        .and_then(serde_json::Value::as_str);
+    if let Some(target_path) = target_wal_path {
         if target_kind == Some("file")
             || (target_kind.is_none() && target_path.starts_with("file://"))
         {
@@ -2769,6 +2769,15 @@ fn db_archive_manifest_wal_path(archive: &Path) -> anyhow::Result<PathBuf> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("db archive wal.path must be a string"))?;
     let wal_path = db_archive_source_wal_path(archive, wal_path);
+    if wal_path.is_file() {
+        verify_db_archive_wal(&manifest, &wal_path)?;
+        return Ok(wal_path);
+    }
+    if target_kind == Some("http") {
+        if let Some(target_path) = target_wal_path {
+            return download_db_archive_wal_to_cache(archive, &manifest, target_path);
+        }
+    }
     verify_db_archive_wal(&manifest, &wal_path)?;
     Ok(wal_path)
 }
@@ -2788,22 +2797,78 @@ fn db_archive_source_wal_path(archive: &Path, wal_path: &str) -> PathBuf {
 fn verify_db_archive_wal(manifest: &serde_json::Value, wal: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(wal)
         .map_err(|e| anyhow::anyhow!("failed to read WAL {}: {e}", wal.display()))?;
+    verify_db_archive_wal_bytes(manifest, &bytes, &wal.display().to_string())
+}
+
+fn verify_db_archive_wal_bytes(
+    manifest: &serde_json::Value,
+    bytes: &[u8],
+    label: &str,
+) -> anyhow::Result<()> {
     let expected_hash = manifest
         .pointer("/wal/hash")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("db archive wal.hash must be a string"))?;
-    let actual_hash = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
+    let actual_hash = format!("fnv1a64:{:016x}", fnv1a64(bytes));
     if actual_hash != expected_hash {
-        anyhow::bail!("db archive WAL hash mismatch for {}", wal.display());
+        anyhow::bail!("db archive WAL hash mismatch for {label}");
     }
     let expected_bytes = manifest
         .pointer("/wal/byte_count")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("db archive wal.byte_count must be a number"))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_bytes {
-        anyhow::bail!("db archive WAL byte count mismatch for {}", wal.display());
+        anyhow::bail!("db archive WAL byte count mismatch for {label}");
     }
     Ok(())
+}
+
+fn download_db_archive_wal_to_cache(
+    archive: &Path,
+    manifest: &serde_json::Value,
+    url: &str,
+) -> anyhow::Result<PathBuf> {
+    let bytes = http_get_bytes(url, "db archive WAL download")?;
+    verify_db_archive_wal_bytes(manifest, &bytes, url)?;
+    let cache_path = db_archive_http_cache_path(archive, manifest, url)?;
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create archive cache {}: {e}", parent.display())
+        })?;
+    }
+    std::fs::write(&cache_path, &bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to write archive cache WAL {}: {e}",
+            cache_path.display()
+        )
+    })?;
+    Ok(cache_path)
+}
+
+fn db_archive_http_cache_path(
+    archive: &Path,
+    manifest: &serde_json::Value,
+    url: &str,
+) -> anyhow::Result<PathBuf> {
+    let hash = manifest
+        .pointer("/wal/hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("db archive wal.hash must be a string"))?;
+    let name = url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("db.wal.jsonl");
+    let file = format!(
+        "{}-{}",
+        dependency_cache_component(hash),
+        dependency_cache_component(name)
+    );
+    let parent = archive.parent().map_or_else(
+        || PathBuf::from(".orv-db-archive-cache"),
+        |parent| parent.join(".orv-db-archive-cache"),
+    );
+    Ok(parent.join(file))
 }
 
 struct DbArchiveFileTarget {
@@ -3025,6 +3090,42 @@ fn http_post_bytes(
         anyhow::bail!("{context} {url} failed with {status}: {response_body}");
     }
     Ok(())
+}
+
+fn http_get_bytes(url: &str, context: &str) -> anyhow::Result<Vec<u8>> {
+    let (host, port, path) = parse_http_url(url)?;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| anyhow::anyhow!("{context} failed to connect {host}:{port}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| anyhow::anyhow!("{context} failed to configure read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| anyhow::anyhow!("{context} failed to configure write timeout: {e}"))?;
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|e| anyhow::anyhow!("{context} failed to write request {url}: {e}"))?;
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response)
+        .map_err(|e| anyhow::anyhow!("{context} failed to read response {url}: {e}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("{context} response missing HTTP header terminator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|e| anyhow::anyhow!("{context} response headers are not UTF-8: {e}"))?;
+    let status = headers.lines().next().unwrap_or_default();
+    if !http_status_is_success(status) {
+        let response_body = String::from_utf8_lossy(&response[header_end + 4..]);
+        anyhow::bail!("{context} {url} failed with {status}: {response_body}");
+    }
+    Ok(response[header_end + 4..].to_vec())
 }
 
 fn http_status_is_success(status: &str) -> bool {

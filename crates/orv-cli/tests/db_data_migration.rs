@@ -22,6 +22,12 @@ fn read_json(path: &Path) -> serde_json::Value {
 }
 
 fn read_http_request(mut stream: TcpStream) -> (String, Vec<u8>) {
+    let (_, path, body) = read_http_request_parts(&mut stream);
+    write_http_response(&mut stream, "201 Created", "application/json", b"{}");
+    (path, body)
+}
+
+fn read_http_request_parts(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -32,29 +38,33 @@ fn read_http_request(mut stream: TcpStream) -> (String, Vec<u8>) {
         headers.push(byte[0]);
     }
     let headers = String::from_utf8(headers).expect("request headers utf-8");
-    let request_path = headers
+    let mut request_parts = headers
         .lines()
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .expect("request path")
-        .to_string();
+        .expect("request line")
+        .split_whitespace();
+    let request_method = request_parts.next().expect("request method").to_string();
+    let request_path = request_parts.next().expect("request path").to_string();
     let content_length = headers
         .lines()
         .find_map(|line| line.strip_prefix("Content-Length: "))
-        .expect("content length")
-        .parse::<usize>()
-        .expect("content length number");
+        .map(|value| value.parse::<usize>().expect("content length number"))
+        .unwrap_or(0);
     let mut body = vec![0_u8; content_length];
-    stream.read_exact(&mut body).expect("read request body");
-    let response_body = "{}";
+    if content_length > 0 {
+        stream.read_exact(&mut body).expect("read request body");
+    }
+    (request_method, request_path, body)
+}
+
+fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
     write!(
         stream,
-        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response_body.len(),
-        response_body
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     )
-    .expect("write response");
-    (request_path, body)
+    .expect("write response headers");
+    stream.write_all(body).expect("write response body");
 }
 
 #[test]
@@ -613,6 +623,97 @@ fn db_archive_http_target_uploads_wal_and_manifest() {
     let uploaded_manifest: serde_json::Value =
         serde_json::from_slice(&requests[1].1).expect("uploaded manifest json");
     assert_eq!(uploaded_manifest["target"], manifest["target"]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn db_restore_archive_http_target_downloads_wal_when_source_is_missing() {
+    let dir = temp_dir("db-restore-http-archive-target");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wal = dir.join("db.wal.jsonl");
+    let archive = dir.join("archive.json");
+    let data = dir.join("data.json");
+    let wal_body = concat!(
+        "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":1000,\"table\":\"User\",\"data\":{\"email\":\"a@example.com\"}}\n",
+        "{\"schema_version\":1,\"op\":\"create\",\"ts_unix_ms\":2000,\"table\":\"User\",\"data\":{\"email\":\"b@example.com\"}}\n",
+    );
+    std::fs::write(&wal, wal_body).expect("write wal");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind archive target");
+    let address = listener.local_addr().expect("archive target address");
+    let server_wal_body = wal_body.as_bytes().to_vec();
+    let server = std::thread::spawn(move || {
+        let (wal_upload, _) = listener.accept().expect("accept wal upload");
+        let wal_upload = read_http_request(wal_upload);
+
+        let (manifest_upload, _) = listener.accept().expect("accept manifest upload");
+        let manifest_upload = read_http_request(manifest_upload);
+
+        let (mut wal_download, _) = listener.accept().expect("accept wal download");
+        let (method, path, body) = read_http_request_parts(&mut wal_download);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/archive/db.wal.jsonl");
+        assert!(body.is_empty());
+        write_http_response(
+            &mut wal_download,
+            "200 OK",
+            "application/x-jsonlines",
+            &server_wal_body,
+        );
+        (wal_upload, manifest_upload)
+    });
+
+    let target = format!("http://{address}/archive");
+    let archive_output = orv()
+        .args(["db", "archive"])
+        .arg("--wal")
+        .arg(&wal)
+        .arg("--out")
+        .arg(&archive)
+        .arg("--target")
+        .arg(&target)
+        .output()
+        .expect("run db archive");
+    assert!(
+        archive_output.status.success(),
+        "archive failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&archive_output.stdout),
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+    std::fs::remove_file(&wal).expect("remove source wal");
+
+    let restore = orv()
+        .args(["db", "restore"])
+        .arg("--archive")
+        .arg(&archive)
+        .arg("--data")
+        .arg(&data)
+        .output()
+        .expect("run db restore");
+
+    assert!(
+        restore.status.success(),
+        "restore failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let (wal_upload, manifest_upload) = server.join().expect("archive server finished");
+    assert_eq!(wal_upload.0, "/archive/db.wal.jsonl");
+    assert_eq!(
+        String::from_utf8(wal_upload.1).expect("uploaded wal utf-8"),
+        wal_body
+    );
+    assert_eq!(manifest_upload.0, "/archive/archive.json");
+    let uploaded_manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_upload.1).expect("uploaded manifest json");
+    assert_eq!(uploaded_manifest["target"]["kind"], "http");
+    let restored = read_json(&data);
+    let rows = restored["tables"]["User"]["rows"]
+        .as_array()
+        .expect("restored rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["email"], "a@example.com");
+    assert_eq!(rows[1]["email"], "b@example.com");
 
     let _ = std::fs::remove_dir_all(dir);
 }
