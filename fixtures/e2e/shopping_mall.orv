@@ -68,6 +68,24 @@
             @input type=number name=total required
             @button type=submit "Reserve order"
           }
+          @form action="/checkout" method=post {
+            @h3 "One-step checkout"
+            @label "Member handle"
+            @input type=text name=handle required
+            @label "SKU"
+            @input type=text name=sku required
+            @label "Quantity"
+            @input type=number name=quantity required
+            @label "Total"
+            @input type=number name=total required
+            @label "Method"
+            @input type=text name=method value=card required
+            @label "Carrier"
+            @input type=text name=carrier value=post required
+            @label "Address"
+            @input type=text name=address required
+            @button type=submit "Checkout"
+          }
           @form action="/payments" method=post {
             @h3 "Capture payment"
             @label "Order ID"
@@ -94,6 +112,7 @@
           @li "POST /members"
           @li "POST /members/login"
           @li "POST /orders"
+          @li "POST /checkout"
           @li "POST /payments"
           @li "POST /shipments"
         }
@@ -217,6 +236,71 @@
   @route GET /orders/:customer {
     let order = await shopdb.find("Order", { customer: @param.customer })
     @respond 200 { order: order }
+  }
+
+  @route POST /checkout {
+    let quantity: int = @body.quantity as int
+    let total: int = @body.total as int
+    let member = await shopdb.find("Member", { handle: @body.handle })
+    if member == void {
+      @respond 404 { err: "member_not_found", handle: @body.handle }
+    }
+    let product = await shopdb.find("Product", { sku: @body.sku })
+    if product == void {
+      @respond 404 { err: "product_not_found", sku: @body.sku }
+    }
+    if product.stock < quantity {
+      @respond 409 { err: "out_of_stock", sku: @body.sku, stock: product.stock }
+    }
+    let remainingStock = product.stock - quantity
+    await shopdb.update("Product", { sku: @body.sku }, { stock: remainingStock })
+    let order = await shopdb.create("Order", {
+      customer: member.handle,
+      memberId: member.id,
+      sku: @body.sku,
+      quantity: quantity,
+      total: total,
+      status: "reserved"
+    })
+    let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")
+    let capture = payments.capture({
+      orderId: order.id,
+      amount: total,
+      method: @body.method
+    })
+    let payment = await shopdb.create("Payment", {
+      orderId: capture.orderId,
+      amount: capture.amount,
+      method: capture.method,
+      provider: capture.provider,
+      reference: capture.id,
+      status: capture.status
+    })
+    await shopdb.update("Order", { id: order.id }, { status: "paid" })
+    let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "file://data/shipments.jsonl")
+    let booking = shipping.book({
+      orderId: order.id,
+      carrier: @body.carrier,
+      address: @body.address
+    })
+    let shipment = await shopdb.create("Shipment", {
+      orderId: booking.orderId,
+      carrier: booking.carrier,
+      address: booking.address,
+      provider: booking.provider,
+      reference: booking.id,
+      status: booking.status,
+      tracking: booking.tracking
+    })
+    await shopdb.update("Order", { id: order.id }, { status: "shipped" })
+    let checkoutOrder = await shopdb.find("Order", { id: order.id })
+    @respond 201 {
+      order: checkoutOrder,
+      payment: payment,
+      shipment: shipment,
+      member: member,
+      remainingStock: remainingStock
+    }
   }
 
   @route POST /payments {

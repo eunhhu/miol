@@ -2789,6 +2789,7 @@ mod tests {
             assert!(home_html.contains("<input type=\"number\" name=\"stock\" required>"));
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
+            assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /shipments"));
@@ -2988,6 +2989,29 @@ mod tests {
                 serde_json::json!("TRK-LOCAL")
             );
 
+            let checkout_payload = serde_json::json!({
+                "handle": "ada",
+                "sku": "mug",
+                "quantity": 1,
+                "total": 1200,
+                "method": "card",
+                "carrier": "post",
+                "address": "Seoul"
+            })
+            .to_string();
+            let (checkout_status, _, checkout_body) =
+                send_request(addr, "POST", "/checkout", Some(checkout_payload)).await;
+            assert_eq!(checkout_status, 201);
+            let checkout: serde_json::Value =
+                serde_json::from_slice(&checkout_body).expect("checkout json");
+            assert_eq!(checkout["order"]["customer"], serde_json::json!("ada"));
+            assert_eq!(checkout["order"]["status"], serde_json::json!("shipped"));
+            assert_eq!(checkout["payment"]["status"], serde_json::json!("captured"));
+            assert_eq!(
+                checkout["shipment"]["tracking"],
+                serde_json::json!("TRK-LOCAL")
+            );
+
             let (summary_status, _, summary_body) =
                 send_request(addr, "GET", "/admin/summary", None).await;
             assert_eq!(summary_status, 200);
@@ -2995,9 +3019,9 @@ mod tests {
                 serde_json::from_slice(&summary_body).expect("admin summary json");
             assert_eq!(summary["products"], serde_json::json!(2));
             assert_eq!(summary["members"], serde_json::json!(1));
-            assert_eq!(summary["orders"], serde_json::json!(2));
-            assert_eq!(summary["payments"], serde_json::json!(1));
-            assert_eq!(summary["shipments"], serde_json::json!(1));
+            assert_eq!(summary["orders"], serde_json::json!(3));
+            assert_eq!(summary["payments"], serde_json::json!(2));
+            assert_eq!(summary["shipments"], serde_json::json!(2));
 
             handle.abort();
 
@@ -3007,6 +3031,22 @@ mod tests {
             assert_eq!(
                 snapshot["tables"]["Member"]["rows"][0]["handle"],
                 serde_json::json!("ada")
+            );
+            assert_eq!(
+                snapshot["tables"]["Order"]["rows"].as_array().map(Vec::len),
+                Some(3)
+            );
+            assert_eq!(
+                snapshot["tables"]["Payment"]["rows"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2)
+            );
+            assert_eq!(
+                snapshot["tables"]["Shipment"]["rows"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2)
             );
             assert_eq!(
                 snapshot["tables"]["Shipment"]["rows"][0]["tracking"],

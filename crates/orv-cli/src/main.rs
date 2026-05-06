@@ -2186,7 +2186,7 @@ orv verify-build dist\n\
 orv run-build dist\n\
 ```\n\
 \n\
-Browser home: http://localhost:8080/ provides product, member signup/login, order, payment, and shipment forms.\n\
+Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/shipment read-model links, operations summary, and persistent storage paths.\n\
 \n\
@@ -2252,6 +2252,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `GET /members/:handle`\n\
 - `POST /orders`\n\
 - `GET /orders/:customer`\n\
+- `POST /checkout`\n\
 - `POST /payments`\n\
 - `POST /shipments`\n\
 - `GET /shipments/:orderId`\n"
@@ -21225,6 +21226,9 @@ test "checkout failing runtime body" {
         assert!(source.contains(r#"shopdb.count("Product", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
+        assert!(source.contains("@form action=\"/checkout\" method=post"));
+        assert!(source.contains("@route POST /checkout"));
+        assert!(source.contains("One-step checkout"));
         assert!(source.contains("@route POST /members"));
         assert!(source.contains("@form action=\"/members/login\" method=post"));
         assert!(source.contains("@route POST /members/login"));
@@ -21289,6 +21293,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("GET /admin/summary"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /members/login"));
+        assert!(guide.contains("POST /checkout"));
         assert!(guide.contains("POST /payments"));
         assert!(guide.contains("POST /shipments"));
         let _ = std::fs::remove_dir_all(dir);
@@ -21324,6 +21329,7 @@ test "checkout failing runtime body" {
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),
+            ("POST", "/checkout"),
             ("POST", "/members"),
             ("POST", "/members/login"),
             ("POST", "/payments"),
