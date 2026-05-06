@@ -6916,6 +6916,15 @@ fn editor_export_state_json_with_trace(
     trace: Option<&Path>,
 ) -> anyhow::Result<serde_json::Value> {
     let mut state = editor_export_state_json(path)?;
+    if let Some(build) = build {
+        state
+            .as_object_mut()
+            .expect("editor export state is object")
+            .insert(
+                "production".to_string(),
+                editor_production_summary_json(build)?,
+            );
+    }
     if let Some(trace) = trace {
         let build = build.ok_or_else(|| anyhow::anyhow!("--build is required with --trace"))?;
         state
@@ -6924,6 +6933,16 @@ fn editor_export_state_json_with_trace(
             .insert("trace".to_string(), editor_trace_json(build, trace)?);
     }
     Ok(state)
+}
+
+fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.production",
+        "build_dir": build.display().to_string(),
+        "db_adapters": reveal_db_adapter_targets(build)?,
+        "commerce_adapters": reveal_commerce_adapter_targets(build)?,
+    }))
 }
 
 fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> serde_json::Value {
@@ -7229,6 +7248,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let debug_config_count = json_array_count(state.pointer("/debug/configurations"));
     let debug_control_count = json_array_count(state.pointer("/debug/controls"));
     let debug_breakpoint_count = editor_debug_breakpoint_count_from_state(state);
+    let production_db_adapter_count = json_array_count(state.pointer("/production/db_adapters"));
+    let production_commerce_adapter_count =
+        json_array_count(state.pointer("/production/commerce_adapters"));
+    let production_summary = editor_production_summary_text(state);
     let trace_count = json_array_count(state.pointer("/trace/frames"));
     let trace_status_counts = editor_trace_status_counts_from_state(state);
     let runtime_status = state
@@ -7272,6 +7295,11 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<span>Debug Controls<b>{debug_control_count}</b></span>"
     )?;
+    write!(
+        &mut html,
+        "<span>Production<b>{}</b></span>",
+        production_db_adapter_count + production_commerce_adapter_count
+    )?;
     write!(&mut html, "<span>Trace<b>{trace_count}</b></span>")?;
     html.push_str("</nav></aside>\n");
     html.push_str("<header class=\"topbar\">");
@@ -7314,6 +7342,12 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("<section class=\"panel\"><h2>Debug Result</h2><pre id=\"debug-result-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Runner Command</h2><pre id=\"debug-control-command\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Selected Debug</h2><pre id=\"debug-detail\" class=\"detail\"></pre></section>");
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Production</h2><div class=\"metric\">{}</div><p class=\"muted\">DB Adapters {production_db_adapter_count} · Commerce Adapters {production_commerce_adapter_count}</p><pre>{}</pre></section>",
+        production_db_adapter_count + production_commerce_adapter_count,
+        html_escape_text(&production_summary)
+    )?;
     write_trace_panel_html(&mut html, trace_count, &trace_status_counts)?;
     html.push_str("<section class=\"panel\"><h2>Selected Trace</h2><pre id=\"trace-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Trace Transport</h2><pre id=\"trace-transport-detail\" class=\"detail\"></pre></section>");
@@ -7405,6 +7439,45 @@ fn editor_trace_status_counts_from_state(state: &serde_json::Value) -> EditorTra
     counts.server_error = json_usize_field(value, "server_error");
     counts.other = json_usize_field(value, "other");
     counts
+}
+
+fn editor_production_summary_text(state: &serde_json::Value) -> String {
+    let Some(production) = state.get("production") else {
+        return "No production build attached.".to_string();
+    };
+    let mut lines = Vec::new();
+    if let Some(build_dir) = production
+        .get("build_dir")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("build {build_dir}"));
+    }
+    for target in production
+        .get("db_adapters")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = json_str_or_empty(target, "path");
+        let adapters = json_array_count(target.get("adapters"));
+        lines.push(format!("DB Adapters {path} ({adapters})"));
+    }
+    for target in production
+        .get("commerce_adapters")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = json_str_or_empty(target, "path");
+        let adapters = json_array_count(target.get("adapters"));
+        lines.push(format!("Commerce Adapters {path} ({adapters})"));
+    }
+    if lines.is_empty() {
+        "No production adapter contracts.".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn json_usize_field(value: &serde_json::Value, key: &str) -> usize {
@@ -37996,6 +38069,48 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("filterTraceFrames"));
         assert!(html.contains("Client Err<b>1</b>"));
         assert!(html.contains("Server Err<b>1</b>"));
+    }
+
+    #[test]
+    fn editor_export_with_build_embeds_production_adapter_summary() {
+        let dir = temp_output_dir("editor-export-production-source");
+        std::fs::create_dir_all(&dir).expect("create editor export source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    @respond 200 { payment: captured.status }
+  }
+}
+"#,
+        )
+        .expect("write editor export source");
+        let out = temp_output_dir("editor-export-production");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let state = editor_export_state_json_with_trace(&path, Some(&out), None)
+            .expect("editor export state");
+        let html = editor_export_html(&state).expect("editor html");
+
+        assert_eq!(
+            state["production"]["db_adapters"][0]["path"],
+            "deploy/db-adapters.json"
+        );
+        assert_eq!(
+            state["production"]["commerce_adapters"][0]["path"],
+            "deploy/commerce-adapters.json"
+        );
+        assert!(html.contains("Production"));
+        assert!(html.contains("DB Adapters"));
+        assert!(html.contains("Commerce Adapters"));
+        assert!(html.contains("deploy/db-adapters.json"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
