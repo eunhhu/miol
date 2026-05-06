@@ -4166,7 +4166,7 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
     } else {
         "PAY-LOCAL"
     };
-    Ok(Value::Object(vec![
+    let mut fields = vec![
         (
             "kind".to_string(),
             Value::Str("payment.capture".to_string()),
@@ -4177,7 +4177,9 @@ fn payment_capture_value(provider: &str, args: &[Value]) -> Result<Value, Runtim
         ("orderId".to_string(), order_id),
         ("amount".to_string(), amount),
         ("method".to_string(), method),
-    ]))
+    ];
+    fields.extend(payment_provider_credential_fields(provider));
+    Ok(Value::Object(fields))
 }
 
 fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -4190,7 +4192,7 @@ fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, Runti
     } else {
         ("SHIP-LOCAL", "TRK-LOCAL")
     };
-    Ok(Value::Object(vec![
+    let mut fields = vec![
         (
             "kind".to_string(),
             Value::Str("shipping.booking".to_string()),
@@ -4202,7 +4204,55 @@ fn shipping_booking_value(provider: &str, args: &[Value]) -> Result<Value, Runti
         ("carrier".to_string(), carrier),
         ("address".to_string(), address),
         ("tracking".to_string(), Value::Str(tracking.to_string())),
-    ]))
+    ];
+    fields.extend(shipping_provider_credential_fields(provider));
+    Ok(Value::Object(fields))
+}
+
+fn payment_provider_credential_fields(provider: &str) -> Vec<(String, Value)> {
+    if provider != "stripe" {
+        return Vec::new();
+    }
+    vec![
+        provider_credential_field("credentialStatus", "STRIPE_SECRET_KEY"),
+        provider_credential_field("webhookSecretStatus", "STRIPE_WEBHOOK_SECRET"),
+    ]
+}
+
+fn shipping_provider_credential_fields(provider: &str) -> Vec<(String, Value)> {
+    if provider != "carrier" {
+        return Vec::new();
+    }
+    vec![
+        provider_credential_field("credentialStatus", "CARRIER_API_KEY"),
+        provider_credential_field("webhookSecretStatus", "CARRIER_WEBHOOK_SECRET"),
+    ]
+}
+
+fn provider_credential_field(field: &str, env: &str) -> (String, Value) {
+    let status = if provider_env_configured(env) {
+        "configured"
+    } else {
+        "missing"
+    };
+    (field.to_string(), Value::Str(status.to_string()))
+}
+
+fn provider_env_configured(env: &str) -> bool {
+    let value = {
+        #[cfg(test)]
+        {
+            let override_v = test_env::ENV_OVERRIDES
+                .get()
+                .and_then(|lock| lock.lock().ok()?.get(env).cloned());
+            override_v.or_else(|| std::env::var(env).ok())
+        }
+        #[cfg(not(test))]
+        {
+            std::env::var(env).ok()
+        }
+    };
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn call_offline_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -9361,6 +9411,33 @@ let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
             out,
             "stripe\ncaptured\nSTRIPE-PAY-LOCAL\ncarrier\nready\nTRK-CARRIER-LOCAL\n"
         );
+    }
+
+    #[test]
+    fn provider_adapters_report_credential_status_without_secret_values() {
+        super::test_env::set("STRIPE_SECRET_KEY", "sk_test_never_print");
+        super::test_env::set("STRIPE_WEBHOOK_SECRET", "");
+        super::test_env::set("CARRIER_API_KEY", "");
+        super::test_env::set("CARRIER_WEBHOOK_SECRET", "carrier_webhook_never_print");
+        let out = run_str(
+            r#"let payments = @payment.connect("stripe://local")
+let captured = payments.capture({ orderId: 7, amount: 25000, method: "card" })
+let shipping = @shipping.connect("carrier://local")
+let booking = shipping.book({ orderId: 7, carrier: "post", address: "Seoul" })
+@out captured.credentialStatus
+@out captured.webhookSecretStatus
+@out booking.credentialStatus
+@out booking.webhookSecretStatus"#,
+        )
+        .unwrap();
+        super::test_env::clear("STRIPE_SECRET_KEY");
+        super::test_env::clear("STRIPE_WEBHOOK_SECRET");
+        super::test_env::clear("CARRIER_API_KEY");
+        super::test_env::clear("CARRIER_WEBHOOK_SECRET");
+
+        assert_eq!(out, "configured\nmissing\nmissing\nconfigured\n");
+        assert!(!out.contains("sk_test_never_print"));
+        assert!(!out.contains("carrier_webhook_never_print"));
     }
 
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
