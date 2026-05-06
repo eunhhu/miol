@@ -6215,6 +6215,33 @@ fn editor_debug_session_json(
             "threadId": 1,
         },
     }));
+    let scopes_seq = next_seq + 1;
+    requests.push(serde_json::json!({
+        "seq": scopes_seq,
+        "type": "request",
+        "command": "scopes",
+        "arguments": {
+            "frameId": 1,
+        },
+    }));
+    let project_variables_seq = next_seq + 2;
+    requests.push(serde_json::json!({
+        "seq": project_variables_seq,
+        "type": "request",
+        "command": "variables",
+        "arguments": {
+            "variablesReference": 1,
+        },
+    }));
+    let locals_variables_seq = next_seq + 3;
+    requests.push(serde_json::json!({
+        "seq": locals_variables_seq,
+        "type": "request",
+        "command": "variables",
+        "arguments": {
+            "variablesReference": 2,
+        },
+    }));
     let input = dap_protocol_input_frames(&requests)?;
     let mut reader = std::io::Cursor::new(input.as_bytes());
     let mut writer = Vec::new();
@@ -6227,6 +6254,15 @@ fn editor_debug_session_json(
     let stack = dap_response_for_request_seq(&frames, stack_seq)
         .and_then(|response| response.get("body").cloned())
         .unwrap_or_else(|| serde_json::json!({}));
+    let scopes = dap_response_for_request_seq(&frames, scopes_seq)
+        .and_then(|response| response.get("body").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let project_variables = dap_response_for_request_seq(&frames, project_variables_seq)
+        .and_then(|response| response.pointer("/body/variables").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let locals = dap_response_for_request_seq(&frames, locals_variables_seq)
+        .and_then(|response| response.pointer("/body/variables").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
     let first_control = control_summaries
         .first()
         .cloned()
@@ -6246,6 +6282,9 @@ fn editor_debug_session_json(
         "control": first_control,
         "controls": control_summaries,
         "stack": stack,
+        "scopes": scopes,
+        "project_variables": project_variables,
+        "locals": locals,
         "frames": frames,
     }))
 }
@@ -6309,6 +6348,18 @@ fn editor_debug_runner_result_panels_json(
                 })),
             "selected_frame": selected_frame,
             "stack_frames": stack_frames,
+            "scopes": debug
+                .get("scopes")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            "project_variables": debug
+                .get("project_variables")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "locals": debug
+                .get("locals")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
             "control_count": json_array_count(debug.get("controls")),
             "breakpoint_count": json_array_count(debug.get("breakpoints")),
             "stopped_event_count": stopped_events.len(),
@@ -6394,6 +6445,16 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let locals = value
+        .pointer("/panels/debug/locals")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let project_variables = value
+        .pointer("/panels/debug/project_variables")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let control_count = value
         .pointer("/panels/debug/control_count")
         .and_then(serde_json::Value::as_u64)
@@ -6431,6 +6492,24 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
             &mut html,
             "<li>{}</li>",
             html_escape_text(&editor_debug_frame_summary(&frame))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Locals</h2><ul class=\"list\">");
+    for local in locals {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_variable_summary(&local))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Project Variables</h2><ul class=\"list\">");
+    for variable in project_variables {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_variable_summary(&variable))
         )?;
     }
     html.push_str("</ul></section>\n");
@@ -6494,6 +6573,26 @@ fn editor_debug_event_summary(event: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_u64)
         .map_or_else(String::new, |thread| format!("thread {thread}"));
     [name.to_string(), reason.to_string(), thread]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn editor_debug_variable_summary(variable: &serde_json::Value) -> String {
+    let name = variable
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("variable");
+    let value = variable
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let value_type = variable
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    [name.to_string(), value.to_string(), value_type.to_string()]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -36885,8 +36984,13 @@ define Auth() -> { @out "auth" }
         assert!(controls
             .iter()
             .all(|control| control["response"]["success"] == true));
-        assert_eq!(debug["transport"]["request_count"], 5);
+        assert_eq!(debug["transport"]["request_count"], 8);
         assert_eq!(debug["stack"]["stackFrames"][0]["line"], 3);
+        assert!(debug["locals"]
+            .as_array()
+            .expect("locals")
+            .iter()
+            .any(|local| local["name"] == "third" && local["value"] == "3"));
         let step_stops = debug["frames"]
             .as_array()
             .expect("frames")
@@ -36920,7 +37024,7 @@ define Auth() -> { @out "auth" }
             editor_debug_session_json(&path, &[EditorDebugControl::Continue], &[breakpoint])
                 .expect("editor debug session");
 
-        assert_eq!(debug["transport"]["request_count"], 5);
+        assert_eq!(debug["transport"]["request_count"], 8);
         assert_eq!(
             debug["breakpoints"][0]["source"]["path"],
             path.display().to_string()
@@ -36961,8 +37065,13 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["kind"], "orv.editor.debug.runner.result");
         assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
         assert_eq!(run["debug"]["transport"]["framing"], "content-length");
-        assert_eq!(run["debug"]["transport"]["request_count"], 5);
+        assert_eq!(run["debug"]["transport"]["request_count"], 8);
         assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
+        assert!(run["debug"]["locals"]
+            .as_array()
+            .expect("locals")
+            .iter()
+            .any(|local| local["name"] == "third" && local["value"] == "3"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -37029,6 +37138,8 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("id=\"orv-debug-result\""));
         assert!(result_html.contains("Selected Frame"));
         assert!(result_html.contains("Stack Frames"));
+        assert!(result_html.contains("Locals"));
+        assert!(result_html.contains("Project Variables"));
         assert!(result_html.contains("Stopped Events"));
         assert!(result_html.contains("line 3"));
         let _ = std::fs::remove_dir_all(dir);
@@ -37065,6 +37176,16 @@ define Auth() -> { @out "auth" }
             .expect("stack frames")
             .iter()
             .any(|frame| frame["line"] == 3));
+        assert!(result["panels"]["debug"]["locals"]
+            .as_array()
+            .expect("locals")
+            .iter()
+            .any(|local| local["name"] == "third" && local["value"] == "3"));
+        assert!(result["panels"]["debug"]["project_variables"]
+            .as_array()
+            .expect("project variables")
+            .iter()
+            .any(|variable| variable["name"] == "stdout"));
         assert!(
             result["panels"]["debug"]["stopped_events"]
                 .as_array()
