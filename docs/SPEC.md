@@ -2782,6 +2782,8 @@ function showAndReturn(a: int, b: int): string -> {
 
 > Deploy commerce adapter 상태: server prod builds write `deploy/commerce-adapters.json`, link it from `deploy/manifest.json` as `server.commerce_adapters`, and require generated runbooks to reference it. The artifact records payment/shipping adapter kind, mode (`file`, `http`, `provider`, or env-only), env/default, endpoint or record path, provider credential env contract, and the reference HTTP POST request contract, and `orv verify-build` rejects drift from the rehydrated source bundle persistence analysis.
 
+> Reveal adapter 상태: `orv reveal`, `orv editor reveal`, and `orv lsp reveal` include production DB and commerce adapter targets so source-origin navigation can surface the checked deploy contracts next to routes/native/client targets.
+
 > Provider webhook 상태: Stripe provider payment handles expose `payments.verifyWebhook({ payload, signature })` in the reference runtime. It validates Stripe-style HMAC-SHA256 signatures from `STRIPE_WEBHOOK_SECRET` and returns status metadata without exposing secrets or payloads. The shop scaffold hosts `POST /webhooks/stripe` as a reference endpoint that passes raw request body and `stripe-signature` through that verifier, stores `WebhookEvent.eventId`, returns the existing row for duplicate provider/eventId deliveries, and reconciles Payment/Order statuses when verified JSON carries `orderId`, `paymentStatus`, and `orderStatus`.
 
 orv 컴파일러는 "프로젝트 특화" 최적화를 수행한다. 핵심 원칙은 다음과 같다.

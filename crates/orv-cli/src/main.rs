@@ -17246,6 +17246,7 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
         "production": {
             "routes": reveal_routes(origin_id, &server_artifacts),
             "native_server": reveal_native_server_targets(dir, origin_id)?,
+            "db_adapters": reveal_db_adapter_targets(dir)?,
             "commerce_adapters": reveal_commerce_adapter_targets(dir)?,
             "client": reveal_client_targets(dir, entry)?,
         },
@@ -17652,6 +17653,43 @@ fn reveal_commerce_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json:
     let artifact = read_json_value(&target_path)?;
     Ok(vec![serde_json::json!({
         "kind": "commerce_adapters",
+        "path": path,
+        "exists": true,
+        "artifact": artifact
+            .get("artifact")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "adapters": artifact
+            .get("adapters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    })])
+}
+
+fn reveal_db_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let deploy_manifest_path = dir.join("deploy").join("manifest.json");
+    if !deploy_manifest_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let deploy = read_json_value(&deploy_manifest_path)?;
+    let Some(path) = deploy
+        .get("server")
+        .and_then(|server| server.get("db_adapters"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(Vec::new());
+    };
+    let target_path = dir.join(path);
+    if !target_path.is_file() {
+        return Ok(vec![serde_json::json!({
+            "kind": "db_adapters",
+            "path": path,
+            "exists": false,
+        })]);
+    }
+    let artifact = read_json_value(&target_path)?;
+    Ok(vec![serde_json::json!({
+        "kind": "db_adapters",
         "path": path,
         "exists": true,
         "artifact": artifact
@@ -35839,6 +35877,52 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["adapters"][0]["env"] == "PAYMENT_ADAPTER_URL"
                 && target["adapters"][0]["endpoint"] == "http://payments.internal/capture"
                 && target["adapters"][0]["request"]["kind"] == "payment.capture"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn reveal_origin_exposes_deploy_db_adapter_contract() {
+        let dir = temp_output_dir("reveal-db-adapters-source");
+        std::fs::create_dir_all(&dir).expect("create db reveal source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db reveal source");
+        let out = temp_output_dir("reveal-db-adapters");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("ping route origin");
+
+        let reveal = reveal_origin_json(&out, &route.id).expect("reveal origin");
+
+        let db_adapters = reveal["production"]["db_adapters"]
+            .as_array()
+            .expect("db adapters");
+        assert!(db_adapters.iter().any(|target| {
+            target["path"] == "deploy/db-adapters.json"
+                && target["exists"] == true
+                && target["adapters"][0]["kind"] == "db"
+                && target["adapters"][0]["provider"] == "postgres"
+                && target["adapters"][0]["env"] == "SHOP_DATABASE_URL"
+                && target["adapters"][0]["endpoint"] == "postgres://db.internal/shop"
+                && target["adapters"][0]["adapter_status"] == "unsupported_runtime"
         }));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
