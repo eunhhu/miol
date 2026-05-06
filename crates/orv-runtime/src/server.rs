@@ -850,7 +850,7 @@ async fn handle_request(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let body_value = match request_body_value(req, &headers).await {
+    let (body_value, raw_body) = match request_body_value(req, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -904,6 +904,7 @@ async fn handle_request(
         params,
         query,
         headers,
+        raw_body,
         body: body_value,
     };
 
@@ -959,7 +960,7 @@ async fn handle_request(
 async fn request_body_value(
     req: Request<Incoming>,
     headers: &HashMap<String, String>,
-) -> Result<Value, ServerResponse> {
+) -> Result<(Value, String), ServerResponse> {
     // `Limited` 로 크기 상한을 걸어 거대 POST 의 메모리 폭주를 차단. 초과 시
     // 413 응답.
     let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
@@ -985,24 +986,28 @@ async fn request_body_value(
         .unwrap_or_default();
     let is_json = content_type.starts_with("application/json");
     let is_form_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
+    let raw_body = String::from_utf8_lossy(&body_bytes).into_owned();
     if body_bytes.is_empty() {
-        Ok(Value::Void)
+        Ok((Value::Void, raw_body))
     } else if is_json {
-        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        let body = serde_json::from_slice::<serde_json::Value>(&body_bytes)
             .map(json_to_value)
-            .map_err(|e| plain_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
+            .map_err(|e| {
+                plain_response(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}"))
+            })?;
+        Ok((body, raw_body))
     } else if is_form_urlencoded {
-        let raw = String::from_utf8_lossy(&body_bytes).into_owned();
-        Ok(Value::Object(
-            parse_query(&raw)
-                .into_iter()
-                .map(|(key, value)| (key, Value::Str(value)))
-                .collect(),
+        Ok((
+            Value::Object(
+                parse_query(&raw_body)
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::Str(value)))
+                    .collect(),
+            ),
+            raw_body,
         ))
     } else {
-        Ok(Value::Str(
-            String::from_utf8_lossy(&body_bytes).into_owned(),
-        ))
+        Ok((Value::Str(raw_body.clone()), raw_body))
     }
 }
 
@@ -1887,6 +1892,45 @@ mod tests {
             .header("content-type", content_type)
             .body(Full::new(Bytes::from(body)))
             .expect("build req");
+        let resp = sender.send_request(req).await.expect("send");
+        let status = resp.status().as_u16();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(std::string::ToString::to_string);
+        let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
+        (status, ct, bytes)
+    }
+
+    async fn send_request_with_headers(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let uri: hyper::Uri = path.parse().expect("uri");
+        let (bytes, has_body) =
+            body.map_or_else(|| (Bytes::new(), false), |b| (Bytes::from(b), true));
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost");
+        if has_body {
+            builder = builder.header("content-type", "application/json");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.body(Full::new(bytes)).expect("build req");
         let resp = sender.send_request(req).await.expect("send");
         let status = resp.status().as_u16();
         let ct = resp
@@ -2792,6 +2836,7 @@ mod tests {
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("POST /payments"));
+            assert!(home_html.contains("POST /webhooks/stripe"));
             assert!(home_html.contains("POST /shipments"));
 
             let (admin_status, admin_ct, admin_body) =
@@ -2803,6 +2848,7 @@ mod tests {
             assert!(admin_html.contains("Operations dashboard"));
             assert!(admin_html.contains("<a href=\"/admin/catalog\">Catalog read model</a>"));
             assert!(admin_html.contains("<a href=\"/admin/summary\">Operations summary</a>"));
+            assert!(admin_html.contains("Stripe webhook events: POST /webhooks/stripe"));
             assert!(admin_html.contains("data/shop.sqlite"));
 
             let (health_status, _, health_body) = send_request(addr, "GET", "/health", None).await;
@@ -3003,6 +3049,36 @@ mod tests {
                 serde_json::json!("TRK-LOCAL")
             );
 
+            crate::interp::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_test");
+            let webhook_payload = r#"{"id":"evt_1"}"#.to_string();
+            let (webhook_status, _, webhook_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/webhooks/stripe",
+                Some(webhook_payload),
+                &[(
+                    "stripe-signature",
+                    "t=1700000000,v1=c89214b5b5da833daed6f0b8c5bb6bd58cea9022bd80ccc78230f3942d632925",
+                )],
+            )
+            .await;
+            crate::interp::test_env::clear("STRIPE_WEBHOOK_SECRET");
+            assert_eq!(webhook_status, 202);
+            let webhook: serde_json::Value =
+                serde_json::from_slice(&webhook_body).expect("webhook json");
+            assert_eq!(
+                webhook["verification"]["status"],
+                serde_json::json!("verified")
+            );
+            assert_eq!(
+                webhook["webhook"]["provider"],
+                serde_json::json!("stripe")
+            );
+            assert_eq!(
+                webhook["webhook"]["status"],
+                serde_json::json!("verified")
+            );
+
             let checkout_payload = serde_json::json!({
                 "handle": "ada",
                 "sku": "mug",
@@ -3036,6 +3112,7 @@ mod tests {
             assert_eq!(summary["orders"], serde_json::json!(3));
             assert_eq!(summary["payments"], serde_json::json!(2));
             assert_eq!(summary["shipments"], serde_json::json!(2));
+            assert_eq!(summary["webhookEvents"], serde_json::json!(1));
 
             handle.abort();
 

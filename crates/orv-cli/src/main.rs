@@ -2241,7 +2241,7 @@ Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default loc
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
-Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`; real provider API calls and webhooks are still future work.\n\
+Provider-mode deploy artifacts expose credential env placeholders such as `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification; real provider API calls are still future work.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -2300,6 +2300,7 @@ The generated launcher path can infer `dist`; `ORV_BUILD_DIR` is an explicit ove
 - `GET /orders/:customer`\n\
 - `POST /checkout`\n\
 - `POST /payments`\n\
+- `POST /webhooks/stripe`\n\
 - `POST /shipments`\n\
 - `GET /shipments/:orderId`\n"
     )
@@ -20731,7 +20732,7 @@ fn collect_commerce_adapter_url(
     }
     let provider_env = provider
         .as_deref()
-        .map(commerce_provider_env)
+        .map(|provider| commerce_provider_env_for_url(provider, url))
         .unwrap_or_default();
     out.commerce_adapters.push(DeployCommerceAdapter {
         kind: kind.to_string(),
@@ -20769,6 +20770,17 @@ fn commerce_provider_env(provider: &str) -> Vec<DeployProviderEnv> {
         ],
         _ => Vec::new(),
     }
+}
+
+fn commerce_provider_env_for_url(provider: &str, url: &str) -> Vec<DeployProviderEnv> {
+    if provider == "stripe" && url.starts_with("stripe://webhook") {
+        return vec![deploy_provider_env(
+            "STRIPE_WEBHOOK_SECRET",
+            false,
+            "webhook_signature",
+        )];
+    }
+    commerce_provider_env(provider)
 }
 
 fn deploy_provider_env(env: &str, required: bool, purpose: &str) -> DeployProviderEnv {
@@ -22737,6 +22749,7 @@ test "checkout failing runtime body" {
         assert!(source.contains("@a href=\"/admin/catalog\" \"Catalog read model\""));
         assert!(source.contains("@route GET /admin/catalog"));
         assert!(source.contains(r#"shopdb.count("Product", {})"#));
+        assert!(source.contains(r#"shopdb.count("WebhookEvent", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
@@ -22747,6 +22760,10 @@ test "checkout failing runtime body" {
         assert!(source.contains("@route POST /members/login"));
         assert!(source.contains(r#"shopdb.create("Session""#));
         assert!(source.contains("@route POST /payments"));
+        assert!(source.contains("@route POST /webhooks/stripe"));
+        assert!(source.contains(r#"@header["stripe-signature"]"#));
+        assert!(source.contains("payments.verifyWebhook"));
+        assert!(source.contains(r#"shopdb.create("WebhookEvent""#));
         assert!(source.contains("@route POST /shipments"));
         assert!(source.contains(
             r#"@payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")"#
@@ -22817,6 +22834,8 @@ test "checkout failing runtime body" {
         assert!(guide.contains("POST /members/login"));
         assert!(guide.contains("POST /checkout"));
         assert!(guide.contains("POST /payments"));
+        assert!(guide.contains("POST /webhooks/stripe"));
+        assert!(guide.contains("Stripe webhook"));
         assert!(guide.contains("POST /shipments"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -22856,6 +22875,7 @@ test "checkout failing runtime body" {
             ("POST", "/members"),
             ("POST", "/members/login"),
             ("POST", "/payments"),
+            ("POST", "/webhooks/stripe"),
             ("POST", "/shipments"),
             ("GET", "/shipments/:orderId"),
         ] {
@@ -22956,6 +22976,31 @@ test "checkout failing runtime body" {
                     }
                 },
                 {
+                    "kind": "payment",
+                    "mode": "provider",
+                    "env": null,
+                    "default": null,
+                    "endpoint": null,
+                    "record_path": null,
+                    "request": {
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "kind": "payment.capture",
+                        "body": {
+                            "kind": "payment.capture",
+                            "payload": "payment capture payload"
+                        }
+                    },
+                    "provider": "stripe",
+                    "provider_env": [
+                        {
+                            "env": "STRIPE_WEBHOOK_SECRET",
+                            "required": false,
+                            "purpose": "webhook_signature"
+                        }
+                    ]
+                },
+                {
                     "kind": "shipping",
                     "mode": "file",
                     "env": "SHIPPING_ADAPTER_URL",
@@ -22995,6 +23040,7 @@ test "checkout failing runtime body" {
         assert!(env_example.contains("SHOP_DATABASE_URL=sqlite://data/shop.sqlite"));
         assert!(env_example.contains("PAYMENT_ADAPTER_URL=file://data/payments.jsonl"));
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
+        assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("deploy/env.example"));
@@ -23008,6 +23054,9 @@ test "checkout failing runtime body" {
         ));
         assert!(runbook.contains(
             "- Commerce adapter env: SHIPPING_ADAPTER_URL default file://data/shipments.jsonl"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: payment stripe STRIPE_WEBHOOK_SECRET optional webhook_signature"
         ));
         cmd_verify_build(&out).expect("verify shop prod build");
         let _ = std::fs::remove_dir_all(dir);

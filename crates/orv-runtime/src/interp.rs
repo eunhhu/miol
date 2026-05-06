@@ -43,7 +43,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// arm 에서 `@env` 평가 시 이 맵을 병합한다. production 빌드에는 이 모듈이
 /// 남지 않는다.
 #[cfg(test)]
-mod test_env {
+pub(crate) mod test_env {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
@@ -84,6 +84,9 @@ pub struct RequestCtx {
     pub query: HashMap<String, String>,
     /// 요청 헤더.
     pub headers: HashMap<String, String>,
+    /// UTF-8/lossy 원문 요청 body. Webhook signature checks need the exact body
+    /// string that reached the server before JSON/form parsing.
+    pub raw_body: String,
     /// 파싱된 body. JSON/form bodies are exposed as objects; unknown content
     /// types remain raw strings, and empty bodies are void.
     pub body: Value,
@@ -98,6 +101,7 @@ impl Default for RequestCtx {
             params: HashMap::new(),
             query: HashMap::new(),
             headers: HashMap::new(),
+            raw_body: String::new(),
             body: Value::Void,
         }
     }
@@ -1625,11 +1629,13 @@ impl<W: Write> Interp<W> {
             HirExprKind::Index { target, index } => {
                 let t = self.eval(target)?;
                 let i = self.eval(index)?;
-                let Value::Int(idx) = i else {
-                    return Err(RuntimeError::native("index must be an integer"));
-                };
-                match t {
-                    Value::Array(items) => {
+                match (t, i) {
+                    (Value::Object(fields), Value::Str(key)) => Ok(fields
+                        .into_iter()
+                        .find(|(field, _)| field == &key)
+                        .map(|(_, value)| value)
+                        .unwrap_or(Value::Void)),
+                    (Value::Array(items), Value::Int(idx)) => {
                         let n = i64::try_from(items.len()).unwrap_or(i64::MAX);
                         let actual = if idx < 0 { idx + n } else { idx };
                         if actual < 0 || actual >= n {
@@ -1639,7 +1645,7 @@ impl<W: Write> Interp<W> {
                         }
                         Ok(items[actual as usize].clone())
                     }
-                    Value::Str(s) => {
+                    (Value::Str(s), Value::Int(idx)) => {
                         let chars: Vec<char> = s.chars().collect();
                         let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
                         let actual = if idx < 0 { idx + n } else { idx };
@@ -1650,7 +1656,15 @@ impl<W: Write> Interp<W> {
                         }
                         Ok(Value::Str(chars[actual as usize].to_string()))
                     }
-                    other => Err(RuntimeError::native(format!("cannot index into {other}"))),
+                    (Value::Object(_), other) => Err(RuntimeError::native(format!(
+                        "object index must be a string, got {other}"
+                    ))),
+                    (other, Value::Int(_)) => {
+                        Err(RuntimeError::native(format!("cannot index into {other}")))
+                    }
+                    (_, other) => Err(RuntimeError::native(format!(
+                        "index must be an integer or object string key, got {other}"
+                    ))),
                 }
             }
             HirExprKind::Field { target, field, .. } => {
@@ -3496,6 +3510,7 @@ impl<W: Write> Interp<W> {
                 ("method".into(), Value::Str(ctx.method.clone())),
                 ("path".into(), Value::Str(ctx.path.clone())),
                 ("ip".into(), Value::Str(ctx.ip.clone())),
+                ("rawBody".into(), Value::Str(ctx.raw_body.clone())),
             ]),
             "response" => {
                 let (status, headers) = match &self.response {
@@ -7688,6 +7703,18 @@ let third: int = 3
     }
 
     #[test]
+    fn request_header_string_index_access() {
+        let ctx = RequestCtx {
+            headers: [("stripe-signature".into(), "t=1,v1=abc".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @header["stripe-signature"]"#, ctx).unwrap();
+        assert_eq!(out, "t=1,v1=abc\n");
+    }
+
+    #[test]
     fn request_body_returns_value() {
         let ctx = RequestCtx {
             body: Value::Str("raw body".into()),
@@ -7706,6 +7733,16 @@ let third: int = 3
         };
         let out = eval_handler_src(r#"@out "{@request.method} {@request.path}""#, ctx).unwrap();
         assert_eq!(out, "POST /items\n");
+    }
+
+    #[test]
+    fn request_meta_exposes_raw_body() {
+        let ctx = RequestCtx {
+            raw_body: r#"{"id":"evt_1"}"#.into(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @request.rawBody"#, ctx).unwrap();
+        assert_eq!(out, "{\"id\":\"evt_1\"}\n");
     }
 
     #[test]
