@@ -2850,6 +2850,7 @@ mod tests {
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("<a href=\"/catalog\">Shop catalog</a>"));
+            assert!(home_html.contains("<a href=\"/account/sessions\">My sessions</a>"));
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /webhooks/stripe"));
             assert!(home_html.contains("POST /shipments"));
@@ -3036,6 +3037,15 @@ mod tests {
             let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
             assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
             assert_eq!(login["session"]["status"], serde_json::json!("active"));
+
+            let (sessions_status, sessions_ct, sessions_body) =
+                send_request(addr, "GET", "/account/sessions", None).await;
+            assert_eq!(sessions_status, 200);
+            assert_eq!(sessions_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let sessions_html = String::from_utf8(sessions_body).expect("sessions html");
+            assert!(sessions_html.contains("<h1>Account Sessions</h1>"));
+            assert!(sessions_html.contains("ada"));
+            assert!(sessions_html.contains("active"));
 
             let payment_payload = serde_json::json!({
                 "orderId": order_id,
