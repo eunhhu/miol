@@ -1857,10 +1857,24 @@ fn native_captured_field_operation_is_direct(
     ) {
         (_, _, _, None, None, None, None) => true,
         (_, _, true, Some("not"), None, None, None) => true,
-        (_, _, true, Some("eq" | "ne" | "and" | "or"), Some("true" | "false"), None, None) => true,
-        (_, _, true, Some("eq" | "ne" | "and" | "or"), None, Some(kind), Some(name)) => {
-            native_captured_bool_operand_is_direct(kind, name, route_params)
-        }
+        (
+            _,
+            _,
+            true,
+            Some("eq" | "ne" | "and" | "or" | "not_and"),
+            Some("true" | "false"),
+            None,
+            None,
+        ) => true,
+        (
+            _,
+            _,
+            true,
+            Some("eq" | "ne" | "and" | "or" | "not_and"),
+            None,
+            Some(kind),
+            Some(name),
+        ) => native_captured_bool_operand_is_direct(kind, name, route_params),
         (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<i64>().is_ok()
         }
@@ -2874,7 +2888,7 @@ fn native_bool_json_outputs(
         (None, None, None, None) => false,
         (Some("not"), None, None, None) => true,
         (
-            Some(op @ ("eq" | "ne" | "and" | "or")),
+            Some(op @ ("eq" | "ne" | "and" | "or" | "not_and")),
             Some(operand @ ("true" | "false")),
             None,
             None,
@@ -2905,6 +2919,7 @@ fn native_bool_binary_result(op: &str, left: bool, right: bool) -> Option<bool> 
         "ne" => Some(left != right),
         "and" => Some(left && right),
         "or" => Some(left || right),
+        "not_and" => Some(!left && right),
         _ => None,
     }
 }
@@ -2922,8 +2937,12 @@ fn push_native_bool_captured_operand_json_value(
         operand_kind,
         operand_name,
     } = operation;
-    let (Some(op @ ("eq" | "ne" | "and" | "or")), None, Some(operand_kind), Some(operand_name)) =
-        (op, operand_json, operand_kind, operand_name)
+    let (
+        Some(op @ ("eq" | "ne" | "and" | "or" | "not_and")),
+        None,
+        Some(operand_kind),
+        Some(operand_name),
+    ) = (op, operand_json, operand_kind, operand_name)
     else {
         return false;
     };
@@ -4396,24 +4415,25 @@ fn captured_bool_comparison_response_operation(
     op: BinaryOp,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
+    if value.operand_json.is_some()
         || value.operand_kind.is_some()
         || value.operand_name.is_some()
         || !value.value_kind.ends_with("_bool")
     {
         return None;
     }
-    value.op = Some(
-        match op {
-            BinaryOp::Eq => "eq",
-            BinaryOp::Ne => "ne",
-            BinaryOp::And => "and",
-            BinaryOp::Or => "or",
-            _ => return None,
-        }
-        .to_string(),
-    );
+    let op_name = match (value.op.as_deref(), op) {
+        (None, BinaryOp::Eq) => "eq",
+        (None, BinaryOp::Ne) => "ne",
+        (None, BinaryOp::And) => "and",
+        (None, BinaryOp::Or) => "or",
+        (Some("not"), BinaryOp::And) => "not_and",
+        _ => return None,
+    };
+    if value.op.is_some() && op_name != "not_and" {
+        return None;
+    }
+    value.op = Some(op_name.to_string());
     if let Some(value_json) = static_bool(rhs).map(|value| value.to_string()) {
         value.operand_json = Some(value_json);
         return Some(value);
@@ -7671,6 +7691,57 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(r#"("false", "true") => body.push_str("true")"#));
         assert!(handlers.contains(r#"("false", "false") => body.push_str("false")"#));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"subscribed\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_negated_request_body_query_bool_and_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /members {
+    @respond 201 { eligible: !(@body.suspended as bool) && (@query.verified as bool) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "eligible");
+        assert_eq!(response.body_request_fields[0].name, "suspended");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_bool"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("not_and")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("query_param_bool")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("verified")
+        );
+        assert!(handlers.contains("match (routes::orv_native_body_field_value(route_match, \"suspended\").unwrap_or(\"\").trim(), routes::orv_native_query_value(route_match, \"verified\").unwrap_or(\"\").trim())"));
+        assert!(handlers.contains(r#"("true", "true") => body.push_str("false")"#));
+        assert!(handlers.contains(r#"("true", "false") => body.push_str("false")"#));
+        assert!(handlers.contains(r#"("false", "true") => body.push_str("true")"#));
+        assert!(handlers.contains(r#"("false", "false") => body.push_str("false")"#));
+        assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"suspended\")"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
