@@ -17073,6 +17073,10 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke.contains(&base_assignment) {
         anyhow::bail!("deploy smoke test must include {base_assignment}");
     }
+    if !smoke.contains("command -v curl") || !smoke.contains("orv deploy smoke test requires curl")
+    {
+        anyhow::bail!("deploy smoke test must check curl availability");
+    }
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
         if !smoke.contains(&ready_assignment) {
@@ -22753,6 +22757,11 @@ fn write_prod_smoke_test_artifact(
 set -eu
 BASE_URL="${{ORV_BASE_URL:-{}}}"
 
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'orv deploy smoke test requires curl\n' >&2
+  exit 127
+fi
+
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
@@ -24226,6 +24235,8 @@ test "checkout failing runtime body" {
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains("command -v curl"));
+        assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains(r#"READY_PATH="/health""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
@@ -33454,6 +33465,8 @@ entry = "src/main.orv"
         assert!(json_routes_include(&routes["routes"], "GET", "/ping"));
         let smoke_test = std::fs::read_to_string(&deploy_smoke_test_path).expect("smoke test");
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains("command -v curl"));
+        assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains(r#"READY_PATH="/ping""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
