@@ -32834,6 +32834,9 @@ entry = "src/main.orv"
   @route POST /quantities {
     @respond 201 { next: 1 + (@body.quantity as int) }
   }
+  @route POST /quantity-doubles {
+    @respond 201 { doubled: 2 * (@body.quantity as int) }
+  }
 }
 "#,
         )
@@ -32891,6 +32894,8 @@ entry = "src/main.orv"
         let sku_label_response = send_raw_http_json_post(address, "/sku-labels", r#"{"sku":"A1"}"#);
         let quantity_response =
             send_raw_http_json_post(address, "/quantities", r#"{"quantity":"7"}"#);
+        let doubled_response =
+            send_raw_http_json_post(address, "/quantity-doubles", r#"{"quantity":"7"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("content-type: application/json"));
@@ -32903,6 +32908,8 @@ entry = "src/main.orv"
         assert!(sku_label_response.contains(r#"{"label":"sku-A1"}"#));
         assert!(quantity_response.starts_with("HTTP/1.1 201"));
         assert!(quantity_response.contains(r#"{"next":8}"#));
+        assert!(doubled_response.starts_with("HTTP/1.1 201"));
+        assert!(doubled_response.contains(r#"{"doubled":14}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

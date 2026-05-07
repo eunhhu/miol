@@ -4799,10 +4799,20 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             lhs,
             rhs,
         ),
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => captured_mul_response_operation(
+            route_param_field_value(lhs),
+            || route_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(route_param_field_value(lhs)?, *op, rhs)
@@ -4862,10 +4872,20 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             lhs,
             rhs,
         ),
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => captured_mul_response_operation(
+            query_param_field_value(lhs),
+            || query_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(query_param_field_value(lhs)?, *op, rhs)
@@ -5003,7 +5023,19 @@ fn captured_add_response_operation(
     ) {
         return captured_string_prefix_concat_response_operation(value, lhs);
     }
-    captured_static_left_numeric_add_response_operation(value, lhs)
+    captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Add, lhs)
+}
+
+fn captured_mul_response_operation(
+    lhs_value: Option<CapturedResponseValue>,
+    rhs_value: impl FnOnce() -> Option<CapturedResponseValue>,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if let Some(value) = lhs_value {
+        return captured_arithmetic_response_operation(value, BinaryOp::Mul, rhs);
+    }
+    captured_static_left_numeric_arithmetic_response_operation(rhs_value()?, BinaryOp::Mul, lhs)
 }
 
 fn captured_string_concat_response_operation(
@@ -5043,14 +5075,22 @@ fn captured_string_prefix_concat_response_operation(
     Some(value)
 }
 
-fn captured_static_left_numeric_add_response_operation(
+fn captured_static_left_numeric_arithmetic_response_operation(
     mut value: CapturedResponseValue,
+    op: BinaryOp,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
     if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
         return None;
     }
-    value.op = Some("add".to_string());
+    value.op = Some(
+        match op {
+            BinaryOp::Add => "add",
+            BinaryOp::Mul => "mul",
+            _ => return None,
+        }
+        .to_string(),
+    );
     if value.value_kind.ends_with("_int") {
         value.operand_json = Some(static_integer(lhs)?.to_string());
         return Some(value);
@@ -5445,10 +5485,20 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             lhs,
             rhs,
         ),
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => captured_mul_response_operation(
+            request_body_field_value(lhs),
+            || request_body_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(request_body_field_value(lhs)?, *op, rhs)
@@ -8062,6 +8112,45 @@ function greet(name: string): string -> "hi {name}""#,
             Some("1")
         );
         assert!(handlers.contains("match value.checked_add(1)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_left_int_mul_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { doubled: 2 * (@body.quantity as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "doubled");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("match value.checked_mul(2)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
