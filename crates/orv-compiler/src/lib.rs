@@ -1836,6 +1836,7 @@ fn native_captured_field_operation_is_direct(
     ) {
         (_, _, _, None, None, None, None) => true,
         (_, _, true, Some("not"), None, None, None) => true,
+        (_, _, true, Some("eq" | "ne"), Some("true" | "false"), None, None) => true,
         (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<i64>().is_ok()
         }
@@ -2794,20 +2795,8 @@ fn push_native_captured_json_value(
             true
         }
         kind if kind == kinds.bool_kind => {
-            let (true_json, false_json) = match operation {
-                NativeCapturedJsonOperation {
-                    op: None,
-                    operand_json: None,
-                    operand_kind: None,
-                    operand_name: None,
-                } => ("true", "false"),
-                NativeCapturedJsonOperation {
-                    op: Some("not"),
-                    operand_json: None,
-                    operand_kind: None,
-                    operand_name: None,
-                } => ("false", "true"),
-                _ => return false,
+            let Some((true_json, false_json)) = native_bool_json_outputs(operation) else {
+                return false;
             };
             let _ = writeln!(
                 source,
@@ -2825,6 +2814,30 @@ fn push_native_captured_json_value(
         }
         _ => false,
     }
+}
+
+fn native_bool_json_outputs(
+    operation: NativeCapturedJsonOperation<'_>,
+) -> Option<(&'static str, &'static str)> {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    let invert = match (op, operand_json, operand_kind, operand_name) {
+        (None, None, None, None) => false,
+        (Some("not"), None, None, None) => true,
+        (Some(op @ ("eq" | "ne")), Some(operand @ ("true" | "false")), None, None) => {
+            matches!(op, "eq") != (operand == "true")
+        }
+        _ => return None,
+    };
+    Some(if invert {
+        ("false", "true")
+    } else {
+        ("true", "false")
+    })
 }
 
 fn push_native_float_success_arm(
@@ -4044,6 +4057,9 @@ fn query_param_field_name(expr: &HirExpr) -> Option<String> {
 
 fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+            captured_bool_comparison_response_operation(route_param_field_value(lhs)?, *op, rhs)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -4078,6 +4094,9 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
 
 fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+            captured_bool_comparison_response_operation(query_param_field_value(lhs)?, *op, rhs)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -4194,6 +4213,31 @@ fn captured_bool_response_operation(
         return None;
     }
     value.op = Some("not".to_string());
+    Some(value)
+}
+
+fn captured_bool_comparison_response_operation(
+    mut value: CapturedResponseValue,
+    op: BinaryOp,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || value.operand_name.is_some()
+        || !value.value_kind.ends_with("_bool")
+    {
+        return None;
+    }
+    value.op = Some(
+        match op {
+            BinaryOp::Eq => "eq",
+            BinaryOp::Ne => "ne",
+            _ => return None,
+        }
+        .to_string(),
+    );
+    value.operand_json = Some(static_bool(rhs)?.to_string());
     Some(value)
 }
 
@@ -4352,6 +4396,9 @@ fn captured_request_body_field_bool_name(expr: &HirExpr) -> Option<String> {
 
 fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::Binary { op, lhs, rhs } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+            captured_bool_comparison_response_operation(request_body_field_value(lhs)?, *op, rhs)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -7197,6 +7244,48 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(r#""true" => body.push_str("false")"#));
         assert!(handlers.contains(r#""false" => body.push_str("true")"#));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"disabled\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_bool_eq_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /members {
+    @respond 201 { subscribed: (@body.subscribed as bool) == true }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "subscribed");
+        assert_eq!(response.body_request_fields[0].name, "subscribed");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_bool"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("eq"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("true")
+        );
+        assert!(handlers.contains("match routes::orv_native_body_field_value(route_match, \"subscribed\").unwrap_or(\"\").trim()"));
+        assert!(handlers.contains(r#""true" => body.push_str("true")"#));
+        assert!(handlers.contains(r#""false" => body.push_str("false")"#));
+        assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"subscribed\")"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
