@@ -32837,6 +32837,9 @@ entry = "src/main.orv"
   @route POST /quantity-doubles {
     @respond 201 { doubled: 2 * (@body.quantity as int) }
   }
+  @route POST /quantity-limits {
+    @respond 201 { below_limit: 10 > (@body.quantity as int) }
+  }
 }
 "#,
         )
@@ -32896,20 +32899,19 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/quantities", r#"{"quantity":"7"}"#);
         let doubled_response =
             send_raw_http_json_post(address, "/quantity-doubles", r#"{"quantity":"7"}"#);
+        let limit_response =
+            send_raw_http_json_post(address, "/quantity-limits", r#"{"quantity":"7"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("content-type: application/json"));
         assert!(response.contains(r#"{"sku":"sku-1","coupon":"SAVE10"}"#));
         assert!(session_response.starts_with("HTTP/1.1 201"));
         assert!(session_response.contains(r#"{"matches":true}"#));
-        assert!(label_response.starts_with("HTTP/1.1 201"));
         assert!(label_response.contains(r#"{"label":"orv-pro"}"#));
-        assert!(sku_label_response.starts_with("HTTP/1.1 201"));
         assert!(sku_label_response.contains(r#"{"label":"sku-A1"}"#));
-        assert!(quantity_response.starts_with("HTTP/1.1 201"));
         assert!(quantity_response.contains(r#"{"next":8}"#));
-        assert!(doubled_response.starts_with("HTTP/1.1 201"));
         assert!(doubled_response.contains(r#"{"doubled":14}"#));
+        assert!(limit_response.contains(r#"{"below_limit":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

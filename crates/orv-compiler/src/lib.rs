@@ -4787,7 +4787,13 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                     | BinaryOp::Or
             ) =>
         {
-            captured_comparison_response_operation(route_param_field_value(lhs)?, *op, rhs)
+            captured_response_comparison_operation(
+                route_param_field_value(lhs),
+                || route_param_field_value(rhs),
+                *op,
+                lhs,
+                rhs,
+            )
         }
         HirExprKind::Binary {
             op: BinaryOp::Add,
@@ -4860,7 +4866,13 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                     | BinaryOp::Or
             ) =>
         {
-            captured_comparison_response_operation(query_param_field_value(lhs)?, *op, rhs)
+            captured_response_comparison_operation(
+                query_param_field_value(lhs),
+                || query_param_field_value(rhs),
+                *op,
+                lhs,
+                rhs,
+            )
         }
         HirExprKind::Binary {
             op: BinaryOp::Add,
@@ -5132,6 +5144,42 @@ fn captured_comparison_response_operation(
         return captured_bool_comparison_response_operation(value, op, rhs);
     }
     captured_numeric_comparison_response_operation(value, op, rhs)
+}
+
+fn captured_response_comparison_operation(
+    lhs_value: Option<CapturedResponseValue>,
+    rhs_value: impl FnOnce() -> Option<CapturedResponseValue>,
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if let Some(value) = lhs_value {
+        return captured_comparison_response_operation(value, op, rhs);
+    }
+    let value = rhs_value()?;
+    if !captured_static_comparison_lhs_is_supported(&value, lhs) {
+        return None;
+    }
+    captured_comparison_response_operation(value, reverse_comparison_op(op)?, lhs)
+}
+
+fn captured_static_comparison_lhs_is_supported(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+) -> bool {
+    if matches!(
+        value.value_kind.as_str(),
+        "route_param" | "query_param" | "request_body_field"
+    ) {
+        return static_string_expr(lhs).is_some();
+    }
+    if value.value_kind.ends_with("_int") {
+        return static_integer(lhs).is_some();
+    }
+    if value.value_kind.ends_with("_float") {
+        return static_float(lhs).is_some();
+    }
+    value.value_kind.ends_with("_bool") && static_bool(lhs).is_some()
 }
 
 fn captured_string_comparison_response_operation(
@@ -5473,7 +5521,13 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
                     | BinaryOp::Or
             ) =>
         {
-            captured_comparison_response_operation(request_body_field_value(lhs)?, *op, rhs)
+            captured_response_comparison_operation(
+                request_body_field_value(lhs),
+                || request_body_field_value(rhs),
+                *op,
+                lhs,
+                rhs,
+            )
         }
         HirExprKind::Binary {
             op: BinaryOp::Add,
@@ -8151,6 +8205,45 @@ function greet(name: string): string -> "hi {name}""#,
             Some("2")
         );
         assert!(handlers.contains("match value.checked_mul(2)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_left_int_comparison_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { below_limit: 10 > (@body.quantity as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "below_limit");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("lt"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("10")
+        );
+        assert!(handlers.contains("if value < 10"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
