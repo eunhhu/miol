@@ -1874,6 +1874,8 @@ fn native_captured_field_operation_is_direct(
         operand_name,
     ) {
         (_, _, _, None, None, None, None) => true,
+        (true, _, _, Some("neg"), None, None, None) => true,
+        (_, true, _, Some("neg"), None, None, None) => true,
         (_, _, true, Some("not"), None, None, None) => true,
         (
             _,
@@ -3045,6 +3047,14 @@ fn push_native_float_success_arm(
             );
             true
         }
+        (Some("neg"), None, None, None) => {
+            source.push_str(
+                "            Ok(value) if value.is_finite() => {\n                let value = -value;\n",
+            );
+            push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
+            source.push_str("            },\n");
+            true
+        }
         (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = static_float_operand_value(operand_json) else {
                 return false;
@@ -3146,6 +3156,17 @@ fn push_native_int_success_arm(
     match (op, operand_json, operand_kind, operand_name) {
         (None, None, None, None) => {
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
+            true
+        }
+        (Some("neg"), None, None, None) => {
+            source.push_str("            Ok(value) => match value.checked_neg() {\n");
+            source.push_str(
+                "                Some(value) => body.push_str(&value.to_string()),\n                None => {\n",
+            );
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
             true
         }
         (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
@@ -4366,6 +4387,10 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             captured_numeric_response_operation(route_param_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => captured_numeric_neg_response_operation(route_param_field_value(expr)?),
+        HirExprKind::Unary {
             op: UnaryOp::Not,
             expr,
         } => captured_bool_response_operation(route_param_field_value(expr)?),
@@ -4412,6 +4437,10 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         {
             captured_numeric_response_operation(query_param_field_value(lhs)?, *op, rhs)
         }
+        HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => captured_numeric_neg_response_operation(query_param_field_value(expr)?),
         HirExprKind::Unary {
             op: UnaryOp::Not,
             expr,
@@ -4507,6 +4536,21 @@ fn captured_numeric_response_operation(
         return Some(value);
     }
     None
+}
+
+fn captured_numeric_neg_response_operation(
+    mut value: CapturedResponseValue,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || value.operand_name.is_some()
+        || !(value.value_kind.ends_with("_int") || value.value_kind.ends_with("_float"))
+    {
+        return None;
+    }
+    value.op = Some("neg".to_string());
+    Some(value)
 }
 
 fn captured_bool_response_operation(
@@ -4765,6 +4809,10 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         {
             captured_numeric_response_operation(request_body_field_value(lhs)?, *op, rhs)
         }
+        HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => captured_numeric_neg_response_operation(request_body_field_value(expr)?),
         HirExprKind::Unary {
             op: UnaryOp::Not,
             expr,
@@ -7357,6 +7405,42 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_request_body_int_neg_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { quantity: -(@body.quantity as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "quantity");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("neg"));
+        assert!(handlers.contains("value.checked_neg()"));
+        assert!(handlers.contains("body.push_str(&value.to_string())"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_request_body_int_mul_literal_response_body() {
         let src = r"@server {
   @listen 8080
@@ -7646,6 +7730,42 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(".trim().parse::<f64>()"));
         assert!(handlers.contains("body.push_str(&value.to_string())"));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"amount\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_neg_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { amount: -(@body.amount as float) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "amount");
+        assert_eq!(response.body_request_fields[0].name, "amount");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("neg"));
+        assert!(handlers.contains("let value = -value;"));
+        assert!(handlers.contains("if value.is_finite()"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

@@ -33063,6 +33063,9 @@ entry = "src/main.orv"
   @route POST /orders/next {
     @respond 201 { quantity: (@body.quantity as int) + 1 }
   }
+  @route POST /orders/neg {
+    @respond 201 { quantity: -(@body.quantity as int) }
+  }
   @route POST /orders/cents {
     @respond 201 { cents: (@body.quantity as int) * 100 }
   }
@@ -33131,6 +33134,7 @@ entry = "src/main.orv"
 
         let response = send_raw_http_json_post(address, "/orders", r#"{"quantity":"7"}"#);
         let next_response = send_raw_http_json_post(address, "/orders/next", r#"{"quantity":"7"}"#);
+        let neg_response = send_raw_http_json_post(address, "/orders/neg", r#"{"quantity":"7"}"#);
         let cents_response =
             send_raw_http_json_post(address, "/orders/cents", r#"{"quantity":"7"}"#);
         let total_response = send_raw_http_json_post(
@@ -33157,6 +33161,8 @@ entry = "src/main.orv"
         assert!(response.contains(r#"{"quantity":7}"#));
         assert!(next_response.starts_with("HTTP/1.1 201"));
         assert!(next_response.contains(r#"{"quantity":8}"#));
+        assert!(neg_response.starts_with("HTTP/1.1 201"));
+        assert!(neg_response.contains(r#"{"quantity":-7}"#));
         assert!(cents_response.starts_with("HTTP/1.1 201"));
         assert!(cents_response.contains(r#"{"cents":700}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
@@ -33186,6 +33192,9 @@ entry = "src/main.orv"
   @listen 8080
   @route POST /payments {
     @respond 201 { amount: @body.amount as float }
+  }
+  @route POST /payments/refund {
+    @respond 201 { amount: -(@body.amount as float) }
   }
   @route POST /payments/total {
     @respond 201 { total: (@body.price as float) * (@body.quantity as float) }
@@ -33242,6 +33251,8 @@ entry = "src/main.orv"
             .expect("native listen address");
 
         let response = send_raw_http_json_post(address, "/payments", r#"{"amount":"12.5"}"#);
+        let refund_response =
+            send_raw_http_json_post(address, "/payments/refund", r#"{"amount":"12.5"}"#);
         let total_response = send_raw_http_json_post(
             address,
             "/payments/total",
@@ -33252,6 +33263,8 @@ entry = "src/main.orv"
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"amount":12.5}"#));
+        assert!(refund_response.starts_with("HTTP/1.1 201"));
+        assert!(refund_response.contains(r#"{"amount":-12.5}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":37.5}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
