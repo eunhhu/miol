@@ -16714,6 +16714,9 @@ fn verify_deploy_server_target(
     let db_adapters = json_str(server, "db_adapters", "deploy server")?;
     let commerce_adapters = json_str(server, "commerce_adapters", "deploy server")?;
     let smoke_test = json_str(server, "smoke_test", "deploy server")?;
+    if smoke_test != DEPLOY_SMOKE_TEST_PATH {
+        anyhow::bail!("deploy server smoke_test must be {DEPLOY_SMOKE_TEST_PATH}");
+    }
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -22002,6 +22005,7 @@ const CLIENT_JS_PATH: &str = "client/app.js";
 const CLIENT_WASM_PATH: &str = "client/app.wasm";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
+const DEPLOY_SMOKE_TEST_PATH: &str = "deploy/smoke-test.sh";
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
@@ -22499,7 +22503,7 @@ fn write_prod_deploy_artifacts(
         let env_example = "deploy/env.example";
         let db_adapters = "deploy/db-adapters.json";
         let commerce_adapters = "deploy/commerce-adapters.json";
-        let smoke_test = "deploy/smoke-test.sh";
+        let smoke_test = DEPLOY_SMOKE_TEST_PATH;
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -34174,6 +34178,36 @@ entry = "src/main.orv"
             .to_string()
             .contains("deploy DB adapters do not match runtime artifact persistence"));
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_smoke_test_path_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-path-source");
+        let out = temp_output_dir("deploy-smoke-path-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let canonical_smoke_path = out.join("deploy").join("smoke-test.sh");
+        let wrong_smoke_path = out.join("deploy").join("alternate-smoke.sh");
+        std::fs::copy(&canonical_smoke_path, &wrong_smoke_path).expect("copy smoke test");
+        let deploy_manifest_path = out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_manifest_path).expect("deploy manifest");
+        deploy["server"]["smoke_test"] = serde_json::json!("deploy/alternate-smoke.sh");
+        write_json(&deploy_manifest_path, &deploy).expect("write corrupt deploy manifest");
+        let runbook_path = out.join("deploy").join("README.md");
+        let runbook = std::fs::read_to_string(&runbook_path).expect("deploy runbook");
+        std::fs::write(
+            &runbook_path,
+            runbook.replace("deploy/smoke-test.sh", "deploy/alternate-smoke.sh"),
+        )
+        .expect("write corrupt deploy runbook");
+
+        let err = cmd_verify_build(&out).expect_err("smoke test path mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy server smoke_test must be deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
 
