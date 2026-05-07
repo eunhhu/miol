@@ -1837,6 +1837,9 @@ fn native_captured_field_operation_is_direct(
         (_, _, _, None, None, None, None) => true,
         (_, _, true, Some("not"), None, None, None) => true,
         (_, _, true, Some("eq" | "ne"), Some("true" | "false"), None, None) => true,
+        (_, _, true, Some("eq" | "ne"), None, Some(kind), Some(name)) => {
+            native_captured_bool_operand_is_direct(kind, name, route_params)
+        }
         (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<i64>().is_ok()
         }
@@ -1877,6 +1880,20 @@ fn native_captured_float_operand_is_direct(
             .iter()
             .any(|route_param| route_param == operand_name),
         "query_param_float" | "request_body_field_float" => !operand_name.is_empty(),
+        _ => false,
+    }
+}
+
+fn native_captured_bool_operand_is_direct(
+    operand_kind: &str,
+    operand_name: &str,
+    route_params: &[String],
+) -> bool {
+    match operand_kind {
+        "route_param_bool" => route_params
+            .iter()
+            .any(|route_param| route_param == operand_name),
+        "query_param_bool" | "request_body_field_bool" => !operand_name.is_empty(),
         _ => false,
     }
 }
@@ -2795,22 +2812,29 @@ fn push_native_captured_json_value(
             true
         }
         kind if kind == kinds.bool_kind => {
-            let Some((true_json, false_json)) = native_bool_json_outputs(operation) else {
-                return false;
-            };
-            let _ = writeln!(
+            if let Some((true_json, false_json)) = native_bool_json_outputs(operation) {
+                let _ = writeln!(
+                    source,
+                    "        match {lookup_expr}.unwrap_or(\"\").trim() {{"
+                );
+                let _ = writeln!(
+                    source,
+                    "            \"true\" => body.push_str(\"{true_json}\"),\n            \"false\" => body.push_str(\"{false_json}\"),\n            _ => {{"
+                );
+                let error_body =
+                    format!(r#"{{"error":"{} bool cast failed"}}"#, kinds.error_prefix);
+                let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+                push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+                source.push_str("            },\n        }\n");
+                return true;
+            }
+            push_native_bool_captured_operand_json_value(
                 source,
-                "        match {lookup_expr}.unwrap_or(\"\").trim() {{"
-            );
-            let _ = writeln!(
-                source,
-                "            \"true\" => body.push_str(\"{true_json}\"),\n            \"false\" => body.push_str(\"{false_json}\"),\n            _ => {{"
-            );
-            let error_body = format!(r#"{{"error":"{} bool cast failed"}}"#, kinds.error_prefix);
-            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
-            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
-            source.push_str("            },\n        }\n");
-            true
+                lookup_expr,
+                operation,
+                kinds.error_prefix,
+                response_origin_id,
+            )
         }
         _ => false,
     }
@@ -2838,6 +2862,55 @@ fn native_bool_json_outputs(
     } else {
         ("true", "false")
     })
+}
+
+fn push_native_bool_captured_operand_json_value(
+    source: &mut String,
+    lookup_expr: &str,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    let (Some(op @ ("eq" | "ne")), None, Some(operand_kind), Some(operand_name)) =
+        (op, operand_json, operand_kind, operand_name)
+    else {
+        return false;
+    };
+    let Some(operand_lookup) = native_bool_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let _ = writeln!(
+        source,
+        "        match ({lookup_expr}.unwrap_or(\"\").trim(), {operand_lookup}.unwrap_or(\"\").trim()) {{"
+    );
+    for (left, right) in [
+        ("true", "true"),
+        ("true", "false"),
+        ("false", "true"),
+        ("false", "false"),
+    ] {
+        let result = (left == right) == (op == "eq");
+        let result_json = if result { "true" } else { "false" };
+        let _ = writeln!(
+            source,
+            "            ({}, {}) => body.push_str({}),",
+            rust_string_literal(left),
+            rust_string_literal(right),
+            rust_string_literal(result_json)
+        );
+    }
+    source.push_str("            _ => {\n");
+    let error_body = format!(r#"{{"error":"{error_prefix} bool cast failed"}}"#);
+    let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+    push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+    source.push_str("            },\n        }\n");
+    true
 }
 
 fn push_native_float_success_arm(
@@ -3041,10 +3114,8 @@ fn native_int_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Opt
         "request_body_field_int" => "routes::orv_native_body_field_value",
         _ => return None,
     };
-    Some(format!(
-        "{lookup}(route_match, {})",
-        rust_string_literal(operand_name)
-    ))
+    let operand_name = rust_string_literal(operand_name);
+    Some(format!("{lookup}(route_match, {operand_name})"))
 }
 
 fn native_float_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Option<String> {
@@ -3052,6 +3123,19 @@ fn native_float_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> O
         "route_param_float" => "routes::orv_native_param_value",
         "query_param_float" => "routes::orv_native_query_value",
         "request_body_field_float" => "routes::orv_native_body_field_value",
+        _ => return None,
+    };
+    Some(format!(
+        "{lookup}(route_match, {})",
+        rust_string_literal(operand_name)
+    ))
+}
+
+fn native_bool_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Option<String> {
+    let lookup = match operand_kind {
+        "route_param_bool" => "routes::orv_native_param_value",
+        "query_param_bool" => "routes::orv_native_query_value",
+        "request_body_field_bool" => "routes::orv_native_body_field_value",
         _ => return None,
     };
     Some(format!(
@@ -4237,7 +4321,13 @@ fn captured_bool_comparison_response_operation(
         }
         .to_string(),
     );
-    value.operand_json = Some(static_bool(rhs)?.to_string());
+    if let Some(value_json) = static_bool(rhs).map(|value| value.to_string()) {
+        value.operand_json = Some(value_json);
+        return Some(value);
+    }
+    let operand = captured_bool_operand(rhs)?;
+    value.operand_kind = Some(operand.value_kind);
+    value.operand_name = Some(operand.name);
     Some(value)
 }
 
@@ -7285,6 +7375,54 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("match routes::orv_native_body_field_value(route_match, \"subscribed\").unwrap_or(\"\").trim()"));
         assert!(handlers.contains(r#""true" => body.push_str("true")"#));
         assert!(handlers.contains(r#""false" => body.push_str("false")"#));
+        assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"subscribed\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_query_bool_eq_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /members {
+    @respond 201 { matches: (@body.subscribed as bool) == (@query.expected as bool) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "matches");
+        assert_eq!(response.body_request_fields[0].name, "subscribed");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_bool"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("eq"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("query_param_bool")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("expected")
+        );
+        assert!(handlers.contains("match (routes::orv_native_body_field_value(route_match, \"subscribed\").unwrap_or(\"\").trim(), routes::orv_native_query_value(route_match, \"expected\").unwrap_or(\"\").trim())"));
+        assert!(handlers.contains(r#"("true", "true") => body.push_str("true")"#));
+        assert!(handlers.contains(r#"("true", "false") => body.push_str("false")"#));
+        assert!(handlers.contains(r#"("false", "true") => body.push_str("false")"#));
+        assert!(handlers.contains(r#"("false", "false") => body.push_str("true")"#));
         assert!(!handlers.contains("orv_native_push_json_string(routes::orv_native_body_field_value(route_match, \"subscribed\")"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
