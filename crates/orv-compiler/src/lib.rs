@@ -4435,8 +4435,25 @@ fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionAr
                 })
         }
         HirExprKind::Paren(expr) => native_response_condition(expr),
+        HirExprKind::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => native_captured_bool_negated_response_condition(expr),
         _ => native_captured_bool_truthy_response_condition(expr),
     }
+}
+
+fn native_captured_bool_negated_response_condition(
+    expr: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    let operand = captured_condition_bool_operand(expr)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_bool_operand(BinaryOp::Ne, operand.kind)?,
+        name: operand.name,
+        value: "true".to_string(),
+        operand_name: None,
+        operand_kind: None,
+    })
 }
 
 fn native_captured_bool_truthy_response_condition(
@@ -7748,6 +7765,49 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(r#""false" => false == true"#));
         assert!(handlers.contains("status: 201"));
         assert!(handlers.contains("status: 400"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_bool_negated_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /members {
+    if !(@body.subscribed as bool) {
+      @respond 400 { err: "not_subscribed" }
+    }
+    @respond 201 { subscribed: @body.subscribed as bool }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_bool_ne");
+        assert_eq!(condition.name, "subscribed");
+        assert_eq!(condition.value, "true");
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "match routes::orv_native_body_field_value(route_match, \"subscribed\").unwrap_or(\"\").trim()"
+        ));
+        assert!(handlers.contains(r#""true" => true != true"#));
+        assert!(handlers.contains(r#""false" => false != true"#));
+        assert!(handlers.contains("status: 400"));
+        assert!(handlers.contains("status: 201"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
