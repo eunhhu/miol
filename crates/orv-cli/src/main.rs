@@ -2284,6 +2284,7 @@ After `orv build . --prod --out dist`, use generated deploy runbook:\n\
 ```sh\n\
 cd dist\n\
 PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
+./deploy/smoke-test.sh\n\
 ```\n\
 \n\
 ## Native Launcher\n\
@@ -2310,6 +2311,7 @@ docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n
 - `deploy/env.example`\n\
 - `deploy/db-adapters.json`\n\
 - `deploy/commerce-adapters.json`\n\
+- `deploy/smoke-test.sh`\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\
@@ -16711,6 +16713,7 @@ fn verify_deploy_server_target(
     let env_example = json_str(server, "env_example", "deploy server")?;
     let db_adapters = json_str(server, "db_adapters", "deploy server")?;
     let commerce_adapters = json_str(server, "commerce_adapters", "deploy server")?;
+    let smoke_test = json_str(server, "smoke_test", "deploy server")?;
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -16786,6 +16789,7 @@ fn verify_deploy_server_target(
     verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
     verify_deploy_db_adapters_artifact(dir, db_adapters, artifact_path, &persistence)?;
     verify_deploy_commerce_adapters_artifact(dir, commerce_adapters, artifact_path, &persistence)?;
+    verify_deploy_smoke_test_artifact(dir, smoke_test, artifact.listen.as_ref(), &artifact)?;
     verify_deploy_runbook_artifact(
         dir,
         runbook,
@@ -16794,6 +16798,7 @@ fn verify_deploy_server_target(
             env_example,
             db_adapters,
             commerce_adapters,
+            smoke_test,
             routes: routes_artifact,
         },
         &artifact,
@@ -17047,6 +17052,52 @@ fn verify_deploy_db_adapters_artifact(
     Ok(())
 }
 
+fn verify_deploy_smoke_test_artifact(
+    dir: &Path,
+    path: &str,
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let smoke_path = dir.join(path);
+    if !smoke_path.is_file() {
+        anyhow::bail!("missing deploy smoke test: {}", smoke_path.display());
+    }
+    let smoke = std::fs::read_to_string(&smoke_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", smoke_path.display()))?;
+    let base_url = deploy_smoke_base_url(listen);
+    let base_assignment = format!(r#"BASE_URL="${{ORV_BASE_URL:-{base_url}}}""#);
+    if !smoke.contains(&base_assignment) {
+        anyhow::bail!("deploy smoke test must include {base_assignment}");
+    }
+    for route in artifact
+        .routes
+        .iter()
+        .filter(|route| route.method == "GET" && !route.path.contains(':'))
+    {
+        let command = format!(r#"curl -fsS "$BASE_URL{}""#, route.path);
+        if !smoke.contains(&command) {
+            let method = &route.method;
+            let path = &route.path;
+            anyhow::bail!("deploy smoke test must cover {method} {path}");
+        }
+    }
+    if deploy_routes_include(artifact, "POST", "/checkout") {
+        for path in ["/products", "/members", "/cart/items", "/checkout"] {
+            let command = format!(r#"curl -fsS -X POST "$BASE_URL{path}""#);
+            if !smoke.contains(&command) {
+                anyhow::bail!("deploy smoke test must cover POST {path}");
+            }
+        }
+        if !smoke.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#) {
+            anyhow::bail!("deploy smoke test must use unique smoke SKU");
+        }
+        if !smoke.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#) {
+            anyhow::bail!("deploy smoke test must use unique smoke member handle");
+        }
+    }
+    Ok(())
+}
+
 fn deploy_env_check_with_lookup<F>(dir: &Path, mut lookup: F) -> anyhow::Result<()>
 where
     F: FnMut(&str) -> Option<String>,
@@ -17173,6 +17224,7 @@ struct DeployRunbookArtifacts<'a> {
     env_example: &'a str,
     db_adapters: &'a str,
     commerce_adapters: &'a str,
+    smoke_test: &'a str,
     routes: &'a str,
 }
 
@@ -17208,6 +17260,14 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains(artifacts.commerce_adapters) {
         let commerce_adapters_path = artifacts.commerce_adapters;
         anyhow::bail!("deploy runbook must reference {commerce_adapters_path}");
+    }
+    if !runbook.contains(artifacts.smoke_test) {
+        let smoke_test_path = artifacts.smoke_test;
+        anyhow::bail!("deploy runbook must reference {smoke_test_path}");
+    }
+    let smoke_command = format!("./{}", artifacts.smoke_test);
+    if !runbook.contains(&smoke_command) {
+        anyhow::bail!("deploy runbook must document deploy smoke test command");
     }
     if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document request trace capture command");
@@ -21884,6 +21944,16 @@ fn deploy_runbook_port_assignment(
 }
 
 fn deploy_runbook_trace_events_url(listen: Option<&orv_compiler::ServerListenArtifact>) -> String {
+    let port = deploy_listen_url_port(listen);
+    format!("http://127.0.0.1:{port}/__orv/trace/events")
+}
+
+fn deploy_smoke_base_url(listen: Option<&orv_compiler::ServerListenArtifact>) -> String {
+    let port = deploy_listen_url_port(listen);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn deploy_listen_url_port(listen: Option<&orv_compiler::ServerListenArtifact>) -> String {
     let port = listen
         .and_then(|listen| {
             listen
@@ -21901,7 +21971,18 @@ fn deploy_runbook_trace_events_url(listen: Option<&orv_compiler::ServerListenArt
                 })
         })
         .unwrap_or_else(|| "8080".to_string());
-    format!("http://127.0.0.1:{port}/__orv/trace/events")
+    port
+}
+
+fn deploy_routes_include(
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+    method: &str,
+    path: &str,
+) -> bool {
+    artifact
+        .routes
+        .iter()
+        .any(|route| route.method == method && route.path == path)
 }
 
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
@@ -22418,6 +22499,7 @@ fn write_prod_deploy_artifacts(
         let env_example = "deploy/env.example";
         let db_adapters = "deploy/db-adapters.json";
         let commerce_adapters = "deploy/commerce-adapters.json";
+        let smoke_test = "deploy/smoke-test.sh";
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -22440,6 +22522,7 @@ fn write_prod_deploy_artifacts(
             targets.server_artifact,
             &persistence,
         )?;
+        write_prod_smoke_test_artifact(out, smoke_test, server_artifact)?;
         write_prod_deploy_runbook(
             out,
             &DeployRunbookArtifacts {
@@ -22447,6 +22530,7 @@ fn write_prod_deploy_artifacts(
                 env_example,
                 db_adapters,
                 commerce_adapters,
+                smoke_test,
                 routes: routes_artifact,
             },
             server_artifact,
@@ -22469,6 +22553,7 @@ fn write_prod_deploy_artifacts(
             "env_example": env_example,
             "db_adapters": db_adapters,
             "commerce_adapters": commerce_adapters,
+            "smoke_test": smoke_test,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
@@ -22630,6 +22715,48 @@ fn write_prod_db_adapters_artifact(
     write_json(&out.join(path), &artifact)
 }
 
+fn write_prod_smoke_test_artifact(
+    out: &Path,
+    path: &str,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<()> {
+    let mut script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+BASE_URL="${{ORV_BASE_URL:-{}}}"
+
+"#,
+        deploy_smoke_base_url(server_artifact.listen.as_ref())
+    );
+    for route in server_artifact
+        .routes
+        .iter()
+        .filter(|route| route.method == "GET" && !route.path.contains(':'))
+    {
+        let _ = writeln!(script, r#"curl -fsS "$BASE_URL{}" >/dev/null"#, route.path);
+    }
+    if deploy_routes_include(server_artifact, "POST", "/checkout") {
+        script.push_str(
+            r#"
+SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
+SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
+SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
+SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
+
+curl -fsS -X POST "$BASE_URL/products" -H 'content-type: application/json' --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}" >/dev/null
+curl -fsS -X POST "$BASE_URL/members" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}" >/dev/null
+curl -fsS -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}" >/dev/null
+curl -fsS -X POST "$BASE_URL/checkout" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}" >/dev/null
+curl -fsS "$BASE_URL/admin/summary" >/dev/null
+"#,
+        );
+    }
+    script.push_str("printf 'orv deploy smoke test passed\\n'\n");
+    let target = out.join(path);
+    write_text(&target, &script)?;
+    set_executable_if_supported(&target)
+}
+
 fn write_prod_deploy_runbook(
     out: &Path,
     artifacts: &DeployRunbookArtifacts<'_>,
@@ -22640,6 +22767,7 @@ fn write_prod_deploy_runbook(
     let env_example_path = artifacts.env_example;
     let db_adapters_path = artifacts.db_adapters;
     let commerce_adapters_path = artifacts.commerce_adapters;
+    let smoke_test_path = artifacts.smoke_test;
     let routes_artifact = artifacts.routes;
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
@@ -22666,6 +22794,7 @@ fn write_prod_deploy_runbook(
 - Env example: {env_example_path}
 - DB adapters: {db_adapters_path}
 - Commerce adapters: {commerce_adapters_path}
+- Smoke test: {smoke_test_path}
 - Routes: {routes_artifact}
 
 ## Native Launcher
@@ -22695,6 +22824,12 @@ orv editor trace . --trace deploy/request-trace.json
 
 ```sh
 orv deploy-env-check .
+```
+
+## Smoke Test
+
+```sh
+./{smoke_test_path}
 ```
 
 {persistence_section}
@@ -23757,6 +23892,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("deploy/env.example"));
         assert!(guide.contains("deploy/db-adapters.json"));
         assert!(guide.contains("deploy/commerce-adapters.json"));
+        assert!(guide.contains("deploy/smoke-test.sh"));
         assert!(guide.contains("server/native-server.json"));
         assert!(guide.contains("server/native/Cargo.toml"));
         assert!(guide.contains("server/native/main.rs"));
@@ -23765,6 +23901,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("server/native/handlers.rs"));
         assert!(guide.contains("cd dist"));
         assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(guide.contains("./deploy/smoke-test.sh"));
         assert!(
             guide.contains("cargo build --manifest-path dist/server/native/Cargo.toml --release")
         );
@@ -23830,6 +23967,8 @@ test "checkout failing runtime body" {
             std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
         let commerce_adapters = read_json_value(&out.join("deploy").join("commerce-adapters.json"))
             .expect("commerce adapters");
+        let smoke_test =
+            std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
         let native_routes =
             std::fs::read_to_string(out.join("server").join("native").join("routes.rs"))
                 .expect("native routes source");
@@ -23919,6 +24058,10 @@ test "checkout failing runtime body" {
         assert_eq!(
             deploy["server"]["commerce_adapters"],
             serde_json::json!("deploy/commerce-adapters.json")
+        );
+        assert_eq!(
+            deploy["server"]["smoke_test"],
+            serde_json::json!("deploy/smoke-test.sh")
         );
         assert_eq!(
             deploy["server"]["persistence"]["commerce_env"],
@@ -24019,10 +24162,21 @@ test "checkout failing runtime body" {
         assert!(env_example.contains("PAYMENT_ADAPTER_URL=file://data/payments.jsonl"));
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
+        assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/health""#));
+        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/products""#));
+        assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/members""#));
+        assert!(smoke_test.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/cart/items""#));
+        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/checkout""#));
+        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/admin/summary""#));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("deploy/env.example"));
         assert!(runbook.contains("deploy/commerce-adapters.json"));
+        assert!(runbook.contains("deploy/smoke-test.sh"));
+        assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
@@ -33088,6 +33242,7 @@ entry = "src/main.orv"
         let deploy_env_example_path = out.join("deploy").join("env.example");
         let deploy_runbook_path = out.join("deploy").join("README.md");
         let deploy_routes_path = out.join("deploy").join("routes.json");
+        let deploy_smoke_test_path = out.join("deploy").join("smoke-test.sh");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         let native_server_plan_path = out.join("server").join("native-server.json");
         assert!(
@@ -33126,6 +33281,11 @@ entry = "src/main.orv"
             deploy_routes_path.display()
         );
         assert!(
+            deploy_smoke_test_path.is_file(),
+            "missing {}",
+            deploy_smoke_test_path.display()
+        );
+        assert!(
             server_entrypoint_path.is_file(),
             "missing {}",
             server_entrypoint_path.display()
@@ -33147,6 +33307,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["compose"], "deploy/compose.yaml");
         assert_eq!(deploy["server"]["env_example"], "deploy/env.example");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
+        assert_eq!(deploy["server"]["smoke_test"], "deploy/smoke-test.sh");
         assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
         assert_eq!(
             deploy["server"]["native_runtime_image_plan"],
@@ -33217,6 +33378,7 @@ entry = "src/main.orv"
             .contains("docker build -f server/native/Dockerfile -t orv-native-server:latest ."));
         assert!(runbook.contains("ORV_BUILD_DIR is an explicit override"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
+        assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("- GET /ping"));
@@ -33224,6 +33386,9 @@ entry = "src/main.orv"
         assert_eq!(routes["schema_version"], 1);
         assert_eq!(routes["artifact"], "server/app.orv-runtime.json");
         assert!(json_routes_include(&routes["routes"], "GET", "/ping"));
+        let smoke_test = std::fs::read_to_string(&deploy_smoke_test_path).expect("smoke test");
+        assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/ping""#));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
