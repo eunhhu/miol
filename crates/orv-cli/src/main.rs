@@ -32653,6 +32653,9 @@ entry = "src/main.orv"
   @route POST /orders {
     @respond 201 { sku: @body.sku, coupon: @query.coupon }
   }
+  @route POST /sessions {
+    @respond 201 { matches: @body.token == @query.token }
+  }
 }
 ",
         )
@@ -32797,6 +32800,9 @@ entry = "src/main.orv"
   @route POST /orders {
     @respond 201 { sku: @body.sku, coupon: @query.coupon }
   }
+  @route POST /sessions {
+    @respond 201 { matches: @body.token == @query.token }
+  }
 }
 ",
         )
@@ -32847,10 +32853,14 @@ entry = "src/main.orv"
 
         let response =
             send_raw_http_json_post(address, "/orders?coupon=SAVE10", r#"{"sku":"sku-1"}"#);
+        let session_response =
+            send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"abc"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("content-type: application/json"));
         assert!(response.contains(r#"{"sku":"sku-1","coupon":"SAVE10"}"#));
+        assert!(session_response.starts_with("HTTP/1.1 201"));
+        assert!(session_response.contains(r#"{"matches":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
