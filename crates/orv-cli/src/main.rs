@@ -17065,6 +17065,7 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke_path.is_file() {
         anyhow::bail!("missing deploy smoke test: {}", smoke_path.display());
     }
+    verify_executable_if_supported(&smoke_path, "deploy smoke test")?;
     let smoke = std::fs::read_to_string(&smoke_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", smoke_path.display()))?;
     let base_url = deploy_smoke_base_url(listen);
@@ -22872,6 +22873,24 @@ fn set_executable_if_supported(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn set_executable_if_supported(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_executable_if_supported(path: &Path, label: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("failed to stat {}: {e}", path.display()))?
+        .permissions();
+    if permissions.mode() & 0o111 == 0 {
+        anyhow::bail!("{label} must be executable: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_executable_if_supported(_path: &Path, _label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -34207,6 +34226,31 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy server smoke_test must be deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_build_rejects_non_executable_deploy_smoke_test() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (src_dir, path) = prod_server_source("deploy-smoke-mode-source");
+        let out = temp_output_dir("deploy-smoke-mode-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let mut permissions = std::fs::metadata(&smoke_path)
+            .expect("smoke metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&smoke_path, permissions).expect("remove executable bit");
+
+        let err = cmd_verify_build(&out).expect_err("smoke test mode mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test must be executable"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
