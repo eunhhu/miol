@@ -1911,7 +1911,7 @@ fn native_string_operation_is_direct(
     route_params: &[String],
 ) -> bool {
     match (op, operand_json, operand_kind, operand_name) {
-        (Some("eq" | "ne" | "concat"), Some(_), None, None) => true,
+        (Some("eq" | "ne" | "concat" | "concat_prefix"), Some(_), None, None) => true,
         (Some("eq" | "ne" | "concat"), None, Some(kind), Some(name)) => {
             native_captured_string_operand_is_direct(kind, name, route_params)
         }
@@ -3129,6 +3129,9 @@ fn push_native_string_operation_json_value(
             push_native_string_comparison_json_value(source, lookup_expr, operation)
         }
         Some("concat") => push_native_string_concat_json_value(source, lookup_expr, operation),
+        Some("concat_prefix") => {
+            push_native_string_prefix_concat_json_value(source, lookup_expr, operation)
+        }
         _ => false,
     }
 }
@@ -3215,6 +3218,37 @@ fn push_native_string_concat_json_value(
         }
         _ => return false,
     }
+    source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
+    source.push_str("        }\n");
+    true
+}
+
+fn push_native_string_prefix_concat_json_value(
+    source: &mut String,
+    lookup_expr: &str,
+    operation: NativeCapturedJsonOperation<'_>,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    let (Some("concat_prefix"), Some(prefix), None, None) =
+        (op, operand_json, operand_kind, operand_name)
+    else {
+        return false;
+    };
+    source.push_str("        {\n");
+    let _ = writeln!(
+        source,
+        "            let mut value = String::from({});",
+        rust_string_literal(prefix)
+    );
+    let _ = writeln!(
+        source,
+        "            value.push_str({lookup_expr}.unwrap_or(\"\"));"
+    );
     source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
     source.push_str("        }\n");
     true
@@ -4755,15 +4789,20 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         {
             captured_comparison_response_operation(route_param_field_value(lhs)?, *op, rhs)
         }
+        HirExprKind::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+        } => captured_add_response_operation(
+            route_param_field_value(lhs),
+            || route_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Rem
-                    | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(route_param_field_value(lhs)?, *op, rhs)
@@ -4813,15 +4852,20 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         {
             captured_comparison_response_operation(query_param_field_value(lhs)?, *op, rhs)
         }
+        HirExprKind::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+        } => captured_add_response_operation(
+            query_param_field_value(lhs),
+            || query_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Rem
-                    | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(query_param_field_value(lhs)?, *op, rhs)
@@ -4943,6 +4987,18 @@ fn captured_arithmetic_response_operation(
     captured_numeric_response_operation(value, op, rhs)
 }
 
+fn captured_add_response_operation(
+    lhs_value: Option<CapturedResponseValue>,
+    rhs_value: impl FnOnce() -> Option<CapturedResponseValue>,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if let Some(value) = lhs_value {
+        return captured_arithmetic_response_operation(value, BinaryOp::Add, rhs);
+    }
+    captured_string_prefix_concat_response_operation(rhs_value()?, lhs)
+}
+
 fn captured_string_concat_response_operation(
     mut value: CapturedResponseValue,
     rhs: &HirExpr,
@@ -4958,6 +5014,25 @@ fn captured_string_concat_response_operation(
     let operand = captured_string_operand(rhs)?;
     value.operand_kind = Some(operand.kind.to_string());
     value.operand_name = Some(operand.name);
+    Some(value)
+}
+
+fn captured_string_prefix_concat_response_operation(
+    mut value: CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || !matches!(
+            value.value_kind.as_str(),
+            "route_param" | "query_param" | "request_body_field"
+        )
+    {
+        return None;
+    }
+    value.op = Some("concat_prefix".to_string());
+    value.operand_json = Some(static_string_expr(lhs)?);
     Some(value)
 }
 
@@ -5334,15 +5409,20 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         {
             captured_comparison_response_operation(request_body_field_value(lhs)?, *op, rhs)
         }
+        HirExprKind::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+        } => captured_add_response_operation(
+            request_body_field_value(lhs),
+            || request_body_field_value(rhs),
+            lhs,
+            rhs,
+        ),
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Rem
-                    | BinaryOp::Pow
+                BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
             ) =>
         {
             captured_arithmetic_response_operation(request_body_field_value(lhs)?, *op, rhs)
@@ -7872,6 +7952,50 @@ function greet(name: string): string -> "hi {name}""#,
             Some("suffix")
         );
         assert!(handlers.contains("value.push_str(operand)"));
+        assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_prefix_string_concat_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /products {
+    @respond 201 { label: "sku-" + @body.sku }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "label");
+        assert_eq!(response.body_request_fields[0].name, "sku");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("concat_prefix")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("sku-")
+        );
+        assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
+        assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
         assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));

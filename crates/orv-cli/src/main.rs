@@ -32648,7 +32648,7 @@ entry = "src/main.orv"
         let path = dir.join("app.orv");
         std::fs::write(
             &path,
-            r"@server {
+            r#"@server {
   @listen 8080
   @route POST /orders {
     @respond 201 { sku: @body.sku, coupon: @query.coupon }
@@ -32659,8 +32659,11 @@ entry = "src/main.orv"
   @route POST /labels {
     @respond 201 { label: @body.first + @query.suffix }
   }
+  @route POST /sku-labels {
+    @respond 201 { label: "sku-" + @body.sku }
+  }
 }
-",
+"#,
         )
         .expect("write source");
         let out = temp_output_dir("native-mixed-dynamic-response-build");
@@ -32671,6 +32674,7 @@ entry = "src/main.orv"
             read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
         let response = &server_artifact["routes"][0]["responses"][0];
         let label_response = &server_artifact["routes"][2]["responses"][0];
+        let sku_label_response = &server_artifact["routes"][3]["responses"][0];
         let handlers =
             std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
                 .expect("handlers source");
@@ -32692,8 +32696,6 @@ entry = "src/main.orv"
         );
         assert_eq!(response["body_object_fields"][1]["name"], "coupon");
         assert_eq!(label_response["body_kind"], "request_body_field_json");
-        assert_eq!(label_response["body_request_fields"][0]["field"], "label");
-        assert_eq!(label_response["body_request_fields"][0]["name"], "first");
         assert_eq!(label_response["body_request_fields"][0]["op"], "concat");
         assert_eq!(
             label_response["body_request_fields"][0]["operand_kind"],
@@ -32703,9 +32705,19 @@ entry = "src/main.orv"
             label_response["body_request_fields"][0]["operand_name"],
             "suffix"
         );
+        assert_eq!(sku_label_response["body_kind"], "request_body_field_json");
+        assert_eq!(
+            sku_label_response["body_request_fields"][0]["op"],
+            "concat_prefix"
+        );
+        assert_eq!(
+            sku_label_response["body_request_fields"][0]["operand_json"],
+            "sku-"
+        );
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
         assert!(handlers.contains("routes::orv_native_query_value(route_match, \"coupon\")"));
         assert!(handlers.contains("value.push_str(operand)"));
+        assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
         assert!(handlers.contains("orv_native_push_json_string("));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
@@ -32812,7 +32824,7 @@ entry = "src/main.orv"
         let path = dir.join("app.orv");
         std::fs::write(
             &path,
-            r"@server {
+            r#"@server {
   @listen 8080
   @route POST /orders {
     @respond 201 { sku: @body.sku, coupon: @query.coupon }
@@ -32823,8 +32835,11 @@ entry = "src/main.orv"
   @route POST /labels {
     @respond 201 { label: @body.first + @query.suffix }
   }
+  @route POST /sku-labels {
+    @respond 201 { label: "sku-" + @body.sku }
+  }
 }
-",
+"#,
         )
         .expect("write source");
         let out = temp_output_dir("native-mixed-dynamic-server-build");
@@ -32877,6 +32892,7 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"abc"}"#);
         let label_response =
             send_raw_http_json_post(address, "/labels?suffix=-pro", r#"{"first":"orv"}"#);
+        let sku_label_response = send_raw_http_json_post(address, "/sku-labels", r#"{"sku":"A1"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("content-type: application/json"));
@@ -32885,6 +32901,8 @@ entry = "src/main.orv"
         assert!(session_response.contains(r#"{"matches":true}"#));
         assert!(label_response.starts_with("HTTP/1.1 201"));
         assert!(label_response.contains(r#"{"label":"orv-pro"}"#));
+        assert!(sku_label_response.starts_with("HTTP/1.1 201"));
+        assert!(sku_label_response.contains(r#"{"label":"sku-A1"}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
