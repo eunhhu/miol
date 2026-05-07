@@ -2271,7 +2271,7 @@ Commerce records: `data/payments.jsonl`, `data/shipments.jsonl`. The default loc
 \n\
 Commerce adapter overrides: set `PAYMENT_ADAPTER_URL` or `SHIPPING_ADAPTER_URL` before Compose launch to point the generated shop at external HTTP adapter endpoints or provider-mode adapters such as `stripe://local` and `carrier://local` without editing source.\n\
 \n\
-Provider-mode deploy artifacts expose endpoint and credential env placeholders such as `STRIPE_API_ENDPOINT`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CARRIER_API_ENDPOINT`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. When `STRIPE_API_ENDPOINT` or `CARRIER_API_ENDPOINT` is configured, provider-mode capture/booking calls POST checked JSON to that endpoint with bearer credentials, stable idempotency keys, and bounded transient retry, then merges the provider JSON response without exposing secret values. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification, duplicate event handling, and Payment/Order status reconciliation from webhook payloads; production provider SDK hardening remains future work.\n\
+Provider-mode deploy artifacts expose endpoint and credential env placeholders such as `STRIPE_API_ENDPOINT`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_WEBHOOK_SECRET_PREVIOUS`, `CARRIER_API_ENDPOINT`, `CARRIER_API_KEY`, and `CARRIER_WEBHOOK_SECRET`. When `STRIPE_API_ENDPOINT` or `CARRIER_API_ENDPOINT` is configured, provider-mode capture/booking calls POST checked JSON to that endpoint with bearer credentials, stable idempotency keys, and bounded transient retry, then merges the provider JSON response without exposing secret values. The shop also exposes `POST /webhooks/stripe` for reference Stripe webhook signature verification with primary/previous webhook secret rotation, duplicate event handling, and Payment/Order status reconciliation from webhook payloads; production provider SDK hardening remains future work.\n\
 \n\
 Compose mounts `data/` into `/app/data`, so the generated production container keeps the shop database and commerce record logs outside the container layer.\n\
 \n\
@@ -21709,6 +21709,11 @@ fn commerce_provider_env(provider: &str) -> Vec<DeployProviderEnv> {
             deploy_provider_env("STRIPE_API_ENDPOINT", false, "api_endpoint"),
             deploy_provider_env("STRIPE_SECRET_KEY", true, "api_secret"),
             deploy_provider_env("STRIPE_WEBHOOK_SECRET", false, "webhook_signature"),
+            deploy_provider_env(
+                "STRIPE_WEBHOOK_SECRET_PREVIOUS",
+                false,
+                "webhook_signature_previous",
+            ),
         ],
         "carrier" => vec![
             deploy_provider_env("CARRIER_API_ENDPOINT", false, "api_endpoint"),
@@ -21721,11 +21726,14 @@ fn commerce_provider_env(provider: &str) -> Vec<DeployProviderEnv> {
 
 fn commerce_provider_env_for_url(provider: &str, url: &str) -> Vec<DeployProviderEnv> {
     if provider == "stripe" && url.starts_with("stripe://webhook") {
-        return vec![deploy_provider_env(
-            "STRIPE_WEBHOOK_SECRET",
-            false,
-            "webhook_signature",
-        )];
+        return vec![
+            deploy_provider_env("STRIPE_WEBHOOK_SECRET", false, "webhook_signature"),
+            deploy_provider_env(
+                "STRIPE_WEBHOOK_SECRET_PREVIOUS",
+                false,
+                "webhook_signature_previous",
+            ),
+        ];
     }
     commerce_provider_env(provider)
 }
@@ -24059,6 +24067,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("carrier://"));
         assert!(guide.contains("STRIPE_SECRET_KEY"));
         assert!(guide.contains("STRIPE_WEBHOOK_SECRET"));
+        assert!(guide.contains("STRIPE_WEBHOOK_SECRET_PREVIOUS"));
         assert!(guide.contains("CARRIER_API_KEY"));
         assert!(guide.contains("CARRIER_WEBHOOK_SECRET"));
         assert!(guide.contains("Compose mounts `data/` into `/app/data`"));
@@ -24259,6 +24268,11 @@ test "checkout failing runtime body" {
                             "env": "STRIPE_WEBHOOK_SECRET",
                             "required": false,
                             "purpose": "webhook_signature"
+                        },
+                        {
+                            "env": "STRIPE_WEBHOOK_SECRET_PREVIOUS",
+                            "required": false,
+                            "purpose": "webhook_signature_previous"
                         }
                     ]
                 },
@@ -24303,6 +24317,7 @@ test "checkout failing runtime body" {
         assert!(env_example.contains("PAYMENT_ADAPTER_URL=file://data/payments.jsonl"));
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
+        assert!(env_example.contains("STRIPE_WEBHOOK_SECRET_PREVIOUS="));
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
@@ -34088,6 +34103,8 @@ entry = "src/main.orv"
         assert!(compose.contains(r#"STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY}""#));
         assert!(compose.contains(r#"STRIPE_API_ENDPOINT: "${STRIPE_API_ENDPOINT}""#));
         assert!(compose.contains(r#"STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET}""#));
+        assert!(compose
+            .contains(r#"STRIPE_WEBHOOK_SECRET_PREVIOUS: "${STRIPE_WEBHOOK_SECRET_PREVIOUS}""#));
         assert!(compose.contains(r#"CARRIER_API_KEY: "${CARRIER_API_KEY}""#));
         assert!(compose.contains(r#"CARRIER_API_ENDPOINT: "${CARRIER_API_ENDPOINT}""#));
         assert!(compose.contains(r#"CARRIER_WEBHOOK_SECRET: "${CARRIER_WEBHOOK_SECRET}""#));
@@ -34117,6 +34134,11 @@ entry = "src/main.orv"
                             "env": "STRIPE_WEBHOOK_SECRET",
                             "required": false,
                             "purpose": "webhook_signature"
+                        },
+                        {
+                            "env": "STRIPE_WEBHOOK_SECRET_PREVIOUS",
+                            "required": false,
+                            "purpose": "webhook_signature_previous"
                         }
                     ],
                     "request": {
@@ -34169,6 +34191,7 @@ entry = "src/main.orv"
         assert!(env_example.contains("STRIPE_API_ENDPOINT="));
         assert!(env_example.contains("STRIPE_SECRET_KEY="));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
+        assert!(env_example.contains("STRIPE_WEBHOOK_SECRET_PREVIOUS="));
         assert!(env_example.contains("CARRIER_API_ENDPOINT="));
         assert!(env_example.contains("CARRIER_API_KEY="));
         assert!(env_example.contains("CARRIER_WEBHOOK_SECRET="));
@@ -34185,6 +34208,9 @@ entry = "src/main.orv"
         ));
         assert!(runbook.contains(
             "- Commerce provider env: payment stripe STRIPE_WEBHOOK_SECRET optional webhook_signature"
+        ));
+        assert!(runbook.contains(
+            "- Commerce provider env: payment stripe STRIPE_WEBHOOK_SECRET_PREVIOUS optional webhook_signature_previous"
         ));
         assert!(runbook.contains(
             "- Commerce provider env: shipping carrier CARRIER_API_ENDPOINT optional api_endpoint"

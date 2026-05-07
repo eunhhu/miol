@@ -4330,13 +4330,25 @@ fn stripe_webhook_verification_value(args: &[Value]) -> Result<Value, RuntimeErr
         .ok_or_else(|| RuntimeError::native("`payment.verifyWebhook` expects signature"))?;
     let payload = value_to_display(&payload);
     let signature = value_to_display(&signature);
-    let (status, webhook_secret_status) = match provider_env_value("STRIPE_WEBHOOK_SECRET") {
-        Some(secret) if stripe_signature_matches(&secret, &payload, &signature)? => {
-            ("verified", "configured")
+    let secrets = stripe_webhook_secrets();
+    let mut matched_secret = None;
+    for secret in &secrets {
+        if stripe_signature_matches(&secret.value, &payload, &signature)? {
+            matched_secret = Some(secret.label);
+            break;
         }
-        Some(_) => ("invalid", "configured"),
-        None => ("missing_secret", "missing"),
+    }
+    let status = match (secrets.is_empty(), matched_secret) {
+        (_, Some(_)) => "verified",
+        (false, None) => "invalid",
+        (true, None) => "missing_secret",
     };
+    let webhook_secret_status = if secrets.is_empty() {
+        "missing"
+    } else {
+        "configured"
+    };
+    let webhook_secret_match = matched_secret.unwrap_or("none");
 
     Ok(Value::Object(vec![
         (
@@ -4353,7 +4365,28 @@ fn stripe_webhook_verification_value(args: &[Value]) -> Result<Value, RuntimeErr
             "webhookSecretStatus".to_string(),
             Value::Str(webhook_secret_status.to_string()),
         ),
+        (
+            "webhookSecretMatch".to_string(),
+            Value::Str(webhook_secret_match.to_string()),
+        ),
     ]))
+}
+
+struct StripeWebhookSecret {
+    label: &'static str,
+    value: String,
+}
+
+fn stripe_webhook_secrets() -> Vec<StripeWebhookSecret> {
+    [
+        ("primary", "STRIPE_WEBHOOK_SECRET"),
+        ("previous", "STRIPE_WEBHOOK_SECRET_PREVIOUS"),
+    ]
+    .into_iter()
+    .filter_map(|(label, env)| {
+        provider_env_value(env).map(|value| StripeWebhookSecret { label, value })
+    })
+    .collect()
 }
 
 fn stripe_signature_matches(
@@ -4499,7 +4532,10 @@ fn payment_provider_credential_fields(provider: &str) -> Vec<(String, Value)> {
     }
     vec![
         provider_credential_field("credentialStatus", "STRIPE_SECRET_KEY"),
-        provider_credential_field("webhookSecretStatus", "STRIPE_WEBHOOK_SECRET"),
+        (
+            "webhookSecretStatus".to_string(),
+            Value::Str(stripe_webhook_secret_status().to_string()),
+        ),
     ]
 }
 
@@ -4520,6 +4556,14 @@ fn provider_credential_field(field: &str, env: &str) -> (String, Value) {
         "missing"
     };
     (field.to_string(), Value::Str(status.to_string()))
+}
+
+fn stripe_webhook_secret_status() -> &'static str {
+    if stripe_webhook_secrets().is_empty() {
+        "missing"
+    } else {
+        "configured"
+    }
 }
 
 fn provider_env_configured(env: &str) -> bool {
@@ -10011,6 +10055,32 @@ let rejected = payments.verifyWebhook({
 
         assert_eq!(out, "verified\ninvalid\nstripe\n");
         assert!(!out.contains("whsec_test"));
+    }
+
+    #[test]
+    fn stripe_provider_adapter_accepts_previous_webhook_secret_for_rotation() {
+        let _env_guard = super::test_env::guard();
+        super::test_env::set("STRIPE_WEBHOOK_SECRET", "whsec_current");
+        super::test_env::set("STRIPE_WEBHOOK_SECRET_PREVIOUS", "whsec_previous");
+        let signature =
+            super::hmac_sha256_hex("whsec_previous", "1700000000.evt_rotated").expect("signature");
+        let out = run_str(&format!(
+            r#"let payments = @payment.connect("stripe://local")
+let verified = payments.verifyWebhook({{
+  payload: "evt_rotated",
+  signature: "t=1700000000,v1={signature}"
+}})
+@out verified.status
+@out verified.webhookSecretStatus
+@out verified.webhookSecretMatch"#
+        ))
+        .unwrap();
+        super::test_env::clear("STRIPE_WEBHOOK_SECRET");
+        super::test_env::clear("STRIPE_WEBHOOK_SECRET_PREVIOUS");
+
+        assert_eq!(out, "verified\nconfigured\nprevious\n");
+        assert!(!out.contains("whsec_current"));
+        assert!(!out.contains("whsec_previous"));
     }
 
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
