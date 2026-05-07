@@ -32656,6 +32656,9 @@ entry = "src/main.orv"
   @route POST /sessions {
     @respond 201 { matches: @body.token == @query.token }
   }
+  @route POST /labels {
+    @respond 201 { label: @body.first + @query.suffix }
+  }
 }
 ",
         )
@@ -32667,6 +32670,7 @@ entry = "src/main.orv"
         let server_artifact =
             read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
         let response = &server_artifact["routes"][0]["responses"][0];
+        let label_response = &server_artifact["routes"][2]["responses"][0];
         let handlers =
             std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
                 .expect("handlers source");
@@ -32687,8 +32691,21 @@ entry = "src/main.orv"
             "query_param"
         );
         assert_eq!(response["body_object_fields"][1]["name"], "coupon");
+        assert_eq!(label_response["body_kind"], "request_body_field_json");
+        assert_eq!(label_response["body_request_fields"][0]["field"], "label");
+        assert_eq!(label_response["body_request_fields"][0]["name"], "first");
+        assert_eq!(label_response["body_request_fields"][0]["op"], "concat");
+        assert_eq!(
+            label_response["body_request_fields"][0]["operand_kind"],
+            "query_param"
+        );
+        assert_eq!(
+            label_response["body_request_fields"][0]["operand_name"],
+            "suffix"
+        );
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
         assert!(handlers.contains("routes::orv_native_query_value(route_match, \"coupon\")"));
+        assert!(handlers.contains("value.push_str(operand)"));
         assert!(handlers.contains("orv_native_push_json_string("));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
@@ -32803,6 +32820,9 @@ entry = "src/main.orv"
   @route POST /sessions {
     @respond 201 { matches: @body.token == @query.token }
   }
+  @route POST /labels {
+    @respond 201 { label: @body.first + @query.suffix }
+  }
 }
 ",
         )
@@ -32855,12 +32875,16 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/orders?coupon=SAVE10", r#"{"sku":"sku-1"}"#);
         let session_response =
             send_raw_http_json_post(address, "/sessions?token=abc", r#"{"token":"abc"}"#);
+        let label_response =
+            send_raw_http_json_post(address, "/labels?suffix=-pro", r#"{"first":"orv"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("content-type: application/json"));
         assert!(response.contains(r#"{"sku":"sku-1","coupon":"SAVE10"}"#));
         assert!(session_response.starts_with("HTTP/1.1 201"));
         assert!(session_response.contains(r#"{"matches":true}"#));
+        assert!(label_response.starts_with("HTTP/1.1 201"));
+        assert!(label_response.contains(r#"{"label":"orv-pro"}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
