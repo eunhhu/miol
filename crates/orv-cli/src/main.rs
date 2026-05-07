@@ -33190,6 +33190,9 @@ entry = "src/main.orv"
   @route POST /payments/total {
     @respond 201 { total: (@body.price as float) * (@body.quantity as float) }
   }
+  @route POST /payments/power {
+    @respond 201 { total: (@body.base as float) ** (@body.exp as float) }
+  }
 }
 "#,
         )
@@ -33244,11 +33247,15 @@ entry = "src/main.orv"
             "/payments/total",
             r#"{"price":"12.5","quantity":"3"}"#,
         );
+        let power_response =
+            send_raw_http_json_post(address, "/payments/power", r#"{"base":"2.5","exp":"2.0"}"#);
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"amount":12.5}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":37.5}"#));
+        assert!(power_response.starts_with("HTTP/1.1 201"));
+        assert!(power_response.contains(r#"{"total":6.25}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

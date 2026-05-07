@@ -1909,12 +1909,24 @@ fn native_captured_field_operation_is_direct(
             Some(kind),
             Some(name),
         ) => native_captured_int_operand_is_direct(kind, name, route_params),
-        (_, true, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
-            operand.parse::<f64>().ok().is_some_and(f64::is_finite)
-        }
-        (_, true, _, Some("add" | "sub" | "mul" | "div" | "rem"), None, Some(kind), Some(name)) => {
-            native_captured_float_operand_is_direct(kind, name, route_params)
-        }
+        (
+            _,
+            true,
+            _,
+            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            Some(operand),
+            None,
+            None,
+        ) => operand.parse::<f64>().ok().is_some_and(f64::is_finite),
+        (
+            _,
+            true,
+            _,
+            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            None,
+            Some(kind),
+            Some(name),
+        ) => native_captured_float_operand_is_direct(kind, name, route_params),
         _ => false,
     }
 }
@@ -3033,23 +3045,23 @@ fn push_native_float_success_arm(
             );
             true
         }
-        (Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand_json), None, None) => {
+        (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = static_float_operand_value(operand_json) else {
                 return false;
             };
-            let Some(operator) = native_float_arithmetic_operator(op) else {
+            let Some(value_expr) = native_float_arithmetic_expr("value", op, operand) else {
                 return false;
             };
             let _ = writeln!(
                 source,
-                "            Ok(value) if value.is_finite() => {{\n                let value = value {operator} {operand};"
+                "            Ok(value) if value.is_finite() => {{\n                let value = {value_expr};"
             );
             push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
             source.push_str("            },\n");
             true
         }
         (
-            Some("add" | "sub" | "mul" | "div" | "rem"),
+            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
             None,
             Some(
                 operand_kind @ ("route_param_float"
@@ -3058,7 +3070,7 @@ fn push_native_float_success_arm(
             ),
             Some(operand_name),
         ) => {
-            let Some(operator) = native_float_arithmetic_operator(op) else {
+            let Some(value_expr) = native_float_arithmetic_expr("value", op, "operand") else {
                 return false;
             };
             let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name)
@@ -3071,14 +3083,11 @@ fn push_native_float_success_arm(
             );
             let _ = writeln!(
                 source,
-                "                Ok(operand) if operand.is_finite() => {{\n                    let value = value {operator} operand;"
+                "                Ok(operand) if operand.is_finite() => {{\n                    let value = {value_expr};"
             );
             push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
             source.push_str("                },\n                _ => {\n");
-            let error_body = format!(
-                r#"{{"error":"{} float operand cast failed"}}"#,
-                error_prefix
-            );
+            let error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("                },\n            },\n");
@@ -3096,19 +3105,20 @@ fn push_native_float_arithmetic_result(
     source.push_str(
         "                if value.is_finite() {\n                    body.push_str(&value.to_string());\n                } else {\n",
     );
-    let error_body = format!(r#"{{"error":"{} float arithmetic failed"}}"#, error_prefix);
+    let error_body = format!(r#"{{"error":"{error_prefix} float arithmetic failed"}}"#);
     let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
     push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
     source.push_str("                }\n");
 }
 
-fn native_float_arithmetic_operator(op: Option<&str>) -> Option<&'static str> {
+fn native_float_arithmetic_expr(lhs: &str, op: Option<&str>, rhs: &str) -> Option<String> {
     match op {
-        Some("add") => Some("+"),
-        Some("sub") => Some("-"),
-        Some("mul") => Some("*"),
-        Some("div") => Some("/"),
-        Some("rem") => Some("%"),
+        Some("add") => Some(format!("{lhs} + {rhs}")),
+        Some("sub") => Some(format!("{lhs} - {rhs}")),
+        Some("mul") => Some(format!("{lhs} * {rhs}")),
+        Some("div") => Some(format!("{lhs} / {rhs}")),
+        Some("rem") => Some(format!("{lhs} % {rhs}")),
+        Some("pow") => Some(format!("{lhs}.powf({rhs})")),
         _ => None,
     }
 }
@@ -8146,6 +8156,52 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"price\")"));
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"quantity\")"));
         assert!(handlers.contains("let value = value * operand;"));
+        assert!(handlers.contains("if value.is_finite()"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_pow_field_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { total: (@body.base as float) ** (@body.exp as float) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "base");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("pow"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("exp")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"base\")"));
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"exp\")"));
+        assert!(handlers.contains("let value = value.powf(operand);"));
         assert!(handlers.contains("if value.is_finite()"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
