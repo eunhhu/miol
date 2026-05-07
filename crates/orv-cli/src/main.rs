@@ -15068,7 +15068,8 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
     verify_client_manifest_paths(dir, manifest)?;
     verify_client_manifest_source_binding(dir, manifest)?;
     verify_client_manifest_wasm_hash(dir, manifest)?;
-    verify_client_manifest_exports(manifest)
+    verify_client_manifest_exports(manifest)?;
+    verify_client_manifest_initial_render(dir, manifest)
 }
 
 fn verify_client_manifest_paths(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -15140,6 +15141,26 @@ fn verify_client_manifest_exports(manifest: &serde_json::Value) -> anyhow::Resul
         || json_str(exports, "memory", "client manifest exports")? != CLIENT_WASM_MEMORY_EXPORT
     {
         anyhow::bail!("client_manifest exports do not match client WASM ABI");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_initial_render(
+    dir: &Path,
+    manifest: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let manifest_initial_render = manifest
+        .get("initial_render")
+        .ok_or_else(|| anyhow::anyhow!("client_manifest initial_render must be an object"))?;
+    let wasm = json_str(manifest, "wasm", "client manifest")?;
+    let wasm_metadata = client_wasm_metadata_value(&dir.join(wasm))?;
+    let wasm_initial_render = wasm_metadata
+        .get("initial_render")
+        .ok_or_else(|| anyhow::anyhow!("client_wasm ORV metadata missing initial_render"))?;
+    for field in ["content_type", "encoding", "html_hash", "byte_length"] {
+        if manifest_initial_render.get(field) != wasm_initial_render.get(field) {
+            anyhow::bail!("client_manifest initial_render does not match client WASM metadata");
+        }
     }
     Ok(())
 }
@@ -15742,6 +15763,25 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
 fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(target)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    verify_client_wasm_bytes(dir, target, &bytes)
+}
+
+fn client_wasm_metadata_value(target: &Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(target)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", target.display()))?;
+    client_wasm_metadata_value_from_bytes(&bytes)
+}
+
+fn client_wasm_metadata_value_from_bytes(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let payload = client_wasm_custom_section_payload(bytes)?
+        .ok_or_else(|| anyhow::anyhow!("client_wasm bundle does not declare ORV metadata"))?;
+    let payload = std::str::from_utf8(payload)
+        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not UTF-8: {e}"))?;
+    serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not JSON: {e}"))
+}
+
+fn verify_client_wasm_bytes(dir: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if bytes.len() < WASM_MODULE_HEADER.len() {
         anyhow::bail!("client_wasm bundle is too small: {}", target.display());
     }
@@ -15754,12 +15794,7 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
             target.display()
         );
     }
-    let payload = client_wasm_custom_section_payload(&bytes)?
-        .ok_or_else(|| anyhow::anyhow!("client_wasm bundle does not declare ORV metadata"))?;
-    let payload = std::str::from_utf8(payload)
-        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not UTF-8: {e}"))?;
-    let metadata: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|e| anyhow::anyhow!("client_wasm ORV metadata is not JSON: {e}"))?;
+    let metadata = client_wasm_metadata_value_from_bytes(bytes)?;
     if metadata
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
@@ -15839,18 +15874,18 @@ fn verify_client_wasm_target(dir: &Path, target: &Path) -> anyhow::Result<()> {
     {
         anyhow::bail!("client_wasm initial_render export metadata is invalid");
     }
-    if !client_wasm_exports_function(&bytes, CLIENT_WASM_START_EXPORT)? {
+    if !client_wasm_exports_function(bytes, CLIENT_WASM_START_EXPORT)? {
         anyhow::bail!("client_wasm bundle must export `{CLIENT_WASM_START_EXPORT}`");
     }
-    if !client_wasm_exports_function(&bytes, CLIENT_WASM_RENDER_PTR_EXPORT)?
-        || !client_wasm_exports_function(&bytes, CLIENT_WASM_RENDER_LEN_EXPORT)?
+    if !client_wasm_exports_function(bytes, CLIENT_WASM_RENDER_PTR_EXPORT)?
+        || !client_wasm_exports_function(bytes, CLIENT_WASM_RENDER_LEN_EXPORT)?
     {
         anyhow::bail!("client_wasm bundle must export initial render pointer and length");
     }
-    if !client_wasm_exports_memory(&bytes, CLIENT_WASM_MEMORY_EXPORT)? {
+    if !client_wasm_exports_memory(bytes, CLIENT_WASM_MEMORY_EXPORT)? {
         anyhow::bail!("client_wasm bundle must export initial render memory");
     }
-    verify_client_wasm_initial_render_data(&bytes, initial_render)?;
+    verify_client_wasm_initial_render_data(bytes, initial_render)?;
     Ok(())
 }
 
@@ -35856,6 +35891,33 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         assert!(
             err.to_string().contains("wasm_hash"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_manifest_initial_render_mismatch() {
+        let out = temp_output_dir("verify-build-client-manifest-render-mismatch");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["initial_render"]["byte_length"] = serde_json::json!(0);
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client manifest render");
+
+        assert!(
+            err.to_string().contains("initial_render"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&out);
