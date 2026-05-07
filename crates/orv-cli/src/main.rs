@@ -15238,15 +15238,7 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
         .get("bindings")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("client_reactive_plan bindings must be an array"))?;
-    if !bindings.iter().any(|binding| {
-        binding.get("kind").and_then(serde_json::Value::as_str) == Some("initial_render")
-            && binding.get("target").and_then(serde_json::Value::as_str) == Some(CLIENT_PAGE_PATH)
-            && binding.get("source").and_then(serde_json::Value::as_str) == Some(CLIENT_WASM_PATH)
-    }) {
-        anyhow::bail!(
-            "client_reactive_plan initial_render binding must target {CLIENT_PAGE_PATH} from {CLIENT_WASM_PATH}"
-        );
-    }
+    verify_client_reactive_plan_initial_render_binding(dir, bindings)?;
     if !signals.iter().all(|signal| {
         let origin_id = signal
             .get("origin_id")
@@ -15299,6 +15291,38 @@ fn verify_client_page_file(target: &Path) -> anyhow::Result<()> {
     }
     if !html.contains("type=\"module\"") || !html.contains("client/app.js") {
         anyhow::bail!("client_page bundle does not load client/app.js");
+    }
+    Ok(())
+}
+
+fn verify_client_reactive_plan_initial_render_binding(
+    dir: &Path,
+    bindings: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let binding = bindings
+        .iter()
+        .find(|binding| {
+            binding.get("kind").and_then(serde_json::Value::as_str) == Some("initial_render")
+                && binding.get("target").and_then(serde_json::Value::as_str)
+                    == Some(CLIENT_PAGE_PATH)
+                && binding.get("source").and_then(serde_json::Value::as_str)
+                    == Some(CLIENT_WASM_PATH)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "client_reactive_plan initial_render binding must target {CLIENT_PAGE_PATH} from {CLIENT_WASM_PATH}"
+            )
+        })?;
+    let manifest = read_json_value(&dir.join(CLIENT_MANIFEST_PATH))?;
+    let initial_render = manifest
+        .get("initial_render")
+        .ok_or_else(|| anyhow::anyhow!("client_manifest initial_render must be an object"))?;
+    for field in ["html_hash", "byte_length"] {
+        if binding.get(field) != initial_render.get(field) {
+            anyhow::bail!(
+                "client_reactive_plan initial_render binding does not match client manifest"
+            );
+        }
     }
     Ok(())
 }
@@ -19681,6 +19705,8 @@ fn write_client_reactive_plan(
         "kind": "initial_render",
         "target": CLIENT_PAGE_PATH,
         "source": CLIENT_WASM_PATH,
+        "html_hash": format!("{:016x}", fnv1a64(binding.initial_render.as_bytes())),
+        "byte_length": binding.initial_render.len(),
     })];
     bindings.extend(signals.iter().map(|signal| {
         serde_json::json!({
@@ -36215,6 +36241,39 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
         let mut plan = read_json_value(&plan_path).expect("reactive plan");
         plan["bindings"] = serde_json::json!([]);
+        write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
+
+        assert!(
+            err.to_string().contains("initial_render binding"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_reactive_plan_initial_render_mismatch() {
+        let out = temp_output_dir("verify-build-client-reactive-render-mismatch");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
+        let mut plan = read_json_value(&plan_path).expect("reactive plan");
+        let binding = plan["bindings"]
+            .as_array_mut()
+            .expect("bindings")
+            .iter_mut()
+            .find(|binding| binding["kind"] == "initial_render")
+            .expect("initial render binding");
+        binding["byte_length"] = serde_json::json!(0);
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
