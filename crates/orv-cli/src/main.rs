@@ -6375,6 +6375,7 @@ fn editor_debug_runner_result_panels_json(
         .unwrap_or(serde_json::Value::Null);
     let stopped_events = editor_debug_event_frames(debug, "stopped");
     let output_events = editor_debug_event_frames(debug, "output");
+    let events = editor_debug_all_event_frames(debug);
     serde_json::json!({
         "debug": {
             "schema_version": 1,
@@ -6402,12 +6403,25 @@ fn editor_debug_runner_result_panels_json(
                 .unwrap_or_else(|| serde_json::json!([])),
             "control_count": json_array_count(debug.get("controls")),
             "breakpoint_count": json_array_count(debug.get("breakpoints")),
+            "event_count": events.len(),
             "stopped_event_count": stopped_events.len(),
             "output_event_count": output_events.len(),
+            "events": events,
             "stopped_events": stopped_events,
             "output_events": output_events,
         },
     })
+}
+
+fn editor_debug_all_event_frames(debug: &serde_json::Value) -> Vec<serde_json::Value> {
+    debug
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("event"))
+        .cloned()
+        .collect()
 }
 
 fn editor_debug_event_frames(
@@ -6477,6 +6491,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .unwrap_or_default();
     let stopped_events = value
         .pointer("/panels/debug/stopped_events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let events = value
+        .pointer("/panels/debug/events")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -6555,6 +6574,15 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     html.push_str("</ul></section>\n");
     html.push_str("<section class=\"panel\"><h2>Stopped Events</h2><ul class=\"list\">");
     for event in stopped_events {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_event_summary(&event))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>All Events</h2><ul class=\"list\">");
+    for event in events {
         write!(
             &mut html,
             "<li>{}</li>",
@@ -38698,6 +38726,8 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("Locals"));
         assert!(result_html.contains("Project Variables"));
         assert!(result_html.contains("Stopped Events"));
+        assert!(result_html.contains("All Events"));
+        assert!(result_html.contains("initialized"));
         assert!(result_html.contains("line 3"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -38749,6 +38779,20 @@ define Auth() -> { @out "auth" }
                 .expect("stopped events")
                 .len()
                 >= 2
+        );
+        assert!(
+            result["panels"]["debug"]["event_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2),
+            "{result}"
+        );
+        assert!(
+            result["panels"]["debug"]["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|event| event["event"] == "stopped"),
+            "{result}"
         );
         assert!(result["panels"]["debug"]["result_artifact"]["path"]
             .as_str()
