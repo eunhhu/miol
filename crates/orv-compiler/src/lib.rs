@@ -1896,9 +1896,19 @@ fn native_captured_field_operation_is_direct(
         (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<i64>().is_ok()
         }
-        (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), None, Some(kind), Some(name)) => {
-            native_captured_int_operand_is_direct(kind, name, route_params)
-        }
+        (true, _, _, Some("pow"), Some(operand), None, None) => operand
+            .parse::<i64>()
+            .ok()
+            .is_some_and(|operand| (0..=63).contains(&operand)),
+        (
+            true,
+            _,
+            _,
+            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            None,
+            Some(kind),
+            Some(name),
+        ) => native_captured_int_operand_is_direct(kind, name, route_params),
         (_, true, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
             operand.parse::<f64>().ok().is_some_and(f64::is_finite)
         }
@@ -2362,6 +2372,10 @@ pub fn orv_native_handle_route(
             continue;
         };
         if !(100..=999).contains(&status) {
+            continue;
+        }
+        let route_params = native_server_route_param_names(&route.path);
+        if !native_server_response_is_direct(response, &route_params) {
             continue;
         }
         if let Some(body_json) = response.body_json.as_ref() {
@@ -3124,17 +3138,20 @@ fn push_native_int_success_arm(
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
             true
         }
-        (Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand_json), None, None) => {
+        (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
             };
-            let method = match op {
-                Some("add") => "checked_add",
-                Some("sub") => "checked_sub",
-                Some("mul") => "checked_mul",
-                Some("div") => "checked_div",
-                Some("rem") => "checked_rem",
-                _ => return false,
+            let Some(method) = native_int_arithmetic_method(op) else {
+                return false;
+            };
+            let operand = if method == "checked_pow" {
+                let Ok(exponent) = u32::try_from(operand) else {
+                    return false;
+                };
+                exponent.to_string()
+            } else {
+                operand.to_string()
             };
             let _ = writeln!(
                 source,
@@ -3143,25 +3160,20 @@ fn push_native_int_success_arm(
             source.push_str(
                 "                Some(value) => body.push_str(&value.to_string()),\n                None => {\n",
             );
-            let error_body = format!(r#"{{"error":"{} int arithmetic failed"}}"#, error_prefix);
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("                },\n            },\n");
             true
         }
         (
-            Some("add" | "sub" | "mul" | "div" | "rem"),
+            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
             None,
             Some(operand_kind @ ("route_param_int" | "query_param_int" | "request_body_field_int")),
             Some(operand_name),
         ) => {
-            let method = match op {
-                Some("add") => "checked_add",
-                Some("sub") => "checked_sub",
-                Some("mul") => "checked_mul",
-                Some("div") => "checked_div",
-                Some("rem") => "checked_rem",
-                _ => return false,
+            let Some(method) = native_int_arithmetic_method(op) else {
+                return false;
             };
             let Some(operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name)
             else {
@@ -3171,26 +3183,50 @@ fn push_native_int_success_arm(
                 source,
                 "            Ok(value) => match {operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
             );
-            let _ = writeln!(
-                source,
-                "                Ok(operand) => match value.{method}(operand) {{"
-            );
+            if method == "checked_pow" {
+                source.push_str(
+                    "                Ok(operand) if (0..=63).contains(&operand) => match value.checked_pow(u32::try_from(operand).unwrap_or(0)) {\n",
+                );
+            } else {
+                let _ = writeln!(
+                    source,
+                    "                Ok(operand) => match value.{method}(operand) {{"
+                );
+            }
             source.push_str(
                 "                    Some(value) => body.push_str(&value.to_string()),\n                    None => {\n",
             );
-            let error_body = format!(r#"{{"error":"{} int arithmetic failed"}}"#, error_prefix);
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
-            source.push_str(
-                "                    },\n                },\n                Err(_) => {\n",
-            );
-            let error_body = format!(r#"{{"error":"{} int operand cast failed"}}"#, error_prefix);
+            source.push_str("                    },\n                },\n");
+            if method == "checked_pow" {
+                source.push_str("                Ok(_) => {\n");
+                let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+                let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+                push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+                source.push_str("                },\n");
+            }
+            source.push_str("                Err(_) => {\n");
+            let error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
             source.push_str("                },\n            },\n");
             true
         }
         _ => false,
+    }
+}
+
+fn native_int_arithmetic_method(op: Option<&str>) -> Option<&'static str> {
+    match op {
+        Some("add") => Some("checked_add"),
+        Some("sub") => Some("checked_sub"),
+        Some("mul") => Some("checked_mul"),
+        Some("div") => Some("checked_div"),
+        Some("rem") => Some("checked_rem"),
+        Some("pow") => Some("checked_pow"),
+        _ => None,
     }
 }
 
@@ -4309,7 +4345,12 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::Pow
             ) =>
         {
             captured_numeric_response_operation(route_param_field_value(lhs)?, *op, rhs)
@@ -4351,7 +4392,12 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::Pow
             ) =>
         {
             captured_numeric_response_operation(query_param_field_value(lhs)?, *op, rhs)
@@ -4425,6 +4471,7 @@ fn captured_numeric_response_operation(
             BinaryOp::Mul => "mul",
             BinaryOp::Div => "div",
             BinaryOp::Rem => "rem",
+            BinaryOp::Pow => "pow",
             _ => return None,
         }
         .to_string(),
@@ -4698,7 +4745,12 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::Pow
             ) =>
         {
             captured_numeric_response_operation(request_body_field_value(lhs)?, *op, rhs)
@@ -7197,7 +7249,7 @@ function greet(name: string): string -> "hi {name}""#,
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { quantity: (@body.quantity as int) ** (@body.bonus as int) }
+    @respond 201 { quantity: (@body.quantity as int) ** -1 }
   }
 }"#;
         let program = lower(src);
@@ -7377,6 +7429,42 @@ function greet(name: string): string -> "hi {name}""#,
             handlers.contains("routes::orv_native_body_field_value(route_match, \"unit_price\")")
         );
         assert!(handlers.contains("value.checked_mul(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_int_pow_field_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: (@body.quantity as int) ** (@body.bonus as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("pow"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("bonus")
+        );
+        assert!(handlers.contains("checked_pow"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -9466,7 +9554,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) ** (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) ** -1 }
   }
 }";
         let program = lower(src);

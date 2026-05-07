@@ -33069,6 +33069,9 @@ entry = "src/main.orv"
   @route POST /orders/total {
     @respond 201 { total: (@body.quantity as int) * (@body.unit_price as int) }
   }
+  @route POST /orders/power {
+    @respond 201 { total: (@body.quantity as int) ** (@body.bonus as int) }
+  }
   @route POST /orders/due {
     @respond 201 { due: (@body.total as int) - (@body.discount as int) }
   }
@@ -33135,6 +33138,8 @@ entry = "src/main.orv"
             "/orders/total",
             r#"{"quantity":"7","unit_price":"125"}"#,
         );
+        let power_response =
+            send_raw_http_json_post(address, "/orders/power", r#"{"quantity":"2","bonus":"6"}"#);
         let due_response = send_raw_http_json_post(
             address,
             "/orders/due",
@@ -33156,6 +33161,8 @@ entry = "src/main.orv"
         assert!(cents_response.contains(r#"{"cents":700}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":875}"#));
+        assert!(power_response.starts_with("HTTP/1.1 201"));
+        assert!(power_response.contains(r#"{"total":64}"#));
         assert!(due_response.starts_with("HTTP/1.1 201"));
         assert!(due_response.contains(r#"{"due":750}"#));
         assert!(share_response.starts_with("HTTP/1.1 201"));
@@ -33417,7 +33424,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) ** (@body.extra as int) }
+    @respond 201 { received: (@body.id as int) ** -1 }
   }
 }
 ",
