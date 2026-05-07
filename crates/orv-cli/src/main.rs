@@ -17066,6 +17066,7 @@ fn verify_deploy_smoke_test_artifact(
         anyhow::bail!("missing deploy smoke test: {}", smoke_path.display());
     }
     verify_executable_if_supported(&smoke_path, "deploy smoke test")?;
+    verify_shell_syntax_if_supported(&smoke_path, "deploy smoke test")?;
     let smoke = std::fs::read_to_string(&smoke_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", smoke_path.display()))?;
     let base_url = deploy_smoke_base_url(listen);
@@ -22940,6 +22941,27 @@ fn verify_executable_if_supported(path: &Path, label: &str) -> anyhow::Result<()
 
 #[cfg(not(unix))]
 fn verify_executable_if_supported(_path: &Path, _label: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_shell_syntax_if_supported(path: &Path, label: &str) -> anyhow::Result<()> {
+    let output = ProcessCommand::new("sh")
+        .arg("-n")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run shell syntax check for {label}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{label} shell syntax invalid: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_shell_syntax_if_supported(_path: &Path, _label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -34310,6 +34332,27 @@ entry = "src/main.orv"
         assert!(err
             .to_string()
             .contains("deploy smoke test must be executable"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_build_rejects_invalid_deploy_smoke_test_shell_syntax() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-syntax-source");
+        let out = temp_output_dir("deploy-smoke-syntax-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let mut smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        smoke.push_str("\nif\n");
+        std::fs::write(&smoke_path, smoke).expect("write corrupt smoke script");
+
+        let err = cmd_verify_build(&out).expect_err("smoke shell syntax mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test shell syntax invalid"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
