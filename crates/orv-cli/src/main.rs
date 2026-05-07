@@ -2283,7 +2283,7 @@ After `orv build . --prod --out dist`, use generated deploy runbook:\n\
 \n\
 ```sh\n\
 cd dist\n\
-PORT=8080 docker compose -f deploy/compose.yaml up --build\n\
+PORT=8080 docker compose -f deploy/compose.yaml up --build -d\n\
 ./deploy/smoke-test.sh\n\
 ```\n\
 \n\
@@ -17245,7 +17245,7 @@ fn verify_deploy_runbook_artifact(
     }
     let runbook = std::fs::read_to_string(&runbook_path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", runbook_path.display()))?;
-    let compose_command = format!("docker compose -f {} up --build", artifacts.compose);
+    let compose_command = format!("docker compose -f {} up --build -d", artifacts.compose);
     if !runbook.contains(&compose_command) {
         anyhow::bail!("deploy runbook must include compose launch command");
     }
@@ -22790,7 +22790,7 @@ fn write_prod_deploy_runbook(
 ## Run
 
 ```sh
-{port_prefix}docker compose -f {compose_path} up --build
+{port_prefix}docker compose -f {compose_path} up --build -d
 ```
 
 ## Artifacts
@@ -23923,7 +23923,7 @@ test "checkout failing runtime body" {
         assert!(guide.contains("server/native/router.rs"));
         assert!(guide.contains("server/native/handlers.rs"));
         assert!(guide.contains("cd dist"));
-        assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build"));
+        assert!(guide.contains("PORT=8080 docker compose -f deploy/compose.yaml up --build -d"));
         assert!(guide.contains("./deploy/smoke-test.sh"));
         assert!(
             guide.contains("cargo build --manifest-path dist/server/native/Cargo.toml --release")
@@ -33390,7 +33390,7 @@ entry = "src/main.orv"
         let env_example = std::fs::read_to_string(&deploy_env_example_path).expect("env example");
         assert!(env_example.contains("PORT=8080"));
         let runbook = std::fs::read_to_string(&deploy_runbook_path).expect("deploy runbook");
-        assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build"));
+        assert!(runbook.contains("docker compose -f deploy/compose.yaml up --build -d"));
         assert!(runbook.contains("deploy/env.example"));
         assert!(runbook.contains("PORT=8080"));
         assert!(runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release"));
