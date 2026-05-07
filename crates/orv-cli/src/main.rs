@@ -6454,6 +6454,56 @@ fn editor_debug_result_artifact_json() -> serde_json::Value {
         "kind": "orv.editor.debug.runner.result",
         "media_type": "application/json",
         "panels": ["debug"],
+        "panel_contract": editor_debug_result_panel_contract_json(),
+    })
+}
+
+fn editor_debug_result_panel_contract_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": "panels.debug",
+        "sections": [
+            {
+                "name": "session_summary",
+                "path": "panels.debug.session_summary",
+                "kind": "object",
+            },
+            {
+                "name": "selected_frame",
+                "path": "panels.debug.selected_frame",
+                "kind": "object",
+            },
+            {
+                "name": "stack_frames",
+                "path": "panels.debug.stack_frames",
+                "kind": "array",
+            },
+            {
+                "name": "locals",
+                "path": "panels.debug.locals",
+                "kind": "array",
+            },
+            {
+                "name": "project_variables",
+                "path": "panels.debug.project_variables",
+                "kind": "array",
+            },
+            {
+                "name": "stopped_events",
+                "path": "panels.debug.stopped_events",
+                "kind": "array",
+            },
+            {
+                "name": "events",
+                "path": "panels.debug.events",
+                "kind": "array",
+            },
+            {
+                "name": "output_events",
+                "path": "panels.debug.output_events",
+                "kind": "array",
+            },
+        ],
     })
 }
 
@@ -38371,6 +38421,20 @@ define Auth() -> { @out "auth" }
             state["debug"]["result_artifact"]["kind"],
             "orv.editor.debug.runner.result"
         );
+        assert_eq!(
+            state["debug"]["result_artifact"]["panel_contract"]["root"],
+            "panels.debug"
+        );
+        assert!(
+            state["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("result panel sections")
+                .iter()
+                .any(|section| {
+                    section["name"] == "session_summary"
+                        && section["path"] == "panels.debug.session_summary"
+                })
+        );
         assert_editor_debug_runner_artifact(&out, &state);
         assert_editor_native_host_manifest(&out, &state);
         assert_editor_debug_configurations(&state);
@@ -38438,6 +38502,14 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             native_host["debug"]["result_artifact"],
             state["debug"]["result_artifact"]
+        );
+        assert!(
+            native_host["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("native host result panel sections")
+                .iter()
+                .any(|section| section["name"] == "events"
+                    && section["path"] == "panels.debug.events")
         );
         assert_eq!(native_host["debug"]["configuration_count"], 3);
         let configurations = native_host["debug"]["configurations"]
