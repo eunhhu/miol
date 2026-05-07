@@ -6376,9 +6376,17 @@ fn editor_debug_runner_result_panels_json(
     let stopped_events = editor_debug_event_frames(debug, "stopped");
     let output_events = editor_debug_event_frames(debug, "output");
     let events = editor_debug_all_event_frames(debug);
+    let session_summary = editor_debug_session_summary_json(
+        debug,
+        &selected_frame,
+        &events,
+        &stopped_events,
+        &output_events,
+    );
     serde_json::json!({
         "debug": {
             "schema_version": 1,
+            "session_summary": session_summary,
             "result_artifact": runner
                 .get("result")
                 .cloned()
@@ -6504,6 +6512,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let session_summary = value
+        .pointer("/panels/debug/session_summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let locals = value
         .pointer("/panels/debug/locals")
         .and_then(serde_json::Value::as_array)
@@ -6540,6 +6552,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         &mut html,
         "<section class=\"panel\"><h2>Breakpoints</h2><div class=\"metric\">{breakpoint_count}</div><p class=\"muted\">requested breakpoints</p></section>"
     )?;
+    html.push_str("<section class=\"panel wide\"><h2>Session Summary</h2><pre>");
+    html.push_str(&html_escape_text(&editor_debug_session_summary_text(
+        &session_summary,
+    )));
+    html.push_str("</pre></section>\n");
     html.push_str("<section class=\"panel\"><h2>Selected Frame</h2><pre>");
     html.push_str(&html_escape_text(&editor_debug_frame_summary(
         &selected_frame,
@@ -6600,6 +6617,103 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     }
     html.push_str("</ul></section>\n</main></body></html>\n");
     Ok(html)
+}
+
+fn editor_debug_session_summary_json(
+    debug: &serde_json::Value,
+    selected_frame: &serde_json::Value,
+    events: &[serde_json::Value],
+    stopped_events: &[serde_json::Value],
+    output_events: &[serde_json::Value],
+) -> serde_json::Value {
+    let selected_line = selected_frame
+        .get("line")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let selected_frame_id = selected_frame
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let selected_frame_name = selected_frame
+        .get("name")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let selected_source = selected_frame
+        .pointer("/source/path")
+        .cloned()
+        .or_else(|| selected_frame.pointer("/source/name").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let last_event = events
+        .last()
+        .and_then(|event| event.get("event"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_stopped_reason = stopped_events
+        .last()
+        .and_then(|event| event.pointer("/body/reason"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "schema_version": 1,
+        "program": debug.get("program").cloned().unwrap_or(serde_json::Value::Null),
+        "selected_frame_id": selected_frame_id,
+        "selected_frame": selected_frame_name,
+        "selected_line": selected_line,
+        "selected_source": selected_source,
+        "last_event": last_event,
+        "last_stopped_reason": last_stopped_reason,
+        "request_count": debug
+            .pointer("/transport/request_count")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0)),
+        "frame_count": debug
+            .pointer("/transport/frame_count")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0)),
+        "control_count": json_array_count(debug.get("controls")),
+        "breakpoint_count": json_array_count(debug.get("breakpoints")),
+        "event_count": events.len(),
+        "stopped_event_count": stopped_events.len(),
+        "output_event_count": output_events.len(),
+    })
+}
+
+fn editor_debug_session_summary_text(summary: &serde_json::Value) -> String {
+    let selected_line = summary
+        .get("selected_line")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "line ?".to_string(), |line| format!("line {line}"));
+    [
+        format!("program {}", json_str_or_empty(summary, "program")),
+        format!(
+            "selected {} {}",
+            json_str_or_empty(summary, "selected_frame"),
+            selected_line
+        ),
+        format!("source {}", json_str_or_empty(summary, "selected_source")),
+        format!("last_event {}", json_str_or_empty(summary, "last_event")),
+        format!(
+            "last_stop {}",
+            json_str_or_empty(summary, "last_stopped_reason")
+        ),
+        format!(
+            "requests {} frames {}",
+            json_u64_field(summary, "request_count"),
+            json_u64_field(summary, "frame_count")
+        ),
+        format!(
+            "controls {} breakpoints {} events {} stopped {} output {}",
+            json_u64_field(summary, "control_count"),
+            json_u64_field(summary, "breakpoint_count"),
+            json_u64_field(summary, "event_count"),
+            json_u64_field(summary, "stopped_event_count"),
+            json_u64_field(summary, "output_event_count")
+        ),
+    ]
+    .into_iter()
+    .filter(|line| !line.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn editor_debug_frame_summary(frame: &serde_json::Value) -> String {
@@ -38748,6 +38862,7 @@ define Auth() -> { @out "auth" }
             std::fs::read_to_string(result_html_path).expect("debug result html artifact");
         assert!(result_html.contains("id=\"orv-debug-result\""));
         assert!(result_html.contains("Selected Frame"));
+        assert!(result_html.contains("Session Summary"));
         assert!(result_html.contains("Stack Frames"));
         assert!(result_html.contains("Locals"));
         assert!(result_html.contains("Project Variables"));
@@ -38783,6 +38898,25 @@ define Auth() -> { @out "auth" }
         assert_eq!(result["panels"]["debug"]["schema_version"], 1);
         assert_eq!(result["panels"]["debug"]["control_count"], 2);
         assert_eq!(result["panels"]["debug"]["breakpoint_count"], 0);
+        assert_eq!(
+            result["panels"]["debug"]["session_summary"]["schema_version"],
+            1
+        );
+        assert_eq!(
+            result["panels"]["debug"]["session_summary"]["program"],
+            path.display().to_string()
+        );
+        assert_eq!(
+            result["panels"]["debug"]["session_summary"]["selected_line"],
+            3
+        );
+        assert_eq!(
+            result["panels"]["debug"]["session_summary"]["control_count"],
+            2
+        );
+        assert!(result["panels"]["debug"]["session_summary"]["last_event"]
+            .as_str()
+            .is_some_and(|event| !event.is_empty()));
         assert_eq!(result["panels"]["debug"]["selected_frame"]["line"], 3);
         assert!(result["panels"]["debug"]["stack_frames"]
             .as_array()
