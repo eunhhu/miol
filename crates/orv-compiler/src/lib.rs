@@ -1586,6 +1586,7 @@ fn native_server_response_condition_is_direct(
                 | "request_body_field_bool_eq"
                 | "request_body_field_bool_ne"
                 | "request_body_field_bool_and"
+                | "request_body_field_bool_or"
                 | "route_param_eq"
                 | "route_param_ne"
                 | "route_param_int_eq"
@@ -1603,6 +1604,7 @@ fn native_server_response_condition_is_direct(
                 | "route_param_bool_eq"
                 | "route_param_bool_ne"
                 | "route_param_bool_and"
+                | "route_param_bool_or"
                 | "query_param_eq"
                 | "query_param_ne"
                 | "query_param_int_eq"
@@ -1620,6 +1622,7 @@ fn native_server_response_condition_is_direct(
                 | "query_param_bool_eq"
                 | "query_param_bool_ne"
                 | "query_param_bool_and"
+                | "query_param_bool_or"
         )
     })
 }
@@ -1637,9 +1640,10 @@ fn native_response_condition_operand_kind(kind: &str) -> &'static str {
         | "route_param_float_le"
         | "route_param_float_gt"
         | "route_param_float_ge" => "route_param_float",
-        "route_param_bool_eq" | "route_param_bool_ne" | "route_param_bool_and" => {
-            "route_param_bool"
-        }
+        "route_param_bool_eq"
+        | "route_param_bool_ne"
+        | "route_param_bool_and"
+        | "route_param_bool_or" => "route_param_bool",
         "query_param_int_eq" | "query_param_int_ne" | "query_param_int_lt"
         | "query_param_int_le" | "query_param_int_gt" | "query_param_int_ge" => "query_param_int",
         "query_param_float_eq"
@@ -1648,9 +1652,10 @@ fn native_response_condition_operand_kind(kind: &str) -> &'static str {
         | "query_param_float_le"
         | "query_param_float_gt"
         | "query_param_float_ge" => "query_param_float",
-        "query_param_bool_eq" | "query_param_bool_ne" | "query_param_bool_and" => {
-            "query_param_bool"
-        }
+        "query_param_bool_eq"
+        | "query_param_bool_ne"
+        | "query_param_bool_and"
+        | "query_param_bool_or" => "query_param_bool",
         "request_body_field_int_eq"
         | "request_body_field_int_ne"
         | "request_body_field_int_lt"
@@ -1665,7 +1670,8 @@ fn native_response_condition_operand_kind(kind: &str) -> &'static str {
         | "request_body_field_float_ge" => "request_body_field_float",
         "request_body_field_bool_eq"
         | "request_body_field_bool_ne"
-        | "request_body_field_bool_and" => "request_body_field_bool",
+        | "request_body_field_bool_and"
+        | "request_body_field_bool_or" => "request_body_field_bool",
         _ => "",
     }
 }
@@ -3300,19 +3306,23 @@ fn native_response_condition_bool_lookup(kind: &str) -> Option<(&'static str, &'
     let lookup = match kind {
         "request_body_field_bool_eq"
         | "request_body_field_bool_ne"
-        | "request_body_field_bool_and" => "routes::orv_native_body_field_value",
-        "route_param_bool_eq" | "route_param_bool_ne" | "route_param_bool_and" => {
-            "routes::orv_native_param_value"
-        }
-        "query_param_bool_eq" | "query_param_bool_ne" | "query_param_bool_and" => {
-            "routes::orv_native_query_value"
-        }
+        | "request_body_field_bool_and"
+        | "request_body_field_bool_or" => "routes::orv_native_body_field_value",
+        "route_param_bool_eq"
+        | "route_param_bool_ne"
+        | "route_param_bool_and"
+        | "route_param_bool_or" => "routes::orv_native_param_value",
+        "query_param_bool_eq"
+        | "query_param_bool_ne"
+        | "query_param_bool_and"
+        | "query_param_bool_or" => "routes::orv_native_query_value",
         _ => return None,
     };
     let operator = match kind {
         "request_body_field_bool_eq" | "route_param_bool_eq" | "query_param_bool_eq" => "==",
         "request_body_field_bool_ne" | "route_param_bool_ne" | "query_param_bool_ne" => "!=",
         "request_body_field_bool_and" | "route_param_bool_and" | "query_param_bool_and" => "&&",
+        "request_body_field_bool_or" | "route_param_bool_or" | "query_param_bool_or" => "||",
         _ => return None,
     };
     Some((lookup, operator))
@@ -4659,6 +4669,7 @@ fn native_response_condition(expr: &HirExpr) -> Option<ServerResponseConditionAr
                 op,
                 BinaryOp::Eq
                     | BinaryOp::And
+                    | BinaryOp::Or
                     | BinaryOp::Ne
                     | BinaryOp::Lt
                     | BinaryOp::Le
@@ -4715,7 +4726,10 @@ fn native_captured_bool_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
-    if !matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::And) {
+    if !matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::And | BinaryOp::Or
+    ) {
         return None;
     }
     if let Some(left) = captured_condition_bool_operand(lhs) {
@@ -4999,12 +5013,15 @@ fn condition_kind_for_bool_operand(op: BinaryOp, operand_kind: &str) -> Option<S
         ("request_body_field_bool", BinaryOp::Eq) => "request_body_field_bool_eq",
         ("request_body_field_bool", BinaryOp::Ne) => "request_body_field_bool_ne",
         ("request_body_field_bool", BinaryOp::And) => "request_body_field_bool_and",
+        ("request_body_field_bool", BinaryOp::Or) => "request_body_field_bool_or",
         ("route_param_bool", BinaryOp::Eq) => "route_param_bool_eq",
         ("route_param_bool", BinaryOp::Ne) => "route_param_bool_ne",
         ("route_param_bool", BinaryOp::And) => "route_param_bool_and",
+        ("route_param_bool", BinaryOp::Or) => "route_param_bool_or",
         ("query_param_bool", BinaryOp::Eq) => "query_param_bool_eq",
         ("query_param_bool", BinaryOp::Ne) => "query_param_bool_ne",
         ("query_param_bool", BinaryOp::And) => "query_param_bool_and",
+        ("query_param_bool", BinaryOp::Or) => "query_param_bool_or",
         _ => return None,
     };
     Some(kind.to_string())
@@ -8320,6 +8337,52 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(r#"("true", "false") => true && false"#));
         assert!(handlers.contains(r#"("false", "true") => false && true"#));
         assert!(handlers.contains(r#"("false", "false") => false && false"#));
+        assert!(handlers.contains("status: 201"));
+        assert!(handlers.contains("status: 403"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_query_bool_or_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /members {
+    if (@body.subscribed as bool) || (@query.override as bool) {
+      @respond 201 { eligible: true }
+    }
+    @respond 403 { err: "not_eligible" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_bool_or");
+        assert_eq!(condition.name, "subscribed");
+        assert_eq!(condition.operand_kind.as_deref(), Some("query_param_bool"));
+        assert_eq!(condition.operand_name.as_deref(), Some("override"));
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains(
+            "match (routes::orv_native_body_field_value(route_match, \"subscribed\").unwrap_or(\"\").trim(), routes::orv_native_query_value(route_match, \"override\").unwrap_or(\"\").trim())"
+        ));
+        assert!(handlers.contains(r#"("true", "true") => true || true"#));
+        assert!(handlers.contains(r#"("true", "false") => true || false"#));
+        assert!(handlers.contains(r#"("false", "true") => false || true"#));
+        assert!(handlers.contains(r#"("false", "false") => false || false"#));
         assert!(handlers.contains("status: 201"));
         assert!(handlers.contains("status: 403"));
         assert!(!handlers.contains("native route body lowering pending"));
