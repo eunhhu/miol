@@ -17073,6 +17073,15 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke.contains(&base_assignment) {
         anyhow::bail!("deploy smoke test must include {base_assignment}");
     }
+    if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
+        let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
+        if !smoke.contains(&ready_assignment) {
+            anyhow::bail!("deploy smoke test must include {ready_assignment}");
+        }
+        if !smoke.contains("for attempt in 1 2 3 4 5") || !smoke.contains("sleep 1") {
+            anyhow::bail!("deploy smoke test must wait for server readiness");
+        }
+    }
     for route in artifact
         .routes
         .iter()
@@ -21989,6 +21998,20 @@ fn deploy_routes_include(
         .any(|route| route.method == method && route.path == path)
 }
 
+fn deploy_smoke_ready_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> Option<&str> {
+    artifact
+        .routes
+        .iter()
+        .find(|route| route.method == "GET" && route.path == "/health")
+        .or_else(|| {
+            artifact
+                .routes
+                .iter()
+                .find(|route| route.method == "GET" && !route.path.contains(':'))
+        })
+        .map(|route| route.path.as_str())
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
@@ -22733,6 +22756,23 @@ BASE_URL="${{ORV_BASE_URL:-{}}}"
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
+    if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
+        let _ = writeln!(
+            script,
+            r#"READY_PATH="{ready_path}"
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  if curl -fsS "$BASE_URL$READY_PATH" >/dev/null; then
+    break
+  fi
+  if [ "$attempt" = "30" ]; then
+    printf 'orv deploy smoke test failed waiting for %s%s\n' "$BASE_URL" "$READY_PATH" >&2
+    exit 1
+  fi
+  sleep 1
+done
+"#
+        );
+    }
     for route in server_artifact
         .routes
         .iter()
@@ -24186,6 +24226,9 @@ test "checkout failing runtime body" {
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains(r#"READY_PATH="/health""#));
+        assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
+        assert!(smoke_test.contains("sleep 1"));
         assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/health""#));
         assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/products""#));
         assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
@@ -33411,6 +33454,9 @@ entry = "src/main.orv"
         assert!(json_routes_include(&routes["routes"], "GET", "/ping"));
         let smoke_test = std::fs::read_to_string(&deploy_smoke_test_path).expect("smoke test");
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains(r#"READY_PATH="/ping""#));
+        assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
+        assert!(smoke_test.contains("sleep 1"));
         assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/ping""#));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
