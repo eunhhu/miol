@@ -17078,6 +17078,9 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must check curl availability");
     }
+    if !smoke.contains("orv_smoke_curl()") || !smoke.contains("orv deploy smoke test failed: %s") {
+        anyhow::bail!("deploy smoke test must label failed curl steps");
+    }
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
         if !smoke.contains(&ready_assignment) {
@@ -17092,7 +17095,10 @@ fn verify_deploy_smoke_test_artifact(
         .iter()
         .filter(|route| route.method == "GET" && !route.path.contains(':'))
     {
-        let command = format!(r#"curl -fsS "$BASE_URL{}""#, route.path);
+        let command = format!(
+            r#"orv_smoke_curl "GET {}" "$BASE_URL{}""#,
+            route.path, route.path
+        );
         if !smoke.contains(&command) {
             let method = &route.method;
             let path = &route.path;
@@ -17101,7 +17107,7 @@ fn verify_deploy_smoke_test_artifact(
     }
     if deploy_routes_include(artifact, "POST", "/checkout") {
         for path in ["/products", "/members", "/cart/items", "/checkout"] {
-            let command = format!(r#"curl -fsS -X POST "$BASE_URL{path}""#);
+            let command = format!(r#"orv_smoke_curl "POST {path}" -X POST "$BASE_URL{path}""#);
             if !smoke.contains(&command) {
                 anyhow::bail!("deploy smoke test must cover POST {path}");
             }
@@ -22763,6 +22769,15 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 127
 fi
 
+orv_smoke_curl() {{
+  label="$1"
+  shift
+  if ! curl -fsS "$@" >/dev/null; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
@@ -22788,7 +22803,11 @@ done
         .iter()
         .filter(|route| route.method == "GET" && !route.path.contains(':'))
     {
-        let _ = writeln!(script, r#"curl -fsS "$BASE_URL{}" >/dev/null"#, route.path);
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_curl "GET {}" "$BASE_URL{}""#,
+            route.path, route.path
+        );
     }
     if deploy_routes_include(server_artifact, "POST", "/checkout") {
         script.push_str(
@@ -22798,11 +22817,11 @@ SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
 
-curl -fsS -X POST "$BASE_URL/products" -H 'content-type: application/json' --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}" >/dev/null
-curl -fsS -X POST "$BASE_URL/members" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}" >/dev/null
-curl -fsS -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}" >/dev/null
-curl -fsS -X POST "$BASE_URL/checkout" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}" >/dev/null
-curl -fsS "$BASE_URL/admin/summary" >/dev/null
+orv_smoke_curl "POST /products" -X POST "$BASE_URL/products" -H 'content-type: application/json' --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
+orv_smoke_curl "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}"
+orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
+orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
+orv_smoke_curl "GET /admin/summary" "$BASE_URL/admin/summary"
 "#,
         );
     }
@@ -24259,17 +24278,28 @@ test "checkout failing runtime body" {
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
+        assert!(smoke_test.contains("orv_smoke_curl()"));
+        assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
         assert!(smoke_test.contains(r#"READY_PATH="/health""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
-        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/health""#));
-        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/products""#));
+        assert!(smoke_test.contains(r#"orv_smoke_curl "GET /health" "$BASE_URL/health""#));
+        assert!(
+            smoke_test.contains(r#"orv_smoke_curl "POST /products" -X POST "$BASE_URL/products""#)
+        );
         assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
-        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/members""#));
+        assert!(
+            smoke_test.contains(r#"orv_smoke_curl "POST /members" -X POST "$BASE_URL/members""#)
+        );
         assert!(smoke_test.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#));
-        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/cart/items""#));
-        assert!(smoke_test.contains(r#"curl -fsS -X POST "$BASE_URL/checkout""#));
-        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/admin/summary""#));
+        assert!(smoke_test
+            .contains(r#"orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items""#));
+        assert!(
+            smoke_test.contains(r#"orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout""#)
+        );
+        assert!(
+            smoke_test.contains(r#"orv_smoke_curl "GET /admin/summary" "$BASE_URL/admin/summary""#)
+        );
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("deploy/env.example"));
@@ -33489,10 +33519,12 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
+        assert!(smoke_test.contains("orv_smoke_curl()"));
+        assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
         assert!(smoke_test.contains(r#"READY_PATH="/ping""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
-        assert!(smoke_test.contains(r#"curl -fsS "$BASE_URL/ping""#));
+        assert!(smoke_test.contains(r#"orv_smoke_curl "GET /ping" "$BASE_URL/ping""#));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
