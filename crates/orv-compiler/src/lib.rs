@@ -4996,7 +4996,14 @@ fn captured_add_response_operation(
     if let Some(value) = lhs_value {
         return captured_arithmetic_response_operation(value, BinaryOp::Add, rhs);
     }
-    captured_string_prefix_concat_response_operation(rhs_value()?, lhs)
+    let value = rhs_value()?;
+    if matches!(
+        value.value_kind.as_str(),
+        "route_param" | "query_param" | "request_body_field"
+    ) {
+        return captured_string_prefix_concat_response_operation(value, lhs);
+    }
+    captured_static_left_numeric_add_response_operation(value, lhs)
 }
 
 fn captured_string_concat_response_operation(
@@ -5034,6 +5041,25 @@ fn captured_string_prefix_concat_response_operation(
     value.op = Some("concat_prefix".to_string());
     value.operand_json = Some(static_string_expr(lhs)?);
     Some(value)
+}
+
+fn captured_static_left_numeric_add_response_operation(
+    mut value: CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+        return None;
+    }
+    value.op = Some("add".to_string());
+    if value.value_kind.ends_with("_int") {
+        value.operand_json = Some(static_integer(lhs)?.to_string());
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        value.operand_json = Some(static_float(lhs)?);
+        return Some(value);
+    }
+    None
 }
 
 fn captured_numeric_neg_response_operation(
@@ -7997,6 +8023,45 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
         assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
         assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_left_int_add_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { next: 1 + (@body.quantity as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "next");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("add"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("1")
+        );
+        assert!(handlers.contains("match value.checked_add(1)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
