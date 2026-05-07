@@ -1852,79 +1852,125 @@ fn native_captured_field_operation_is_direct(
     operand_name: Option<&str>,
     route_params: &[String],
 ) -> bool {
-    let int_kind = matches!(
-        value_kind,
-        "route_param_int" | "query_param_int" | "request_body_field_int"
-    );
-    let float_kind = matches!(
-        value_kind,
-        "route_param_float" | "query_param_float" | "request_body_field_float"
-    );
-    let bool_kind = matches!(
+    if op.is_none() && operand_json.is_none() && operand_kind.is_none() && operand_name.is_none() {
+        return true;
+    }
+    if matches!(
         value_kind,
         "route_param_bool" | "query_param_bool" | "request_body_field_bool"
-    );
-    match (
-        int_kind,
-        float_kind,
-        bool_kind,
+    ) {
+        return native_bool_operation_is_direct(
+            op,
+            operand_json,
+            operand_kind,
+            operand_name,
+            route_params,
+        );
+    }
+    if matches!(
+        value_kind,
+        "route_param_int" | "query_param_int" | "request_body_field_int"
+    ) {
+        return native_int_operation_is_direct(
+            op,
+            operand_json,
+            operand_kind,
+            operand_name,
+            route_params,
+        );
+    }
+    matches!(
+        value_kind,
+        "route_param_float" | "query_param_float" | "request_body_field_float"
+    ) && native_float_operation_is_direct(
         op,
         operand_json,
         operand_kind,
         operand_name,
-    ) {
-        (_, _, _, None, None, None, None) => true,
-        (true, _, _, Some("neg"), None, None, None) => true,
-        (_, true, _, Some("neg"), None, None, None) => true,
-        (_, _, true, Some("not"), None, None, None) => true,
+        route_params,
+    )
+}
+
+fn native_bool_operation_is_direct(
+    op: Option<&str>,
+    operand_json: Option<&str>,
+    operand_kind: Option<&str>,
+    operand_name: Option<&str>,
+    route_params: &[String],
+) -> bool {
+    match (op, operand_json, operand_kind, operand_name) {
+        (Some("not"), None, None, None) => true,
         (
-            _,
-            _,
-            true,
             Some("eq" | "ne" | "and" | "or" | "not_and" | "not_or" | "and_not" | "or_not"),
             Some("true" | "false"),
             None,
             None,
         ) => true,
         (
-            _,
-            _,
-            true,
             Some("eq" | "ne" | "and" | "or" | "not_and" | "not_or" | "and_not" | "or_not"),
             None,
             Some(kind),
             Some(name),
         ) => native_captured_bool_operand_is_direct(kind, name, route_params),
-        (true, _, _, Some("add" | "sub" | "mul" | "div" | "rem"), Some(operand), None, None) => {
-            operand.parse::<i64>().is_ok()
-        }
-        (true, _, _, Some("pow"), Some(operand), None, None) => operand
+        _ => false,
+    }
+}
+
+fn native_int_operation_is_direct(
+    op: Option<&str>,
+    operand_json: Option<&str>,
+    operand_kind: Option<&str>,
+    operand_name: Option<&str>,
+    route_params: &[String],
+) -> bool {
+    match (op, operand_json, operand_kind, operand_name) {
+        (Some("neg"), None, None, None) => true,
+        (
+            Some("eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"),
+            Some(operand),
+            None,
+            None,
+        ) => operand.parse::<i64>().is_ok(),
+        (Some("pow"), Some(operand), None, None) => operand
             .parse::<i64>()
             .ok()
             .is_some_and(|operand| (0..=63).contains(&operand)),
         (
-            true,
-            _,
-            _,
-            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            Some(
+                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"
+                | "pow",
+            ),
             None,
             Some(kind),
             Some(name),
         ) => native_captured_int_operand_is_direct(kind, name, route_params),
+        _ => false,
+    }
+}
+
+fn native_float_operation_is_direct(
+    op: Option<&str>,
+    operand_json: Option<&str>,
+    operand_kind: Option<&str>,
+    operand_name: Option<&str>,
+    route_params: &[String],
+) -> bool {
+    match (op, operand_json, operand_kind, operand_name) {
+        (Some("neg"), None, None, None) => true,
         (
-            _,
-            true,
-            _,
-            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            Some(
+                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"
+                | "pow",
+            ),
             Some(operand),
             None,
             None,
         ) => operand.parse::<f64>().ok().is_some_and(f64::is_finite),
         (
-            _,
-            true,
-            _,
-            Some("add" | "sub" | "mul" | "div" | "rem" | "pow"),
+            Some(
+                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"
+                | "pow",
+            ),
             None,
             Some(kind),
             Some(name),
@@ -3055,6 +3101,26 @@ fn push_native_float_success_arm(
             source.push_str("            },\n");
             true
         }
+        (Some("eq" | "ne" | "lt" | "le" | "gt" | "ge"), Some(operand_json), None, None) => {
+            push_native_float_static_comparison_success_arm(source, op, operand_json)
+        }
+        (
+            Some("eq" | "ne" | "lt" | "le" | "gt" | "ge"),
+            None,
+            Some(
+                operand_kind @ ("route_param_float"
+                | "query_param_float"
+                | "request_body_field_float"),
+            ),
+            Some(operand_name),
+        ) => push_native_float_captured_comparison_success_arm(
+            source,
+            op,
+            operand_kind,
+            operand_name,
+            error_prefix,
+            response_origin_id,
+        ),
         (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = static_float_operand_value(operand_json) else {
                 return false;
@@ -3105,6 +3171,57 @@ fn push_native_float_success_arm(
         }
         _ => false,
     }
+}
+
+fn push_native_float_static_comparison_success_arm(
+    source: &mut String,
+    op: Option<&str>,
+    operand_json: &str,
+) -> bool {
+    let Some(operand) = static_float_operand_value(operand_json) else {
+        return false;
+    };
+    let Some(operator) = native_comparison_operator(op) else {
+        return false;
+    };
+    source.push_str("            Ok(value) if value.is_finite() => {\n");
+    push_native_comparison_json_result(source, "value", operator, operand, "                ");
+    source.push_str("            },\n");
+    true
+}
+
+fn push_native_float_captured_comparison_success_arm(
+    source: &mut String,
+    op: Option<&str>,
+    operand_kind: &str,
+    operand_name: &str,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let Some(operator) = native_comparison_operator(op) else {
+        return false;
+    };
+    let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let _ = writeln!(
+        source,
+        "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    source.push_str("                Ok(operand) if operand.is_finite() => {\n");
+    push_native_comparison_json_result(
+        source,
+        "value",
+        operator,
+        "operand",
+        "                    ",
+    );
+    source.push_str("                },\n                _ => {\n");
+    let error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
+    let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+    push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
 }
 
 fn push_native_float_arithmetic_result(
@@ -3169,6 +3286,22 @@ fn push_native_int_success_arm(
             source.push_str("                },\n            },\n");
             true
         }
+        (Some("eq" | "ne" | "lt" | "le" | "gt" | "ge"), Some(operand_json), None, None) => {
+            push_native_int_static_comparison_success_arm(source, op, operand_json)
+        }
+        (
+            Some("eq" | "ne" | "lt" | "le" | "gt" | "ge"),
+            None,
+            Some(operand_kind @ ("route_param_int" | "query_param_int" | "request_body_field_int")),
+            Some(operand_name),
+        ) => push_native_int_captured_comparison_success_arm(
+            source,
+            op,
+            operand_kind,
+            operand_name,
+            error_prefix,
+            response_origin_id,
+        ),
         (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
@@ -3249,6 +3382,63 @@ fn push_native_int_success_arm(
     }
 }
 
+fn push_native_int_static_comparison_success_arm(
+    source: &mut String,
+    op: Option<&str>,
+    operand_json: &str,
+) -> bool {
+    let Some(operand) = operand_json.parse::<i64>().ok() else {
+        return false;
+    };
+    let Some(operator) = native_comparison_operator(op) else {
+        return false;
+    };
+    source.push_str("            Ok(value) => {\n");
+    push_native_comparison_json_result(
+        source,
+        "value",
+        operator,
+        &operand.to_string(),
+        "                ",
+    );
+    source.push_str("            },\n");
+    true
+}
+
+fn push_native_int_captured_comparison_success_arm(
+    source: &mut String,
+    op: Option<&str>,
+    operand_kind: &str,
+    operand_name: &str,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let Some(operator) = native_comparison_operator(op) else {
+        return false;
+    };
+    let Some(operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let _ = writeln!(
+        source,
+        "            Ok(value) => match {operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    source.push_str("                Ok(operand) => {\n");
+    push_native_comparison_json_result(
+        source,
+        "value",
+        operator,
+        "operand",
+        "                    ",
+    );
+    source.push_str("                },\n                Err(_) => {\n");
+    let error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
+    let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+    push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
 fn native_int_arithmetic_method(op: Option<&str>) -> Option<&'static str> {
     match op {
         Some("add") => Some("checked_add"),
@@ -3259,6 +3449,32 @@ fn native_int_arithmetic_method(op: Option<&str>) -> Option<&'static str> {
         Some("pow") => Some("checked_pow"),
         _ => None,
     }
+}
+
+fn native_comparison_operator(op: Option<&str>) -> Option<&'static str> {
+    match op {
+        Some("eq") => Some("=="),
+        Some("ne") => Some("!="),
+        Some("lt") => Some("<"),
+        Some("le") => Some("<="),
+        Some("gt") => Some(">"),
+        Some("ge") => Some(">="),
+        _ => None,
+    }
+}
+
+fn push_native_comparison_json_result(
+    source: &mut String,
+    lhs: &str,
+    operator: &str,
+    rhs: &str,
+    indent: &str,
+) {
+    let _ = writeln!(source, "{indent}if {lhs} {operator} {rhs} {{");
+    let _ = writeln!(source, "{indent}    body.push_str(\"true\");");
+    let _ = writeln!(source, "{indent}}} else {{");
+    let _ = writeln!(source, "{indent}    body.push_str(\"false\");");
+    let _ = writeln!(source, "{indent}}}");
 }
 
 fn native_int_operand_lookup_expr(operand_kind: &str, operand_name: &str) -> Option<String> {
@@ -4368,10 +4584,17 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::And | BinaryOp::Or
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or
             ) =>
         {
-            captured_bool_comparison_response_operation(route_param_field_value(lhs)?, *op, rhs)
+            captured_comparison_response_operation(route_param_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
@@ -4419,10 +4642,17 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::And | BinaryOp::Or
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or
             ) =>
         {
-            captured_bool_comparison_response_operation(query_param_field_value(lhs)?, *op, rhs)
+            captured_comparison_response_operation(query_param_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
@@ -4551,6 +4781,60 @@ fn captured_numeric_neg_response_operation(
     }
     value.op = Some("neg".to_string());
     Some(value)
+}
+
+fn captured_comparison_response_operation(
+    value: CapturedResponseValue,
+    op: BinaryOp,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.value_kind.ends_with("_bool") {
+        return captured_bool_comparison_response_operation(value, op, rhs);
+    }
+    captured_numeric_comparison_response_operation(value, op, rhs)
+}
+
+fn captured_numeric_comparison_response_operation(
+    mut value: CapturedResponseValue,
+    op: BinaryOp,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+        return None;
+    }
+    value.op = Some(
+        match op {
+            BinaryOp::Eq => "eq",
+            BinaryOp::Ne => "ne",
+            BinaryOp::Lt => "lt",
+            BinaryOp::Le => "le",
+            BinaryOp::Gt => "gt",
+            BinaryOp::Ge => "ge",
+            _ => return None,
+        }
+        .to_string(),
+    );
+    if value.value_kind.ends_with("_int") {
+        if let Some(operand) = static_integer(rhs) {
+            value.operand_json = Some(operand.to_string());
+            return Some(value);
+        }
+        let operand = captured_integer_operand(rhs)?;
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        if let Some(operand) = static_float(rhs) {
+            value.operand_json = Some(operand);
+            return Some(value);
+        }
+        let operand = captured_float_operand(rhs)?;
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    None
 }
 
 fn captured_bool_response_operation(
@@ -4791,10 +5075,17 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
-                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::And | BinaryOp::Or
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or
             ) =>
         {
-            captured_bool_comparison_response_operation(request_body_field_value(lhs)?, *op, rhs)
+            captured_comparison_response_operation(request_body_field_value(lhs)?, *op, rhs)
         }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
@@ -7700,6 +7991,50 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_request_body_int_captured_comparison_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { available: (@body.quantity as int) <= (@body.stock as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "available");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("le"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("stock")
+        );
+        assert!(handlers.contains("if value <= operand"));
+        assert!(handlers.contains("body.push_str(\"true\")"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_request_body_float_cast_response_body() {
         let src = r#"@server {
   @listen 8080
@@ -7766,6 +8101,50 @@ function greet(name: string): string -> "hi {name}""#,
         assert_eq!(response.body_request_fields[0].op.as_deref(), Some("neg"));
         assert!(handlers.contains("let value = -value;"));
         assert!(handlers.contains("if value.is_finite()"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_query_float_comparison_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { under_limit: (@body.amount as float) <= (@query.limit as float) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "under_limit");
+        assert_eq!(response.body_request_fields[0].name, "amount");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("le"));
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("query_param_float")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("limit")
+        );
+        assert!(handlers.contains("if value <= operand"));
+        assert!(handlers.contains("operand.is_finite()"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

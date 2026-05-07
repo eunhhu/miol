@@ -33084,6 +33084,9 @@ entry = "src/main.orv"
   @route POST /orders/remainder {
     @respond 201 { remainder: (@body.total as int) % (@body.parts as int) }
   }
+  @route POST /orders/available {
+    @respond 201 { available: (@body.quantity as int) <= (@body.stock as int) }
+  }
 }
 "#,
         )
@@ -33156,6 +33159,11 @@ entry = "src/main.orv"
             "/orders/remainder",
             r#"{"total":"875","parts":"6"}"#,
         );
+        let available_response = send_raw_http_json_post(
+            address,
+            "/orders/available",
+            r#"{"quantity":"7","stock":"10"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -33175,6 +33183,8 @@ entry = "src/main.orv"
         assert!(share_response.contains(r#"{"share":125}"#));
         assert!(remainder_response.starts_with("HTTP/1.1 201"));
         assert!(remainder_response.contains(r#"{"remainder":5}"#));
+        assert!(available_response.starts_with("HTTP/1.1 201"));
+        assert!(available_response.contains(r#"{"available":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -33201,6 +33211,9 @@ entry = "src/main.orv"
   }
   @route POST /payments/power {
     @respond 201 { total: (@body.base as float) ** (@body.exp as float) }
+  }
+  @route POST /payments/under-limit {
+    @respond 201 { under_limit: (@body.amount as float) <= (@query.limit as float) }
   }
 }
 "#,
@@ -33260,6 +33273,11 @@ entry = "src/main.orv"
         );
         let power_response =
             send_raw_http_json_post(address, "/payments/power", r#"{"base":"2.5","exp":"2.0"}"#);
+        let under_limit_response = send_raw_http_json_post(
+            address,
+            "/payments/under-limit?limit=20.0",
+            r#"{"amount":"12.5"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"amount":12.5}"#));
@@ -33269,6 +33287,8 @@ entry = "src/main.orv"
         assert!(total_response.contains(r#"{"total":37.5}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
         assert!(power_response.contains(r#"{"total":6.25}"#));
+        assert!(under_limit_response.starts_with("HTTP/1.1 201"));
+        assert!(under_limit_response.contains(r#"{"under_limit":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
