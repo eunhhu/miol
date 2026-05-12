@@ -1915,6 +1915,9 @@ fn native_string_operation_is_direct(
         (Some("concat_affix"), Some(operand), None, None) => {
             native_string_affix_operand(operand).is_some()
         }
+        (Some("concat_join"), Some(_), Some(kind), Some(name)) => {
+            native_captured_string_operand_is_direct(kind, name, route_params)
+        }
         (Some("eq" | "ne" | "concat"), None, Some(kind), Some(name)) => {
             native_captured_string_operand_is_direct(kind, name, route_params)
         }
@@ -3141,6 +3144,9 @@ fn push_native_string_operation_json_value(
         Some("concat_affix") => {
             push_native_string_affix_concat_json_value(source, lookup_expr, operation)
         }
+        Some("concat_join") => {
+            push_native_string_join_concat_json_value(source, lookup_expr, operation)
+        }
         _ => false,
     }
 }
@@ -3297,6 +3303,45 @@ fn push_native_string_affix_concat_json_value(
         "            value.push_str({});",
         rust_string_literal(suffix)
     );
+    source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
+    source.push_str("        }\n");
+    true
+}
+
+fn push_native_string_join_concat_json_value(
+    source: &mut String,
+    lookup_expr: &str,
+    operation: NativeCapturedJsonOperation<'_>,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    let (Some("concat_join"), Some(separator), Some(kind), Some(name)) =
+        (op, operand_json, operand_kind, operand_name)
+    else {
+        return false;
+    };
+    let Some(operand_lookup) = native_string_operand_lookup_expr(kind, name) else {
+        return false;
+    };
+    source.push_str("        {\n");
+    let _ = writeln!(
+        source,
+        "            let mut value = String::from({lookup_expr}.unwrap_or(\"\"));"
+    );
+    let _ = writeln!(
+        source,
+        "            value.push_str({});",
+        rust_string_literal(separator)
+    );
+    let _ = writeln!(
+        source,
+        "            let operand = {operand_lookup}.unwrap_or(\"\");"
+    );
+    source.push_str("            value.push_str(operand);\n");
     source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
     source.push_str("        }\n");
     true
@@ -4767,7 +4812,7 @@ fn mixed_object_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseObjectF
                 }
                 out.push(artifact);
             }
-            ((has_static && has_dynamic) || (has_dynamic && has_mixed_source)).then_some(out)
+            (has_dynamic && (has_static || has_mixed_source)).then_some(out)
         }
         HirExprKind::Paren(expr) => mixed_object_json_payload(expr),
         _ => None,
@@ -5235,6 +5280,11 @@ fn captured_string_interpolation_response_operation(
     segments: &[HirStringSegment],
     captured_value: fn(&HirExpr) -> Option<CapturedResponseValue>,
 ) -> Option<CapturedResponseValue> {
+    if let Some(value) =
+        captured_joined_string_interpolation_response_operation(segments, captured_value)
+    {
+        return Some(value);
+    }
     let mut prefix = String::new();
     let mut suffix = String::new();
     let mut value = None;
@@ -5277,6 +5327,48 @@ fn captured_string_interpolation_response_operation(
             Some(value)
         }
     }
+}
+
+fn captured_joined_string_interpolation_response_operation(
+    segments: &[HirStringSegment],
+    captured_value: fn(&HirExpr) -> Option<CapturedResponseValue>,
+) -> Option<CapturedResponseValue> {
+    let mut before_first = String::new();
+    let mut separator = String::new();
+    let mut after_second = String::new();
+    let mut captures = Vec::new();
+    for segment in segments {
+        match segment {
+            HirStringSegment::Str(text) => match captures.len() {
+                0 => before_first.push_str(text),
+                1 => separator.push_str(text),
+                2 => after_second.push_str(text),
+                _ => return None,
+            },
+            HirStringSegment::Interp(expr) => captures.push(expr.as_ref()),
+        }
+    }
+    if !before_first.is_empty() || !after_second.is_empty() || captures.len() != 2 {
+        return None;
+    }
+    let mut value = captured_value(captures[0])?;
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || value.operand_name.is_some()
+        || !matches!(
+            value.value_kind.as_str(),
+            "route_param" | "query_param" | "request_body_field"
+        )
+    {
+        return None;
+    }
+    let operand = captured_string_operand(captures[1])?;
+    value.op = Some("concat_join".to_string());
+    value.operand_json = Some(separator);
+    value.operand_kind = Some(operand.kind.to_string());
+    value.operand_name = Some(operand.name);
+    Some(value)
 }
 
 fn captured_static_left_numeric_arithmetic_response_operation(
@@ -8460,6 +8552,57 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
         assert!(handlers.contains("value.push_str(\"-v1\")"));
         assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_joined_string_interpolation_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /labels {
+    @respond 201 { label: "{@body.first}-{@query.suffix}" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "label");
+        assert_eq!(response.body_request_fields[0].name, "first");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("concat_join")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("-")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("query_param")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("suffix")
+        );
+        assert!(handlers.contains("value.push_str(\"-\")"));
+        assert!(handlers.contains("value.push_str(operand)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
