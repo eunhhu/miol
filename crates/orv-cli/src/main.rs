@@ -33124,6 +33124,9 @@ entry = "src/main.orv"
   @route POST /orders/next {
     @respond 201 { quantity: (@body.quantity as int) + 1 }
   }
+  @route POST /orders/remaining {
+    @respond 201 { remaining: 10 - (@body.quantity as int) }
+  }
   @route POST /orders/neg {
     @respond 201 { quantity: -(@body.quantity as int) }
   }
@@ -33198,6 +33201,8 @@ entry = "src/main.orv"
 
         let response = send_raw_http_json_post(address, "/orders", r#"{"quantity":"7"}"#);
         let next_response = send_raw_http_json_post(address, "/orders/next", r#"{"quantity":"7"}"#);
+        let remaining_response =
+            send_raw_http_json_post(address, "/orders/remaining", r#"{"quantity":"7"}"#);
         let neg_response = send_raw_http_json_post(address, "/orders/neg", r#"{"quantity":"7"}"#);
         let cents_response =
             send_raw_http_json_post(address, "/orders/cents", r#"{"quantity":"7"}"#);
@@ -33230,6 +33235,8 @@ entry = "src/main.orv"
         assert!(response.contains(r#"{"quantity":7}"#));
         assert!(next_response.starts_with("HTTP/1.1 201"));
         assert!(next_response.contains(r#"{"quantity":8}"#));
+        assert!(remaining_response.starts_with("HTTP/1.1 201"));
+        assert!(remaining_response.contains(r#"{"remaining":3}"#));
         assert!(neg_response.starts_with("HTTP/1.1 201"));
         assert!(neg_response.contains(r#"{"quantity":-7}"#));
         assert!(cents_response.starts_with("HTTP/1.1 201"));
@@ -33266,6 +33273,9 @@ entry = "src/main.orv"
   }
   @route POST /payments/refund {
     @respond 201 { amount: -(@body.amount as float) }
+  }
+  @route POST /payments/remaining {
+    @respond 201 { remaining: 100.5 - (@body.amount as float) }
   }
   @route POST /payments/total {
     @respond 201 { total: (@body.price as float) * (@body.quantity as float) }
@@ -33327,6 +33337,8 @@ entry = "src/main.orv"
         let response = send_raw_http_json_post(address, "/payments", r#"{"amount":"12.5"}"#);
         let refund_response =
             send_raw_http_json_post(address, "/payments/refund", r#"{"amount":"12.5"}"#);
+        let remaining_response =
+            send_raw_http_json_post(address, "/payments/remaining", r#"{"amount":"12.5"}"#);
         let total_response = send_raw_http_json_post(
             address,
             "/payments/total",
@@ -33340,16 +33352,16 @@ entry = "src/main.orv"
             r#"{"amount":"12.5"}"#,
         );
 
-        assert!(response.starts_with("HTTP/1.1 201"));
-        assert!(response.contains(r#"{"amount":12.5}"#));
-        assert!(refund_response.starts_with("HTTP/1.1 201"));
-        assert!(refund_response.contains(r#"{"amount":-12.5}"#));
-        assert!(total_response.starts_with("HTTP/1.1 201"));
-        assert!(total_response.contains(r#"{"total":37.5}"#));
-        assert!(power_response.starts_with("HTTP/1.1 201"));
-        assert!(power_response.contains(r#"{"total":6.25}"#));
-        assert!(under_limit_response.starts_with("HTTP/1.1 201"));
-        assert!(under_limit_response.contains(r#"{"under_limit":true}"#));
+        let assert_created = |response: &str, body: &str| {
+            assert!(response.starts_with("HTTP/1.1 201"));
+            assert!(response.contains(body));
+        };
+        assert_created(&response, r#"{"amount":12.5}"#);
+        assert_created(&refund_response, r#"{"amount":-12.5}"#);
+        assert_created(&remaining_response, r#"{"remaining":88}"#);
+        assert_created(&total_response, r#"{"total":37.5}"#);
+        assert_created(&power_response, r#"{"total":6.25}"#);
+        assert_created(&under_limit_response, r#"{"under_limit":true}"#);
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

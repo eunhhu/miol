@@ -1954,7 +1954,10 @@ fn native_int_operation_is_direct(
     match (op, operand_json, operand_kind, operand_name) {
         (Some("neg"), None, None, None) => true,
         (
-            Some("eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"),
+            Some(
+                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "rsub" | "mul" | "div"
+                | "rem",
+            ),
             Some(operand),
             None,
             None,
@@ -1987,8 +1990,8 @@ fn native_float_operation_is_direct(
         (Some("neg"), None, None, None) => true,
         (
             Some(
-                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"
-                | "pow",
+                "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "rsub" | "mul" | "div"
+                | "rem" | "pow",
             ),
             Some(operand),
             None,
@@ -3301,7 +3304,12 @@ fn push_native_float_success_arm(
             error_prefix,
             response_origin_id,
         ),
-        (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
+        (
+            Some("add" | "sub" | "rsub" | "mul" | "div" | "rem" | "pow"),
+            Some(operand_json),
+            None,
+            None,
+        ) => {
             let Some(operand) = static_float_operand_value(operand_json) else {
                 return false;
             };
@@ -3422,6 +3430,7 @@ fn native_float_arithmetic_expr(lhs: &str, op: Option<&str>, rhs: &str) -> Optio
     match op {
         Some("add") => Some(format!("{lhs} + {rhs}")),
         Some("sub") => Some(format!("{lhs} - {rhs}")),
+        Some("rsub") => Some(format!("{rhs} - {lhs}")),
         Some("mul") => Some(format!("{lhs} * {rhs}")),
         Some("div") => Some(format!("{lhs} / {rhs}")),
         Some("rem") => Some(format!("{lhs} % {rhs}")),
@@ -3482,6 +3491,24 @@ fn push_native_int_success_arm(
             error_prefix,
             response_origin_id,
         ),
+        (Some("rsub"), Some(operand_json), None, None) => {
+            let Some(operand) = operand_json.parse::<i64>().ok() else {
+                return false;
+            };
+            let operand = format!("{operand}_i64");
+            let _ = writeln!(
+                source,
+                "            Ok(value) => match {operand}.checked_sub(value) {{"
+            );
+            source.push_str(
+                "                Some(value) => body.push_str(&value.to_string()),\n                None => {\n",
+            );
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
+            true
+        }
         (Some("add" | "sub" | "mul" | "div" | "rem" | "pow"), Some(operand_json), None, None) => {
             let Some(operand) = operand_json.parse::<i64>().ok() else {
                 return false;
@@ -4806,6 +4833,16 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } => captured_sub_response_operation(
+            route_param_field_value(lhs),
+            || route_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
+        HirExprKind::Binary {
             op: BinaryOp::Mul,
             lhs,
             rhs,
@@ -4816,10 +4853,7 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary { op, lhs, rhs }
-            if matches!(
-                op,
-                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
-            ) =>
+            if matches!(op, BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow) =>
         {
             captured_arithmetic_response_operation(route_param_field_value(lhs)?, *op, rhs)
         }
@@ -4885,6 +4919,16 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } => captured_sub_response_operation(
+            query_param_field_value(lhs),
+            || query_param_field_value(rhs),
+            lhs,
+            rhs,
+        ),
+        HirExprKind::Binary {
             op: BinaryOp::Mul,
             lhs,
             rhs,
@@ -4895,10 +4939,7 @@ fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary { op, lhs, rhs }
-            if matches!(
-                op,
-                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
-            ) =>
+            if matches!(op, BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow) =>
         {
             captured_arithmetic_response_operation(query_param_field_value(lhs)?, *op, rhs)
         }
@@ -5038,6 +5079,18 @@ fn captured_add_response_operation(
     captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Add, lhs)
 }
 
+fn captured_sub_response_operation(
+    lhs_value: Option<CapturedResponseValue>,
+    rhs_value: impl FnOnce() -> Option<CapturedResponseValue>,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if let Some(value) = lhs_value {
+        return captured_arithmetic_response_operation(value, BinaryOp::Sub, rhs);
+    }
+    captured_static_left_numeric_arithmetic_response_operation(rhs_value()?, BinaryOp::Sub, lhs)
+}
+
 fn captured_mul_response_operation(
     lhs_value: Option<CapturedResponseValue>,
     rhs_value: impl FnOnce() -> Option<CapturedResponseValue>,
@@ -5098,6 +5151,7 @@ fn captured_static_left_numeric_arithmetic_response_operation(
     value.op = Some(
         match op {
             BinaryOp::Add => "add",
+            BinaryOp::Sub => "rsub",
             BinaryOp::Mul => "mul",
             _ => return None,
         }
@@ -5540,6 +5594,16 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } => captured_sub_response_operation(
+            request_body_field_value(lhs),
+            || request_body_field_value(rhs),
+            lhs,
+            rhs,
+        ),
+        HirExprKind::Binary {
             op: BinaryOp::Mul,
             lhs,
             rhs,
@@ -5550,10 +5614,7 @@ fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
             rhs,
         ),
         HirExprKind::Binary { op, lhs, rhs }
-            if matches!(
-                op,
-                BinaryOp::Sub | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow
-            ) =>
+            if matches!(op, BinaryOp::Div | BinaryOp::Rem | BinaryOp::Pow) =>
         {
             captured_arithmetic_response_operation(request_body_field_value(lhs)?, *op, rhs)
         }
@@ -8172,6 +8233,45 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_static_left_int_sub_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { remaining: 10 - (@body.quantity as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "remaining");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("rsub"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("10")
+        );
+        assert!(handlers.contains("match 10_i64.checked_sub(value)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_static_left_int_mul_response_body() {
         let src = r"@server {
   @listen 8080
@@ -8810,6 +8910,45 @@ function greet(name: string): string -> "hi {name}""#,
         assert_eq!(response.body_request_fields[0].op.as_deref(), Some("neg"));
         assert!(handlers.contains("let value = -value;"));
         assert!(handlers.contains("if value.is_finite()"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_left_float_sub_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { remaining: 100.5 - (@body.amount as float) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "remaining");
+        assert_eq!(response.body_request_fields[0].name, "amount");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("rsub"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("100.5")
+        );
+        assert!(handlers.contains("let value = 100.5 - value;"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
