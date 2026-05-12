@@ -1912,6 +1912,9 @@ fn native_string_operation_is_direct(
 ) -> bool {
     match (op, operand_json, operand_kind, operand_name) {
         (Some("eq" | "ne" | "concat" | "concat_prefix"), Some(_), None, None) => true,
+        (Some("concat_affix"), Some(operand), None, None) => {
+            native_string_affix_operand(operand).is_some()
+        }
         (Some("eq" | "ne" | "concat"), None, Some(kind), Some(name)) => {
             native_captured_string_operand_is_direct(kind, name, route_params)
         }
@@ -3135,6 +3138,9 @@ fn push_native_string_operation_json_value(
         Some("concat_prefix") => {
             push_native_string_prefix_concat_json_value(source, lookup_expr, operation)
         }
+        Some("concat_affix") => {
+            push_native_string_affix_concat_json_value(source, lookup_expr, operation)
+        }
         _ => false,
     }
 }
@@ -3255,6 +3261,55 @@ fn push_native_string_prefix_concat_json_value(
     source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
     source.push_str("        }\n");
     true
+}
+
+fn push_native_string_affix_concat_json_value(
+    source: &mut String,
+    lookup_expr: &str,
+    operation: NativeCapturedJsonOperation<'_>,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+    } = operation;
+    let (Some("concat_affix"), Some(operand), None, None) =
+        (op, operand_json, operand_kind, operand_name)
+    else {
+        return false;
+    };
+    let Some((prefix, suffix)) = native_string_affix_operand(operand) else {
+        return false;
+    };
+    source.push_str("        {\n");
+    let _ = writeln!(
+        source,
+        "            let mut value = String::from({});",
+        rust_string_literal(prefix)
+    );
+    let _ = writeln!(
+        source,
+        "            value.push_str({lookup_expr}.unwrap_or(\"\"));"
+    );
+    let _ = writeln!(
+        source,
+        "            value.push_str({});",
+        rust_string_literal(suffix)
+    );
+    source.push_str("            orv_native_push_json_string(&value, &mut body);\n");
+    source.push_str("        }\n");
+    true
+}
+
+fn native_string_affix_operand(operand: &str) -> Option<(&str, &str)> {
+    let (prefix_len, affixes) = operand.split_once(':')?;
+    let prefix_len = prefix_len.parse::<usize>().ok()?;
+    if !affixes.is_char_boundary(prefix_len) {
+        return None;
+    }
+    let (prefix, suffix) = affixes.split_at(prefix_len);
+    Some((prefix, suffix))
 }
 
 fn push_native_float_success_arm(
@@ -5216,7 +5271,11 @@ fn captured_string_interpolation_response_operation(
             value.operand_json = Some(suffix);
             Some(value)
         }
-        (false, false) => None,
+        (false, false) => {
+            value.op = Some("concat_affix".to_string());
+            value.operand_json = Some(format!("{}:{prefix}{suffix}", prefix.len()));
+            Some(value)
+        }
     }
 }
 
@@ -8359,6 +8418,47 @@ function greet(name: string): string -> "hi {name}""#,
             handlers.contains("let mut value = String::from(routes::orv_native_body_field_value")
         );
         assert!(handlers.contains("value.push_str(\"-sku\")"));
+        assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_affix_string_interpolation_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /products {
+    @respond 201 { label: "sku-{@body.sku}-v1" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "label");
+        assert_eq!(response.body_request_fields[0].name, "sku");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("concat_affix")
+        );
+        assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
+        assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
+        assert!(handlers.contains("value.push_str(\"-v1\")"));
         assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));

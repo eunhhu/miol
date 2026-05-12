@@ -32660,7 +32660,7 @@ entry = "src/main.orv"
     @respond 201 { label: @body.first + @query.suffix }
   }
   @route POST /sku-labels {
-    @respond 201 { label: "sku-{@body.sku}" }
+    @respond 201 { label: "sku-{@body.sku}-v1" }
   }
   @route POST /quantities {
     @respond 201 { next: 1 + (@body.quantity as int) }
@@ -32700,16 +32700,17 @@ entry = "src/main.orv"
         assert_eq!(sku_label_response["body_kind"], "request_body_field_json");
         assert_eq!(
             sku_label_response["body_request_fields"][0]["op"],
-            "concat_prefix"
+            "concat_affix"
         );
         assert_eq!(
             sku_label_response["body_request_fields"][0]["operand_json"],
-            "sku-"
+            "4:sku--v1"
         );
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"sku\")"));
         assert!(handlers.contains("routes::orv_native_query_value(route_match, \"coupon\")"));
         assert!(handlers.contains("value.push_str(operand)"));
         assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
+        assert!(handlers.contains("value.push_str(\"-v1\")"));
         assert!(handlers.contains("match value.checked_add(1)"));
         assert!(handlers.contains("orv_native_push_json_string("));
         assert!(!handlers.contains("native route body lowering pending"));
@@ -32910,7 +32911,7 @@ entry = "src/main.orv"
     @respond 201 { label: @body.first + @query.suffix }
   }
   @route POST /sku-labels {
-    @respond 201 { label: "sku-{@body.sku}" }
+    @respond 201 { label: "sku-{@body.sku}-v1" }
   }
   @route POST /quantities {
     @respond 201 { next: 1 + (@body.quantity as int) }
@@ -32989,7 +32990,7 @@ entry = "src/main.orv"
         assert!(session_response.starts_with("HTTP/1.1 201"));
         assert!(session_response.contains(r#"{"matches":true}"#));
         assert!(label_response.contains(r#"{"label":"orv-pro"}"#));
-        assert!(sku_label_response.contains(r#"{"label":"sku-A1"}"#));
+        assert!(sku_label_response.contains(r#"{"label":"sku-A1-v1"}"#));
         assert!(quantity_response.contains(r#"{"next":8}"#));
         assert!(doubled_response.contains(r#"{"doubled":14}"#));
         assert!(limit_response.contains(r#"{"below_limit":true}"#));
