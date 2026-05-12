@@ -32740,8 +32740,8 @@ entry = "src/main.orv"
     }
 
     #[test]
-    fn build_lowers_static_left_div_rem_response_into_native_handler_source() {
-        let dir = temp_output_dir("native-static-left-div-rem-response-source");
+    fn build_lowers_static_left_ordered_arithmetic_response_into_native_handler_source() {
+        let dir = temp_output_dir("native-static-left-ordered-response-source");
         std::fs::create_dir_all(&dir).expect("create source dir");
         let path = dir.join("app.orv");
         std::fs::write(
@@ -32760,11 +32760,17 @@ entry = "src/main.orv"
   @route POST /float/remainder {
     @respond 201 { remainder: 10.5 % (@body.amount as float) }
   }
+  @route POST /int/power {
+    @respond 201 { total: 2 ** (@body.exp as int) }
+  }
+  @route POST /float/power {
+    @respond 201 { total: 2.0 ** (@body.exp as float) }
+  }
 }
 ",
         )
         .expect("write source");
-        let out = temp_output_dir("native-static-left-div-rem-response-build");
+        let out = temp_output_dir("native-static-left-ordered-response-build");
 
         cmd_build(&path, &out).expect("build artifacts");
 
@@ -32778,17 +32784,23 @@ entry = "src/main.orv"
         let float_ratio = &server_artifact["routes"][2]["responses"][0]["body_request_fields"][0];
         let float_remainder =
             &server_artifact["routes"][3]["responses"][0]["body_request_fields"][0];
+        let int_power = &server_artifact["routes"][4]["responses"][0]["body_request_fields"][0];
+        let float_power = &server_artifact["routes"][5]["responses"][0]["body_request_fields"][0];
 
         assert_eq!(int_unit["op"], "rdiv");
         assert_eq!(int_remainder["op"], "rrem");
         assert_eq!(float_ratio["op"], "rdiv");
         assert_eq!(float_remainder["op"], "rrem");
+        assert_eq!(int_power["op"], "rpow");
+        assert_eq!(float_power["op"], "rpow");
         assert!(handlers.contains("100_i64.checked_div(value)"));
         assert!(handlers.contains("10_i64.checked_rem(value)"));
         assert!(handlers.contains("let value = 100.0 / value;"));
         assert!(handlers.contains("let value = 10.5 % value;"));
+        assert!(handlers.contains("2_i64.checked_pow(u32::try_from(value).unwrap_or(0))"));
+        assert!(handlers.contains("let value = (2.0_f64).powf(value);"));
         assert!(!handlers.contains("native route body lowering pending"));
-        cmd_verify_build(&out).expect("verify static-left div/rem native build");
+        cmd_verify_build(&out).expect("verify static-left ordered native build");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let output = std::process::Command::new(cargo)
             .arg("check")
@@ -32797,11 +32809,11 @@ entry = "src/main.orv"
             .arg("--color")
             .arg("never")
             .output()
-            .expect("cargo check static-left div/rem native launcher");
+            .expect("cargo check static-left ordered native launcher");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "static-left div/rem native launcher cargo check failed:\n{stderr}"
+            "static-left ordered native launcher cargo check failed:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
