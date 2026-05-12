@@ -7506,6 +7506,36 @@ fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value
         "live_refresh": live_refresh,
         "transport": trace.pointer("/live_refresh/transport").cloned().unwrap_or(serde_json::Value::Null),
         "stream_runner": stream_runner,
+        "panel_contract": editor_native_host_trace_panel_contract_json(),
+    })
+}
+
+fn editor_native_host_trace_panel_contract_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": "trace",
+        "sections": [
+            {
+                "name": "status_filters",
+                "path": "trace.status_filters",
+                "kind": "array",
+            },
+            {
+                "name": "frames",
+                "path": "trace.frames",
+                "kind": "array",
+            },
+            {
+                "name": "transport",
+                "path": "trace.transport",
+                "kind": "object",
+            },
+            {
+                "name": "stream_runner",
+                "path": "trace.stream_runner",
+                "kind": "object",
+            },
+        ],
     })
 }
 
@@ -39593,6 +39623,17 @@ define Auth() -> { @out "auth" }
         assert!(filters
             .iter()
             .any(|filter| filter["name"] == "client_error" && filter["count"] == 1));
+        assert_eq!(native_host["trace"]["panel_contract"]["root"], "trace");
+        let sections = native_host["trace"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("native trace panel sections");
+        assert!(sections
+            .iter()
+            .any(|section| section["name"] == "status_filters"
+                && section["path"] == "trace.status_filters"));
+        assert!(sections
+            .iter()
+            .any(|section| section["name"] == "frames" && section["path"] == "trace.frames"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(build_out);
     }
