@@ -6376,6 +6376,16 @@ fn editor_debug_runner_result_panels_json(
     let stopped_events = editor_debug_event_frames(debug, "stopped");
     let output_events = editor_debug_event_frames(debug, "output");
     let events = editor_debug_all_event_frames(debug);
+    let controls = debug
+        .get("controls")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let breakpoints = debug
+        .get("breakpoints")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let session_summary = editor_debug_session_summary_json(
         debug,
         &selected_frame,
@@ -6409,8 +6419,10 @@ fn editor_debug_runner_result_panels_json(
                 .get("locals")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([])),
-            "control_count": json_array_count(debug.get("controls")),
-            "breakpoint_count": json_array_count(debug.get("breakpoints")),
+            "control_count": controls.len(),
+            "breakpoint_count": breakpoints.len(),
+            "controls": controls,
+            "breakpoints": breakpoints,
             "event_count": events.len(),
             "stopped_event_count": stopped_events.len(),
             "output_event_count": output_events.len(),
@@ -6486,6 +6498,16 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
             {
                 "name": "project_variables",
                 "path": "panels.debug.project_variables",
+                "kind": "array",
+            },
+            {
+                "name": "controls",
+                "path": "panels.debug.controls",
+                "kind": "array",
+            },
+            {
+                "name": "breakpoints",
+                "path": "panels.debug.breakpoints",
                 "kind": "array",
             },
             {
@@ -6576,6 +6598,16 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let controls = value
+        .pointer("/panels/debug/controls")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let breakpoints = value
+        .pointer("/panels/debug/breakpoints")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let control_count = value
         .pointer("/panels/debug/control_count")
         .and_then(serde_json::Value::as_u64)
@@ -6636,6 +6668,24 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
             &mut html,
             "<li>{}</li>",
             html_escape_text(&editor_debug_variable_summary(&variable))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Executed Controls</h2><ul class=\"list\">");
+    for control in controls {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_control_summary(&control))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Requested Breakpoints</h2><ul class=\"list\">");
+    for breakpoint in breakpoints {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_breakpoint_summary(&breakpoint))
         )?;
     }
     html.push_str("</ul></section>\n");
@@ -6809,6 +6859,66 @@ fn editor_debug_event_summary(event: &serde_json::Value) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn editor_debug_control_summary(control: &serde_json::Value) -> String {
+    let name = control
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("control");
+    let command = control
+        .pointer("/request/command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let success = control
+        .pointer("/response/success")
+        .and_then(serde_json::Value::as_bool)
+        .map_or_else(String::new, |success| {
+            format!("success {}", if success { "true" } else { "false" })
+        });
+    [name.to_string(), command.to_string(), success]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn editor_debug_breakpoint_summary(breakpoint: &serde_json::Value) -> String {
+    let source = breakpoint
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("source");
+    let lines = breakpoint
+        .get("lines")
+        .and_then(serde_json::Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let success = breakpoint
+        .pointer("/response/success")
+        .and_then(serde_json::Value::as_bool)
+        .map_or_else(String::new, |success| {
+            format!("success {}", if success { "true" } else { "false" })
+        });
+    [
+        source.to_string(),
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("lines {lines}")
+        },
+        success,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn editor_debug_variable_summary(variable: &serde_json::Value) -> String {
@@ -39098,6 +39208,24 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["kind"], "orv.editor.debug.runner.result");
         assert_eq!(run["debug"]["breakpoints"][0]["response"]["success"], true);
         assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
+        assert!(run["panels"]["debug"]["controls"]
+            .as_array()
+            .expect("panel controls")
+            .iter()
+            .any(|control| control["name"] == "Continue"));
+        assert!(run["panels"]["debug"]["breakpoints"]
+            .as_array()
+            .expect("panel breakpoints")
+            .iter()
+            .any(|breakpoint| {
+                breakpoint["source"]["path"]
+                    .as_str()
+                    .is_some_and(|source| source.ends_with("app.orv"))
+                    && breakpoint["lines"]
+                        .as_array()
+                        .is_some_and(|lines| lines.iter().any(|line| line == 3))
+                    && breakpoint["response"]["success"] == true
+            }));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -39140,6 +39268,8 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("Stack Frames"));
         assert!(result_html.contains("Locals"));
         assert!(result_html.contains("Project Variables"));
+        assert!(result_html.contains("Executed Controls"));
+        assert!(result_html.contains("Requested Breakpoints"));
         assert!(result_html.contains("Stopped Events"));
         assert!(result_html.contains("All Events"));
         assert!(result_html.contains("initialized"));
@@ -39172,6 +39302,26 @@ define Auth() -> { @out "auth" }
         assert_eq!(result["panels"]["debug"]["schema_version"], 1);
         assert_eq!(result["panels"]["debug"]["control_count"], 2);
         assert_eq!(result["panels"]["debug"]["breakpoint_count"], 0);
+        let panel_controls = result["panels"]["debug"]["controls"]
+            .as_array()
+            .expect("panel controls");
+        assert_eq!(panel_controls.len(), 2);
+        assert_eq!(panel_controls[0]["name"], "Next");
+        assert_eq!(panel_controls[1]["name"], "Next");
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
+                section["name"] == "controls" && section["path"] == "panels.debug.controls"
+            }));
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
+                section["name"] == "breakpoints" && section["path"] == "panels.debug.breakpoints"
+            }));
         assert_eq!(
             result["panels"]["debug"]["session_summary"]["schema_version"],
             1
