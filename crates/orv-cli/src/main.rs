@@ -32660,7 +32660,7 @@ entry = "src/main.orv"
     @respond 201 { label: @body.first + @query.suffix }
   }
   @route POST /sku-labels {
-    @respond 201 { label: "sku-" + @body.sku }
+    @respond 201 { label: "sku-{@body.sku}" }
   }
   @route POST /quantities {
     @respond 201 { next: 1 + (@body.quantity as int) }
@@ -32910,7 +32910,7 @@ entry = "src/main.orv"
     @respond 201 { label: @body.first + @query.suffix }
   }
   @route POST /sku-labels {
-    @respond 201 { label: "sku-" + @body.sku }
+    @respond 201 { label: "sku-{@body.sku}" }
   }
   @route POST /quantities {
     @respond 201 { next: 1 + (@body.quantity as int) }

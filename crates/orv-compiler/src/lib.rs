@@ -4838,6 +4838,9 @@ fn query_param_field_name(expr: &HirExpr) -> Option<String> {
 
 fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::String(segments) => {
+            captured_string_interpolation_response_operation(segments, route_param_field_value)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -4920,6 +4923,9 @@ fn route_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
 
 fn query_param_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::String(segments) => {
+            captured_string_interpolation_response_operation(segments, query_param_field_value)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -5168,6 +5174,50 @@ fn captured_string_prefix_concat_response_operation(
     value.op = Some("concat_prefix".to_string());
     value.operand_json = Some(static_string_expr(lhs)?);
     Some(value)
+}
+
+fn captured_string_interpolation_response_operation(
+    segments: &[HirStringSegment],
+    captured_value: fn(&HirExpr) -> Option<CapturedResponseValue>,
+) -> Option<CapturedResponseValue> {
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    let mut value = None;
+    for segment in segments {
+        match segment {
+            HirStringSegment::Str(text) if value.is_some() => suffix.push_str(text),
+            HirStringSegment::Str(text) => prefix.push_str(text),
+            HirStringSegment::Interp(expr) if value.is_none() => {
+                value = Some(captured_value(expr)?);
+            }
+            HirStringSegment::Interp(_) => return None,
+        }
+    }
+    let mut value = value?;
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || !matches!(
+            value.value_kind.as_str(),
+            "route_param" | "query_param" | "request_body_field"
+        )
+    {
+        return None;
+    }
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => Some(value),
+        (false, true) => {
+            value.op = Some("concat_prefix".to_string());
+            value.operand_json = Some(prefix);
+            Some(value)
+        }
+        (true, false) => {
+            value.op = Some("concat".to_string());
+            value.operand_json = Some(suffix);
+            Some(value)
+        }
+        (false, false) => None,
+    }
 }
 
 fn captured_static_left_numeric_arithmetic_response_operation(
@@ -5595,6 +5645,9 @@ fn captured_request_body_field_bool_name(expr: &HirExpr) -> Option<String> {
 
 fn request_body_field_value(expr: &HirExpr) -> Option<CapturedResponseValue> {
     match &expr.kind {
+        HirExprKind::String(segments) => {
+            captured_string_interpolation_response_operation(segments, request_body_field_value)
+        }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -8216,6 +8269,96 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
         assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
+        assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_prefix_string_interpolation_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /products {
+    @respond 201 { label: "sku-{@body.sku}" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "label");
+        assert_eq!(response.body_request_fields[0].name, "sku");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("concat_prefix")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("sku-")
+        );
+        assert!(handlers.contains("let mut value = String::from(\"sku-\")"));
+        assert!(handlers.contains("value.push_str(routes::orv_native_body_field_value"));
+        assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_suffix_string_interpolation_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /products {
+    @respond 201 { label: "{@body.sku}-sku" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "label");
+        assert_eq!(response.body_request_fields[0].name, "sku");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("concat")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("-sku")
+        );
+        assert!(
+            handlers.contains("let mut value = String::from(routes::orv_native_body_field_value")
+        );
+        assert!(handlers.contains("value.push_str(\"-sku\")"));
         assert!(handlers.contains("orv_native_push_json_string(&value, &mut body)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
