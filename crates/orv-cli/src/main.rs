@@ -32740,6 +32740,75 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn build_lowers_static_left_div_rem_response_into_native_handler_source() {
+        let dir = temp_output_dir("native-static-left-div-rem-response-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r"@server {
+  @listen 8080
+  @route POST /int/unit {
+    @respond 201 { unit: 100 / (@body.parts as int) }
+  }
+  @route POST /int/remainder {
+    @respond 201 { remainder: 10 % (@body.parts as int) }
+  }
+  @route POST /float/ratio {
+    @respond 201 { ratio: 100.0 / (@body.amount as float) }
+  }
+  @route POST /float/remainder {
+    @respond 201 { remainder: 10.5 % (@body.amount as float) }
+  }
+}
+",
+        )
+        .expect("write source");
+        let out = temp_output_dir("native-static-left-div-rem-response-build");
+
+        cmd_build(&path, &out).expect("build artifacts");
+
+        let server_artifact =
+            read_json_value(&out.join(SERVER_ARTIFACT_PATH)).expect("server artifact");
+        let handlers =
+            std::fs::read_to_string(out.join("server").join("native").join("handlers.rs"))
+                .expect("handlers source");
+        let int_unit = &server_artifact["routes"][0]["responses"][0]["body_request_fields"][0];
+        let int_remainder = &server_artifact["routes"][1]["responses"][0]["body_request_fields"][0];
+        let float_ratio = &server_artifact["routes"][2]["responses"][0]["body_request_fields"][0];
+        let float_remainder =
+            &server_artifact["routes"][3]["responses"][0]["body_request_fields"][0];
+
+        assert_eq!(int_unit["op"], "rdiv");
+        assert_eq!(int_remainder["op"], "rrem");
+        assert_eq!(float_ratio["op"], "rdiv");
+        assert_eq!(float_remainder["op"], "rrem");
+        assert!(handlers.contains("100_i64.checked_div(value)"));
+        assert!(handlers.contains("10_i64.checked_rem(value)"));
+        assert!(handlers.contains("let value = 100.0 / value;"));
+        assert!(handlers.contains("let value = 10.5 % value;"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        cmd_verify_build(&out).expect("verify static-left div/rem native build");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .arg("check")
+            .arg("--manifest-path")
+            .arg(out.join("server").join("native").join("Cargo.toml"))
+            .arg("--color")
+            .arg("never")
+            .output()
+            .expect("cargo check static-left div/rem native launcher");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "static-left div/rem native launcher cargo check failed:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn generated_native_server_serves_mixed_static_and_request_body_field_response() {
         let dir = temp_output_dir("native-mixed-body-field-server-source");
         std::fs::create_dir_all(&dir).expect("create source dir");
