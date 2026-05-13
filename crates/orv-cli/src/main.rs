@@ -36787,6 +36787,9 @@ entry = "src/main.orv"
     }
     @respond 201 { quantity: (@body.quantity as int) + ((@body.bonus as int) * 2) }
   }
+  @route POST /orders-bonus-left {
+    @respond 201 { quantity: ((@body.bonus as int) * 2) + (@body.quantity as int) }
+  }
   @route POST /members {
     if @body.password != @body.confirm {
       @respond 400 { err: "password_mismatch" }
@@ -36930,6 +36933,11 @@ entry = "src/main.orv"
             "/orders-bonus",
             r#"{"sku":"sku-7","quantity":"7","bonus":"2"}"#,
         );
+        let created_bonus_left = send_raw_http_json_post(
+            address,
+            "/orders-bonus-left",
+            r#"{"quantity":"7","bonus":"2"}"#,
+        );
         let mismatch = send_raw_http_json_post(
             address,
             "/members",
@@ -37020,6 +37028,8 @@ entry = "src/main.orv"
         assert!(missing_bonus.contains(r#"{"err":"missing_sku"}"#));
         assert!(created_bonus.starts_with("HTTP/1.1 201"));
         assert!(created_bonus.contains(r#"{"quantity":11}"#));
+        assert!(created_bonus_left.starts_with("HTTP/1.1 201"));
+        assert!(created_bonus_left.contains(r#"{"quantity":11}"#));
         assert!(mismatch.starts_with("HTTP/1.1 400"));
         assert!(mismatch.contains(r#"{"err":"password_mismatch"}"#));
         assert!(member.starts_with("HTTP/1.1 201"));

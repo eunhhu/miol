@@ -5357,7 +5357,9 @@ fn captured_add_response_operation(
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
     if let Some(value) = lhs_value {
-        return captured_arithmetic_response_operation(value, BinaryOp::Add, rhs);
+        if let Some(value) = captured_arithmetic_response_operation(value, BinaryOp::Add, rhs) {
+            return Some(value);
+        }
     }
     let value = rhs_value()?;
     if matches!(
@@ -5365,6 +5367,9 @@ fn captured_add_response_operation(
         "route_param" | "query_param" | "request_body_field"
     ) {
         return captured_string_prefix_concat_response_operation(value, lhs);
+    }
+    if let Some(value) = captured_scaled_left_add_response_operation(&value, lhs) {
+        return Some(value);
     }
     captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Add, lhs)
 }
@@ -5552,6 +5557,36 @@ fn captured_static_left_numeric_arithmetic_response_operation(
     }
     if value.value_kind.ends_with("_float") {
         value.operand_json = Some(static_float(lhs)?);
+        return Some(value);
+    }
+    None
+}
+
+fn captured_scaled_left_add_response_operation(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || value.operand_name.is_some()
+    {
+        return None;
+    }
+    let mut value = captured_response_value(value.name.clone(), &value.value_kind);
+    value.op = Some("add_scaled".to_string());
+    if value.value_kind.ends_with("_int") {
+        let operand = captured_scaled_integer_operand(lhs)?;
+        value.operand_json = Some(operand.scale.to_string());
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        let operand = captured_scaled_float_operand(lhs)?;
+        value.operand_json = Some(operand.scale);
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
         return Some(value);
     }
     None
@@ -9297,6 +9332,58 @@ function greet(name: string): string -> "hi {name}""#,
         );
 
         assert_eq!(artifact.routes[0].responses.len(), 2);
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "quantity");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_scaled")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("bonus")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("operand.checked_mul(2)"));
+        assert!(handlers.contains("value.checked_add(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains("fn orv_native_reference_bridge("));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_scaled_left_int_add_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { quantity: ((@body.bonus as int) * 2) + (@body.quantity as int) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
         assert_eq!(response.body_kind, "request_body_field_json");
         assert_eq!(response.body_request_fields[0].field, "quantity");
         assert_eq!(response.body_request_fields[0].name, "quantity");
