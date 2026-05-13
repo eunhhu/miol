@@ -158,6 +158,8 @@ HIR + ProjectGraph v1 → build-manifest.json + bundle-plan.json + origin-map.js
 
 Final unconditional `@respond` 앞에 놓인 `if ... else if ...` guard chain도 ordered response artifact로 직접 낮춘다.
 
+`else { if ... }`처럼 block이 single nested `if`를 감싼 response chain도 같은 ordered response artifact로 낮춘다.
+
 ### 로드맵: 의미 기반 프로젝트 그래프 확장
 
 ```

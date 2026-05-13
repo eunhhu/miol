@@ -36614,6 +36614,17 @@ entry = "src/main.orv"
       @respond 409 { err: "out_of_stock" }
     }
   }
+  @route POST /tiered-block-inventory {
+    if (@body.quantity as int) <= 0 {
+      @respond 400 { err: "bad_quantity" }
+    } else {
+      if (@body.quantity as int) <= (@body.stock as int) {
+        @respond 201 { accepted: true, quantity: @body.quantity as int }
+      } else {
+        @respond 409 { err: "out_of_stock" }
+      }
+    }
+  }
   @route POST /tiered-fallback-inventory {
     if (@body.quantity as int) <= 0 {
       @respond 400 { err: "bad_quantity" }
@@ -36746,6 +36757,16 @@ entry = "src/main.orv"
             "/tiered-inventory",
             r#"{"quantity":"7","stock":"5"}"#,
         );
+        let accepted_tiered_block_inventory = send_raw_http_json_post(
+            address,
+            "/tiered-block-inventory",
+            r#"{"quantity":"3","stock":"5"}"#,
+        );
+        let rejected_tiered_block_inventory = send_raw_http_json_post(
+            address,
+            "/tiered-block-inventory",
+            r#"{"quantity":"7","stock":"5"}"#,
+        );
         let invalid_tiered_fallback_inventory = send_raw_http_json_post(
             address,
             "/tiered-fallback-inventory",
@@ -36802,6 +36823,10 @@ entry = "src/main.orv"
         assert!(accepted_tiered_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_tiered_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_tiered_inventory.contains(r#"{"err":"out_of_stock"}"#));
+        assert!(accepted_tiered_block_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_tiered_block_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
+        assert!(rejected_tiered_block_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_tiered_block_inventory.contains(r#"{"err":"out_of_stock"}"#));
         assert!(invalid_tiered_fallback_inventory.starts_with("HTTP/1.1 400"));
         assert!(invalid_tiered_fallback_inventory.contains(r#"{"err":"bad_quantity"}"#));
         assert!(accepted_tiered_fallback_inventory.starts_with("HTTP/1.1 201"));

@@ -6457,6 +6457,12 @@ fn collect_guarded_else_if_response_artifacts(
 ) -> Option<()> {
     match &expr.kind {
         HirExprKind::If { .. } => collect_guarded_response_artifacts_from_if(expr, out),
+        HirExprKind::Block(block) => {
+            let [HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+                return None;
+            };
+            collect_guarded_else_if_response_artifacts(expr, out)
+        }
         HirExprKind::Paren(expr) => collect_guarded_else_if_response_artifacts(expr, out),
         _ => None,
     }
@@ -6503,6 +6509,17 @@ fn collect_else_response_artifacts(
 ) -> Option<()> {
     match &expr.kind {
         HirExprKind::If { .. } => collect_if_else_response_artifacts(expr, out),
+        HirExprKind::Block(block) => {
+            let [HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+                return None;
+            };
+            if matches!(expr.kind, HirExprKind::If { .. }) {
+                return collect_if_else_response_artifacts(expr, out);
+            }
+            let (respond, status, payload) = response_expr(expr)?;
+            out.push(server_response_artifact(respond, status, payload, None));
+            Some(())
+        }
         HirExprKind::Paren(expr) => collect_else_response_artifacts(expr, out),
         _ => {
             let (respond, status, payload) = response_expr_from_else_branch(expr)?;
@@ -11009,6 +11026,58 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_block_wrapped_else_if_response_route() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /inventory {
+    if (@body.quantity as int) <= 0 {
+      @respond 400 { err: "bad_quantity" }
+    } else {
+      if (@body.quantity as int) <= (@body.stock as int) {
+        @respond 201 { accepted: true, quantity: @body.quantity as int }
+      } else {
+        @respond 409 { err: "out_of_stock" }
+      }
+    }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(artifact.routes[0].responses.len(), 3);
+        assert_eq!(
+            artifact.routes[0].responses[0]
+                .condition
+                .as_ref()
+                .map(|condition| condition.value.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            artifact.routes[0].responses[1]
+                .condition
+                .as_ref()
+                .and_then(|condition| condition.operand_name.as_deref()),
+            Some("stock")
+        );
+        assert!(artifact.routes[0].responses[2].condition.is_none());
+        assert!(handlers.contains("status: 400"));
+        assert!(handlers.contains("status: 201"));
+        assert!(handlers.contains("status: 409"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_else_if_then_final_response_route() {
         let src = r#"@server {
   @listen 8080
@@ -11017,6 +11086,57 @@ function greet(name: string): string -> "hi {name}""#,
       @respond 400 { err: "bad_quantity" }
     } else if (@body.quantity as int) <= (@body.stock as int) {
       @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "out_of_stock" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(artifact.routes[0].responses.len(), 3);
+        assert_eq!(
+            artifact.routes[0].responses[0]
+                .condition
+                .as_ref()
+                .map(|condition| condition.value.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            artifact.routes[0].responses[1]
+                .condition
+                .as_ref()
+                .and_then(|condition| condition.operand_name.as_deref()),
+            Some("stock")
+        );
+        assert!(artifact.routes[0].responses[2].condition.is_none());
+        assert!(handlers.contains("status: 400"));
+        assert!(handlers.contains("status: 201"));
+        assert!(handlers.contains("status: 409"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_block_wrapped_else_if_then_final_response_route() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /inventory {
+    if (@body.quantity as int) <= 0 {
+      @respond 400 { err: "bad_quantity" }
+    } else {
+      if (@body.quantity as int) <= (@body.stock as int) {
+        @respond 201 { accepted: true, quantity: @body.quantity as int }
+      }
     }
     @respond 409 { err: "out_of_stock" }
   }
