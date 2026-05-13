@@ -69,6 +69,10 @@ Trace transport is also mirrored for native hosts: when an editor export include
 
 The LSP session keeps `textDocument/didOpen` and full-sync `textDocument/didChange` buffers so later file URI requests can run against unsaved content, and clears that cache on `textDocument/didClose`.
 
+## Tree-sitter
+
+`tree-sitter-orv/` ships the source grammar package for `.orv` editor integrations, including `grammar.js`, highlight/local query files, and a local smoke check. Generated parser C files and editor-specific bindings are intentionally not committed yet; run `npm run test:grammar` for the source grammar smoke check and `tree-sitter generate` from that directory when the Tree-sitter CLI is installed.
+
 ## DAP
 
 `orv dap serve --stdio` reuses the same project loader and ProjectGraph as CLI/LSP. It supports initialize/cancel/launch/attach/configurationDone, source/function/instruction/data breakpoints, breakpoint/goto/step-in target discovery, exception info, threads/stackTrace/scopes/variables, variable/expression mutation, evaluate/completions, loadedSources/modules/source, source-frame disassemble/readMemory, continue/reverseContinue/goto/stepIn/stepBack/restartFrame, disconnect/terminate/terminateThreads, and stdio lifecycle/output events.

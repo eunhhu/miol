@@ -1,0 +1,20 @@
+{
+  "name": "tree-sitter-orv",
+  "version": "0.1.0",
+  "description": "Tree-sitter source grammar and queries for the Orv language.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "grammar.js",
+  "scripts": {
+    "test:grammar": "node test/grammar-smoke.cjs"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.orv",
+      "file-types": [
+        "orv"
+      ],
+      "injection-regex": "^orv$"
+    }
+  ]
+}
