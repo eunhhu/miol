@@ -33959,6 +33959,12 @@ entry = "src/main.orv"
   @route GET /products/:id/shift/:offset {
     @respond 200 { shifted: (@param.id as int) + (@param.offset as int) }
   }
+  @route GET /products/:price/float-math/:tax {
+    @respond 200 {
+      discounted: (@param.price as float) * 0.5,
+      taxed: (@param.price as float) + (@param.tax as float)
+    }
+  }
   @route GET /products/:id/mixed {
     @respond 200 {
       kind: "calc",
@@ -33982,6 +33988,12 @@ entry = "src/main.orv"
       half: (@query.page as int) / 2,
       parity: (@query.page as int) % 2
     }
+  }
+  @route GET /search/float-total {
+    @respond 200 { total: (@query.amount as float) * (@query.quantity as float) }
+  }
+  @route GET /search/float-ratio {
+    @respond 200 { ratio: 100.0 / (@query.parts as float) }
   }
 }
 "#,
@@ -34038,11 +34050,15 @@ entry = "src/main.orv"
         let route_response = send_raw_http(address, "/products/42");
         let route_math_response = send_raw_http(address, "/products/13/math");
         let route_shift_response = send_raw_http(address, "/products/13/shift/4");
+        let route_float_response = send_raw_http(address, "/products/12.5/float-math/1.25");
         let route_mixed_response = send_raw_http(address, "/products/41/mixed?page=13");
         let query_response = send_raw_http(address, "/search?page=12.5");
         let next_response = send_raw_http(address, "/search/next?page=12");
         let step_response = send_raw_http(address, "/search/step?page=12&step=3");
         let math_response = send_raw_http(address, "/search/math?page=13");
+        let float_total_response =
+            send_raw_http(address, "/search/float-total?amount=12.5&quantity=3");
+        let float_ratio_response = send_raw_http(address, "/search/float-ratio?parts=4");
 
         assert!(route_response.starts_with("HTTP/1.1 200"));
         assert!(route_response.contains(r#"{"id":42}"#));
@@ -34050,6 +34066,8 @@ entry = "src/main.orv"
         assert!(route_math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
         assert!(route_shift_response.starts_with("HTTP/1.1 200"));
         assert!(route_shift_response.contains(r#"{"shifted":17}"#));
+        assert!(route_float_response.starts_with("HTTP/1.1 200"));
+        assert!(route_float_response.contains(r#"{"discounted":6.25,"taxed":13.75}"#));
         assert!(route_mixed_response.starts_with("HTTP/1.1 200"));
         assert!(route_mixed_response.contains(r#"{"kind":"calc","next_id":42,"prev_page":12}"#));
         assert!(query_response.starts_with("HTTP/1.1 200"));
@@ -34060,6 +34078,10 @@ entry = "src/main.orv"
         assert!(step_response.contains(r#"{"next":15}"#));
         assert!(math_response.starts_with("HTTP/1.1 200"));
         assert!(math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
+        assert!(float_total_response.starts_with("HTTP/1.1 200"));
+        assert!(float_total_response.contains(r#"{"total":37.5}"#));
+        assert!(float_ratio_response.starts_with("HTTP/1.1 200"));
+        assert!(float_ratio_response.contains(r#"{"ratio":25}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);

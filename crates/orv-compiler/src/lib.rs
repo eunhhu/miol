@@ -10377,6 +10377,78 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_route_param_float_arithmetic_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /products/:price/:tax {
+    @respond 200 {
+      discounted: (@param.price as float) * 0.5,
+      taxed: (@param.price as float) + (@param.tax as float),
+      remaining: 100.0 - (@param.price as float),
+      power: 2.0 ** (@param.tax as float)
+    }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "route_param_json");
+        assert_eq!(response.body_route_params.len(), 4);
+        assert_eq!(response.body_route_params[0].field, "discounted");
+        assert_eq!(response.body_route_params[0].param, "price");
+        assert_eq!(
+            response.body_route_params[0].value_kind,
+            "route_param_float"
+        );
+        assert_eq!(response.body_route_params[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_route_params[0].operand_json.as_deref(),
+            Some("0.5")
+        );
+        assert_eq!(response.body_route_params[1].field, "taxed");
+        assert_eq!(response.body_route_params[1].param, "price");
+        assert_eq!(response.body_route_params[1].op.as_deref(), Some("add"));
+        assert_eq!(
+            response.body_route_params[1].operand_kind.as_deref(),
+            Some("route_param_float")
+        );
+        assert_eq!(
+            response.body_route_params[1].operand_name.as_deref(),
+            Some("tax")
+        );
+        assert_eq!(response.body_route_params[2].op.as_deref(), Some("rsub"));
+        assert_eq!(
+            response.body_route_params[2].operand_json.as_deref(),
+            Some("100.0")
+        );
+        assert_eq!(response.body_route_params[3].op.as_deref(), Some("rpow"));
+        assert_eq!(
+            response.body_route_params[3].operand_json.as_deref(),
+            Some("2.0")
+        );
+        assert!(handlers.contains("routes::orv_native_param_value(route_match, \"price\")"));
+        assert!(handlers.contains("routes::orv_native_param_value(route_match, \"tax\")"));
+        assert!(handlers.contains(".trim().parse::<f64>()"));
+        assert!(handlers.contains("let value = value * 0.5;"));
+        assert!(handlers.contains("let value = value + operand;"));
+        assert!(handlers.contains("let value = 100.0 - value;"));
+        assert!(handlers.contains("let value = (2.0_f64).powf(value);"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_query_param_float_cast_response_body() {
         let src = r"@server {
   @listen 8080
@@ -10409,6 +10481,65 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(!handlers.contains(
             "orv_native_push_json_string(routes::orv_native_query_value(route_match, \"page\")"
         ));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_query_param_float_arithmetic_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route GET /search {
+    @respond 200 {
+      total: (@query.amount as float) * (@query.quantity as float),
+      ratio: 100.0 / (@query.parts as float)
+    }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "query_param_json");
+        assert_eq!(response.body_query_params.len(), 2);
+        assert_eq!(response.body_query_params[0].field, "total");
+        assert_eq!(response.body_query_params[0].param, "amount");
+        assert_eq!(
+            response.body_query_params[0].value_kind,
+            "query_param_float"
+        );
+        assert_eq!(response.body_query_params[0].op.as_deref(), Some("mul"));
+        assert_eq!(
+            response.body_query_params[0].operand_kind.as_deref(),
+            Some("query_param_float")
+        );
+        assert_eq!(
+            response.body_query_params[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(response.body_query_params[1].field, "ratio");
+        assert_eq!(response.body_query_params[1].param, "parts");
+        assert_eq!(response.body_query_params[1].op.as_deref(), Some("rdiv"));
+        assert_eq!(
+            response.body_query_params[1].operand_json.as_deref(),
+            Some("100.0")
+        );
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"amount\")"));
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"quantity\")"));
+        assert!(handlers.contains("routes::orv_native_query_value(route_match, \"parts\")"));
+        assert!(handlers.contains(".trim().parse::<f64>()"));
+        assert!(handlers.contains("let value = value * operand;"));
+        assert!(handlers.contains("let value = 100.0 / value;"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
