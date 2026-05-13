@@ -22000,6 +22000,10 @@ fn add_client_manifest_reveal_fields(
         .get("exports")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    target["capabilities"] = manifest
+        .get("capabilities")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     target["blocked_by"] = manifest
         .get("blocked_by")
         .cloned()
@@ -43656,6 +43660,13 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["wasm_hash"]
                     .as_str()
                     .is_some_and(|hash| !hash.is_empty())
+                && target["capabilities"]["runtime"] == "client_wasm"
+                && target["capabilities"]["bindings"]["signal_text"] == 1
+                && target["capabilities"]["surfaces"]
+                    .as_array()
+                    .expect("manifest capability surfaces")
+                    .iter()
+                    .any(|surface| surface == "signal_text")
                 && target["blockers"]
                     .as_array()
                     .expect("manifest blockers")
