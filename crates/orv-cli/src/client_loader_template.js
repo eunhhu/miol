@@ -393,9 +393,14 @@ function renderSignalTextCondition(condition, reactiveState) {
   return renderSignalAttrCondition(condition, reactiveState);
 }
 
+function signalTextBindingCursorKey(binding, expectedText) {
+  return `${binding.selector}\u0000${expectedText}`;
+}
+
 function bindReactiveDom(plan, root, reactiveState) {
   const bindings = new Map();
   const boundElements = new Set();
+  const cursors = new Map();
   if (!root) {
     return { count: 0, update() {} };
   }
@@ -406,8 +411,11 @@ function bindReactiveDom(plan, root, reactiveState) {
       continue;
     }
     const expectedText = renderSignalTextBinding(binding, reactiveState);
+    const key = signalTextBindingCursorKey(binding, expectedText);
+    const cursor = cursors.get(key) || 0;
     const element = Array.from(root.querySelectorAll(binding.selector))
-      .find((candidate) => candidate.textContent === expectedText);
+      .filter((candidate) => candidate.textContent === expectedText)[cursor];
+    cursors.set(key, cursor + 1);
     if (!element) {
       continue;
     }
@@ -515,9 +523,14 @@ function decodeSignalConditionOperand(operand) {
   }
 }
 
+function signalAttrBindingCursorKey(binding, expected) {
+  return `${binding.selector}\u0000${binding.attr}\u0000${expected}`;
+}
+
 function bindReactiveAttrs(plan, root, reactiveState) {
   const bindings = new Map();
   const boundElements = new Set();
+  const cursors = new Map();
   if (!root) {
     return { count: 0, update() {} };
   }
@@ -528,8 +541,11 @@ function bindReactiveAttrs(plan, root, reactiveState) {
       continue;
     }
     const expected = displaySignalValue(renderSignalAttrBinding(binding, reactiveState));
+    const key = signalAttrBindingCursorKey(binding, expected);
+    const cursor = cursors.get(key) || 0;
     const element = Array.from(root.querySelectorAll(binding.selector))
-      .find((candidate) => displaySignalValue(elementSignalAttrValue(candidate, binding.attr)) === expected);
+      .filter((candidate) => displaySignalValue(elementSignalAttrValue(candidate, binding.attr)) === expected)[cursor];
+    cursors.set(key, cursor + 1);
     if (!element) {
       continue;
     }

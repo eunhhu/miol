@@ -16242,10 +16242,12 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("renderSignalTextCondition")
         || !source.contains("text_condition")
         || !source.contains("signalTextBindingStateKeys")
+        || !source.contains("signalTextBindingCursorKey")
         || !source.contains("state_keys")
         || !source.contains("renderSignalAttrBinding")
         || !source.contains("attr_template")
         || !source.contains("signalAttrBindingStateKeys")
+        || !source.contains("signalAttrBindingCursorKey")
         || !source.contains("renderSignalAttrCondition")
         || !source.contains("attr_condition")
         || !source.contains("compareSignalAttrCondition")
@@ -34157,10 +34159,12 @@ entry = "src/main.orv"
             "renderSignalTextCondition",
             "text_condition",
             "signalTextBindingStateKeys",
+            "signalTextBindingCursorKey",
             "state_keys",
             "renderSignalAttrBinding",
             "attr_template",
             "signalAttrBindingStateKeys",
+            "signalAttrBindingCursorKey",
             "renderSignalAttrCondition",
             "attr_condition",
             "compareSignalAttrCondition",
@@ -38211,6 +38215,67 @@ let sig count: int = 0
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("renderSignalTextCondition"));
         assert!(loader.contains("text_condition"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_duplicate_signal_slot_cursor_contract() {
+        let out = temp_output_dir("client-reactive-duplicate-slot-cursors");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig first: string = "same"
+let sig second: string = "same"
+@out @html { @body {
+  @p first
+  @p second
+  @input value={first}
+  @input value={second}
+} }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        let text_bindings = reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .filter(|binding| binding["kind"] == "signal_text")
+            .collect::<Vec<_>>();
+        assert_eq!(text_bindings.len(), 2);
+        assert!(text_bindings
+            .iter()
+            .any(|binding| binding["state_key"] == "first" && binding["selector"] == "p"));
+        assert!(text_bindings
+            .iter()
+            .any(|binding| binding["state_key"] == "second" && binding["selector"] == "p"));
+        let attr_bindings = reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .filter(|binding| binding["kind"] == "signal_attr")
+            .collect::<Vec<_>>();
+        assert_eq!(attr_bindings.len(), 2);
+        assert!(attr_bindings.iter().any(|binding| {
+            binding["state_key"] == "first"
+                && binding["selector"] == "input"
+                && binding["attr"] == "value"
+        }));
+        assert!(attr_bindings.iter().any(|binding| {
+            binding["state_key"] == "second"
+                && binding["selector"] == "input"
+                && binding["attr"] == "value"
+        }));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("signalTextBindingCursorKey"));
+        assert!(loader.contains("signalAttrBindingCursorKey"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }
