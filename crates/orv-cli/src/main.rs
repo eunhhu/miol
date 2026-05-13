@@ -6547,6 +6547,7 @@ fn editor_debug_runner_result_panels_json(
         &stopped_events,
         &output_events,
     );
+    let source_navigation = editor_debug_source_navigation_json(&selected_frame, &stack_frames);
     serde_json::json!({
         "debug": {
             "schema_version": 1,
@@ -6561,6 +6562,7 @@ fn editor_debug_runner_result_panels_json(
                 })),
             "selected_frame": selected_frame,
             "stack_frames": stack_frames,
+            "source_navigation": source_navigation,
             "scopes": debug
                 .get("scopes")
                 .cloned()
@@ -6643,6 +6645,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
                 "name": "stack_frames",
                 "path": "panels.debug.stack_frames",
                 "kind": "array",
+            },
+            {
+                "name": "source_navigation",
+                "path": "panels.debug.source_navigation",
+                "kind": "object",
             },
             {
                 "name": "scopes",
@@ -6747,6 +6754,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .pointer("/panels/debug/session_summary")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let source_navigation = value
+        .pointer("/panels/debug/source_navigation")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let locals = value
         .pointer("/panels/debug/locals")
         .and_then(serde_json::Value::as_array)
@@ -6806,6 +6817,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     html.push_str("<section class=\"panel\"><h2>Selected Frame</h2><pre>");
     html.push_str(&html_escape_text(&editor_debug_frame_summary(
         &selected_frame,
+    )));
+    html.push_str("</pre></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Source Navigation</h2><pre>");
+    html.push_str(&html_escape_text(&editor_debug_source_navigation_summary(
+        &source_navigation,
     )));
     html.push_str("</pre></section>\n");
     html.push_str("<section class=\"panel\"><h2>Stack Frames</h2><ul class=\"list\">");
@@ -6951,6 +6967,55 @@ fn editor_debug_session_summary_json(
     })
 }
 
+fn editor_debug_source_navigation_json(
+    selected_frame: &serde_json::Value,
+    stack_frames: &[serde_json::Value],
+) -> serde_json::Value {
+    let frames = stack_frames
+        .iter()
+        .filter_map(editor_debug_source_navigation_frame_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": 1,
+        "selected": editor_debug_source_navigation_frame_json(selected_frame)
+            .unwrap_or_else(|| serde_json::json!({})),
+        "frame_count": frames.len(),
+        "frames": frames,
+    })
+}
+
+fn editor_debug_source_navigation_frame_json(
+    frame: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let source_path = frame
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let source_name = frame
+        .pointer("/source/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(source_path);
+    if source_path.is_empty() && source_name.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "frame_id": frame.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "frame_name": frame
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("frame")),
+        "source": {
+            "path": source_path,
+            "name": source_name,
+        },
+        "line": frame.get("line").cloned().unwrap_or(serde_json::Value::Null),
+        "column": frame
+            .get("column")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1)),
+    }))
+}
+
 fn editor_debug_session_summary_text(summary: &serde_json::Value) -> String {
     let selected_line = summary
         .get("selected_line")
@@ -6987,6 +7052,50 @@ fn editor_debug_session_summary_text(summary: &serde_json::Value) -> String {
     .filter(|line| !line.trim().is_empty())
     .collect::<Vec<_>>()
     .join("\n")
+}
+
+fn editor_debug_source_navigation_summary(navigation: &serde_json::Value) -> String {
+    let selected = navigation
+        .get("selected")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let selected_line = selected
+        .get("line")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "line ?".to_string(), |line| format!("line {line}"));
+    let selected_path = selected
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut lines = vec![
+        format!("selected {}", json_str_or_empty(&selected, "frame_name")),
+        format!("{selected_line} {selected_path}"),
+        format!("frames {}", json_u64_field(navigation, "frame_count")),
+    ];
+    if let Some(frames) = navigation
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+    {
+        for frame in frames {
+            let line = frame
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| "line ?".to_string(), |line| format!("line {line}"));
+            let source = frame
+                .pointer("/source/path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            lines.push(format!(
+                "{} {line} {source}",
+                json_str_or_empty(frame, "frame_name")
+            ));
+        }
+    }
+    lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn editor_debug_frame_summary(frame: &serde_json::Value) -> String {
@@ -43225,6 +43334,7 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("id=\"orv-debug-result\""));
         assert!(result_html.contains("Selected Frame"));
         assert!(result_html.contains("Session Summary"));
+        assert!(result_html.contains("Source Navigation"));
         assert!(result_html.contains("Stack Frames"));
         assert!(result_html.contains("Scopes"));
         assert!(result_html.contains("Locals"));
@@ -43274,6 +43384,14 @@ define Auth() -> { @out "auth" }
             .expect("panel sections")
             .iter()
             .any(|section| {
+                section["name"] == "source_navigation"
+                    && section["path"] == "panels.debug.source_navigation"
+            }));
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
                 section["name"] == "scopes" && section["path"] == "panels.debug.scopes"
             }));
         assert!(result["runner"]["result"]["panel_contract"]["sections"]
@@ -43313,6 +43431,20 @@ define Auth() -> { @out "auth" }
         assert!(result["panels"]["debug"]["stack_frames"]
             .as_array()
             .expect("stack frames")
+            .iter()
+            .any(|frame| frame["line"] == 3));
+        assert_eq!(
+            result["panels"]["debug"]["source_navigation"]["selected"]["line"],
+            3
+        );
+        assert!(
+            result["panels"]["debug"]["source_navigation"]["selected"]["source"]["path"]
+                .as_str()
+                .is_some_and(|source| source.ends_with("app.orv"))
+        );
+        assert!(result["panels"]["debug"]["source_navigation"]["frames"]
+            .as_array()
+            .expect("source navigation frames")
             .iter()
             .any(|frame| frame["line"] == 3));
         assert!(result["panels"]["debug"]["scopes"]["scopes"]
