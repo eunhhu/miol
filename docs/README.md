@@ -179,7 +179,7 @@ Editor DAP/native trace control 세부: exported debug controls now include exac
 
 Editor native runtime 세부: `native-host.json` now mirrors the exported runtime status/stdout/error, async runtime metadata, runtime frames, and `runtime.panel_contract` so native UI hosts can render runtime inspection without reparsing the static shell.
 
-Editor native production 세부: build-backed exports now add `production.panel_contract` for DB and commerce adapter sections in `native-host.json`, matching the runtime/debug/trace panel contract shape.
+Editor native production 세부: build-backed exports now add `production.summary` plus `production.panel_contract` for DB and commerce adapter sections in `native-host.json`, matching the runtime/debug/trace panel contract shape.
 
 Client blocker 세부: `client/manifest.json` and `client/reactive-plan.json` now include structured `blockers` entries aligned with `blocked_by`, and `orv verify-build` rejects missing blocker detail.
 

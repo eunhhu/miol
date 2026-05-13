@@ -7751,6 +7751,10 @@ fn editor_native_host_production_json(production: &serde_json::Value) -> serde_j
         return serde_json::Value::Null;
     };
     object.insert(
+        "summary".to_string(),
+        editor_native_host_production_summary_json(production),
+    );
+    object.insert(
         "panel_contract".to_string(),
         editor_native_host_production_panel_contract_json(),
     );
@@ -7763,6 +7767,11 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
         "root": "production",
         "sections": [
             {
+                "name": "summary",
+                "path": "production.summary",
+                "kind": "object",
+            },
+            {
                 "name": "db_adapters",
                 "path": "production.db_adapters",
                 "kind": "array",
@@ -7774,6 +7783,49 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
             },
         ],
     })
+}
+
+fn editor_native_host_production_summary_json(production: &serde_json::Value) -> serde_json::Value {
+    let db_adapters = production
+        .get("db_adapters")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let commerce_adapters = production
+        .get("commerce_adapters")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let db_adapter_count = production_adapter_entry_count(&db_adapters);
+    let commerce_adapter_count = production_adapter_entry_count(&commerce_adapters);
+    serde_json::json!({
+        "schema_version": 1,
+        "build_dir": production
+            .get("build_dir")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+        "db_target_count": db_adapters.len(),
+        "commerce_target_count": commerce_adapters.len(),
+        "db_adapter_count": db_adapter_count,
+        "commerce_adapter_count": commerce_adapter_count,
+        "adapter_count": db_adapter_count + commerce_adapter_count,
+        "missing_artifact_count": production_missing_artifact_count(&db_adapters)
+            + production_missing_artifact_count(&commerce_adapters),
+    })
+}
+
+fn production_adapter_entry_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(|target| json_array_count(target.get("adapters")))
+        .sum()
+}
+
+fn production_missing_artifact_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .filter(|target| target.get("exists").and_then(serde_json::Value::as_bool) == Some(false))
+        .count()
 }
 
 fn editor_native_host_runtime_json(state: &serde_json::Value) -> serde_json::Value {
@@ -43871,12 +43923,37 @@ define Auth() -> { @out "auth" }
             "deploy/commerce-adapters.json"
         );
         assert_eq!(
+            native_host["production"]["summary"]["schema_version"],
+            serde_json::json!(1)
+        );
+        assert_eq!(native_host["production"]["summary"]["db_target_count"], 1);
+        assert_eq!(
+            native_host["production"]["summary"]["commerce_target_count"],
+            1
+        );
+        assert!(
+            native_host["production"]["summary"]["adapter_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2),
+            "{native_host}"
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["missing_artifact_count"],
+            0
+        );
+        assert_eq!(
             native_host["production"]["panel_contract"]["root"],
             "production"
         );
         let production_sections = native_host["production"]["panel_contract"]["sections"]
             .as_array()
             .expect("production panel sections");
+        assert!(
+            production_sections
+                .iter()
+                .any(|section| section["name"] == "summary"
+                    && section["path"] == "production.summary")
+        );
         assert!(production_sections
             .iter()
             .any(|section| section["name"] == "db_adapters"
