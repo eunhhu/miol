@@ -455,6 +455,15 @@ fn parse_editor_debug_data_breakpoint(value: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+fn parse_editor_debug_exception_filter(value: &str) -> Result<String, String> {
+    let filter = value.trim();
+    if matches!(filter, "orv.diagnostics" | "orv.runtime") {
+        Ok(filter.to_string())
+    } else {
+        Err("exception filter must be `orv.diagnostics` or `orv.runtime`".to_string())
+    }
+}
+
 #[derive(Subcommand)]
 enum WorkspaceCommand {
     /// 워크스페이스 member 프로젝트를 생성하고 root manifest에 등록한다.
@@ -550,6 +559,9 @@ enum EditorCommand {
         /// Apply a DAP data breakpoint for a local variable before controls.
         #[arg(long = "data-breakpoint", value_parser = parse_editor_debug_data_breakpoint)]
         data_breakpoints: Vec<String>,
+        /// Configure DAP exception filters before launch.
+        #[arg(long = "exception-filter", value_parser = parse_editor_debug_exception_filter)]
+        exception_filters: Vec<String>,
         /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
         #[arg(long = "control", value_enum)]
         controls: Vec<EditorDebugControl>,
@@ -570,6 +582,9 @@ enum EditorCommand {
         /// Apply a DAP data breakpoint for a local variable before controls.
         #[arg(long = "data-breakpoint", value_parser = parse_editor_debug_data_breakpoint)]
         data_breakpoints: Vec<String>,
+        /// Configure DAP exception filters before launch.
+        #[arg(long = "exception-filter", value_parser = parse_editor_debug_exception_filter)]
+        exception_filters: Vec<String>,
         /// 실행할 DAP control request. 여러 번 지정하면 같은 session 에서 순서대로 실행한다.
         #[arg(long = "control", value_enum)]
         controls: Vec<EditorDebugControl>,
@@ -1174,6 +1189,7 @@ fn main() -> ExitCode {
                 breakpoints,
                 function_breakpoints,
                 data_breakpoints,
+                exception_filters,
                 controls,
                 watch_expressions,
             } => match cmd_editor_debug(
@@ -1182,6 +1198,7 @@ fn main() -> ExitCode {
                 &breakpoints,
                 &function_breakpoints,
                 &data_breakpoints,
+                &exception_filters,
                 &watch_expressions,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1195,6 +1212,7 @@ fn main() -> ExitCode {
                 breakpoints,
                 function_breakpoints,
                 data_breakpoints,
+                exception_filters,
                 controls,
                 watch_expressions,
             } => match cmd_editor_run_debug(
@@ -1203,6 +1221,7 @@ fn main() -> ExitCode {
                 &breakpoints,
                 &function_breakpoints,
                 &data_breakpoints,
+                &exception_filters,
                 &watch_expressions,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1544,6 +1563,7 @@ fn cmd_editor_debug(
     breakpoints: &[EditorDebugBreakpoint],
     function_breakpoints: &[String],
     data_breakpoints: &[String],
+    exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<()> {
     let entry = project_entry_path(path)?;
@@ -1553,6 +1573,7 @@ fn cmd_editor_debug(
         breakpoints,
         function_breakpoints,
         data_breakpoints,
+        exception_filters,
         watch_expressions,
     )?;
     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -1565,6 +1586,7 @@ fn cmd_editor_run_debug(
     breakpoints: &[EditorDebugBreakpoint],
     function_breakpoints: &[String],
     data_breakpoints: &[String],
+    exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<()> {
     let value = editor_debug_runner_session_json(
@@ -1573,6 +1595,7 @@ fn cmd_editor_run_debug(
         breakpoints,
         function_breakpoints,
         data_breakpoints,
+        exception_filters,
         watch_expressions,
     )?;
     write_editor_debug_runner_result_if_configured(state, &value)?;
@@ -6444,6 +6467,7 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
         "breakpoint_sources": editor_debug_breakpoint_sources_json(&loaded.files),
         "function_breakpoints": editor_debug_function_breakpoints_json(&loaded),
         "data_breakpoints": editor_debug_data_breakpoints_json(&loaded),
+        "exception_filters": editor_debug_exception_filters_json(),
     }))
 }
 
@@ -6453,6 +6477,7 @@ fn editor_debug_session_json(
     breakpoints: &[EditorDebugBreakpoint],
     function_breakpoints: &[String],
     data_breakpoints: &[String],
+    exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<serde_json::Value> {
     let controls = if controls.is_empty() {
@@ -6467,6 +6492,11 @@ fn editor_debug_session_json(
         "arguments": {},
     })];
     let mut next_seq = 2_u64;
+    let exception_filter_requests = editor_debug_push_exception_filter_requests(
+        &mut requests,
+        &mut next_seq,
+        exception_filters,
+    );
     let function_breakpoint_requests = editor_debug_push_function_breakpoint_requests(
         &mut requests,
         &mut next_seq,
@@ -6546,6 +6576,8 @@ fn editor_debug_session_json(
         data_breakpoint_info_requests,
         data_breakpoint_set_request,
     );
+    let exception_filter_summaries =
+        editor_debug_exception_filter_summaries(&frames, exception_filter_requests);
     let control_summaries = editor_debug_control_summaries(&frames, control_requests);
     let watch_expression_summaries =
         editor_debug_watch_expression_summaries(&frames, watch_expression_requests);
@@ -6579,6 +6611,7 @@ fn editor_debug_session_json(
         "breakpoints": breakpoint_summaries,
         "function_breakpoints": function_breakpoint_summaries,
         "data_breakpoints": data_breakpoint_summaries,
+        "exception_filters": exception_filter_summaries,
         "control": first_control,
         "controls": control_summaries,
         "watch_expressions": watch_expression_summaries,
@@ -6596,6 +6629,7 @@ fn editor_debug_runner_session_json(
     breakpoints: &[EditorDebugBreakpoint],
     function_breakpoints: &[String],
     data_breakpoints: &[String],
+    exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<serde_json::Value> {
     let state = read_json_value(state_path)?;
@@ -6619,6 +6653,7 @@ fn editor_debug_runner_session_json(
         breakpoints,
         function_breakpoints,
         data_breakpoints,
+        exception_filters,
         watch_expressions,
     )?;
     Ok(serde_json::json!({
@@ -6667,6 +6702,11 @@ fn editor_debug_runner_result_panels_json(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let exception_filters = debug
+        .get("exception_filters")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let watch_expressions = debug
         .get("watch_expressions")
         .and_then(serde_json::Value::as_array)
@@ -6711,11 +6751,13 @@ fn editor_debug_runner_result_panels_json(
             "breakpoint_count": breakpoints.len(),
             "function_breakpoint_count": function_breakpoints.len(),
             "data_breakpoint_count": data_breakpoints.len(),
+            "exception_filter_count": exception_filters.len(),
             "watch_expression_count": watch_expressions.len(),
             "controls": controls,
             "breakpoints": breakpoints,
             "function_breakpoints": function_breakpoints,
             "data_breakpoints": data_breakpoints,
+            "exception_filters": exception_filters,
             "watch_expressions": watch_expressions,
             "event_count": events.len(),
             "stopped_event_count": stopped_events.len(),
@@ -6822,6 +6864,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
             {
                 "name": "data_breakpoints",
                 "path": "panels.debug.data_breakpoints",
+                "kind": "array",
+            },
+            {
+                "name": "exception_filters",
+                "path": "panels.debug.exception_filters",
                 "kind": "array",
             },
             {
@@ -6946,6 +6993,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let exception_filters = value
+        .pointer("/panels/debug/exception_filters")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let watch_expressions = value
         .pointer("/panels/debug/watch_expressions")
         .and_then(serde_json::Value::as_array)
@@ -6965,6 +7017,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .unwrap_or(0);
     let data_breakpoint_count = value
         .pointer("/panels/debug/data_breakpoint_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let exception_filter_count = value
+        .pointer("/panels/debug/exception_filter_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let mut html = String::new();
@@ -6992,6 +7048,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     write!(
         &mut html,
         "<section class=\"panel\"><h2>Data Breakpoints</h2><div class=\"metric\">{data_breakpoint_count}</div><p class=\"muted\">requested local data breakpoints</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Exception Filters</h2><div class=\"metric\">{exception_filter_count}</div><p class=\"muted\">configured exception filters</p></section>"
     )?;
     html.push_str("<section class=\"panel wide\"><h2>Session Summary</h2><pre>");
     html.push_str(&html_escape_text(&editor_debug_session_summary_text(
@@ -7077,6 +7137,15 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
             &mut html,
             "<li>{}</li>",
             html_escape_text(&editor_debug_data_breakpoint_summary(&breakpoint))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Exception Filters</h2><ul class=\"list\">");
+    for filter in exception_filters {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_exception_filter_summary(&filter))
         )?;
     }
     html.push_str("</ul></section>\n");
@@ -7174,6 +7243,7 @@ fn editor_debug_session_summary_json(
         "breakpoint_count": json_array_count(debug.get("breakpoints")),
         "function_breakpoint_count": json_array_count(debug.get("function_breakpoints")),
         "data_breakpoint_count": json_array_count(debug.get("data_breakpoints")),
+        "exception_filter_count": json_array_count(debug.get("exception_filters")),
         "watch_expression_count": json_array_count(debug.get("watch_expressions")),
         "event_count": events.len(),
         "stopped_event_count": stopped_events.len(),
@@ -7254,11 +7324,12 @@ fn editor_debug_session_summary_text(summary: &serde_json::Value) -> String {
             json_u64_field(summary, "frame_count")
         ),
         format!(
-            "controls {} breakpoints {} function_breakpoints {} data_breakpoints {} watches {} events {} stopped {} output {}",
+            "controls {} breakpoints {} function_breakpoints {} data_breakpoints {} exception_filters {} watches {} events {} stopped {} output {}",
             json_u64_field(summary, "control_count"),
             json_u64_field(summary, "breakpoint_count"),
             json_u64_field(summary, "function_breakpoint_count"),
             json_u64_field(summary, "data_breakpoint_count"),
+            json_u64_field(summary, "exception_filter_count"),
             json_u64_field(summary, "watch_expression_count"),
             json_u64_field(summary, "event_count"),
             json_u64_field(summary, "stopped_event_count"),
@@ -7507,6 +7578,37 @@ fn editor_debug_data_breakpoint_summary(breakpoint: &serde_json::Value) -> Strin
         .join(" ")
 }
 
+fn editor_debug_exception_filter_summary(filter: &serde_json::Value) -> String {
+    let filters = filter
+        .get("filters")
+        .and_then(serde_json::Value::as_array)
+        .map(|filters| {
+            filters
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .or_else(|| {
+            filter
+                .get("filter")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "exception".to_string());
+    let success = filter
+        .pointer("/response/success")
+        .and_then(serde_json::Value::as_bool)
+        .map_or_else(String::new, |success| {
+            format!("success {}", if success { "true" } else { "false" })
+        });
+    [format!("filters {filters}"), success]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn editor_debug_watch_expression_summary(expression: &serde_json::Value) -> String {
     let label = expression
         .get("expression")
@@ -7606,6 +7708,22 @@ fn editor_debug_push_function_breakpoint_requests(
     let request = editor_debug_set_function_breakpoints_request_json(seq, &names);
     requests.push(request.clone());
     vec![(seq, names, request)]
+}
+
+fn editor_debug_push_exception_filter_requests(
+    requests: &mut Vec<serde_json::Value>,
+    next_seq: &mut u64,
+    exception_filters: &[String],
+) -> Vec<(u64, Vec<String>, serde_json::Value)> {
+    let filters = editor_debug_exception_filter_names(exception_filters);
+    if filters.is_empty() {
+        return Vec::new();
+    }
+    let seq = *next_seq;
+    *next_seq += 1;
+    let request = editor_debug_set_exception_breakpoints_request_json(seq, &filters);
+    requests.push(request.clone());
+    vec![(seq, filters, request)]
 }
 
 fn editor_debug_push_data_breakpoint_requests(
@@ -7758,6 +7876,23 @@ fn editor_debug_data_breakpoint_summaries(
     })]
 }
 
+fn editor_debug_exception_filter_summaries(
+    frames: &[serde_json::Value],
+    exception_filter_requests: Vec<(u64, Vec<String>, serde_json::Value)>,
+) -> Vec<serde_json::Value> {
+    exception_filter_requests
+        .into_iter()
+        .map(|(seq, filters, request)| {
+            serde_json::json!({
+                "filters": filters,
+                "request": request,
+                "response": dap_response_for_request_seq(frames, seq)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
 fn editor_debug_watch_expression_summaries(
     frames: &[serde_json::Value],
     watch_requests: Vec<(u64, String, serde_json::Value)>,
@@ -7860,6 +7995,8 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
             "function_breakpoint_format": "<function-name>",
             "data_breakpoint_argument": "--data-breakpoint",
             "data_breakpoint_format": "<local-name>",
+            "exception_filter_argument": "--exception-filter",
+            "exception_filter_format": "<orv.diagnostics|orv.runtime>",
             "watch_expression_argument": "--watch-expression",
             "watch_expression_format": "<expression>",
             "reuse_session": true,
@@ -7946,6 +8083,22 @@ fn editor_debug_data_breakpoint_runner_command(
     ])
 }
 
+fn editor_debug_exception_filter_runner_command(
+    filter: &str,
+    control: EditorDebugControl,
+) -> serde_json::Value {
+    serde_json::json!([
+        "orv",
+        "editor",
+        "run-debug",
+        EDITOR_DEBUG_SESSION_RUNNER_PATH,
+        "--exception-filter",
+        filter,
+        "--control",
+        control.cli_value()
+    ])
+}
+
 fn editor_debug_breakpoint_request_groups(
     breakpoints: &[EditorDebugBreakpoint],
 ) -> Vec<(PathBuf, Vec<u64>)> {
@@ -7978,6 +8131,17 @@ fn editor_debug_data_breakpoint_names(data_breakpoints: &[String]) -> Vec<String
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn editor_debug_exception_filter_names(exception_filters: &[String]) -> Vec<String> {
+    exception_filters
+        .iter()
+        .map(|filter| filter.trim())
+        .filter(|filter| matches!(*filter, "orv.diagnostics" | "orv.runtime"))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(str::to_string)
@@ -8049,6 +8213,20 @@ fn editor_debug_set_data_breakpoints_request_json(seq: u64, names: &[String]) ->
                     })
                 })
                 .collect::<Vec<_>>(),
+        },
+    })
+}
+
+fn editor_debug_set_exception_breakpoints_request_json(
+    seq: u64,
+    filters: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "request",
+        "command": "setExceptionBreakpoints",
+        "arguments": {
+            "filters": filters,
         },
     })
 }
@@ -8221,6 +8399,28 @@ fn editor_debug_data_breakpoints_json(
         .collect()
 }
 
+fn editor_debug_exception_filters_json() -> Vec<serde_json::Value> {
+    [
+        ("orv.diagnostics", "ORV diagnostics"),
+        ("orv.runtime", "ORV runtime errors"),
+    ]
+    .into_iter()
+    .map(|(filter, label)| {
+        let filters = vec![filter.to_string()];
+        serde_json::json!({
+            "filter": filter,
+            "label": label,
+            "default": true,
+            "request": editor_debug_set_exception_breakpoints_request_json(0, &filters),
+            "runner_command": editor_debug_exception_filter_runner_command(
+                filter,
+                EditorDebugControl::Continue,
+            ),
+        })
+    })
+    .collect()
+}
+
 fn editor_export_state_json(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -8308,6 +8508,10 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .get("data_breakpoints")
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
+    let exception_filter_count = debug
+        .get("exception_filters")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
     let control_commands = debug
         .get("controls")
         .and_then(serde_json::Value::as_array)
@@ -8327,6 +8531,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
     let breakpoint_commands = editor_native_host_breakpoint_commands_json(debug);
     let function_breakpoint_commands = editor_native_host_function_breakpoint_commands_json(debug);
     let data_breakpoint_commands = editor_native_host_data_breakpoint_commands_json(debug);
+    let exception_filter_commands = editor_native_host_exception_filter_commands_json(debug);
     let trace_enabled = state.get("trace").is_some();
     let production_state = state
         .get("production")
@@ -8356,6 +8561,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "breakpoint_commands": breakpoint_commands,
             "function_breakpoint_commands": function_breakpoint_commands,
             "data_breakpoint_commands": data_breakpoint_commands,
+            "exception_filter_commands": exception_filter_commands,
             "panel_contract": editor_native_host_debug_panel_contract_json(),
             "control_count": controls,
             "breakpoint_argument": runner
@@ -8382,6 +8588,14 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .pointer("/session/data_breakpoint_format")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("<local-name>")),
+            "exception_filter_argument": runner
+                .pointer("/session/exception_filter_argument")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("--exception-filter")),
+            "exception_filter_format": runner
+                .pointer("/session/exception_filter_format")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("<orv.diagnostics|orv.runtime>")),
             "watch_expression_argument": runner
                 .pointer("/session/watch_expression_argument")
                 .cloned()
@@ -8402,6 +8616,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "breakpoint_count": breakpoint_count,
             "function_breakpoint_count": function_breakpoint_count,
             "data_breakpoint_count": data_breakpoint_count,
+            "exception_filter_count": exception_filter_count,
             "reuse_session": runner
                 .pointer("/session/reuse_session")
                 .cloned()
@@ -8607,6 +8822,11 @@ fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
                 "kind": "array",
             },
             {
+                "name": "exception_filter_commands",
+                "path": "debug.exception_filter_commands",
+                "kind": "array",
+            },
+            {
                 "name": "function_breakpoint_argument",
                 "path": "debug.function_breakpoint_argument",
                 "kind": "string",
@@ -8614,6 +8834,11 @@ fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
             {
                 "name": "data_breakpoint_argument",
                 "path": "debug.data_breakpoint_argument",
+                "kind": "string",
+            },
+            {
+                "name": "exception_filter_argument",
+                "path": "debug.exception_filter_argument",
                 "kind": "string",
             },
             {
@@ -8746,6 +8971,40 @@ fn editor_native_host_data_breakpoint_commands_json(
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({})),
                 "command": breakpoint
+                    .get("runner_command")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            })
+        })
+        .collect()
+}
+
+fn editor_native_host_exception_filter_commands_json(
+    debug: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(exception_filters) = debug
+        .get("exception_filters")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    exception_filters
+        .iter()
+        .map(|filter| {
+            serde_json::json!({
+                "filter": filter
+                    .get("filter")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("")),
+                "label": filter
+                    .get("label")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("")),
+                "request": filter
+                    .get("request")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                "command": filter
                     .get("runner_command")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!([])),
@@ -8995,6 +9254,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let debug_breakpoint_count = editor_debug_breakpoint_count_from_state(state);
     let debug_function_breakpoint_count = editor_debug_function_breakpoint_count_from_state(state);
     let debug_data_breakpoint_count = editor_debug_data_breakpoint_count_from_state(state);
+    let debug_exception_filter_count = editor_debug_exception_filter_count_from_state(state);
     let production_db_adapter_count = json_array_count(state.pointer("/production/db_adapters"));
     let production_commerce_adapter_count =
         json_array_count(state.pointer("/production/commerce_adapters"));
@@ -9100,6 +9360,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<section class=\"panel\"><h2>Data Breakpoints</h2><div class=\"metric\">{debug_data_breakpoint_count}</div><p class=\"muted\">Local variables for DAP setDataBreakpoints.</p><ul id=\"debug-data-breakpoint-list\" class=\"list\"></ul></section>"
     )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Exception Filters</h2><div class=\"metric\">{debug_exception_filter_count}</div><p class=\"muted\">DAP exception filter presets.</p><ul id=\"debug-exception-filter-list\" class=\"list\"></ul></section>"
+    )?;
     write_editor_graph_panel_html(&mut html, &graph_panel)?;
     html.push_str("<section class=\"panel\"><h2>Debug Runner</h2><pre id=\"debug-runner-detail\" class=\"detail\"></pre></section>");
     html.push_str("<section class=\"panel\"><h2>Debug Result</h2><pre id=\"debug-result-detail\" class=\"detail\"></pre></section>");
@@ -9144,6 +9408,9 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     );
     html.push_str(
         "<script>\nfunction renderDataBreakpoints(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-data-breakpoint-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  for (const breakpoint of state.debug?.data_breakpoints || []) {\n    const row = document.createElement('li');\n    const source = breakpoint.source || {};\n    const line = source.line ? `:${source.line}` : '';\n    row.textContent = `${breakpoint.name || 'local'}${line}`;\n    row.tabIndex = 0;\n    const show = () => {\n      renderDebugControlCommand({runner_command: breakpoint.runner_command || []});\n      renderDebugDetail({info_request: breakpoint.info_request || {}, request: breakpoint.request || {}, runner_command: breakpoint.runner_command || [], source});\n    };\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n}\nrenderDataBreakpoints();\n</script>\n",
+    );
+    html.push_str(
+        "<script>\nfunction renderExceptionFilters(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-exception-filter-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  for (const filter of state.debug?.exception_filters || []) {\n    const row = document.createElement('li');\n    row.textContent = filter.label || filter.filter || 'exception filter';\n    row.tabIndex = 0;\n    const show = () => {\n      renderDebugControlCommand({runner_command: filter.runner_command || []});\n      renderDebugDetail({request: filter.request || {}, runner_command: filter.runner_command || []});\n    };\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n}\nrenderExceptionFilters();\n</script>\n",
     );
     html.push_str(
         "<script>\nfunction renderDebugCapabilities(){\n  const stateNode = document.getElementById('orv-editor-state');\n  const target = document.getElementById('debug-capability-list');\n  if (!stateNode || !target) return;\n  const state = JSON.parse(stateNode.textContent);\n  target.textContent = '';\n  for (const [name, value] of Object.entries(state.debug?.capabilities || {})) {\n    if (value !== true && !Array.isArray(value)) continue;\n    const row = document.createElement('li');\n    row.textContent = Array.isArray(value) ? `${name} (${value.length})` : name;\n    row.tabIndex = 0;\n    const show = () => renderDebugDetail({name, value});\n    row.addEventListener('click', show);\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') {\n        event.preventDefault();\n        show();\n      }\n    });\n    target.appendChild(row);\n  }\n}\nrenderDebugCapabilities();\n</script>\n</body>\n</html>\n",
@@ -9205,6 +9472,10 @@ fn editor_debug_function_breakpoint_count_from_state(state: &serde_json::Value) 
 
 fn editor_debug_data_breakpoint_count_from_state(state: &serde_json::Value) -> usize {
     json_array_count(state.pointer("/debug/data_breakpoints"))
+}
+
+fn editor_debug_exception_filter_count_from_state(state: &serde_json::Value) -> usize {
+    json_array_count(state.pointer("/debug/exception_filters"))
 }
 
 fn editor_debug_capability_count_from_state(state: &serde_json::Value) -> usize {
@@ -36175,6 +36446,28 @@ entry = "src/main.orv"
     }
 
     #[test]
+    fn editor_debug_subcommand_accepts_exception_filter() {
+        let parsed = Cli::try_parse_from([
+            "orv",
+            "editor",
+            "debug",
+            "fixtures/e2e/hello.orv",
+            "--exception-filter",
+            "orv.runtime",
+        ])
+        .unwrap_or_else(|err| panic!("{}", err.render()));
+        let Command::Editor {
+            command: EditorCommand::Debug {
+                exception_filters, ..
+            },
+        } = parsed.command
+        else {
+            panic!("expected editor debug command");
+        };
+        assert_eq!(exception_filters, vec!["orv.runtime".to_string()]);
+    }
+
+    #[test]
     fn editor_run_debug_subcommand_accepts_exported_state() {
         let parsed = Cli::try_parse_from([
             "orv",
@@ -44233,6 +44526,10 @@ define Auth() -> { @out "auth" }
             "--data-breakpoint"
         );
         assert_eq!(
+            state["debug"]["session_runner"]["session"]["exception_filter_argument"],
+            "--exception-filter"
+        );
+        assert_eq!(
             state["debug"]["session_runner"]["session"]["watch_expression_argument"],
             "--watch-expression"
         );
@@ -44264,6 +44561,18 @@ define Auth() -> { @out "auth" }
                             command.iter().any(|part| part == "--data-breakpoint")
                                 && command.iter().any(|part| part == "total")
                         })
+            }));
+        assert!(state["debug"]["exception_filters"]
+            .as_array()
+            .expect("exception filters")
+            .iter()
+            .any(|filter| {
+                filter["filter"] == "orv.runtime"
+                    && filter["request"]["command"] == "setExceptionBreakpoints"
+                    && filter["runner_command"].as_array().is_some_and(|command| {
+                        command.iter().any(|part| part == "--exception-filter")
+                            && command.iter().any(|part| part == "orv.runtime")
+                    })
             }));
         assert_eq!(
             state["debug"]["session_runner"]["result"]["path"],
@@ -44308,6 +44617,7 @@ define Auth() -> { @out "auth" }
         let run = editor_debug_runner_session_json(
             &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
             &[EditorDebugControl::Next],
+            &[],
             &[],
             &[],
             &[],
@@ -44367,6 +44677,14 @@ define Auth() -> { @out "auth" }
             "<local-name>"
         );
         assert_eq!(
+            native_host["debug"]["exception_filter_argument"],
+            "--exception-filter"
+        );
+        assert_eq!(
+            native_host["debug"]["exception_filter_format"],
+            "<orv.diagnostics|orv.runtime>"
+        );
+        assert_eq!(
             native_host["debug"]["watch_expression_argument"],
             "--watch-expression"
         );
@@ -44410,12 +44728,20 @@ define Auth() -> { @out "auth" }
                 && section["path"] == "debug.data_breakpoint_commands"
         }));
         assert!(debug_sections.iter().any(|section| {
+            section["name"] == "exception_filter_commands"
+                && section["path"] == "debug.exception_filter_commands"
+        }));
+        assert!(debug_sections.iter().any(|section| {
             section["name"] == "function_breakpoint_argument"
                 && section["path"] == "debug.function_breakpoint_argument"
         }));
         assert!(debug_sections.iter().any(|section| {
             section["name"] == "data_breakpoint_argument"
                 && section["path"] == "debug.data_breakpoint_argument"
+        }));
+        assert!(debug_sections.iter().any(|section| {
+            section["name"] == "exception_filter_argument"
+                && section["path"] == "debug.exception_filter_argument"
         }));
         assert!(debug_sections.iter().any(|section| {
             section["name"] == "watch_expression_argument"
@@ -44453,6 +44779,14 @@ define Auth() -> { @out "auth" }
                 .as_array()
                 .expect("native host result panel sections")
                 .iter()
+                .any(|section| section["name"] == "exception_filters"
+                    && section["path"] == "panels.debug.exception_filters")
+        );
+        assert!(
+            native_host["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("native host result panel sections")
+                .iter()
                 .any(|section| section["name"] == "watch_expressions"
                     && section["path"] == "panels.debug.watch_expressions")
         );
@@ -44475,6 +44809,9 @@ define Auth() -> { @out "auth" }
             .as_u64()
             .is_some_and(|count| count > 0));
         assert!(native_host["debug"]["data_breakpoint_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert!(native_host["debug"]["exception_filter_count"]
             .as_u64()
             .is_some_and(|count| count > 0));
         let control_commands = native_host["debug"]["control_commands"]
@@ -44563,6 +44900,17 @@ define Auth() -> { @out "auth" }
                 && breakpoint["command"].as_array().is_some_and(|command| {
                     command.iter().any(|part| part == "--data-breakpoint")
                         && command.iter().any(|part| part == "total")
+                })
+        }));
+        let exception_filter_commands = native_host["debug"]["exception_filter_commands"]
+            .as_array()
+            .expect("native host exception filter commands");
+        assert!(exception_filter_commands.iter().any(|filter| {
+            filter["filter"] == "orv.runtime"
+                && filter["request"]["command"] == "setExceptionBreakpoints"
+                && filter["command"].as_array().is_some_and(|command| {
+                    command.iter().any(|part| part == "--exception-filter")
+                        && command.iter().any(|part| part == "orv.runtime")
                 })
         }));
     }
@@ -44692,6 +45040,7 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("id=\"debug-breakpoint-list\""));
         assert!(html.contains("id=\"debug-function-breakpoint-list\""));
         assert!(html.contains("id=\"debug-data-breakpoint-list\""));
+        assert!(html.contains("id=\"debug-exception-filter-list\""));
         assert!(html.contains("id=\"debug-capability-list\""));
         assert!(html.contains("id=\"debug-runner-detail\""));
         assert!(html.contains("id=\"debug-result-detail\""));
@@ -44703,6 +45052,7 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("renderDebugControlCommand"));
         assert!(html.contains("renderFunctionBreakpoints"));
         assert!(html.contains("renderDataBreakpoints"));
+        assert!(html.contains("renderExceptionFilters"));
     }
 
     fn assert_editor_debug_control(
@@ -44748,7 +45098,7 @@ define Auth() -> { @out "auth" }
         std::fs::write(&path, "let first: int = 1\nlet second: int = 2\n").expect("write source");
 
         let debug =
-            editor_debug_session_json(&path, &[EditorDebugControl::Next], &[], &[], &[], &[])
+            editor_debug_session_json(&path, &[EditorDebugControl::Next], &[], &[], &[], &[], &[])
                 .expect("editor debug session");
 
         assert_eq!(debug["kind"], "orv.editor.debug");
@@ -44783,6 +45133,7 @@ define Auth() -> { @out "auth" }
         let debug = editor_debug_session_json(
             &path,
             &[EditorDebugControl::Next, EditorDebugControl::Next],
+            &[],
             &[],
             &[],
             &[],
@@ -44830,6 +45181,7 @@ define Auth() -> { @out "auth" }
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("editor debug session");
 
@@ -44853,9 +45205,16 @@ define Auth() -> { @out "auth" }
         let path = dir.join("app.orv");
         std::fs::write(&path, "let answer: int = 42\n").expect("write source");
 
-        let debug =
-            editor_debug_session_json(&path, &[EditorDebugControl::Terminate], &[], &[], &[], &[])
-                .expect("editor debug session");
+        let debug = editor_debug_session_json(
+            &path,
+            &[EditorDebugControl::Terminate],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("editor debug session");
 
         assert_eq!(debug["control"]["request"]["command"], "terminate");
         assert_eq!(debug["control"]["response"]["success"], true);
@@ -44889,6 +45248,7 @@ define Auth() -> { @out "auth" }
             &path,
             &[EditorDebugControl::Continue],
             &[breakpoint],
+            &[],
             &[],
             &[],
             &[],
@@ -44930,6 +45290,7 @@ define Auth() -> { @out "auth" }
             &[EditorDebugControl::Continue],
             &[],
             &function_breakpoints,
+            &[],
             &[],
             &[],
         )
@@ -44975,6 +45336,7 @@ define Auth() -> { @out "auth" }
             &[],
             &data_breakpoints,
             &[],
+            &[],
         )
         .expect("editor debug session");
 
@@ -45008,6 +45370,38 @@ define Auth() -> { @out "auth" }
     }
 
     #[test]
+    fn editor_debug_exception_filter_argument_configures_dap_session() {
+        let dir = temp_output_dir("editor-debug-exception-filter");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(&path, "let answer: int = 42\n").expect("write source");
+        let exception_filters = vec!["orv.runtime".to_string()];
+
+        let debug = editor_debug_session_json(
+            &path,
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &exception_filters,
+            &[],
+        )
+        .expect("editor debug session");
+
+        assert_eq!(
+            debug["exception_filters"][0]["request"]["command"],
+            "setExceptionBreakpoints"
+        );
+        assert_eq!(
+            debug["exception_filters"][0]["filters"],
+            serde_json::json!(["orv.runtime"])
+        );
+        assert_eq!(debug["exception_filters"][0]["response"]["success"], true);
+        assert_eq!(debug["control"]["response"]["success"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn editor_run_debug_executes_exported_session_runner() {
         let dir = temp_output_dir("editor-run-debug");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -45023,6 +45417,7 @@ define Auth() -> { @out "auth" }
         let run = editor_debug_runner_session_json(
             &out.join("state.json"),
             &[EditorDebugControl::Next, EditorDebugControl::Next],
+            &[],
             &[],
             &[],
             &[],
@@ -45061,6 +45456,7 @@ define Auth() -> { @out "auth" }
             &out.join("debug").join("session-runner.json"),
             &[EditorDebugControl::Continue],
             &[breakpoint],
+            &[],
             &[],
             &[],
             &[],
@@ -45107,6 +45503,7 @@ define Auth() -> { @out "auth" }
             &[],
             &[],
             &data_breakpoints,
+            &[],
             &[],
         )
         .expect("run exported debug runner");
@@ -45159,6 +45556,7 @@ define Auth() -> { @out "auth" }
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("run exported debug runner");
 
@@ -45183,6 +45581,7 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("Requested Breakpoints"));
         assert!(result_html.contains("Function Breakpoints"));
         assert!(result_html.contains("Data Breakpoints"));
+        assert!(result_html.contains("Exception Filters"));
         assert!(result_html.contains("Watch Expressions"));
         assert!(result_html.contains("Stopped Events"));
         assert!(result_html.contains("All Events"));
@@ -45211,6 +45610,7 @@ define Auth() -> { @out "auth" }
             &[],
             &[],
             &[],
+            &[],
             &watch_expressions,
         )
         .expect("run exported debug runner");
@@ -45222,6 +45622,7 @@ define Auth() -> { @out "auth" }
         assert_eq!(result["panels"]["debug"]["breakpoint_count"], 0);
         assert_eq!(result["panels"]["debug"]["function_breakpoint_count"], 0);
         assert_eq!(result["panels"]["debug"]["data_breakpoint_count"], 0);
+        assert_eq!(result["panels"]["debug"]["exception_filter_count"], 0);
         assert_eq!(result["panels"]["debug"]["watch_expression_count"], 2);
         let panel_controls = result["panels"]["debug"]["controls"]
             .as_array()
@@ -45279,6 +45680,14 @@ define Auth() -> { @out "auth" }
             .expect("panel sections")
             .iter()
             .any(|section| {
+                section["name"] == "exception_filters"
+                    && section["path"] == "panels.debug.exception_filters"
+            }));
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
                 section["name"] == "watch_expressions"
                     && section["path"] == "panels.debug.watch_expressions"
             }));
@@ -45304,6 +45713,10 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             result["panels"]["debug"]["session_summary"]["data_breakpoint_count"],
+            0
+        );
+        assert_eq!(
+            result["panels"]["debug"]["session_summary"]["exception_filter_count"],
             0
         );
         assert_eq!(
