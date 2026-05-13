@@ -52,6 +52,7 @@ type ArchiveHttpHeaders = Vec<(String, String)>;
 const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
 const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_DEBUG_SESSION_RESULT_HTML_PATH: &str = "debug/session-result.html";
+const EDITOR_RUNTIME_PANEL_HTML_PATH: &str = "runtime/panel.html";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 const EDITOR_TRACE_PANEL_HTML_PATH: &str = "trace/panel.html";
@@ -1627,6 +1628,7 @@ fn cmd_editor_export_with_options(
         &editor_native_host_manifest_json(&entry, &state),
     )?;
     write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
+    let runtime_panel_written = write_editor_runtime_panel_html_if_configured(out, &state)?;
     let trace_panel_written = write_editor_trace_panel_html_if_configured(out, &state)?;
     let mut files = vec![
         "index.html",
@@ -1634,6 +1636,9 @@ fn cmd_editor_export_with_options(
         EDITOR_DEBUG_SESSION_RUNNER_PATH,
         EDITOR_NATIVE_HOST_MANIFEST_PATH,
     ];
+    if runtime_panel_written {
+        files.push(EDITOR_RUNTIME_PANEL_HTML_PATH);
+    }
     if trace_panel_written {
         files.push(EDITOR_TRACE_PANEL_HTML_PATH);
     }
@@ -8556,6 +8561,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
         "debug_session_result": EDITOR_DEBUG_SESSION_RESULT_PATH,
         "debug_session_result_html": EDITOR_DEBUG_SESSION_RESULT_HTML_PATH,
+        "runtime_panel_html": EDITOR_RUNTIME_PANEL_HTML_PATH,
     });
     if trace_enabled {
         artifacts
@@ -8774,6 +8780,19 @@ fn editor_native_host_runtime_json(state: &serde_json::Value) -> serde_json::Val
         "frame_count": frames.len(),
         "frames": frames,
         "panel": panel,
+        "panel_html_path": EDITOR_RUNTIME_PANEL_HTML_PATH,
+        "panel_artifact": editor_runtime_panel_artifact_json(),
+        "panel_contract": editor_native_host_runtime_panel_contract_json(),
+    })
+}
+
+fn editor_runtime_panel_artifact_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.runtime.panel",
+        "path": EDITOR_RUNTIME_PANEL_HTML_PATH,
+        "media_type": "text/html",
+        "source": "native-host.runtime",
         "panel_contract": editor_native_host_runtime_panel_contract_json(),
     })
 }
@@ -8796,6 +8815,11 @@ fn editor_native_host_runtime_panel_contract_json() -> serde_json::Value {
             {
                 "name": "async",
                 "path": "runtime.async",
+                "kind": "object",
+            },
+            {
+                "name": "panel_artifact",
+                "path": "runtime.panel_artifact",
                 "kind": "object",
             },
         ],
@@ -9232,6 +9256,75 @@ fn editor_trace_frame_reveal_command_json(
         return serde_json::Value::Null;
     }
     serde_json::json!(["orv", "editor", "reveal", build_dir, origin_id])
+}
+
+fn write_editor_runtime_panel_html_if_configured(
+    out: &Path,
+    state: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    if state.get("runtime").is_none() {
+        return Ok(false);
+    }
+    let runtime = editor_native_host_runtime_json(state);
+    let html = editor_runtime_panel_html(&runtime)?;
+    write_text(&out.join(EDITOR_RUNTIME_PANEL_HTML_PATH), &html)?;
+    Ok(true)
+}
+
+fn editor_runtime_panel_html(runtime: &serde_json::Value) -> anyhow::Result<String> {
+    let status = html_escape_text(
+        runtime
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    let stdout = html_escape_text(
+        runtime
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
+    let error = html_escape_text(
+        runtime
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
+    let frame_count = json_usize_field(runtime, "frame_count");
+    let async_json = html_escape_text(&serde_json::to_string_pretty(
+        runtime.get("async").unwrap_or(&serde_json::Value::Null),
+    )?);
+    let panel_json = html_escape_text(&serde_json::to_string_pretty(
+        runtime.get("panel").unwrap_or(&serde_json::Value::Null),
+    )?);
+    let panel_contract_json = html_escape_text(&serde_json::to_string_pretty(
+        runtime
+            .get("panel_contract")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
+    let runtime_json = html_script_json(&serde_json::to_string_pretty(runtime)?);
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>orv Runtime Panel</title>\n<style>\n:root{color-scheme:light dark;--bg:#f8f7f3;--fg:#151713;--muted:#697067;--panel:#fff;--line:#d8d9d2;--accent:#375f94;--accent-weak:#dde8f5;--bad:#a43737;}\n@media (prefers-color-scheme: dark){:root{--bg:#11130f;--fg:#eef0ea;--muted:#a8aea2;--panel:#191c17;--line:#30362d;--accent:#8ab8f0;--accent-weak:#1e314a;--bad:#ff9d9d;}}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;}header{padding:24px 28px 12px;border-bottom:1px solid var(--line);}h1{font-size:24px;margin:0 0 12px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}.summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--panel)}.metric b{display:block;font-size:22px;line-height:1.1}.ok{color:var(--accent)}.err{color:var(--bad)}main{display:grid;grid-template-columns:minmax(280px,380px) minmax(0,1fr);gap:16px;padding:16px 28px 28px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.list{list-style:none;margin:0;padding:0;display:grid;gap:8px}.list li{border:1px solid var(--line);border-radius:6px;padding:10px;cursor:pointer;background:var(--bg)}.list li:focus,.list li:hover{outline:2px solid var(--accent);outline-offset:1px}pre{margin:0;white-space:pre-wrap;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wide{grid-column:1/-1}@media (max-width:900px){main,.summary,.detail-grid{grid-template-columns:1fr}main{padding:14px}header{padding:18px 14px 8px}}\n</style>\n</head>\n<body>\n",
+    );
+    writeln!(
+        &mut html,
+        "<header><h1>Runtime Panel</h1><section class=\"summary\"><div class=\"metric\"><span>Status</span><b class=\"{}\">{status}</b></div><div class=\"metric\"><span>Frames</span><b>{frame_count}</b></div></section></header>",
+        if status == "ok" { "ok" } else { "err" }
+    )?;
+    html.push_str("<main><section class=\"panel\"><h2>Frames</h2><ul id=\"runtime-frame-list\" class=\"list\"></ul></section><section class=\"panel\"><h2>Selected Frame</h2><pre id=\"runtime-frame-detail\">No runtime frame selected.</pre></section><section class=\"detail-grid\">\n");
+    writeln!(
+        &mut html,
+        "<section class=\"panel\"><h2>Stdout</h2><pre>{stdout}</pre></section><section class=\"panel\"><h2>Error</h2><pre>{error}</pre></section><section class=\"panel\"><h2>Async Runtime</h2><pre>{async_json}</pre></section><section class=\"panel\"><h2>Runtime Panel</h2><pre>{panel_json}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract_json}</pre></section></section></main>"
+    )?;
+    writeln!(
+        &mut html,
+        "<script id=\"orv-runtime\" type=\"application/json\">{runtime_json}</script>"
+    )?;
+    html.push_str(
+        "<script>\nconst runtime = JSON.parse(document.getElementById('orv-runtime').textContent);\nconst frames = Array.isArray(runtime.frames) ? runtime.frames : [];\nconst list = document.getElementById('runtime-frame-list');\nconst detail = document.getElementById('runtime-frame-detail');\nfunction frameLabel(frame){\n  const source = frame?.source || {};\n  const label = source.name || source.path || 'frame';\n  const line = frame?.line ? `:${frame.line}` : '';\n  return `#${(frame?.index ?? 0) + 1} ${label}${line}`;\n}\nfunction renderDetail(frame){\n  if (!frame) { detail.textContent = 'No runtime frame selected.'; return; }\n  const source = frame.source || {};\n  const locals = (frame.locals || []).map(local => `  ${local.name}: ${local.value}${local.type ? ` (${local.type})` : ''}`);\n  const stack = (frame.stack || []).map(call => `  ${call.name || 'frame'} ${call.source?.name || call.source?.path || ''}:${call.line || ''}`.trim());\n  const lines = [\n    frameLabel(frame),\n    source.path ? `source ${source.path}${frame.line ? `:${frame.line}` : ''}` : '',\n    frame.output ? `output ${String(frame.output).trimEnd()}` : '',\n    locals.length ? `locals\\n${locals.join('\\n')}` : '',\n    stack.length ? `stack\\n${stack.join('\\n')}` : ''\n  ].filter(Boolean);\n  detail.textContent = lines.join('\\n');\n}\nfor (const frame of frames) {\n  const row = document.createElement('li');\n  row.textContent = frameLabel(frame);\n  row.tabIndex = 0;\n  row.addEventListener('click', () => renderDetail(frame));\n  row.addEventListener('keydown', event => {\n    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); renderDetail(frame); }\n  });\n  list.appendChild(row);\n}\nrenderDetail(frames[0]);\n</script>\n</body>\n</html>\n",
+    );
+    Ok(html)
 }
 
 fn write_editor_trace_panel_html_if_configured(
@@ -44530,6 +44623,8 @@ define Auth() -> { @out "auth" }
         cmd_editor_export(&path, &out).expect("editor export");
 
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let runtime_panel = std::fs::read_to_string(out.join(EDITOR_RUNTIME_PANEL_HTML_PATH))
+            .expect("runtime panel");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
         let native_host =
             read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
@@ -44552,6 +44647,24 @@ define Auth() -> { @out "auth" }
         assert!(native_host["runtime"]["frame_count"]
             .as_u64()
             .is_some_and(|count| count > 0));
+        assert!(runtime_panel.contains("Runtime Panel"));
+        assert!(runtime_panel.contains("editor-export-ready"));
+        assert_eq!(
+            native_host["artifacts"]["runtime_panel_html"],
+            EDITOR_RUNTIME_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["runtime"]["panel_html_path"],
+            EDITOR_RUNTIME_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["runtime"]["panel_artifact"]["path"],
+            EDITOR_RUNTIME_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["runtime"]["panel_artifact"]["kind"],
+            "orv.editor.runtime.panel"
+        );
         assert_eq!(native_host["runtime"]["panel_contract"]["root"], "runtime");
         let runtime_sections = native_host["runtime"]["panel_contract"]["sections"]
             .as_array()
@@ -44562,6 +44675,10 @@ define Auth() -> { @out "auth" }
         assert!(runtime_sections
             .iter()
             .any(|section| section["name"] == "frames" && section["path"] == "runtime.frames"));
+        assert!(runtime_sections
+            .iter()
+            .any(|section| section["name"] == "panel_artifact"
+                && section["path"] == "runtime.panel_artifact"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
