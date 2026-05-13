@@ -53,6 +53,7 @@ const EDITOR_DEBUG_SESSION_RUNNER_PATH: &str = "debug/session-runner.json";
 const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_DEBUG_SESSION_RESULT_HTML_PATH: &str = "debug/session-result.html";
 const EDITOR_RUNTIME_PANEL_HTML_PATH: &str = "runtime/panel.html";
+const EDITOR_PRODUCTION_PANEL_HTML_PATH: &str = "production/panel.html";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
 const EDITOR_TRACE_PANEL_HTML_PATH: &str = "trace/panel.html";
@@ -1629,6 +1630,7 @@ fn cmd_editor_export_with_options(
     )?;
     write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
     let runtime_panel_written = write_editor_runtime_panel_html_if_configured(out, &state)?;
+    let production_panel_written = write_editor_production_panel_html_if_configured(out, &state)?;
     let trace_panel_written = write_editor_trace_panel_html_if_configured(out, &state)?;
     let mut files = vec![
         "index.html",
@@ -1638,6 +1640,9 @@ fn cmd_editor_export_with_options(
     ];
     if runtime_panel_written {
         files.push(EDITOR_RUNTIME_PANEL_HTML_PATH);
+    }
+    if production_panel_written {
+        files.push(EDITOR_PRODUCTION_PANEL_HTML_PATH);
     }
     if trace_panel_written {
         files.push(EDITOR_TRACE_PANEL_HTML_PATH);
@@ -8549,6 +8554,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
     let data_breakpoint_commands = editor_native_host_data_breakpoint_commands_json(debug);
     let exception_filter_commands = editor_native_host_exception_filter_commands_json(debug);
     let trace_enabled = state.get("trace").is_some();
+    let production_enabled = state.get("production").is_some();
     let production_state = state
         .get("production")
         .cloned()
@@ -8570,6 +8576,15 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             .insert(
                 "trace_panel_html".to_string(),
                 serde_json::json!(EDITOR_TRACE_PANEL_HTML_PATH),
+            );
+    }
+    if production_enabled {
+        artifacts
+            .as_object_mut()
+            .expect("native host artifacts is object")
+            .insert(
+                "production_panel_html".to_string(),
+                serde_json::json!(EDITOR_PRODUCTION_PANEL_HTML_PATH),
             );
     }
     serde_json::json!({
@@ -8674,7 +8689,26 @@ fn editor_native_host_production_json(production: &serde_json::Value) -> serde_j
         "panel_contract".to_string(),
         editor_native_host_production_panel_contract_json(),
     );
+    object.insert(
+        "panel_html_path".to_string(),
+        serde_json::json!(EDITOR_PRODUCTION_PANEL_HTML_PATH),
+    );
+    object.insert(
+        "panel_artifact".to_string(),
+        editor_production_panel_artifact_json(),
+    );
     serde_json::Value::Object(object)
+}
+
+fn editor_production_panel_artifact_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.production.panel",
+        "path": EDITOR_PRODUCTION_PANEL_HTML_PATH,
+        "media_type": "text/html",
+        "source": "native-host.production",
+        "panel_contract": editor_native_host_production_panel_contract_json(),
+    })
 }
 
 fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
@@ -8696,6 +8730,11 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
                 "name": "commerce_adapters",
                 "path": "production.commerce_adapters",
                 "kind": "array",
+            },
+            {
+                "name": "panel_artifact",
+                "path": "production.panel_artifact",
+                "kind": "object",
             },
         ],
     })
@@ -8742,6 +8781,71 @@ fn production_missing_artifact_count(targets: &[serde_json::Value]) -> usize {
         .iter()
         .filter(|target| target.get("exists").and_then(serde_json::Value::as_bool) == Some(false))
         .count()
+}
+
+fn write_editor_production_panel_html_if_configured(
+    out: &Path,
+    state: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let Some(production) = state.get("production") else {
+        return Ok(false);
+    };
+    let production = editor_native_host_production_json(production);
+    let html = editor_production_panel_html(&production)?;
+    write_text(&out.join(EDITOR_PRODUCTION_PANEL_HTML_PATH), &html)?;
+    Ok(true)
+}
+
+fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Result<String> {
+    let summary = production
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let build_dir = html_escape_text(
+        production
+            .get("build_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
+    let db_target_count = json_usize_field(&summary, "db_target_count");
+    let commerce_target_count = json_usize_field(&summary, "commerce_target_count");
+    let adapter_count = json_usize_field(&summary, "adapter_count");
+    let missing_artifact_count = json_usize_field(&summary, "missing_artifact_count");
+    let db_adapters = html_escape_text(&serde_json::to_string_pretty(
+        production
+            .get("db_adapters")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
+    let commerce_adapters = html_escape_text(&serde_json::to_string_pretty(
+        production
+            .get("commerce_adapters")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
+    let panel_contract = html_escape_text(&serde_json::to_string_pretty(
+        production
+            .get("panel_contract")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
+    let production_json = html_script_json(&serde_json::to_string_pretty(production)?);
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>orv Production Panel</title>\n<style>\n:root{color-scheme:light dark;--bg:#f7f6f2;--fg:#151713;--muted:#6b7067;--panel:#fff;--line:#d8d9d2;--accent:#67610f;--bad:#a43737;}\n@media (prefers-color-scheme: dark){:root{--bg:#11130f;--fg:#eef0ea;--muted:#a8aea2;--panel:#191c17;--line:#30362d;--accent:#d8cc65;--bad:#ff9d9d;}}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;}header{padding:24px 28px 12px;border-bottom:1px solid var(--line);}h1{font-size:24px;margin:0 0 8px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}.muted{color:var(--muted)}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--panel)}.metric b{display:block;font-size:22px;line-height:1.1}.metric .bad{color:var(--bad)}main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 28px 28px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.wide{grid-column:1/-1}pre{margin:0;white-space:pre-wrap;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}@media (max-width:900px){main,.summary{grid-template-columns:1fr}main{padding:14px}header{padding:18px 14px 8px}}\n</style>\n</head>\n<body>\n",
+    );
+    writeln!(
+        &mut html,
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        if missing_artifact_count == 0 { "" } else { "bad" }
+    )?;
+    writeln!(
+        &mut html,
+        "<main><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
+    )?;
+    writeln!(
+        &mut html,
+        "<script id=\"orv-production\" type=\"application/json\">{production_json}</script>"
+    )?;
+    html.push_str("</body>\n</html>\n");
+    Ok(html)
 }
 
 fn editor_native_host_runtime_json(state: &serde_json::Value) -> serde_json::Value {
@@ -46462,11 +46566,44 @@ define Auth() -> { @out "auth" }
             .iter()
             .any(|section| section["name"] == "commerce_adapters"
                 && section["path"] == "production.commerce_adapters"));
+        assert!(production_sections
+            .iter()
+            .any(|section| section["name"] == "panel_artifact"
+                && section["path"] == "production.panel_artifact"));
+        assert_eq!(
+            native_host["production"]["panel_html_path"],
+            EDITOR_PRODUCTION_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["production"]["panel_artifact"]["path"],
+            EDITOR_PRODUCTION_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["production"]["panel_artifact"]["kind"],
+            "orv.editor.production.panel"
+        );
         assert_eq!(native_host["capabilities"]["production_adapters"], true);
         assert!(html.contains("Production"));
         assert!(html.contains("DB Adapters"));
         assert!(html.contains("Commerce Adapters"));
         assert!(html.contains("deploy/db-adapters.json"));
+        let editor_out = dir.join("editor");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&out), None)
+            .expect("editor export with production panel");
+        let export_native_host =
+            read_json_value(&editor_out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH))
+                .expect("native host");
+        let production_panel =
+            std::fs::read_to_string(editor_out.join(EDITOR_PRODUCTION_PANEL_HTML_PATH))
+                .expect("production panel");
+        assert_eq!(
+            export_native_host["artifacts"]["production_panel_html"],
+            EDITOR_PRODUCTION_PANEL_HTML_PATH
+        );
+        assert!(production_panel.contains("Production Panel"));
+        assert!(production_panel.contains("DB Adapters"));
+        assert!(production_panel.contains("Commerce Adapters"));
+        assert!(production_panel.contains("deploy/db-adapters.json"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
