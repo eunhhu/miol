@@ -22158,24 +22158,17 @@ fn client_reactive_plan_json(entry: &Path, binding: &ClientSourceBinding<'_>) ->
         "runtime_features": ["client_wasm"],
         "signals": signals,
         "bindings": bindings,
-        "blocked_by": ["reactive-dom-diff", "dynamic-client-codegen"],
+        "blocked_by": ["reactive-dom-diff"],
         "blockers": client_reactive_plan_blockers_json(),
     })
 }
 
 fn client_reactive_plan_blockers_json() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "id": "reactive-dom-diff",
-            "artifact": CLIENT_REACTIVE_PLAN_PATH,
-            "reason": "full DOM diff codegen is not emitted yet",
-        }),
-        serde_json::json!({
-            "id": "dynamic-client-codegen",
-            "artifact": CLIENT_JS_PATH,
-            "reason": "generated loader still uses the checked reactive plan bootstrap",
-        }),
-    ]
+    vec![serde_json::json!({
+        "id": "reactive-dom-diff",
+        "artifact": CLIENT_REACTIVE_PLAN_PATH,
+        "reason": "full DOM diff codegen is not emitted yet",
+    })]
 }
 
 fn client_reactive_plan_signals(binding: &ClientSourceBinding<'_>) -> Vec<serde_json::Value> {
@@ -41951,6 +41944,11 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("blocked_by")
             .iter()
             .any(|item| item == "reactive-dom-diff"));
+        assert!(!reactive_plan["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "dynamic-client-codegen"));
         assert!(reactive_plan["blockers"]
             .as_array()
             .expect("blockers")
