@@ -1977,6 +1977,10 @@ fn native_int_operation_is_direct(
             Some(kind),
             Some(name),
         ) => native_captured_int_operand_is_direct(kind, name, route_params),
+        (Some("add_scaled" | "sub_scaled"), Some(operand), Some(kind), Some(name)) => {
+            operand.parse::<i64>().is_ok()
+                && native_captured_int_operand_is_direct(kind, name, route_params)
+        }
         _ => false,
     }
 }
@@ -2008,6 +2012,10 @@ fn native_float_operation_is_direct(
             Some(kind),
             Some(name),
         ) => native_captured_float_operand_is_direct(kind, name, route_params),
+        (Some("add_scaled" | "sub_scaled"), Some(operand), Some(kind), Some(name)) => {
+            operand.parse::<f64>().ok().is_some_and(f64::is_finite)
+                && native_captured_float_operand_is_direct(kind, name, route_params)
+        }
         _ => false,
     }
 }
@@ -3482,6 +3490,40 @@ fn push_native_float_success_arm(
             source.push_str("                },\n            },\n");
             true
         }
+        (
+            Some(op @ ("add_scaled" | "sub_scaled")),
+            Some(scale_json),
+            Some(
+                operand_kind @ ("route_param_float"
+                | "query_param_float"
+                | "request_body_field_float"),
+            ),
+            Some(operand_name),
+        ) => {
+            let Some(scale) = static_float_operand_value(scale_json) else {
+                return false;
+            };
+            let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name)
+            else {
+                return false;
+            };
+            let operator = if op == "add_scaled" { "+" } else { "-" };
+            let _ = writeln!(
+                source,
+                "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+            );
+            let _ = writeln!(
+                source,
+                "                Ok(operand) if operand.is_finite() => {{\n                    let operand = operand * {scale};\n                    let value = value {operator} operand;"
+            );
+            push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
+            source.push_str("                },\n                _ => {\n");
+            let error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
+            true
+        }
         _ => false,
     }
 }
@@ -3739,6 +3781,55 @@ fn push_native_int_success_arm(
                 source.push_str("                },\n");
             }
             source.push_str("                Err(_) => {\n");
+            let error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                },\n            },\n");
+            true
+        }
+        (
+            Some(op @ ("add_scaled" | "sub_scaled")),
+            Some(scale_json),
+            Some(operand_kind @ ("route_param_int" | "query_param_int" | "request_body_field_int")),
+            Some(operand_name),
+        ) => {
+            let Some(scale) = scale_json.parse::<i64>().ok() else {
+                return false;
+            };
+            let Some(operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name)
+            else {
+                return false;
+            };
+            let method = if op == "add_scaled" {
+                "checked_add"
+            } else {
+                "checked_sub"
+            };
+            let _ = writeln!(
+                source,
+                "            Ok(value) => match {operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+            );
+            let _ = writeln!(
+                source,
+                "                Ok(operand) => match operand.checked_mul({scale}) {{"
+            );
+            let _ = writeln!(
+                source,
+                "                    Some(operand) => match value.{method}(operand) {{"
+            );
+            source.push_str(
+                "                        Some(value) => body.push_str(&value.to_string()),\n                        None => {\n",
+            );
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str("                        },\n                    },\n                    None => {\n");
+            let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+            let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+            push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+            source.push_str(
+                "                    },\n                },\n                Err(_) => {\n",
+            );
             let error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
             let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
             push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
@@ -5193,6 +5284,22 @@ fn captured_numeric_response_operation(
             value.operand_json = Some(operand.to_string());
             return Some(value);
         }
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            if let Some(operand) = captured_scaled_integer_operand(rhs) {
+                value.op = Some(
+                    match op {
+                        BinaryOp::Add => "add_scaled",
+                        BinaryOp::Sub => "sub_scaled",
+                        _ => return None,
+                    }
+                    .to_string(),
+                );
+                value.operand_json = Some(operand.scale.to_string());
+                value.operand_kind = Some(operand.value_kind);
+                value.operand_name = Some(operand.name);
+                return Some(value);
+            }
+        }
         let operand = captured_integer_operand(rhs)?;
         value.operand_kind = Some(operand.value_kind);
         value.operand_name = Some(operand.name);
@@ -5202,6 +5309,22 @@ fn captured_numeric_response_operation(
         if let Some(operand) = static_float(rhs) {
             value.operand_json = Some(operand);
             return Some(value);
+        }
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            if let Some(operand) = captured_scaled_float_operand(rhs) {
+                value.op = Some(
+                    match op {
+                        BinaryOp::Add => "add_scaled",
+                        BinaryOp::Sub => "sub_scaled",
+                        _ => return None,
+                    }
+                    .to_string(),
+                );
+                value.operand_json = Some(operand.scale);
+                value.operand_kind = Some(operand.value_kind);
+                value.operand_name = Some(operand.name);
+                return Some(value);
+            }
         }
         let operand = captured_float_operand(rhs)?;
         value.operand_kind = Some(operand.value_kind);
@@ -5645,9 +5768,21 @@ struct CapturedIntegerOperand {
     name: String,
 }
 
+struct CapturedScaledIntegerOperand {
+    value_kind: String,
+    name: String,
+    scale: i64,
+}
+
 struct CapturedFloatOperand {
     value_kind: String,
     name: String,
+}
+
+struct CapturedScaledFloatOperand {
+    value_kind: String,
+    name: String,
+    scale: String,
 }
 
 struct CapturedBoolOperand {
@@ -5699,6 +5834,35 @@ fn captured_integer_operand(expr: &HirExpr) -> Option<CapturedIntegerOperand> {
     None
 }
 
+fn captured_scaled_integer_operand(expr: &HirExpr) -> Option<CapturedScaledIntegerOperand> {
+    match &expr.kind {
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            if let (Some(operand), Some(scale)) =
+                (captured_integer_operand(lhs), static_integer(rhs))
+            {
+                return Some(CapturedScaledIntegerOperand {
+                    value_kind: operand.value_kind,
+                    name: operand.name,
+                    scale,
+                });
+            }
+            let scale = static_integer(lhs)?;
+            let operand = captured_integer_operand(rhs)?;
+            Some(CapturedScaledIntegerOperand {
+                value_kind: operand.value_kind,
+                name: operand.name,
+                scale,
+            })
+        }
+        HirExprKind::Paren(expr) => captured_scaled_integer_operand(expr),
+        _ => None,
+    }
+}
+
 fn captured_float_operand(expr: &HirExpr) -> Option<CapturedFloatOperand> {
     if let Some(name) = captured_route_param_float_name(expr) {
         return Some(CapturedFloatOperand {
@@ -5719,6 +5883,33 @@ fn captured_float_operand(expr: &HirExpr) -> Option<CapturedFloatOperand> {
         });
     }
     None
+}
+
+fn captured_scaled_float_operand(expr: &HirExpr) -> Option<CapturedScaledFloatOperand> {
+    match &expr.kind {
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            if let (Some(operand), Some(scale)) = (captured_float_operand(lhs), static_float(rhs)) {
+                return Some(CapturedScaledFloatOperand {
+                    value_kind: operand.value_kind,
+                    name: operand.name,
+                    scale,
+                });
+            }
+            let scale = static_float(lhs)?;
+            let operand = captured_float_operand(rhs)?;
+            Some(CapturedScaledFloatOperand {
+                value_kind: operand.value_kind,
+                name: operand.name,
+                scale,
+            })
+        }
+        HirExprKind::Paren(expr) => captured_scaled_float_operand(expr),
+        _ => None,
+    }
 }
 
 fn captured_bool_operand(expr: &HirExpr) -> Option<CapturedBoolOperand> {
@@ -9082,7 +9273,7 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
-    fn native_server_launcher_falls_back_for_dynamic_multi_response_routes() {
+    fn native_server_launcher_lowers_nested_scaled_int_multi_response_route() {
         let src = r#"@server {
   @listen 8080
   @route POST /orders {
@@ -9097,6 +9288,8 @@ function greet(name: string): string -> "hi {name}""#,
         let manifest = build_manifest("server.orv", &map);
         let artifact =
             server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[1];
+        let handlers = native_server_handlers_source(&artifact);
         let launcher = native_server_launcher_source(
             "server/app.orv-runtime.json",
             "server/native-server.json",
@@ -9104,9 +9297,35 @@ function greet(name: string): string -> "hi {name}""#,
         );
 
         assert_eq!(artifact.routes[0].responses.len(), 2);
-        assert!(launcher.contains("fn orv_native_reference_bridge("));
-        assert!(launcher.contains(r#"std::process::Command::new("orv")"#));
-        assert!(!launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "quantity");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_scaled")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("bonus")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("operand.checked_mul(2)"));
+        assert!(handlers.contains("value.checked_add(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains("fn orv_native_reference_bridge("));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
     }
 
     #[test]
@@ -12176,7 +12395,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * 2) }
+    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * (@body.scale as int)) }
   }
 }";
         let program = lower(src);

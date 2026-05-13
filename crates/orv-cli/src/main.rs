@@ -36781,6 +36781,12 @@ entry = "src/main.orv"
     }
     @respond 201 { sku: @body.sku }
   }
+  @route POST /orders-bonus {
+    if @body.sku == "" {
+      @respond 400 { err: "missing_sku" }
+    }
+    @respond 201 { quantity: (@body.quantity as int) + ((@body.bonus as int) * 2) }
+  }
   @route POST /members {
     if @body.password != @body.confirm {
       @respond 400 { err: "password_mismatch" }
@@ -36918,6 +36924,12 @@ entry = "src/main.orv"
 
         let missing = send_raw_http_json_post(address, "/orders", r#"{"sku":""}"#);
         let created = send_raw_http_json_post(address, "/orders", r#"{"sku":"sku-7"}"#);
+        let missing_bonus = send_raw_http_json_post(address, "/orders-bonus", r#"{"sku":""}"#);
+        let created_bonus = send_raw_http_json_post(
+            address,
+            "/orders-bonus",
+            r#"{"sku":"sku-7","quantity":"7","bonus":"2"}"#,
+        );
         let mismatch = send_raw_http_json_post(
             address,
             "/members",
@@ -37004,6 +37016,10 @@ entry = "src/main.orv"
         assert!(missing.contains(r#"{"err":"missing_sku"}"#));
         assert!(created.starts_with("HTTP/1.1 201"));
         assert!(created.contains(r#"{"sku":"sku-7"}"#));
+        assert!(missing_bonus.starts_with("HTTP/1.1 400"));
+        assert!(missing_bonus.contains(r#"{"err":"missing_sku"}"#));
+        assert!(created_bonus.starts_with("HTTP/1.1 201"));
+        assert!(created_bonus.contains(r#"{"quantity":11}"#));
         assert!(mismatch.starts_with("HTTP/1.1 400"));
         assert!(mismatch.contains(r#"{"err":"password_mismatch"}"#));
         assert!(member.starts_with("HTTP/1.1 201"));
@@ -37526,7 +37542,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * 2) }
+    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * (@body.scale as int)) }
   }
 }
 ",
