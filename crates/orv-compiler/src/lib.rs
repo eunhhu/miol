@@ -2085,6 +2085,24 @@ fn native_int_operation_is_direct(
             operand.parse::<i64>().is_ok()
                 && native_captured_int_operand_is_direct(kind, name, route_params)
         }
+        (
+            Some(
+                "add_product_static"
+                | "sub_product_static"
+                | "rsub_product_static"
+                | "mul_product_static"
+                | "div_product_static"
+                | "rdiv_product_static"
+                | "rem_product_static"
+                | "rrem_product_static",
+            ),
+            Some(operand),
+            Some(kind),
+            Some(name),
+        ) => {
+            operand.parse::<i64>().is_ok()
+                && native_captured_int_operand_is_direct(kind, name, route_params)
+        }
         _ => false,
     }
 }
@@ -2152,6 +2170,24 @@ fn native_float_operation_is_direct(
                 "add_scaled" | "sub_scaled" | "rsub_scaled" | "mul_scaled" | "div_scaled"
                 | "rdiv_scaled" | "rem_scaled" | "rrem_scaled" | "eq_scaled" | "ne_scaled"
                 | "lt_scaled" | "le_scaled" | "gt_scaled" | "ge_scaled",
+            ),
+            Some(operand),
+            Some(kind),
+            Some(name),
+        ) => {
+            operand.parse::<f64>().ok().is_some_and(f64::is_finite)
+                && native_captured_float_operand_is_direct(kind, name, route_params)
+        }
+        (
+            Some(
+                "add_product_static"
+                | "sub_product_static"
+                | "rsub_product_static"
+                | "mul_product_static"
+                | "div_product_static"
+                | "rdiv_product_static"
+                | "rem_product_static"
+                | "rrem_product_static",
             ),
             Some(operand),
             Some(kind),
@@ -3581,6 +3617,26 @@ fn push_native_float_success_arm(
     if matches!(
         op,
         Some(
+            "add_product_static"
+                | "sub_product_static"
+                | "rsub_product_static"
+                | "mul_product_static"
+                | "div_product_static"
+                | "rdiv_product_static"
+                | "rem_product_static"
+                | "rrem_product_static"
+        )
+    ) {
+        return push_native_float_product_static_arithmetic_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
+    if matches!(
+        op,
+        Some(
             "add_product"
                 | "sub_product"
                 | "rsub_product"
@@ -3852,6 +3908,91 @@ fn push_native_float_product_arithmetic_success_arm(
     true
 }
 
+fn push_native_float_product_static_arithmetic_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    } = operation;
+    let (
+        Some(
+            op @ ("add_product_static"
+            | "sub_product_static"
+            | "rsub_product_static"
+            | "mul_product_static"
+            | "div_product_static"
+            | "rdiv_product_static"
+            | "rem_product_static"
+            | "rrem_product_static"),
+        ),
+        Some(operand_json),
+        Some(operand_kind),
+        Some(operand_name),
+        None,
+        None,
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(static_operand) = static_float_operand_value(operand_json) else {
+        return false;
+    };
+    let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let value_expr = match op {
+        "add_product_static" => format!("product + {static_operand}"),
+        "sub_product_static" => format!("product - {static_operand}"),
+        "rsub_product_static" => format!("{static_operand} - product"),
+        "mul_product_static" => format!("product * {static_operand}"),
+        "div_product_static" => format!("product / {static_operand}"),
+        "rdiv_product_static" => format!("{static_operand} / product"),
+        "rem_product_static" => format!("product % {static_operand}"),
+        "rrem_product_static" => format!("{static_operand} % product"),
+        _ => return false,
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} float arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    source.push_str("                Ok(product_right) if product_right.is_finite() => {\n");
+    source.push_str("                    let product = value * product_right;\n");
+    source.push_str("                    if product.is_finite() {\n");
+    let _ = writeln!(source, "                        let value = {value_expr};");
+    source.push_str(
+        "                        if value.is_finite() {\n                            body.push_str(&value.to_string());\n                        } else {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                        }\n                    } else {\n");
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                    }\n                },\n                _ => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
 fn push_native_float_product_comparison_success_arm(
     source: &mut String,
     operation: NativeCapturedJsonOperation<'_>,
@@ -4091,6 +4232,26 @@ fn push_native_int_success_arm(
         )
     ) {
         return push_native_int_product_comparison_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
+    if matches!(
+        op,
+        Some(
+            "add_product_static"
+                | "sub_product_static"
+                | "rsub_product_static"
+                | "mul_product_static"
+                | "div_product_static"
+                | "rdiv_product_static"
+                | "rem_product_static"
+                | "rrem_product_static"
+        )
+    ) {
+        return push_native_int_product_static_arithmetic_success_arm(
             source,
             operation,
             error_prefix,
@@ -4440,6 +4601,98 @@ fn push_native_int_product_arithmetic_success_arm(
         "                        },\n                    },\n                    Err(_) => {\n",
     );
     push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                    },\n                },\n                Err(_) => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
+fn push_native_int_product_static_arithmetic_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    } = operation;
+    let (
+        Some(
+            op @ ("add_product_static"
+            | "sub_product_static"
+            | "rsub_product_static"
+            | "mul_product_static"
+            | "div_product_static"
+            | "rdiv_product_static"
+            | "rem_product_static"
+            | "rrem_product_static"),
+        ),
+        Some(operand_json),
+        Some(operand_kind),
+        Some(operand_name),
+        None,
+        None,
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(static_operand) = operand_json.parse::<i64>().ok() else {
+        return false;
+    };
+    let Some(operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let static_receiver = format!("{static_operand}_i64");
+    let static_argument = static_operand.to_string();
+    let (receiver, method, argument) = match op {
+        "add_product_static" => ("product", "checked_add", static_argument.as_str()),
+        "sub_product_static" => ("product", "checked_sub", static_argument.as_str()),
+        "rsub_product_static" => (static_receiver.as_str(), "checked_sub", "product"),
+        "mul_product_static" => ("product", "checked_mul", static_argument.as_str()),
+        "div_product_static" => ("product", "checked_div", static_argument.as_str()),
+        "rdiv_product_static" => (static_receiver.as_str(), "checked_div", "product"),
+        "rem_product_static" => ("product", "checked_rem", static_argument.as_str()),
+        "rrem_product_static" => (static_receiver.as_str(), "checked_rem", "product"),
+        _ => return false,
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) => match {operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    source.push_str(
+        "                Ok(product_right) => match value.checked_mul(product_right) {\n",
+    );
+    let _ = writeln!(
+        source,
+        "                    Some(product) => match {receiver}.{method}({argument}) {{"
+    );
+    source.push_str(
+        "                        Some(value) => body.push_str(&value.to_string()),\n                        None => {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str(
+        "                        },\n                    },\n                    None => {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
     source.push_str("                    },\n                },\n                Err(_) => {\n");
     push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
     source.push_str("                },\n            },\n");
@@ -6053,6 +6306,7 @@ fn request_body_field_name(expr: &HirExpr) -> Option<String> {
     }
 }
 
+#[derive(Clone)]
 struct CapturedResponseValue {
     name: String,
     value_kind: String,
@@ -6104,11 +6358,81 @@ fn captured_response_value_with_product_operand(
     value
 }
 
+fn captured_response_value_is_plain_product(value: &CapturedResponseValue) -> bool {
+    matches!(value.op.as_deref(), Some("mul"))
+        && value.operand_json.is_none()
+        && value.operand_kind.is_some()
+        && value.operand_name.is_some()
+        && value.secondary_operand_kind.is_none()
+        && value.secondary_operand_name.is_none()
+        && (value.value_kind.ends_with("_int") || value.value_kind.ends_with("_float"))
+}
+
+fn captured_product_static_right_op_name(op: BinaryOp) -> Option<&'static str> {
+    match op {
+        BinaryOp::Add => Some("add_product_static"),
+        BinaryOp::Sub => Some("sub_product_static"),
+        BinaryOp::Mul => Some("mul_product_static"),
+        BinaryOp::Div => Some("div_product_static"),
+        BinaryOp::Rem => Some("rem_product_static"),
+        _ => None,
+    }
+}
+
+fn captured_product_static_left_op_name(op: BinaryOp) -> Option<&'static str> {
+    match op {
+        BinaryOp::Add => Some("add_product_static"),
+        BinaryOp::Sub => Some("rsub_product_static"),
+        BinaryOp::Mul => Some("mul_product_static"),
+        BinaryOp::Div => Some("rdiv_product_static"),
+        BinaryOp::Rem => Some("rrem_product_static"),
+        _ => None,
+    }
+}
+
+fn captured_product_static_response_operation(
+    value: &CapturedResponseValue,
+    op_name: &str,
+    static_operand: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if !captured_response_value_is_plain_product(value) {
+        return None;
+    }
+    let mut value = value.clone();
+    value.op = Some(op_name.to_string());
+    if value.value_kind.ends_with("_int") {
+        value.operand_json = Some(static_integer(static_operand)?.to_string());
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        value.operand_json = Some(static_float(static_operand)?);
+        return Some(value);
+    }
+    None
+}
+
+fn captured_product_static_left_response_operation(
+    value: &CapturedResponseValue,
+    op: BinaryOp,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    captured_product_static_response_operation(
+        value,
+        captured_product_static_left_op_name(op)?,
+        lhs,
+    )
+}
+
 fn captured_numeric_response_operation(
     mut value: CapturedResponseValue,
     op: BinaryOp,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
+    if let Some(op_name) = captured_product_static_right_op_name(op) {
+        if let Some(value) = captured_product_static_response_operation(&value, op_name, rhs) {
+            return Some(value);
+        }
+    }
     if value.has_operation() {
         return None;
     }
@@ -6277,6 +6601,10 @@ fn captured_add_response_operation(
     if let Some(value) = captured_product_left_add_response_operation(&value, lhs) {
         return Some(value);
     }
+    if let Some(value) = captured_product_static_left_response_operation(&value, BinaryOp::Add, lhs)
+    {
+        return Some(value);
+    }
     captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Add, lhs)
 }
 
@@ -6311,6 +6639,9 @@ fn captured_ordered_arithmetic_response_operation(
     if let Some(value) = product_left {
         return Some(value);
     }
+    if let Some(value) = captured_product_static_left_response_operation(&value, op, lhs) {
+        return Some(value);
+    }
     captured_static_left_numeric_arithmetic_response_operation(value, op, lhs)
 }
 
@@ -6330,6 +6661,10 @@ fn captured_mul_response_operation(
         return Some(value);
     }
     if let Some(value) = captured_product_left_response_operation(&value, lhs, "mul_product") {
+        return Some(value);
+    }
+    if let Some(value) = captured_product_static_left_response_operation(&value, BinaryOp::Mul, lhs)
+    {
         return Some(value);
     }
     captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Mul, lhs)
@@ -11909,6 +12244,92 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_product_static_int_add_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: ((@body.quantity as int) * (@body.unit_price as int)) + 25 }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_product_static")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("unit_price")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("25")
+        );
+        assert!(handlers.contains("value.checked_mul(product_right)"));
+        assert!(handlers.contains("product.checked_add(25)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_static_left_product_int_sub_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { remaining: 1000 - ((@body.quantity as int) * (@body.unit_price as int)) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "remaining");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("rsub_product_static")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("unit_price")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("1000")
+        );
+        assert!(handlers.contains("value.checked_mul(product_right)"));
+        assert!(handlers.contains("1000_i64.checked_sub(product)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_request_body_float_cast_response_body() {
         let src = r#"@server {
   @listen 8080
@@ -12686,6 +13107,57 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"quantity\")"));
         assert!(handlers.contains("let value = value * operand;"));
         assert!(handlers.contains("if value.is_finite()"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_product_static_float_add_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { total: ((@body.price as float) * (@body.quantity as float)) + 1.25 }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "price");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_product_static")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("1.25")
+        );
+        assert!(handlers.contains("let product = value * product_right;"));
+        assert!(handlers.contains("let value = product + 1.25;"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
