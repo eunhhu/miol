@@ -37264,6 +37264,9 @@ entry = "src/main.orv"
   @route POST /orders/total-with-fee {
     @respond 201 { total: (@body.fee as int) + ((@body.quantity as int) * (@body.unit_price as int)) }
   }
+  @route POST /orders/scaled-product-fee {
+    @respond 201 { total: (@body.base as int) + (((@body.quantity as int) * (@body.unit_price as int)) * 100) }
+  }
   @route POST /orders/product-plus-static-fee {
     @respond 201 { total: ((@body.quantity as int) * (@body.unit_price as int)) + 25 }
   }
@@ -37397,6 +37400,11 @@ entry = "src/main.orv"
             "/orders/total-with-fee",
             r#"{"fee":"25","quantity":"7","unit_price":"125"}"#,
         );
+        let scaled_product_fee_response = send_raw_http_json_post(
+            address,
+            "/orders/scaled-product-fee",
+            r#"{"base":"25","quantity":"7","unit_price":"125"}"#,
+        );
         let product_plus_static_fee_response = send_raw_http_json_post(
             address,
             "/orders/product-plus-static-fee",
@@ -37510,6 +37518,8 @@ entry = "src/main.orv"
         assert!(total_response.contains(r#"{"total":875}"#));
         assert!(total_with_fee_response.starts_with("HTTP/1.1 201"));
         assert!(total_with_fee_response.contains(r#"{"total":900}"#));
+        assert!(scaled_product_fee_response.starts_with("HTTP/1.1 201"));
+        assert!(scaled_product_fee_response.contains(r#"{"total":87525}"#));
         assert!(product_plus_static_fee_response.starts_with("HTTP/1.1 201"));
         assert!(product_plus_static_fee_response.contains(r#"{"total":900}"#));
         assert!(product_plus_product_fee_response.starts_with("HTTP/1.1 201"));
@@ -37582,6 +37592,9 @@ entry = "src/main.orv"
   }
   @route POST /payments/total-plus-fee {
     @respond 201 { total: ((@body.price as float) * (@body.quantity as float)) + 1.25 }
+  }
+  @route POST /payments/scaled-product-fee {
+    @respond 201 { total: (@body.base as float) + (((@body.price as float) * (@body.quantity as float)) * 0.5) }
   }
   @route POST /payments/power {
     @respond 201 { total: (@body.base as float) ** (@body.exp as float) }
@@ -37664,6 +37677,11 @@ entry = "src/main.orv"
             "/payments/total-plus-fee",
             r#"{"price":"12.5","quantity":"3"}"#,
         );
+        let scaled_product_fee_response = send_raw_http_json_post(
+            address,
+            "/payments/scaled-product-fee",
+            r#"{"base":"1.25","price":"12.5","quantity":"3"}"#,
+        );
         let power_response =
             send_raw_http_json_post(address, "/payments/power", r#"{"base":"2.5","exp":"2.0"}"#);
         let under_limit_response = send_raw_http_json_post(
@@ -37701,6 +37719,7 @@ entry = "src/main.orv"
         assert_created(&remaining_response, r#"{"remaining":88}"#);
         assert_created(&total_response, r#"{"total":37.5}"#);
         assert_created(&total_plus_fee_response, r#"{"total":38.75}"#);
+        assert_created(&scaled_product_fee_response, r#"{"total":20}"#);
         assert_created(&power_response, r#"{"total":6.25}"#);
         assert_created(&under_limit_response, r#"{"under_limit":true}"#);
         assert_created(
