@@ -6434,6 +6434,15 @@ fn if_else_route_response_artifacts(handler: &HirBlock) -> Option<Vec<ServerResp
     let [HirStmt::Expr(expr)] = handler.stmts.as_slice() else {
         return None;
     };
+    let mut out = Vec::new();
+    collect_if_else_response_artifacts(expr, &mut out)?;
+    (out.len() >= 2).then_some(out)
+}
+
+fn collect_if_else_response_artifacts(
+    expr: &HirExpr,
+    out: &mut Vec<ServerResponseArtifact>,
+) -> Option<()> {
     let HirExprKind::If {
         cond,
         then,
@@ -6447,11 +6456,28 @@ fn if_else_route_response_artifacts(handler: &HirBlock) -> Option<Vec<ServerResp
     }
     let condition = native_response_condition(cond)?;
     let (then_respond, then_status, then_payload) = response_expr_from_stmt(&then.stmts[0])?;
-    let (else_respond, else_status, else_payload) = response_expr_from_else_branch(else_branch)?;
-    Some(vec![
-        server_response_artifact(then_respond, then_status, then_payload, Some(condition)),
-        server_response_artifact(else_respond, else_status, else_payload, None),
-    ])
+    out.push(server_response_artifact(
+        then_respond,
+        then_status,
+        then_payload,
+        Some(condition),
+    ));
+    collect_else_response_artifacts(else_branch, out)
+}
+
+fn collect_else_response_artifacts(
+    expr: &HirExpr,
+    out: &mut Vec<ServerResponseArtifact>,
+) -> Option<()> {
+    match &expr.kind {
+        HirExprKind::If { .. } => collect_if_else_response_artifacts(expr, out),
+        HirExprKind::Paren(expr) => collect_else_response_artifacts(expr, out),
+        _ => {
+            let (respond, status, payload) = response_expr_from_else_branch(expr)?;
+            out.push(server_response_artifact(respond, status, payload, None));
+            Some(())
+        }
+    }
 }
 
 fn response_expr_from_stmt(stmt: &HirStmt) -> Option<(&HirExpr, &HirExpr, &HirExpr)> {
@@ -10857,6 +10883,60 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(
             "routes::orv_native_body_field_value(route_match, \"stock\").unwrap_or(\"\").trim().parse::<i64>()"
         ));
+        assert!(handlers.contains("status: 201"));
+        assert!(handlers.contains("status: 409"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_else_if_response_route() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /inventory {
+    if (@body.quantity as int) <= 0 {
+      @respond 400 { err: "bad_quantity" }
+    } else if (@body.quantity as int) <= (@body.stock as int) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    } else {
+      @respond 409 { err: "out_of_stock" }
+    }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(artifact.routes[0].responses.len(), 3);
+        let invalid_condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("invalid quantity condition");
+        assert_eq!(invalid_condition.kind, "request_body_field_int_le");
+        assert_eq!(invalid_condition.name, "quantity");
+        assert_eq!(invalid_condition.value, "0");
+        let stock_condition = artifact.routes[0].responses[1]
+            .condition
+            .as_ref()
+            .expect("stock condition");
+        assert_eq!(stock_condition.kind, "request_body_field_int_le");
+        assert_eq!(stock_condition.name, "quantity");
+        assert_eq!(
+            stock_condition.operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(stock_condition.operand_name.as_deref(), Some("stock"));
+        assert!(artifact.routes[0].responses[2].condition.is_none());
+        assert!(handlers.contains("status: 400"));
         assert!(handlers.contains("status: 201"));
         assert!(handlers.contains("status: 409"));
         assert!(!handlers.contains("native route body lowering pending"));
