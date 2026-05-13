@@ -37270,6 +37270,9 @@ entry = "src/main.orv"
   @route POST /orders/product-plus-product-fee {
     @respond 201 { total: ((@body.quantity as int) * (@body.unit_price as int)) + ((@body.fee_units as int) * (@body.fee_value as int)) }
   }
+  @route POST /orders/triple-product-fee {
+    @respond 201 { total: (@body.base as int) + (((@body.quantity as int) * (@body.unit_price as int)) * (@body.bundle_count as int)) }
+  }
   @route POST /orders/static-minus-product {
     @respond 201 { remaining: 1000 - ((@body.quantity as int) * (@body.unit_price as int)) }
   }
@@ -37404,6 +37407,11 @@ entry = "src/main.orv"
             "/orders/product-plus-product-fee",
             r#"{"quantity":"7","unit_price":"125","fee_units":"2","fee_value":"50"}"#,
         );
+        let triple_product_fee_response = send_raw_http_json_post(
+            address,
+            "/orders/triple-product-fee",
+            r#"{"base":"25","quantity":"7","unit_price":"125","bundle_count":"2"}"#,
+        );
         let static_minus_product_response = send_raw_http_json_post(
             address,
             "/orders/static-minus-product",
@@ -37506,6 +37514,8 @@ entry = "src/main.orv"
         assert!(product_plus_static_fee_response.contains(r#"{"total":900}"#));
         assert!(product_plus_product_fee_response.starts_with("HTTP/1.1 201"));
         assert!(product_plus_product_fee_response.contains(r#"{"total":975}"#));
+        assert!(triple_product_fee_response.starts_with("HTTP/1.1 201"));
+        assert!(triple_product_fee_response.contains(r#"{"total":1775}"#));
         assert!(static_minus_product_response.starts_with("HTTP/1.1 201"));
         assert!(static_minus_product_response.contains(r#"{"remaining":125}"#));
         assert!(bundles_response.starts_with("HTTP/1.1 201"));
@@ -37584,6 +37594,9 @@ entry = "src/main.orv"
   }
   @route POST /payments/product-plus-product-fee {
     @respond 201 { total: ((@body.price as float) * (@body.quantity as float)) + ((@body.fee as float) * (@body.fee_units as float)) }
+  }
+  @route POST /payments/triple-product-fee {
+    @respond 201 { total: (@body.base as float) + (((@body.price as float) * (@body.quantity as float)) * (@body.multiplier as float)) }
   }
   @route POST /payments/product-under-product-limit {
     @respond 201 { under_limit: ((@body.price as float) * (@body.quantity as float)) <= ((@body.limit_price as float) * (@body.limit_units as float)) }
@@ -37668,6 +37681,11 @@ entry = "src/main.orv"
             "/payments/product-plus-product-fee",
             r#"{"price":"12.5","quantity":"3","fee":"1.25","fee_units":"2"}"#,
         );
+        let triple_product_fee_response = send_raw_http_json_post(
+            address,
+            "/payments/triple-product-fee",
+            r#"{"base":"1.25","price":"12.5","quantity":"3","multiplier":"2.0"}"#,
+        );
         let product_under_product_limit_response = send_raw_http_json_post(
             address,
             "/payments/product-under-product-limit",
@@ -37690,6 +37708,7 @@ entry = "src/main.orv"
             r#"{"under_limit":true}"#,
         );
         assert_created(&product_plus_product_fee_response, r#"{"total":40}"#);
+        assert_created(&triple_product_fee_response, r#"{"total":76.25}"#);
         assert_created(
             &product_under_product_limit_response,
             r#"{"under_limit":true}"#,
@@ -37897,7 +37916,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + (((@body.bonus as int) * (@body.scale as int)) * (@body.extra as int)) }
+    @respond 201 { received: (@body.id as int) + ((((@body.bonus as int) * (@body.scale as int)) * (@body.extra as int)) * (@body.more as int)) }
   }
 }
 ",
