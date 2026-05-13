@@ -1962,16 +1962,12 @@ fn native_int_operation_is_direct(
         (
             Some(
                 "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "rsub" | "mul" | "div"
-                | "rdiv" | "rem" | "rrem" | "rpow",
+                | "rdiv" | "rem" | "rrem" | "pow" | "rpow",
             ),
             Some(operand),
             None,
             None,
         ) => operand.parse::<i64>().is_ok(),
-        (Some("pow"), Some(operand), None, None) => operand
-            .parse::<i64>()
-            .ok()
-            .is_some_and(|operand| (0..=63).contains(&operand)),
         (
             Some(
                 "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "add" | "sub" | "mul" | "div" | "rem"
@@ -3644,11 +3640,18 @@ fn push_native_int_success_arm(
             let Some(method) = native_int_arithmetic_method(op) else {
                 return false;
             };
+            if method == "checked_pow" && !(0..=63).contains(&operand) {
+                source.push_str("            Ok(_) => {\n");
+                let error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+                let body_expr = format!("{}.to_string()", rust_string_literal(&error_body));
+                push_native_handler_response_return(source, 500, &body_expr, response_origin_id);
+                source.push_str("            },\n");
+                return true;
+            }
             let operand = if method == "checked_pow" {
-                let Ok(exponent) = u32::try_from(operand) else {
-                    return false;
-                };
-                exponent.to_string()
+                u32::try_from(operand)
+                    .expect("static int pow exponent is checked to fit u32")
+                    .to_string()
             } else {
                 operand.to_string()
             };
@@ -9034,7 +9037,7 @@ function greet(name: string): string -> "hi {name}""#,
     if @body.sku == "" {
       @respond 404 { err: "missing_sku" }
     }
-    @respond 201 { quantity: (@body.quantity as int) ** -1 }
+    @respond 201 { quantity: (@body.quantity as int) + ((@body.bonus as int) * 2) }
   }
 }"#;
         let program = lower(src);
@@ -9286,6 +9289,38 @@ function greet(name: string): string -> "hi {name}""#,
             Some("bonus")
         );
         assert!(handlers.contains("checked_pow"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_invalid_static_int_pow_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: (@body.quantity as int) ** -1 }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].op.as_deref(), Some("pow"));
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("-1")
+        );
+        assert!(handlers.contains("native request body int arithmetic failed"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -11985,7 +12020,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) ** -1 }
+    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * 2) }
   }
 }";
         let program = lower(src);

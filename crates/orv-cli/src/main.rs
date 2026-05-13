@@ -36860,6 +36860,9 @@ entry = "src/main.orv"
   @route POST /orders/power {
     @respond 201 { total: (@body.quantity as int) ** (@body.bonus as int) }
   }
+  @route POST /orders/power-invalid {
+    @respond 201 { total: (@body.quantity as int) ** -1 }
+  }
   @route POST /orders/due {
     @respond 201 { due: (@body.total as int) - (@body.discount as int) }
   }
@@ -36934,6 +36937,8 @@ entry = "src/main.orv"
         );
         let power_response =
             send_raw_http_json_post(address, "/orders/power", r#"{"quantity":"2","bonus":"6"}"#);
+        let invalid_power_response =
+            send_raw_http_json_post(address, "/orders/power-invalid", r#"{"quantity":"2"}"#);
         let due_response = send_raw_http_json_post(
             address,
             "/orders/due",
@@ -36966,6 +36971,9 @@ entry = "src/main.orv"
         assert!(total_response.contains(r#"{"total":875}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
         assert!(power_response.contains(r#"{"total":64}"#));
+        assert!(invalid_power_response.starts_with("HTTP/1.1 500"));
+        assert!(invalid_power_response
+            .contains(r#"{"error":"native request body int arithmetic failed"}"#));
         assert!(due_response.starts_with("HTTP/1.1 201"));
         assert!(due_response.contains(r#"{"due":750}"#));
         assert!(share_response.starts_with("HTTP/1.1 201"));
@@ -37280,7 +37288,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) ** -1 }
+    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * 2) }
   }
 }
 ",
