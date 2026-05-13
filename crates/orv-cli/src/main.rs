@@ -311,6 +311,7 @@ enum EditorDebugControl {
     StepOut,
     RestartFrame,
     Restart,
+    Terminate,
     TerminateThreads,
     Disconnect,
 }
@@ -328,6 +329,7 @@ impl EditorDebugControl {
             Self::StepOut => "Step Out",
             Self::RestartFrame => "Restart Frame",
             Self::Restart => "Restart",
+            Self::Terminate => "Terminate",
             Self::TerminateThreads => "Terminate Threads",
             Self::Disconnect => "Disconnect",
         }
@@ -345,6 +347,7 @@ impl EditorDebugControl {
             Self::StepOut => "step-out",
             Self::RestartFrame => "restart-frame",
             Self::Restart => "restart",
+            Self::Terminate => "terminate",
             Self::TerminateThreads => "terminate-threads",
             Self::Disconnect => "disconnect",
         }
@@ -390,6 +393,10 @@ impl EditorDebugControl {
             }),
             Self::Restart => serde_json::json!({
                 "command": "restart",
+                "arguments": {},
+            }),
+            Self::Terminate => serde_json::json!({
+                "command": "terminate",
                 "arguments": {},
             }),
             Self::TerminateThreads => serde_json::json!({
@@ -7162,7 +7169,7 @@ fn editor_debug_session_runner_json(path: &Path) -> serde_json::Value {
     })
 }
 
-const fn editor_debug_control_order() -> [EditorDebugControl; 12] {
+const fn editor_debug_control_order() -> [EditorDebugControl; 13] {
     [
         EditorDebugControl::Continue,
         EditorDebugControl::Pause,
@@ -7174,6 +7181,7 @@ const fn editor_debug_control_order() -> [EditorDebugControl; 12] {
         EditorDebugControl::StepOut,
         EditorDebugControl::RestartFrame,
         EditorDebugControl::Restart,
+        EditorDebugControl::Terminate,
         EditorDebugControl::TerminateThreads,
         EditorDebugControl::Disconnect,
     ]
@@ -39566,6 +39574,14 @@ define Auth() -> { @out "auth" }
                     == serde_json::json!({"command": "restartFrame", "arguments": {"frameId": 1}})
         }));
         assert!(control_commands.iter().any(|command| {
+            command["name"] == "Terminate"
+                && command["request"]
+                    == serde_json::json!({"command": "terminate", "arguments": {}})
+                && command["command"]
+                    .as_array()
+                    .is_some_and(|command| command.iter().any(|part| part == "terminate"))
+        }));
+        assert!(control_commands.iter().any(|command| {
             command["name"] == "Terminate Threads"
                 && command["request"]
                     == serde_json::json!({"command": "terminateThreads", "arguments": {"threadIds": [1]}})
@@ -39688,6 +39704,12 @@ define Auth() -> { @out "auth" }
             "Restart",
             &serde_json::json!({"command": "restart", "arguments": {}}),
         );
+        assert_editor_debug_control(
+            controls,
+            "Terminate",
+            &serde_json::json!({"command": "terminate", "arguments": {}}),
+        );
+        assert_editor_debug_control_runner_command(controls, "Terminate", "terminate");
         assert_editor_debug_control(
             controls,
             "Terminate Threads",
@@ -39840,6 +39862,29 @@ define Auth() -> { @out "auth" }
             .expect("editor debug session");
 
         assert_eq!(debug["control"]["request"]["command"], "terminateThreads");
+        assert_eq!(debug["control"]["response"]["success"], true);
+        assert!(debug["stack"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty));
+        assert!(debug["frames"]
+            .as_array()
+            .expect("frames")
+            .iter()
+            .any(|frame| frame["type"] == "event" && frame["event"] == "terminated"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_debug_terminate_control_uses_dap_session() {
+        let dir = temp_output_dir("editor-debug-terminate");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(&path, "let answer: int = 42\n").expect("write source");
+
+        let debug = editor_debug_session_json(&path, &[EditorDebugControl::Terminate], &[])
+            .expect("editor debug session");
+
+        assert_eq!(debug["control"]["request"]["command"], "terminate");
         assert_eq!(debug["control"]["response"]["success"], true);
         assert!(debug["stack"]
             .as_object()
