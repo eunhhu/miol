@@ -8482,6 +8482,7 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
         "schema_version": 1,
         "kind": "orv.editor.production",
         "build_dir": build.display().to_string(),
+        "client": reveal_client_bundle_targets(build)?,
         "db_adapters": reveal_db_adapter_targets(build)?,
         "commerce_adapters": reveal_commerce_adapter_targets(build)?,
     }))
@@ -8560,6 +8561,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let production_adapters = production_adapter_count(&production_state) > 0;
+    let client_bundles = production_client_bundle_count(&production_state) > 0;
     let production = editor_native_host_production_json(&production_state);
     let runtime = editor_native_host_runtime_json(state);
     let trace = editor_native_host_trace_json(state);
@@ -8677,6 +8679,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "runtime_inspection": true,
             "dap_controls": controls > 0,
             "production_adapters": production_adapters,
+            "client_bundles": client_bundles,
             "trace_navigation": trace_enabled,
         },
     })
@@ -8828,6 +8831,11 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
                 "kind": "array",
             },
             {
+                "name": "client",
+                "path": "production.client",
+                "kind": "array",
+            },
+            {
                 "name": "commerce_adapters",
                 "path": "production.commerce_adapters",
                 "kind": "array",
@@ -8852,6 +8860,11 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let client = production
+        .get("client")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let db_adapter_count = production_adapter_entry_count(&db_adapters);
     let commerce_adapter_count = production_adapter_entry_count(&commerce_adapters);
     serde_json::json!({
@@ -8860,14 +8873,38 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
             .get("build_dir")
             .cloned()
             .unwrap_or_else(|| serde_json::json!("")),
+        "client_target_count": client.len(),
+        "client_manifest_count": production_client_manifest_count(&client),
+        "client_capability_surface_count": production_client_capability_surface_count(&client),
         "db_target_count": db_adapters.len(),
         "commerce_target_count": commerce_adapters.len(),
         "db_adapter_count": db_adapter_count,
         "commerce_adapter_count": commerce_adapter_count,
         "adapter_count": db_adapter_count + commerce_adapter_count,
         "missing_artifact_count": production_missing_artifact_count(&db_adapters)
-            + production_missing_artifact_count(&commerce_adapters),
+            + production_missing_artifact_count(&commerce_adapters)
+            + production_missing_artifact_count(&client),
     })
+}
+
+fn production_client_manifest_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .filter(|target| {
+            target.get("kind").and_then(serde_json::Value::as_str) == Some("client_manifest")
+        })
+        .count()
+}
+
+fn production_client_capability_surface_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .find(|target| {
+            target.get("kind").and_then(serde_json::Value::as_str) == Some("client_manifest")
+        })
+        .and_then(|target| target.pointer("/capabilities/surfaces"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn production_adapter_entry_count(targets: &[serde_json::Value]) -> usize {
@@ -8910,8 +8947,12 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     let db_target_count = json_usize_field(&summary, "db_target_count");
     let commerce_target_count = json_usize_field(&summary, "commerce_target_count");
+    let client_target_count = json_usize_field(&summary, "client_target_count");
     let adapter_count = json_usize_field(&summary, "adapter_count");
     let missing_artifact_count = json_usize_field(&summary, "missing_artifact_count");
+    let client = html_escape_text(&serde_json::to_string_pretty(
+        production.get("client").unwrap_or(&serde_json::Value::Null),
+    )?);
     let db_adapters = html_escape_text(&serde_json::to_string_pretty(
         production
             .get("db_adapters")
@@ -8934,12 +8975,12 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
         if missing_artifact_count == 0 { "" } else { "bad" }
     )?;
     writeln!(
         &mut html,
-        "<main><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
+        "<main><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
     )?;
     writeln!(
         &mut html,
@@ -9108,6 +9149,10 @@ fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
 fn production_adapter_count(production: &serde_json::Value) -> usize {
     json_array_count(production.get("db_adapters"))
         + json_array_count(production.get("commerce_adapters"))
+}
+
+fn production_client_bundle_count(production: &serde_json::Value) -> usize {
+    json_array_count(production.get("client"))
 }
 
 fn editor_native_host_breakpoint_commands_json(
@@ -9690,6 +9735,7 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let debug_function_breakpoint_count = editor_debug_function_breakpoint_count_from_state(state);
     let debug_data_breakpoint_count = editor_debug_data_breakpoint_count_from_state(state);
     let debug_exception_filter_count = editor_debug_exception_filter_count_from_state(state);
+    let production_client_target_count = json_array_count(state.pointer("/production/client"));
     let production_db_adapter_count = json_array_count(state.pointer("/production/db_adapters"));
     let production_commerce_adapter_count =
         json_array_count(state.pointer("/production/commerce_adapters"));
@@ -9744,7 +9790,9 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     write!(
         &mut html,
         "<span>Production<b>{}</b></span>",
-        production_db_adapter_count + production_commerce_adapter_count
+        production_client_target_count
+            + production_db_adapter_count
+            + production_commerce_adapter_count
     )?;
     write!(&mut html, "<span>Trace<b>{trace_count}</b></span>")?;
     html.push_str("</nav></aside>\n");
@@ -9806,8 +9854,10 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     html.push_str("<section class=\"panel\"><h2>Selected Debug</h2><pre id=\"debug-detail\" class=\"detail\"></pre></section>");
     write!(
         &mut html,
-        "<section class=\"panel\"><h2>Production</h2><div class=\"metric\">{}</div><p class=\"muted\">DB Adapters {production_db_adapter_count} · Commerce Adapters {production_commerce_adapter_count}</p><pre>{}</pre></section>",
-        production_db_adapter_count + production_commerce_adapter_count,
+        "<section class=\"panel\"><h2>Production</h2><div class=\"metric\">{}</div><p class=\"muted\">Client Bundles {production_client_target_count} · DB Adapters {production_db_adapter_count} · Commerce Adapters {production_commerce_adapter_count}</p><pre>{}</pre></section>",
+        production_client_target_count
+            + production_db_adapter_count
+            + production_commerce_adapter_count,
         html_escape_text(&production_summary)
     )?;
     write_trace_panel_html(&mut html, trace_count, &trace_status_counts)?;
@@ -9952,6 +10002,16 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         lines.push(format!("build {build_dir}"));
     }
     for target in production
+        .get("client")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = json_str_or_empty(target, "kind");
+        let path = json_str_or_empty(target, "path");
+        lines.push(format!("Client {kind} {path}"));
+    }
+    for target in production
         .get("db_adapters")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -9972,7 +10032,7 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         lines.push(format!("Commerce Adapters {path} ({adapters})"));
     }
     if lines.is_empty() {
-        "No production adapter contracts.".to_string()
+        "No production contracts.".to_string()
     } else {
         lines.join("\n")
     }
@@ -21934,6 +21994,10 @@ fn reveal_client_targets(
     if !matches!(entry.kind.as_str(), "signal" | "await") {
         return Ok(Vec::new());
     }
+    reveal_client_bundle_targets(dir)
+}
+
+fn reveal_client_bundle_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
     let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
         return Ok(Vec::new());
@@ -46897,6 +46961,88 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("DB Adapters"));
         assert!(production_panel.contains("Commerce Adapters"));
         assert!(production_panel.contains("deploy/db-adapters.json"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn editor_export_with_build_embeds_production_client_capabilities() {
+        let dir = temp_output_dir("editor-export-production-client-source");
+        std::fs::create_dir_all(&dir).expect("create editor export client source dir");
+        let path = dir.join("page.orv");
+        std::fs::write(
+            &path,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write editor export client source");
+        let out = temp_output_dir("editor-export-production-client");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let state = editor_export_state_json_with_trace(&path, Some(&out), None)
+            .expect("editor export state");
+        let html = editor_export_html(&state).expect("editor html");
+        let client_targets = state["production"]["client"]
+            .as_array()
+            .expect("production client targets");
+        let client_manifest = client_targets
+            .iter()
+            .find(|target| target["kind"] == "client_manifest")
+            .expect("client manifest target");
+
+        assert_eq!(client_manifest["path"], CLIENT_MANIFEST_PATH);
+        assert_eq!(
+            client_manifest["capabilities"]["runtime"],
+            serde_json::json!("client_wasm")
+        );
+        assert_eq!(
+            client_manifest["capabilities"]["bindings"]["signal_text"],
+            1
+        );
+        assert!(client_manifest["capabilities"]["surfaces"]
+            .as_array()
+            .expect("client capability surfaces")
+            .iter()
+            .any(|surface| surface == "signal_text"));
+
+        let native_host = editor_native_host_manifest_json(&path, &state);
+        assert_eq!(native_host["capabilities"]["client_bundles"], true);
+        assert_eq!(
+            native_host["production"]["summary"]["client_manifest_count"],
+            1
+        );
+        assert!(
+            native_host["production"]["summary"]["client_target_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 5),
+            "{native_host}"
+        );
+        assert!(
+            native_host["production"]["summary"]["client_capability_surface_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2),
+            "{native_host}"
+        );
+        let production_sections = native_host["production"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("production panel sections");
+        assert!(production_sections
+            .iter()
+            .any(|section| section["name"] == "client" && section["path"] == "production.client"));
+        assert!(html.contains("Client Bundles"));
+        assert!(html.contains("client/app.wasm"));
+
+        let editor_out = dir.join("editor");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&out), None)
+            .expect("editor export with production client");
+        let export_native_host =
+            read_json_value(&editor_out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH))
+                .expect("native host");
+        let production_panel =
+            std::fs::read_to_string(editor_out.join(EDITOR_PRODUCTION_PANEL_HTML_PATH))
+                .expect("production panel");
+        assert_eq!(export_native_host["capabilities"]["client_bundles"], true);
+        assert!(production_panel.contains("Client Bundles"));
+        assert!(production_panel.contains("signal_text"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
