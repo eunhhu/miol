@@ -8823,6 +8823,11 @@ impl LspSession {
         let Some((start, end, name)) = identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Null);
         };
+        if !lsp_renamable_identifier_name(name)
+            || lsp_is_builtin_domain_identifier(&file.source, start, name)
+        {
+            return Ok(serde_json::Value::Null);
+        }
         Ok(serde_json::json!({
             "range": lsp_range_for_source(
                 &file.source,
@@ -8841,17 +8846,24 @@ impl LspSession {
             .pointer("/params/newName")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("newName must be a string"))?;
-        if !lsp_valid_identifier_name(new_name) {
-            return Err(anyhow::anyhow!("newName must be a valid identifier"));
+        if !lsp_renamable_identifier_name(new_name) {
+            return Err(anyhow::anyhow!(
+                "newName must be a valid non-keyword identifier"
+            ));
         }
         let loaded = self.loaded_project_for_path(&path)?;
         let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
             return Ok(serde_json::json!({ "changes": {} }));
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some((_, _, name)) = identifier_span_at_byte(&file.source, byte) else {
+        let Some((start, _, name)) = identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::json!({ "changes": {} }));
         };
+        if !lsp_renamable_identifier_name(name)
+            || lsp_is_builtin_domain_identifier(&file.source, start, name)
+        {
+            return Ok(serde_json::json!({ "changes": {} }));
+        }
         let mut changes = serde_json::Map::new();
         for file in &loaded.files {
             let edits: Vec<_> = identifier_occurrences(&file.source, name)
@@ -14314,6 +14326,62 @@ fn lsp_valid_identifier_name(name: &str) -> bool {
         return false;
     };
     (first.is_ascii_alphabetic() || first == b'_') && bytes.all(is_identifier_byte)
+}
+
+fn lsp_renamable_identifier_name(name: &str) -> bool {
+    lsp_valid_identifier_name(name) && !lsp_reserved_identifier_name(name)
+}
+
+fn lsp_reserved_identifier_name(name: &str) -> bool {
+    matches!(
+        name,
+        "let"
+            | "mut"
+            | "sig"
+            | "const"
+            | "function"
+            | "async"
+            | "await"
+            | "return"
+            | "if"
+            | "else"
+            | "when"
+            | "for"
+            | "in"
+            | "while"
+            | "break"
+            | "continue"
+            | "try"
+            | "catch"
+            | "throw"
+            | "struct"
+            | "enum"
+            | "type"
+            | "define"
+            | "pub"
+            | "import"
+            | "void"
+            | "as"
+            | "true"
+            | "false"
+            | "null"
+            | "int"
+            | "float"
+            | "string"
+            | "bool"
+    )
+}
+
+fn lsp_is_builtin_domain_identifier(source: &str, start: usize, name: &str) -> bool {
+    let Some(previous) = start.checked_sub(1) else {
+        return false;
+    };
+    if source.as_bytes().get(previous) != Some(&b'@') {
+        return false;
+    }
+    name.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
 }
 
 fn lsp_file_uri_path(uri: &str) -> anyhow::Result<PathBuf> {
@@ -30832,6 +30900,58 @@ function greet(user: User): string -> {
     }
 
     #[test]
+    fn lsp_prepare_rename_rejects_language_tokens_and_builtin_directives() {
+        let dir = temp_output_dir("lsp-prepare-rename-language-token");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "struct User { id: int }\n@server {\n  @route GET /ping {\n    @respond 200 \"ok\"\n  }\n}\n",
+        )
+        .expect("write source");
+
+        let keyword_response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 29,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 0,
+                    "character": 1,
+                },
+            },
+        }));
+        let route_response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": 4,
+                },
+            },
+        }));
+
+        assert_eq!(keyword_response["id"], 29);
+        assert!(
+            keyword_response.get("error").is_none(),
+            "{keyword_response}"
+        );
+        assert!(keyword_response["result"].is_null());
+        assert_eq!(route_response["id"], 30);
+        assert!(route_response.get("error").is_none(), "{route_response}");
+        assert!(route_response["result"].is_null());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lsp_rename_returns_workspace_edit_for_project_references() {
         let dir = temp_output_dir("lsp-rename");
         let models = dir.join("models");
@@ -30886,6 +31006,37 @@ function greet(user: User): string -> {
         assert!(imported_edits
             .iter()
             .any(|edit| edit["newText"] == "Account"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_rename_rejects_keyword_new_name() {
+        let dir = temp_output_dir("lsp-rename-keyword-new-name");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "struct User { id: int }\n").expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 0,
+                    "character": 8,
+                },
+                "newName": "struct",
+            },
+        }));
+
+        assert_eq!(response["id"], 31);
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-keyword identifier")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
