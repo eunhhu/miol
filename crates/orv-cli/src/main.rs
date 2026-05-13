@@ -10668,9 +10668,10 @@ impl DapSession {
         if frame_id != 1 {
             anyhow::bail!("scopes currently supports current ORV frameId 1");
         }
-        let (source_name, source_path, source_uri, _) = dap_current_source_and_line(launched);
+        let (source, _) = dap_current_source_and_line(launched);
         let project_variable_count = dap_project_variables(launched).len();
         let local_variable_count = dap_current_locals(launched).len();
+        let scope_source = dap_source_json_with_reference(&source, 0);
         Ok(serde_json::json!({
             "scopes": [
                 {
@@ -10678,24 +10679,14 @@ impl DapSession {
                     "variablesReference": 1,
                     "namedVariables": project_variable_count,
                     "expensive": false,
-                    "source": {
-                        "name": source_name,
-                        "path": source_path,
-                        "sourceReference": 0,
-                        "uri": source_uri,
-                    },
+                    "source": scope_source,
                 },
                 {
                     "name": "Locals",
                     "variablesReference": 2,
                     "namedVariables": local_variable_count,
                     "expensive": false,
-                    "source": {
-                        "name": source_name,
-                        "path": source_path,
-                        "sourceReference": 0,
-                        "uri": source_uri,
-                    },
+                    "source": scope_source,
                 },
             ],
         }))
@@ -12459,35 +12450,35 @@ fn dap_runtime_value_display(value: &orv_runtime::Value) -> (String, String) {
     }
 }
 
-fn dap_current_source_and_line(launched: &DapLaunchState) -> (String, String, String, u64) {
+fn dap_current_source_and_line(launched: &DapLaunchState) -> (DapSourceInfo, u64) {
     if let Some(frame) = launched.frames.get(launched.current_frame_index) {
-        return (
-            frame.source.name.clone(),
-            frame.source.path.display().to_string(),
-            frame.source.uri.clone(),
-            frame.line,
-        );
+        return (frame.source.clone(), frame.line);
     }
-    (
-        launched.name.clone(),
-        launched.path.display().to_string(),
-        launched.uri.clone(),
-        launched.stopped_line,
-    )
+    let source = launched
+        .sources
+        .iter()
+        .find(|source| dap_normalize_path(&source.path) == dap_normalize_path(&launched.path))
+        .cloned()
+        .unwrap_or_else(|| DapSourceInfo {
+            reference: 0,
+            name: launched.name.clone(),
+            path: launched.path.clone(),
+            uri: launched.uri.clone(),
+            checksum: String::new(),
+        });
+    (source, launched.stopped_line)
 }
 
 fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
     let current_frame = launched.frames.get(launched.current_frame_index);
-    let (source_name, source_path, source_uri, line) = dap_current_source_and_line(launched);
+    let (current_source, line) = dap_current_source_and_line(launched);
     let current_name = current_frame
         .and_then(|frame| frame.stack.last())
         .map_or_else(|| "orv entry".to_string(), |frame| frame.name.clone());
     let mut frames = vec![dap_stack_frame_json(
         1,
         &current_name,
-        &source_name,
-        &source_path,
-        &source_uri,
+        &current_source,
         line,
     )];
     if let Some(current_frame) = current_frame {
@@ -12495,19 +12486,22 @@ fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
             frames.push(dap_stack_frame_json(
                 u64::try_from(index + 2).unwrap_or(u64::MAX),
                 &stack_frame.name,
-                &stack_frame.source.name,
-                &stack_frame.source.path.display().to_string(),
-                &stack_frame.source.uri,
+                &stack_frame.source,
                 stack_frame.line,
             ));
         }
         if !current_frame.stack.is_empty() {
+            let entry_source = launched
+                .sources
+                .iter()
+                .find(|source| {
+                    dap_normalize_path(&source.path) == dap_normalize_path(&launched.path)
+                })
+                .unwrap_or(&current_source);
             frames.push(dap_stack_frame_json(
                 u64::try_from(frames.len() + 1).unwrap_or(u64::MAX),
                 "orv entry",
-                &launched.name,
-                &launched.path.display().to_string(),
-                &launched.uri,
+                entry_source,
                 1,
             ));
         }
@@ -12558,20 +12552,13 @@ fn dap_usize_argument(request: &serde_json::Value, name: &str) -> Option<usize> 
 fn dap_stack_frame_json(
     id: u64,
     name: &str,
-    source_name: &str,
-    source_path: &str,
-    source_uri: &str,
+    source: &DapSourceInfo,
     line: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "name": name,
-        "source": {
-            "name": source_name,
-            "path": source_path,
-            "sourceReference": 0,
-            "uri": source_uri,
-        },
+        "source": dap_source_json_with_reference(source, 0),
         "line": line,
         "column": 1,
     })
@@ -12645,12 +12632,7 @@ fn dap_disassembled_instruction_json(index: usize, frame: &DapFrameState) -> ser
     serde_json::json!({
         "address": format!("orv:frame:{}", index.saturating_add(1)),
         "instruction": format!("{name} line {}", frame.line),
-        "location": {
-            "name": frame.source.name,
-            "path": frame.source.path.display().to_string(),
-            "sourceReference": 0,
-            "uri": frame.source.uri,
-        },
+        "location": dap_source_json_with_reference(&frame.source, 0),
         "line": frame.line,
         "column": 1,
     })
@@ -12708,12 +12690,7 @@ fn dap_step_in_targets_json(launched: &DapLaunchState) -> Vec<serde_json::Value>
                 "label": call_frame.name,
                 "line": call_frame.line,
                 "column": 1,
-                "source": {
-                    "name": call_frame.source.name,
-                    "path": call_frame.source.path.display().to_string(),
-                    "sourceReference": 0,
-                    "uri": call_frame.source.uri,
-                },
+                "source": dap_source_json_with_reference(&call_frame.source, 0),
             }))
         })
         .collect()
@@ -13409,10 +13386,17 @@ fn dap_source_info(file: &SourceFile, reference: u64) -> DapSourceInfo {
 }
 
 fn dap_source_json(source: &DapSourceInfo) -> serde_json::Value {
+    dap_source_json_with_reference(source, source.reference)
+}
+
+fn dap_source_json_with_reference(
+    source: &DapSourceInfo,
+    source_reference: u64,
+) -> serde_json::Value {
     serde_json::json!({
         "name": source.name,
         "path": source.path.display().to_string(),
-        "sourceReference": source.reference,
+        "sourceReference": source_reference,
         "uri": source.uri,
         "checksums": [
             {
@@ -26961,7 +26945,8 @@ function greet(user: User): string -> "hello"
         let dir = temp_output_dir("dap-disassemble");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("app.orv");
-        std::fs::write(&source, "let first: int = 1\nlet second: int = 2\n").expect("write source");
+        let source_text = "let first: int = 1\nlet second: int = 2\n";
+        std::fs::write(&source, source_text).expect("write source");
         let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
         let mut session = DapSession::default();
 
@@ -27001,6 +26986,14 @@ function greet(user: User): string -> "hello"
         assert_eq!(
             instructions[0]["location"]["path"],
             canonical_source.display().to_string()
+        );
+        assert_eq!(
+            instructions[0]["location"]["checksums"][0]["algorithm"],
+            serde_json::json!("SHA256")
+        );
+        assert_eq!(
+            instructions[0]["location"]["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(source_text.as_bytes()))
         );
         assert_eq!(instructions[0]["line"], 1);
         assert_eq!(instructions[1]["address"], "orv:frame:2");
@@ -29320,16 +29313,13 @@ let done: int = total
         let dir = temp_output_dir("dap-step-in-targets");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("app.orv");
-        std::fs::write(
-            &source,
-            r"function add(a: int, b: int): int -> {
+        let source_text = r"function add(a: int, b: int): int -> {
   let result: int = a + b
   result
 }
 let total: int = add(2, 3)
-",
-        )
-        .expect("write source");
+";
+        std::fs::write(&source, source_text).expect("write source");
         let mut session = DapSession::default();
 
         session
@@ -29352,13 +29342,13 @@ let total: int = add(2, 3)
                 },
             }))
             .expect("stepInTargets response");
-        let target_id = targets["body"]["targets"]
+        let add_target = targets["body"]["targets"]
             .as_array()
             .expect("targets")
             .iter()
             .find(|target| target["label"] == "add")
-            .and_then(|target| target["id"].as_u64())
-            .expect("add target id");
+            .expect("add target");
+        let target_id = add_target["id"].as_u64().expect("add target id");
         let step_in = session
             .message_response(&serde_json::json!({
                 "seq": 200,
@@ -29383,9 +29373,17 @@ let total: int = add(2, 3)
             .expect("stack response");
 
         assert_eq!(targets["success"], true, "{targets}");
+        assert_eq!(
+            add_target["source"]["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(source_text.as_bytes()))
+        );
         assert_eq!(step_in["success"], true, "{step_in}");
         assert_eq!(stack["body"]["stackFrames"][0]["name"], "add");
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert_eq!(
+            stack["body"]["stackFrames"][0]["source"]["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(source_text.as_bytes()))
+        );
         assert!(events.iter().any(|event| {
             event["type"] == "event"
                 && event["event"] == "stopped"
@@ -30367,7 +30365,8 @@ function greet(user: User): string -> "hello"
         let dir = temp_output_dir("dap-variables");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("app.orv");
-        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let source_text = "let answer: int = 42\n";
+        std::fs::write(&source, source_text).expect("write source");
         let canonical_source = std::fs::canonicalize(&source).expect("canonical source");
         let mut session = DapSession::default();
 
@@ -30407,6 +30406,14 @@ function greet(user: User): string -> "hello"
         assert_eq!(scopes["body"]["scopes"][0]["variablesReference"], 1);
         assert_eq!(scopes["body"]["scopes"][0]["namedVariables"], 6);
         assert_eq!(scopes["body"]["scopes"][1]["name"], "Locals");
+        assert_eq!(
+            scopes["body"]["scopes"][0]["source"]["checksums"][0]["algorithm"],
+            serde_json::json!("SHA256")
+        );
+        assert_eq!(
+            scopes["body"]["scopes"][0]["source"]["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(source_text.as_bytes()))
+        );
         assert!(scopes["body"]["scopes"][1]["namedVariables"]
             .as_u64()
             .is_some_and(|count| count >= 1));
