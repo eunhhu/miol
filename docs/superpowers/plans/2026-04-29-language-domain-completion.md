@@ -150,6 +150,8 @@
 
 **Editor production adapter panel delta (2026-05-06):** `orv editor export <file> --out <dir> --build <build-dir>` now embeds `state.production` and `native-host.json` `production` with checked DB and commerce adapter contract targets, sets `capabilities.production_adapters`, and the static editor shell renders a Production panel with adapter counts and artifact paths. 2026-05-13 adds `production.summary` plus `production.panel_contract` for DB and commerce adapter sections, matching the runtime/debug/trace native-host panel contract shape. 2026-05-14 adds a focused `production/panel.html` companion artifact and mirrors it through `artifacts.production_panel_html`, `production.panel_html_path`, `production.panel_artifact`, and the production panel contract.
 
+**Editor native-host panel inventory delta (2026-05-14):** `native-host.json` now includes ordered `panels[]` entries for debug result, runtime, and the available production/trace companions. Each entry carries the panel name/title/root, artifact path/kind/media type, and panel contract so native hosts can build a panel switcher without probing unrelated manifest sections.
+
 ---
 
 ### Task 1: Parser Surface Gap Closure

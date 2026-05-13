@@ -8561,6 +8561,10 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .unwrap_or(serde_json::Value::Null);
     let production_adapters = production_adapter_count(&production_state) > 0;
     let production = editor_native_host_production_json(&production_state);
+    let runtime = editor_native_host_runtime_json(state);
+    let trace = editor_native_host_trace_json(state);
+    let panels =
+        editor_native_host_panel_inventory_json(&result_artifact, &runtime, &production, &trace);
     let mut artifacts = serde_json::json!({
         "shell": "index.html",
         "state": "state.json",
@@ -8664,9 +8668,10 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .cloned()
                 .unwrap_or(serde_json::json!(true)),
         },
-        "runtime": editor_native_host_runtime_json(state),
+        "runtime": runtime,
         "production": production,
-        "trace": editor_native_host_trace_json(state),
+        "trace": trace,
+        "panels": panels,
         "capabilities": {
             "project_graph": true,
             "runtime_inspection": true,
@@ -8674,6 +8679,102 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "production_adapters": production_adapters,
             "trace_navigation": trace_enabled,
         },
+    })
+}
+
+fn editor_native_host_panel_inventory_json(
+    debug_result_artifact: &serde_json::Value,
+    runtime: &serde_json::Value,
+    production: &serde_json::Value,
+    trace: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut panels = Vec::new();
+    panels.push(editor_native_host_panel_inventory_entry_json(
+        "debug_result",
+        "Debug Result",
+        "debug",
+        debug_result_artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str),
+        debug_result_artifact
+            .get("kind")
+            .and_then(serde_json::Value::as_str),
+        debug_result_artifact
+            .get("media_type")
+            .and_then(serde_json::Value::as_str),
+        debug_result_artifact.get("panel_contract"),
+    ));
+    panels.push(editor_native_host_panel_inventory_entry_json(
+        "runtime",
+        "Runtime",
+        "runtime",
+        runtime
+            .pointer("/panel_artifact/path")
+            .and_then(serde_json::Value::as_str),
+        runtime
+            .pointer("/panel_artifact/kind")
+            .and_then(serde_json::Value::as_str),
+        runtime
+            .pointer("/panel_artifact/media_type")
+            .and_then(serde_json::Value::as_str),
+        runtime.get("panel_contract"),
+    ));
+    if !production.is_null() {
+        panels.push(editor_native_host_panel_inventory_entry_json(
+            "production",
+            "Production",
+            "production",
+            production
+                .pointer("/panel_artifact/path")
+                .and_then(serde_json::Value::as_str),
+            production
+                .pointer("/panel_artifact/kind")
+                .and_then(serde_json::Value::as_str),
+            production
+                .pointer("/panel_artifact/media_type")
+                .and_then(serde_json::Value::as_str),
+            production.get("panel_contract"),
+        ));
+    }
+    if !trace.is_null() {
+        panels.push(editor_native_host_panel_inventory_entry_json(
+            "trace",
+            "Trace",
+            "trace",
+            trace
+                .pointer("/panel_artifact/path")
+                .and_then(serde_json::Value::as_str),
+            trace
+                .pointer("/panel_artifact/kind")
+                .and_then(serde_json::Value::as_str),
+            trace
+                .pointer("/panel_artifact/media_type")
+                .and_then(serde_json::Value::as_str),
+            trace.get("panel_contract"),
+        ));
+    }
+    panels
+}
+
+fn editor_native_host_panel_inventory_entry_json(
+    name: &str,
+    title: &str,
+    root: &str,
+    path: Option<&str>,
+    kind: Option<&str>,
+    media_type: Option<&str>,
+    panel_contract: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "title": title,
+        "root": root,
+        "artifact": {
+            "path": path.unwrap_or(""),
+            "kind": kind.unwrap_or(""),
+            "media_type": media_type.unwrap_or(""),
+        },
+        "panel_contract": panel_contract.cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -44769,6 +44870,19 @@ define Auth() -> { @out "auth" }
             native_host["runtime"]["panel_artifact"]["kind"],
             "orv.editor.runtime.panel"
         );
+        let panels = native_host["panels"]
+            .as_array()
+            .expect("native host panel inventory");
+        assert!(panels.iter().any(|panel| {
+            panel["name"] == "debug_result"
+                && panel["artifact"]["path"] == EDITOR_DEBUG_SESSION_RESULT_PATH
+        }));
+        assert!(panels.iter().any(|panel| {
+            panel["name"] == "runtime"
+                && panel["artifact"]["path"] == EDITOR_RUNTIME_PANEL_HTML_PATH
+        }));
+        assert!(!panels.iter().any(|panel| panel["name"] == "production"));
+        assert!(!panels.iter().any(|panel| panel["name"] == "trace"));
         assert_eq!(native_host["runtime"]["panel_contract"]["root"], "runtime");
         let runtime_sections = native_host["runtime"]["panel_contract"]["sections"]
             .as_array()
@@ -46244,6 +46358,12 @@ define Auth() -> { @out "auth" }
             native_host["trace"]["panel_artifact"]["kind"],
             "orv.editor.trace.panel"
         );
+        let panels = native_host["panels"]
+            .as_array()
+            .expect("native host panel inventory");
+        assert!(panels.iter().any(|panel| {
+            panel["name"] == "trace" && panel["artifact"]["path"] == EDITOR_TRACE_PANEL_HTML_PATH
+        }));
         assert_eq!(native_host["capabilities"]["trace_navigation"], true);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -46600,6 +46720,13 @@ define Auth() -> { @out "auth" }
             export_native_host["artifacts"]["production_panel_html"],
             EDITOR_PRODUCTION_PANEL_HTML_PATH
         );
+        let export_panels = export_native_host["panels"]
+            .as_array()
+            .expect("native host panel inventory");
+        assert!(export_panels.iter().any(|panel| {
+            panel["name"] == "production"
+                && panel["artifact"]["path"] == EDITOR_PRODUCTION_PANEL_HTML_PATH
+        }));
         assert!(production_panel.contains("Production Panel"));
         assert!(production_panel.contains("DB Adapters"));
         assert!(production_panel.contains("Commerce Adapters"));
