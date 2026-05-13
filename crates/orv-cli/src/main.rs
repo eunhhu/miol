@@ -10650,6 +10650,7 @@ impl DapSession {
             .ok_or_else(|| anyhow::anyhow!("launch is required before stackTrace"))?;
         let frames = dap_stack_frames_json(launched);
         let total_frames = frames.len();
+        let frames = dap_paginate_json_values(frames, request, "startFrame", "levels");
         Ok(serde_json::json!({
             "stackFrames": frames,
             "totalFrames": total_frames,
@@ -10700,11 +10701,12 @@ impl DapSession {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("variables.arguments.variablesReference is required"))?;
         if variables_reference == 2 {
+            let variables = dap_current_locals(launched)
+                .iter()
+                .map(dap_variable_json)
+                .collect::<Vec<_>>();
             return Ok(serde_json::json!({
-                "variables": dap_current_locals(launched)
-                    .iter()
-                    .map(dap_variable_json)
-                    .collect::<Vec<_>>(),
+                "variables": dap_paginate_json_values(variables, request, "start", "count"),
             }));
         }
         if variables_reference != 1 {
@@ -10752,7 +10754,7 @@ impl DapSession {
             variables.extend(dap_async_runtime_variables(launched, async_runtime));
         }
         Ok(serde_json::json!({
-            "variables": variables,
+            "variables": dap_paginate_json_values(variables, request, "start", "count"),
         }))
     }
 
@@ -12496,6 +12498,29 @@ fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
         }
     }
     frames
+}
+
+fn dap_paginate_json_values(
+    values: Vec<serde_json::Value>,
+    request: &serde_json::Value,
+    start_name: &str,
+    count_name: &str,
+) -> Vec<serde_json::Value> {
+    let total = values.len();
+    let start = dap_usize_argument(request, start_name)
+        .unwrap_or(0)
+        .min(total);
+    let count =
+        dap_usize_argument(request, count_name).unwrap_or_else(|| total.saturating_sub(start));
+    values.into_iter().skip(start).take(count).collect()
+}
+
+fn dap_usize_argument(request: &serde_json::Value, name: &str) -> Option<usize> {
+    request
+        .get("arguments")
+        .and_then(|arguments| arguments.get(name))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn dap_stack_frame_json(
@@ -27762,6 +27787,68 @@ let total: int = add(2, 3)
     }
 
     #[test]
+    fn dap_stack_trace_honors_start_frame_and_levels() {
+        let dir = temp_output_dir("dap-stack-trace-paging");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 204,
+                "type": "request",
+                "command": "setFunctionBreakpoints",
+                "arguments": {
+                    "breakpoints": [
+                        { "name": "add" },
+                    ],
+                },
+            }))
+            .expect("setFunctionBreakpoints response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 205,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 206,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                    "startFrame": 1,
+                    "levels": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(stack["success"], true, "{stack}");
+        assert_eq!(stack["body"]["totalFrames"], 2);
+        let frames = stack["body"]["stackFrames"]
+            .as_array()
+            .expect("stack frames");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["name"], "orv entry");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn dap_continue_stops_at_next_function_breakpoint_frame() {
         let dir = temp_output_dir("dap-continue-function-breakpoint");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -30368,6 +30455,69 @@ function greet(user: User): string -> "hello"
         assert!(vars
             .iter()
             .any(|var| var["name"] == "ready" && var["value"] == "true" && var["type"] == "bool"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_variables_honor_start_and_count() {
+        let dir = temp_output_dir("dap-variables-paging");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let answer: int = 42\nconst greeting = \"hello\"\nlet ready = true\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 207,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 208,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first next response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 209,
+                "type": "request",
+                "command": "next",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("second next response");
+        let locals = session
+            .message_response(&serde_json::json!({
+                "seq": 210,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 2,
+                    "start": 1,
+                    "count": 1,
+                },
+            }))
+            .expect("locals response");
+
+        assert_eq!(locals["success"], true, "{locals}");
+        let vars = locals["body"]["variables"].as_array().expect("locals");
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0]["name"], "greeting");
+        assert_eq!(vars[0]["value"], "\"hello\"");
         let _ = std::fs::remove_dir_all(dir);
     }
 
