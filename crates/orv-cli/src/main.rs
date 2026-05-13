@@ -16257,6 +16257,8 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("bindReactiveAttrs")
         || !source.contains("bindReactiveEvents")
         || !source.contains("applySignalAction")
+        || !source.contains("assign_add")
+        || !source.contains("assign_sub")
         || !source.contains("assign_toggle")
         || !source.contains("assign_event_target_value")
         || !source.contains("assign_event_target_checked")
@@ -34174,6 +34176,8 @@ entry = "src/main.orv"
             "bindReactiveAttrs",
             "bindReactiveEvents",
             "applySignalAction",
+            "assign_add",
+            "assign_sub",
             "assign_toggle",
             "assign_event_target_checked",
             "assign_event_target_value",
@@ -37427,6 +37431,35 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let loader = std::fs::read_to_string(&loader_path)
             .expect("client loader")
             .replace("loadReactivePlan", "loadReactiveContract");
+        std::fs::write(&loader_path, loader).expect("rewrite loader");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
+
+        assert!(
+            err.to_string().contains("client reactive plan"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_js_without_event_arithmetic_actions() {
+        let out = temp_output_dir("verify-build-client-js-event-arithmetic");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @button onClick={count += 1} \"+\" @button onClick={count -= 1} \"-\" } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let loader_path = build_out.join("client").join("app.js");
+        let loader = std::fs::read_to_string(&loader_path)
+            .expect("client loader")
+            .replace("assign_add", "assign_plus")
+            .replace("assign_sub", "assign_minus");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
