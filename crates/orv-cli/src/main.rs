@@ -7373,11 +7373,12 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .unwrap_or_default();
     let breakpoint_commands = editor_native_host_breakpoint_commands_json(debug);
     let trace_enabled = state.get("trace").is_some();
-    let production = state
+    let production_state = state
         .get("production")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let production_adapters = production_adapter_count(&production) > 0;
+    let production_adapters = production_adapter_count(&production_state) > 0;
+    let production = editor_native_host_production_json(&production_state);
     serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.native_host",
@@ -7433,6 +7434,36 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "production_adapters": production_adapters,
             "trace_navigation": trace_enabled,
         },
+    })
+}
+
+fn editor_native_host_production_json(production: &serde_json::Value) -> serde_json::Value {
+    let Some(mut object) = production.as_object().cloned() else {
+        return serde_json::Value::Null;
+    };
+    object.insert(
+        "panel_contract".to_string(),
+        editor_native_host_production_panel_contract_json(),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": "production",
+        "sections": [
+            {
+                "name": "db_adapters",
+                "path": "production.db_adapters",
+                "kind": "array",
+            },
+            {
+                "name": "commerce_adapters",
+                "path": "production.commerce_adapters",
+                "kind": "array",
+            },
+        ],
     })
 }
 
@@ -39892,6 +39923,21 @@ define Auth() -> { @out "auth" }
             native_host["production"]["commerce_adapters"][0]["path"],
             "deploy/commerce-adapters.json"
         );
+        assert_eq!(
+            native_host["production"]["panel_contract"]["root"],
+            "production"
+        );
+        let production_sections = native_host["production"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("production panel sections");
+        assert!(production_sections
+            .iter()
+            .any(|section| section["name"] == "db_adapters"
+                && section["path"] == "production.db_adapters"));
+        assert!(production_sections
+            .iter()
+            .any(|section| section["name"] == "commerce_adapters"
+                && section["path"] == "production.commerce_adapters"));
         assert_eq!(native_host["capabilities"]["production_adapters"], true);
         assert!(html.contains("Production"));
         assert!(html.contains("DB Adapters"));
