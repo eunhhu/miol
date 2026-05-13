@@ -37171,6 +37171,12 @@ entry = "src/main.orv"
   @route POST /orders/total-with-fee {
     @respond 201 { total: (@body.fee as int) + ((@body.quantity as int) * (@body.unit_price as int)) }
   }
+  @route POST /orders/bundles {
+    @respond 201 { bundles: (@body.total as int) / ((@body.quantity as int) * (@body.unit_price as int)) }
+  }
+  @route POST /orders/remainder-product-left {
+    @respond 201 { remainder: ((@body.quantity as int) * (@body.unit_price as int)) % (@body.total as int) }
+  }
   @route POST /orders/power {
     @respond 201 { total: (@body.quantity as int) ** (@body.bonus as int) }
   }
@@ -37280,6 +37286,16 @@ entry = "src/main.orv"
             "/orders/total-with-fee",
             r#"{"fee":"25","quantity":"7","unit_price":"125"}"#,
         );
+        let bundles_response = send_raw_http_json_post(
+            address,
+            "/orders/bundles",
+            r#"{"total":"1750","quantity":"7","unit_price":"125"}"#,
+        );
+        let remainder_product_left_response = send_raw_http_json_post(
+            address,
+            "/orders/remainder-product-left",
+            r#"{"quantity":"7","unit_price":"125","total":"400"}"#,
+        );
         let power_response =
             send_raw_http_json_post(address, "/orders/power", r#"{"quantity":"2","bonus":"6"}"#);
         let invalid_power_response =
@@ -37353,6 +37369,10 @@ entry = "src/main.orv"
         assert!(total_response.contains(r#"{"total":875}"#));
         assert!(total_with_fee_response.starts_with("HTTP/1.1 201"));
         assert!(total_with_fee_response.contains(r#"{"total":900}"#));
+        assert!(bundles_response.starts_with("HTTP/1.1 201"));
+        assert!(bundles_response.contains(r#"{"bundles":2}"#));
+        assert!(remainder_product_left_response.starts_with("HTTP/1.1 201"));
+        assert!(remainder_product_left_response.contains(r#"{"remainder":75}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
         assert!(power_response.contains(r#"{"total":64}"#));
         assert!(invalid_power_response.starts_with("HTTP/1.1 500"));
