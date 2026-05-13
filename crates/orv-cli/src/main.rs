@@ -36862,6 +36862,12 @@ entry = "src/main.orv"
     }
     @respond 409 { err: "over_total" }
   }
+  @route POST /inventory-value-scaled {
+    if (@body.total as int) <= (((@body.quantity as int) * (@body.unit_price as int)) * 100) {
+      @respond 201 { accepted: true, total: @body.total as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
   @route POST /inventory-value-static {
     if ((@body.quantity as int) * (@body.unit_price as int)) <= 1000 {
       @respond 201 { accepted: true, quantity: @body.quantity as int }
@@ -37070,6 +37076,16 @@ entry = "src/main.orv"
             "/inventory-value-product",
             r#"{"quantity":"9","unit_price":"125","stock":"8","reserve_price":"125"}"#,
         );
+        let accepted_scaled_product_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-scaled",
+            r#"{"total":"87500","quantity":"7","unit_price":"125"}"#,
+        );
+        let rejected_scaled_product_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-scaled",
+            r#"{"total":"87501","quantity":"7","unit_price":"125"}"#,
+        );
         let accepted_ifelse_inventory = send_raw_http_json_post(
             address,
             "/ifelse-inventory",
@@ -37185,6 +37201,12 @@ entry = "src/main.orv"
         assert!(accepted_product_value_inventory.contains(r#"{"accepted":true,"quantity":7}"#));
         assert!(rejected_product_value_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_product_value_inventory.contains(r#"{"err":"over_total"}"#));
+        assert!(accepted_scaled_product_value_inventory.starts_with("HTTP/1.1 201"));
+        assert!(
+            accepted_scaled_product_value_inventory.contains(r#"{"accepted":true,"total":87500}"#)
+        );
+        assert!(rejected_scaled_product_value_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_scaled_product_value_inventory.contains(r#"{"err":"over_total"}"#));
         assert!(accepted_ifelse_inventory.starts_with("HTTP/1.1 201"));
         assert!(accepted_ifelse_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_ifelse_inventory.starts_with("HTTP/1.1 409"));
