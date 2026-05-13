@@ -14532,13 +14532,15 @@ fn lsp_code_actions_json(
         .iter()
         .filter(|diagnostic| lsp_diagnostic_file_id(diagnostic) == Some(file.id))
         .filter(|diagnostic| lsp_span_overlaps_range(lsp_diagnostic_span(diagnostic), start, end))
-        .map(|diagnostic| {
+        .flat_map(|diagnostic| {
             let diagnostic_json = lsp_diagnostic_json(diagnostic, &loaded.files);
             let range = diagnostic_json
                 .get("range")
                 .cloned()
                 .unwrap_or_else(|| lsp_range_for_source(&file.source, start, end));
-            serde_json::json!({
+            let mut actions =
+                lsp_diagnostic_edit_code_actions_json(diagnostic, &diagnostic_json, &uri, &range);
+            actions.push(serde_json::json!({
                 "title": format!("Reveal diagnostic: {}", diagnostic.message),
                 "kind": "quickfix",
                 "diagnostics": [diagnostic_json],
@@ -14552,9 +14554,71 @@ fn lsp_code_actions_json(
                         diagnostic.message,
                     ],
                 },
-            })
+            }));
+            actions
         })
         .collect()
+}
+
+fn lsp_diagnostic_edit_code_actions_json(
+    diagnostic: &orv_diagnostics::Diagnostic,
+    diagnostic_json: &serde_json::Value,
+    uri: &str,
+    range: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    match diagnostic.message.as_str() {
+        "expected HTTP method after `@route`" => lsp_insert_text_code_action_json(
+            "Insert default GET route head",
+            uri,
+            range,
+            "GET /path ",
+            diagnostic_json,
+        )
+        .into_iter()
+        .collect(),
+        "expected path starting with `/` or `*` after HTTP method" => {
+            lsp_insert_text_code_action_json(
+                "Insert default route path",
+                uri,
+                range,
+                "/path ",
+                diagnostic_json,
+            )
+            .into_iter()
+            .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn lsp_insert_text_code_action_json(
+    title: &str,
+    uri: &str,
+    range: &serde_json::Value,
+    new_text: &str,
+    diagnostic_json: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let start = range.get("start")?.clone();
+    let edit_range = serde_json::json!({
+        "start": start,
+        "end": start,
+    });
+    let mut changes = serde_json::Map::new();
+    changes.insert(
+        uri.to_string(),
+        serde_json::json!([{
+            "range": edit_range,
+            "newText": new_text,
+        }]),
+    );
+    Some(serde_json::json!({
+        "title": title,
+        "kind": "quickfix",
+        "diagnostics": [diagnostic_json.clone()],
+        "edit": {
+            "changes": changes,
+        },
+    }))
 }
 
 fn lsp_execute_reveal_diagnostic_json(request: &serde_json::Value) -> serde_json::Value {
@@ -30508,6 +30572,102 @@ function greet(user: User): string -> "hello"
             action["command"]["arguments"][0],
             format!("file://{}", canonical_source.display())
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_code_action_inserts_default_route_method_and_path() {
+        let dir = temp_output_dir("lsp-code-action-route-method");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@server {\n  @route {\n}\n").expect("write source");
+        let uri = format!("file://{}", source.display());
+        let canonical_uri = format!(
+            "file://{}",
+            std::fs::canonicalize(&source)
+                .expect("canonical source")
+                .display()
+        );
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                },
+                "range": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 10 },
+                },
+                "context": {
+                    "diagnostics": [],
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 33);
+        assert!(response.get("error").is_none(), "{response}");
+        let actions = response["result"].as_array().expect("code actions");
+        let action = actions
+            .iter()
+            .find(|action| action["title"] == "Insert default GET route head")
+            .expect("route method quickfix");
+        assert_eq!(action["kind"], "quickfix");
+        let change = &action["edit"]["changes"][canonical_uri.as_str()][0];
+        assert_eq!(change["newText"], "GET /path ");
+        assert_eq!(change["range"]["start"]["line"], 1);
+        assert_eq!(change["range"]["start"]["character"], 9);
+        assert_eq!(change["range"]["end"], change["range"]["start"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_code_action_inserts_default_route_path() {
+        let dir = temp_output_dir("lsp-code-action-route-path");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@server {\n  @route GET {\n}\n").expect("write source");
+        let uri = format!("file://{}", source.display());
+        let canonical_uri = format!(
+            "file://{}",
+            std::fs::canonicalize(&source)
+                .expect("canonical source")
+                .display()
+        );
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                },
+                "range": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 14 },
+                },
+                "context": {
+                    "diagnostics": [],
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 34);
+        assert!(response.get("error").is_none(), "{response}");
+        let actions = response["result"].as_array().expect("code actions");
+        let action = actions
+            .iter()
+            .find(|action| action["title"] == "Insert default route path")
+            .expect("route path quickfix");
+        assert_eq!(action["kind"], "quickfix");
+        let change = &action["edit"]["changes"][canonical_uri.as_str()][0];
+        assert_eq!(change["newText"], "/path ");
+        assert_eq!(change["range"]["start"]["line"], 1);
+        assert_eq!(change["range"]["start"]["character"], 13);
+        assert_eq!(change["range"]["end"], change["range"]["start"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
