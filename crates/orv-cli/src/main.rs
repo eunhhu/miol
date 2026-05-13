@@ -2382,6 +2382,10 @@ struct OrvTestCase {
     file: PathBuf,
     name: String,
     span: ByteRange,
+    start_line: usize,
+    start_character: usize,
+    end_line: usize,
+    end_character: usize,
 }
 
 fn cmd_test(path: &Path, filter: Option<&str>, list: bool) -> anyhow::Result<()> {
@@ -2402,6 +2406,22 @@ fn orv_test_list_json(path: &Path, filter: Option<&str>) -> anyhow::Result<serde
             serde_json::json!({
                 "path": case.file.display().to_string(),
                 "name": case.name,
+                "line": case.start_line + 1,
+                "column": case.start_character + 1,
+                "span": {
+                    "start": case.span.start,
+                    "end": case.span.end,
+                },
+                "range": {
+                    "start": {
+                        "line": case.start_line,
+                        "character": case.start_character,
+                    },
+                    "end": {
+                        "line": case.end_line,
+                        "character": case.end_character,
+                    },
+                },
             })
         })
         .collect::<Vec<_>>();
@@ -2517,10 +2537,16 @@ fn orv_test_blocks(source: &str) -> Vec<OrvTestCase> {
         let Some(end) = orv_test_block_end(&lexed.tokens[index + 2..]) else {
             continue;
         };
+        let (start_line, start_character) = byte_position(source, head.span.range.start);
+        let (end_line, end_character) = byte_position(source, end);
         blocks.push(OrvTestCase {
             file: PathBuf::new(),
             name: name.clone(),
             span: ByteRange::new(head.span.range.start, end),
+            start_line,
+            start_character,
+            end_line,
+            end_character,
         });
     }
     blocks
@@ -25755,6 +25781,13 @@ test "checkout failing runtime body" {
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0]["name"], "checkout shows cart");
         assert_eq!(tests[0]["path"], source.display().to_string());
+        assert_eq!(tests[0]["line"], 1);
+        assert_eq!(tests[0]["column"], 1);
+        assert_eq!(tests[0]["span"]["start"], 0);
+        assert!(tests[0]["span"]["end"].as_u64().is_some_and(|end| end > 0));
+        assert_eq!(tests[0]["range"]["start"]["line"], 0);
+        assert_eq!(tests[0]["range"]["start"]["character"], 0);
+        assert_eq!(tests[0]["range"]["end"]["line"], 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
