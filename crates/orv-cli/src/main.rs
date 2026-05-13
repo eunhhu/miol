@@ -8314,12 +8314,11 @@ impl LspSession {
             Some("textDocument/inlayHint") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.inlay_hint_result(request))
             }
-            Some("textDocument/formatting") => {
-                lsp_jsonrpc_result_or_invalid_params(&id, self.formatting_result(request))
-            }
-            Some("textDocument/rangeFormatting") => {
-                lsp_jsonrpc_result_or_invalid_params(&id, self.range_formatting_result(request))
-            }
+            Some(
+                method @ ("textDocument/formatting"
+                | "textDocument/rangeFormatting"
+                | "textDocument/onTypeFormatting"),
+            ) => lsp_jsonrpc_result_or_invalid_params(&id, self.formatting_result(method, request)),
             Some("textDocument/completion") => {
                 lsp_jsonrpc_result_or_invalid_params(&id, self.completion_result(request))
             }
@@ -8340,6 +8339,19 @@ impl LspSession {
             "textDocument/documentColor" => self.document_color_result(request),
             "textDocument/colorPresentation" => Self::color_presentation_result(request),
             _ => unreachable!("color method dispatch is filtered by jsonrpc_response"),
+        }
+    }
+
+    fn formatting_result(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        match method {
+            "textDocument/formatting" => self.document_formatting_result(request),
+            "textDocument/rangeFormatting" => self.range_formatting_result(request),
+            "textDocument/onTypeFormatting" => self.on_type_formatting_result(request),
+            _ => unreachable!("formatting method dispatch is filtered by jsonrpc_response"),
         }
     }
 
@@ -8436,6 +8448,10 @@ impl LspSession {
                     "inlayHintProvider": true,
                     "documentFormattingProvider": true,
                     "documentRangeFormattingProvider": true,
+                    "documentOnTypeFormattingProvider": {
+                        "firstTriggerCharacter": "}",
+                        "moreTriggerCharacter": ["{", "\n"],
+                    },
                     "completionProvider": {
                         "triggerCharacters": ["@", ".", ":"],
                     },
@@ -8912,7 +8928,10 @@ impl LspSession {
         )))
     }
 
-    fn formatting_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    fn document_formatting_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let uri = lsp_text_document_uri(request)?;
         let path = lsp_file_uri_path(uri)?;
         let loaded = self.loaded_project_for_path(&path)?;
@@ -8945,6 +8964,52 @@ impl LspSession {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         let (start, end, edit_range) = lsp_line_range_for_formatting(&file.source, requested_range);
+        let Some(source_slice) = file.source.get(start..end) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let formatted = lsp_format_source_with_initial_indent(
+            source_slice,
+            lsp_formatting_tab_size(request),
+            lsp_formatting_insert_spaces(request),
+            lsp_indent_level_before(&file.source, start),
+        );
+        if formatted == source_slice {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        }
+        Ok(serde_json::Value::Array(vec![serde_json::json!({
+            "range": edit_range,
+            "newText": formatted,
+        })]))
+    }
+
+    fn on_type_formatting_result(
+        &self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let trigger = request
+            .pointer("/params/ch")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("onTypeFormatting ch must be a string"))?;
+        if !matches!(trigger, "}" | "{" | "\n") {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        }
+        let uri = lsp_text_document_uri(request)?;
+        let path = lsp_file_uri_path(uri)?;
+        let position = lsp_text_document_position(request)?;
+        let loaded = self.loaded_project_for_path(&path)?;
+        let Some(file) = lsp_source_file_for_path(&loaded.files, &path) else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        if trigger == "\n" {
+            return Ok(lsp_newline_on_type_formatting_edit_json(
+                &file.source,
+                position.0,
+                lsp_formatting_tab_size(request),
+                lsp_formatting_insert_spaces(request),
+            ));
+        }
+        let (start, end, edit_range) =
+            lsp_current_line_range_for_formatting(&file.source, position.0);
         let Some(source_slice) = file.source.get(start..end) else {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
@@ -13432,6 +13497,54 @@ fn lsp_line_range_for_formatting(
             u32::try_from(end).unwrap_or(u32::MAX),
         ),
     )
+}
+
+fn lsp_current_line_range_for_formatting(
+    source: &str,
+    line: usize,
+) -> (usize, usize, serde_json::Value) {
+    let start = lsp_line_start_byte(source, line);
+    let end = lsp_line_start_byte(source, line.saturating_add(1)).max(start);
+    (
+        start,
+        end,
+        lsp_range_for_source(
+            source,
+            u32::try_from(start).unwrap_or(u32::MAX),
+            u32::try_from(end).unwrap_or(u32::MAX),
+        ),
+    )
+}
+
+fn lsp_newline_on_type_formatting_edit_json(
+    source: &str,
+    line: usize,
+    tab_size: usize,
+    insert_spaces: bool,
+) -> serde_json::Value {
+    let (start, end, edit_range) = lsp_current_line_range_for_formatting(source, line);
+    let Some(source_slice) = source.get(start..end) else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    if !source_slice.trim().is_empty() {
+        return serde_json::Value::Array(Vec::new());
+    }
+    let indent_unit = if insert_spaces {
+        " ".repeat(tab_size)
+    } else {
+        "\t".to_string()
+    };
+    let mut new_text = indent_unit.repeat(lsp_indent_level_before(source, start));
+    if source_slice.ends_with('\n') {
+        new_text.push('\n');
+    }
+    if new_text == source_slice {
+        return serde_json::Value::Array(Vec::new());
+    }
+    serde_json::Value::Array(vec![serde_json::json!({
+        "range": edit_range,
+        "newText": new_text,
+    })])
 }
 
 fn lsp_line_start_byte(source: &str, target_line: usize) -> usize {
@@ -25457,6 +25570,17 @@ function greet(user: User): string -> "hello"
             assert_eq!(capabilities[provider], true, "{provider}");
         }
         assert_eq!(
+            capabilities["documentOnTypeFormattingProvider"]["firstTriggerCharacter"],
+            "}"
+        );
+        assert!(
+            capabilities["documentOnTypeFormattingProvider"]["moreTriggerCharacter"]
+                .as_array()
+                .expect("on type trigger characters")
+                .iter()
+                .any(|trigger| trigger == "\n")
+        );
+        assert_eq!(
             capabilities["documentLinkProvider"]["resolveProvider"],
             false
         );
@@ -31147,6 +31271,100 @@ let u: User = { id: 1 }
             edits[0]["newText"],
             "  @route GET /ping {\n    @respond 200 {\n      ok: true\n    }\n  }\n"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_on_type_formatting_indents_new_current_line() {
+        let dir = temp_output_dir("lsp-on-type-formatting-newline");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let uri = format!("file://{}", source.display());
+        let mut session = LspSession::default();
+        session.handle_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "orv",
+                    "version": 1,
+                    "text": "@server {\n",
+                },
+            },
+        }));
+
+        let response = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 46,
+            "method": "textDocument/onTypeFormatting",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": { "line": 1, "character": 0 },
+                "ch": "\n",
+                "options": {
+                    "tabSize": 2,
+                    "insertSpaces": true,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 46);
+        assert!(response.get("error").is_none(), "{response}");
+        let edits = response["result"].as_array().expect("format edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["range"]["start"]["line"], 1);
+        assert_eq!(edits[0]["range"]["start"]["character"], 0);
+        assert_eq!(edits[0]["newText"], "  ");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_on_type_formatting_aligns_closing_brace_line() {
+        let dir = temp_output_dir("lsp-on-type-formatting-brace");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let uri = format!("file://{}", source.display());
+        let mut session = LspSession::default();
+        session.handle_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "orv",
+                    "version": 1,
+                    "text": "@server {\n  @route GET /ping {\n    @respond 200 {\n      ok: true\n}\n  }\n}\n",
+                },
+            },
+        }));
+
+        let response = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 47,
+            "method": "textDocument/onTypeFormatting",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": { "line": 4, "character": 1 },
+                "ch": "}",
+                "options": {
+                    "tabSize": 2,
+                    "insertSpaces": true,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 47);
+        assert!(response.get("error").is_none(), "{response}");
+        let edits = response["result"].as_array().expect("format edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["range"]["start"]["line"], 4);
+        assert_eq!(edits[0]["range"]["end"]["line"], 5);
+        assert_eq!(edits[0]["newText"], "    }\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
