@@ -54,6 +54,7 @@ const EDITOR_DEBUG_SESSION_RESULT_PATH: &str = "debug/session-result.json";
 const EDITOR_DEBUG_SESSION_RESULT_HTML_PATH: &str = "debug/session-result.html";
 const EDITOR_NATIVE_HOST_MANIFEST_PATH: &str = "native-host.json";
 const EDITOR_TRACE_STREAM_EVENTS_PATH: &str = "trace/events.sse";
+const EDITOR_TRACE_PANEL_HTML_PATH: &str = "trace/panel.html";
 const DB_ARCHIVE_S3_ENDPOINT_ENV: &str = "ORV_DB_ARCHIVE_S3_ENDPOINT";
 const DB_ARCHIVE_S3_AUTH_ENV: &str = "ORV_DB_ARCHIVE_S3_AUTH";
 const DB_ARCHIVE_S3_AUTH_TOKEN_ENV: &str = "ORV_DB_ARCHIVE_S3_AUTH_TOKEN";
@@ -1626,6 +1627,16 @@ fn cmd_editor_export_with_options(
         &editor_native_host_manifest_json(&entry, &state),
     )?;
     write_text(&out.join("index.html"), &editor_export_html(&state)?)?;
+    let trace_panel_written = write_editor_trace_panel_html_if_configured(out, &state)?;
+    let mut files = vec![
+        "index.html",
+        "state.json",
+        EDITOR_DEBUG_SESSION_RUNNER_PATH,
+        EDITOR_NATIVE_HOST_MANIFEST_PATH,
+    ];
+    if trace_panel_written {
+        files.push(EDITOR_TRACE_PANEL_HTML_PATH);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -1633,7 +1644,7 @@ fn cmd_editor_export_with_options(
             "kind": "orv.editor.export",
             "entry": entry.display().to_string(),
             "out": out.display().to_string(),
-            "files": ["index.html", "state.json", EDITOR_DEBUG_SESSION_RUNNER_PATH, EDITOR_NATIVE_HOST_MANIFEST_PATH],
+            "files": files,
         }))?
     );
     Ok(())
@@ -8539,17 +8550,27 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .unwrap_or(serde_json::Value::Null);
     let production_adapters = production_adapter_count(&production_state) > 0;
     let production = editor_native_host_production_json(&production_state);
+    let mut artifacts = serde_json::json!({
+        "shell": "index.html",
+        "state": "state.json",
+        "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
+        "debug_session_result": EDITOR_DEBUG_SESSION_RESULT_PATH,
+        "debug_session_result_html": EDITOR_DEBUG_SESSION_RESULT_HTML_PATH,
+    });
+    if trace_enabled {
+        artifacts
+            .as_object_mut()
+            .expect("native host artifacts is object")
+            .insert(
+                "trace_panel_html".to_string(),
+                serde_json::json!(EDITOR_TRACE_PANEL_HTML_PATH),
+            );
+    }
     serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.native_host",
         "entry": entry.display().to_string(),
-        "artifacts": {
-            "shell": "index.html",
-            "state": "state.json",
-            "debug_session_runner": EDITOR_DEBUG_SESSION_RUNNER_PATH,
-            "debug_session_result": EDITOR_DEBUG_SESSION_RESULT_PATH,
-            "debug_session_result_html": EDITOR_DEBUG_SESSION_RESULT_HTML_PATH,
-        },
+        "artifacts": artifacts,
         "debug": {
             "protocol": adapter.get("protocol").cloned().unwrap_or_else(|| serde_json::json!("dap")),
             "adapter_command": adapter.get("command").cloned().unwrap_or_else(|| serde_json::json!(["orv", "dap", "serve", "--stdio"])),
@@ -9042,6 +9063,19 @@ fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value
         "live_refresh": live_refresh,
         "transport": trace.pointer("/live_refresh/transport").cloned().unwrap_or(serde_json::Value::Null),
         "stream_runner": stream_runner,
+        "panel_html_path": EDITOR_TRACE_PANEL_HTML_PATH,
+        "panel_artifact": editor_trace_panel_artifact_json(),
+        "panel_contract": editor_native_host_trace_panel_contract_json(),
+    })
+}
+
+fn editor_trace_panel_artifact_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.trace.panel",
+        "path": EDITOR_TRACE_PANEL_HTML_PATH,
+        "media_type": "text/html",
+        "source": "native-host.trace",
         "panel_contract": editor_native_host_trace_panel_contract_json(),
     })
 }
@@ -9074,6 +9108,11 @@ fn editor_native_host_trace_panel_contract_json() -> serde_json::Value {
             {
                 "name": "stream_runner",
                 "path": "trace.stream_runner",
+                "kind": "object",
+            },
+            {
+                "name": "panel_artifact",
+                "path": "trace.panel_artifact",
                 "kind": "object",
             },
         ],
@@ -9193,6 +9232,104 @@ fn editor_trace_frame_reveal_command_json(
         return serde_json::Value::Null;
     }
     serde_json::json!(["orv", "editor", "reveal", build_dir, origin_id])
+}
+
+fn write_editor_trace_panel_html_if_configured(
+    out: &Path,
+    state: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    if state.get("trace").is_none() {
+        return Ok(false);
+    }
+    let trace = editor_native_host_trace_json(state);
+    let html = editor_trace_panel_html(&trace)?;
+    write_text(&out.join(EDITOR_TRACE_PANEL_HTML_PATH), &html)?;
+    Ok(true)
+}
+
+fn editor_trace_panel_html(trace: &serde_json::Value) -> anyhow::Result<String> {
+    let summary = trace
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let transport = trace
+        .get("transport")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let stream_runner = trace
+        .get("stream_runner")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let panel_contract = trace
+        .get("panel_contract")
+        .cloned()
+        .unwrap_or_else(editor_native_host_trace_panel_contract_json);
+    let trace_json = html_script_json(&serde_json::to_string_pretty(trace)?);
+    let transport_json = html_escape_text(&serde_json::to_string_pretty(&transport)?);
+    let stream_runner_json = html_escape_text(&serde_json::to_string_pretty(&stream_runner)?);
+    let panel_contract_json = html_escape_text(&serde_json::to_string_pretty(&panel_contract)?);
+    let trace_path = html_escape_text(
+        summary
+            .get("trace_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
+    let build_dir = html_escape_text(
+        summary
+            .get("build_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
+    let frame_count = json_usize_field(&summary, "frame_count");
+    let status_counts = summary
+        .get("status_counts")
+        .unwrap_or(&serde_json::Value::Null);
+    let ok_count = json_usize_field(status_counts, "ok");
+    let client_error_count = json_usize_field(status_counts, "client_error");
+    let server_error_count = json_usize_field(status_counts, "server_error");
+    let first_request = trace_panel_request_label(summary.get("first_request"));
+    let last_request = trace_panel_request_label(summary.get("last_request"));
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>orv Trace Panel</title>\n<style>\n:root{color-scheme:light dark;--bg:#f7f7f4;--fg:#161714;--muted:#6b6f69;--panel:#ffffff;--line:#d7d9d2;--accent:#0d6b5f;--accent-weak:#dcefeb;--bad:#a43434;--warn:#8a5a00;}\n@media (prefers-color-scheme: dark){:root{--bg:#11130f;--fg:#ecefe8;--muted:#a8aea2;--panel:#191c17;--line:#30362d;--accent:#67c7b5;--accent-weak:#203a35;--bad:#ff9d9d;--warn:#e8c06b;}}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;}header{padding:24px 28px 12px;border-bottom:1px solid var(--line);}h1{font-size:24px;margin:0 0 8px;}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}.muted{color:var(--muted)}main{display:grid;grid-template-columns:minmax(280px,380px) minmax(0,1fr);gap:16px;padding:16px 28px 28px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--bg)}.metric b{display:block;font-size:22px;line-height:1.1}.filterbar{display:flex;flex-wrap:wrap;gap:8px}.filterbar button{border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:7px 10px;cursor:pointer}.filterbar button[aria-pressed=\"true\"]{border-color:var(--accent);background:var(--accent-weak)}.list{list-style:none;margin:0;padding:0;display:grid;gap:8px}.list li{border:1px solid var(--line);border-radius:6px;padding:10px;cursor:pointer;background:var(--bg)}.list li:focus,.list li:hover{outline:2px solid var(--accent);outline-offset:1px}.status-client_error,.status-server_error{color:var(--bad)}.status-redirect,.status-other{color:var(--warn)}pre{margin:0;white-space:pre-wrap;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wide{grid-column:1/-1}@media (max-width:900px){main{grid-template-columns:1fr;padding:14px}.summary,.detail-grid{grid-template-columns:1fr}header{padding:18px 14px 8px}}\n</style>\n</head>\n<body>\n",
+    );
+    writeln!(
+        &mut html,
+        "<header><h1>Trace Panel</h1><div class=\"muted\">{trace_path}</div><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Frames</span><b>{frame_count}</b></div><div class=\"metric\"><span>OK</span><b>{ok_count}</b></div><div class=\"metric\"><span>Client Err</span><b>{client_error_count}</b></div><div class=\"metric\"><span>Server Err</span><b>{server_error_count}</b></div></section></header>"
+    )?;
+    writeln!(
+        &mut html,
+        "<main><section class=\"panel\"><h2>Status Filters</h2><div id=\"trace-filterbar\" class=\"filterbar\"></div><p class=\"muted\">First: {}</p><p class=\"muted\">Last: {}</p></section>",
+        html_escape_text(&first_request),
+        html_escape_text(&last_request)
+    )?;
+    html.push_str(
+        "<section class=\"panel\"><h2>Frame Detail</h2><pre id=\"trace-frame-detail\">No trace frame selected.</pre></section>\n<section class=\"panel\"><h2>Frames</h2><ul id=\"trace-frame-list\" class=\"list\"></ul></section>\n<section class=\"detail-grid\">\n",
+    );
+    writeln!(
+        &mut html,
+        "<section class=\"panel\"><h2>Transport</h2><pre>{transport_json}</pre></section><section class=\"panel\"><h2>Trace Stream Runner</h2><pre>{stream_runner_json}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract_json}</pre></section></section></main>"
+    )?;
+    writeln!(
+        &mut html,
+        "<script id=\"orv-trace\" type=\"application/json\">{trace_json}</script>"
+    )?;
+    html.push_str(
+        "<script>\nconst trace = JSON.parse(document.getElementById('orv-trace').textContent);\nconst frames = Array.isArray(trace.frames) ? trace.frames : [];\nconst filters = Array.isArray(trace.status_filters) ? trace.status_filters : [];\nconst filterbar = document.getElementById('trace-filterbar');\nconst list = document.getElementById('trace-frame-list');\nconst detail = document.getElementById('trace-frame-detail');\nfunction frameLabel(frame){\n  return frame?.summary?.label || `${frame?.request?.method || ''} ${frame?.request?.path || ''}`.trim() || frame?.origin_id || 'request';\n}\nfunction renderDetail(frame){\n  if (!frame) { detail.textContent = 'No trace frame selected.'; return; }\n  const source = frame.source || {};\n  const production = frame.production || {};\n  const request = frame.request || {};\n  const lines = [\n    frameLabel(frame),\n    frame.summary?.status_class ? `status ${frame.summary.status_class}` : '',\n    frame.origin_id ? `origin ${frame.origin_id}` : '',\n    source.path ? `source ${source.path}${source.location?.line ? `:${source.location.line}` : ''}` : '',\n    production.path ? `production ${production.path}` : '',\n    Array.isArray(frame.reveal_command) ? `reveal ${frame.reveal_command.join(' ')}` : '',\n    request.params && Object.keys(request.params).length ? `params ${JSON.stringify(request.params)}` : '',\n    request.query && Object.keys(request.query).length ? `query ${JSON.stringify(request.query)}` : '',\n    request.body ? `body ${request.body}` : '',\n    source.snippet || ''\n  ].filter(Boolean);\n  detail.textContent = lines.join('\\n');\n}\nfunction renderFrames(filter){\n  const rows = filter === 'all' ? frames : frames.filter(frame => frame.summary?.status_class === filter);\n  list.textContent = '';\n  for (const frame of rows) {\n    const row = document.createElement('li');\n    const status = frame.summary?.status_class || 'other';\n    row.className = `status-${status}`;\n    row.textContent = frameLabel(frame);\n    row.tabIndex = 0;\n    row.addEventListener('click', () => renderDetail(frame));\n    row.addEventListener('keydown', event => {\n      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); renderDetail(frame); }\n    });\n    list.appendChild(row);\n  }\n  renderDetail(rows[0]);\n}\nfor (const filter of filters) {\n  const button = document.createElement('button');\n  button.type = 'button';\n  button.dataset.filter = filter.name || 'all';\n  button.setAttribute('aria-pressed', button.dataset.filter === 'all' ? 'true' : 'false');\n  button.textContent = `${filter.label || filter.name || 'Filter'} ${filter.count ?? 0}`;\n  button.addEventListener('click', () => {\n    for (const item of filterbar.querySelectorAll('button')) item.setAttribute('aria-pressed', 'false');\n    button.setAttribute('aria-pressed', 'true');\n    renderFrames(button.dataset.filter || 'all');\n  });\n  filterbar.appendChild(button);\n}\nif (!filters.length) {\n  const empty = document.createElement('span');\n  empty.className = 'muted';\n  empty.textContent = 'No trace filters.';\n  filterbar.appendChild(empty);\n}\nrenderFrames('all');\n</script>\n</body>\n</html>\n",
+    );
+    Ok(html)
+}
+
+fn trace_panel_request_label(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(|value| value.get("label"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn html_script_json(value: &str) -> String {
+    value.replace('&', "\\u0026").replace('<', "\\u003c")
 }
 
 struct EditorGraphPanel {
@@ -45851,6 +45988,8 @@ define Auth() -> { @out "auth" }
             .expect("editor export with trace");
 
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
+        let trace_panel =
+            std::fs::read_to_string(out.join(EDITOR_TRACE_PANEL_HTML_PATH)).expect("trace panel");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
         let native_host =
             read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
@@ -45864,6 +46003,25 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             state["trace"]["frames"][0]["navigation"]["focus"]["panel"],
             "routes"
+        );
+        assert!(trace_panel.contains("Trace Panel"));
+        assert!(trace_panel.contains("GET /ping -> 200"));
+        assert!(trace_panel.contains(route.id.as_str()));
+        assert_eq!(
+            native_host["artifacts"]["trace_panel_html"],
+            EDITOR_TRACE_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["trace"]["panel_html_path"],
+            EDITOR_TRACE_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["trace"]["panel_artifact"]["path"],
+            EDITOR_TRACE_PANEL_HTML_PATH
+        );
+        assert_eq!(
+            native_host["trace"]["panel_artifact"]["kind"],
+            "orv.editor.trace.panel"
         );
         assert_eq!(native_host["capabilities"]["trace_navigation"], true);
         let _ = std::fs::remove_dir_all(dir);
@@ -45894,6 +46052,10 @@ define Auth() -> { @out "auth" }
         let native_host = read_json_value(&editor_out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH))
             .expect("native host");
         assert_eq!(native_host["trace"]["kind"], "orv.editor.native_host.trace");
+        assert_eq!(
+            native_host["trace"]["panel_html_path"],
+            EDITOR_TRACE_PANEL_HTML_PATH
+        );
         assert_eq!(
             native_host["trace"]["transport"]["url"],
             "http://127.0.0.1:8080/__orv/trace/events"
@@ -46043,6 +46205,10 @@ define Auth() -> { @out "auth" }
         assert!(sections
             .iter()
             .any(|section| section["name"] == "frames" && section["path"] == "trace.frames"));
+        assert!(sections
+            .iter()
+            .any(|section| section["name"] == "panel_artifact"
+                && section["path"] == "trace.panel_artifact"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(build_out);
     }
