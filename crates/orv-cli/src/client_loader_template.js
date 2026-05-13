@@ -4,7 +4,8 @@ const manifestUrl = new URL(ORV_CLIENT_BOOTSTRAP.manifestUrl, import.meta.url);
 const reactivePlanUrl = new URL(ORV_CLIENT_BOOTSTRAP.reactivePlanUrl, import.meta.url);
 const wasmUrl = new URL(ORV_CLIENT_BOOTSTRAP.wasmUrl, import.meta.url);
 const sourceBundleUrl = new URL(ORV_CLIENT_BOOTSTRAP.sourceBundleUrl, import.meta.url);
-const root = document.querySelector('[data-orv-client="wasm"]');
+const root = document.querySelector("#orv-root") ??
+  document.querySelector('[data-orv-client="wasm"]');
 
 const FNV_OFFSET = 0xcbf29ce484222325n;
 const FNV_PRIME = 0x100000001b3n;
@@ -694,6 +695,15 @@ function validateInitialRender(manifest, html) {
   }
 }
 
+function initialRenderMountHtml(html) {
+  const trimmed = html.trimStart().toLowerCase();
+  if (!trimmed.startsWith("<html") && !trimmed.startsWith("<!doctype")) {
+    return html;
+  }
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  return parsed.body ? parsed.body.innerHTML : html;
+}
+
 function validateWasmBundle(manifest, bytes) {
   const actualHash = fnv1a64(new Uint8Array(bytes));
   if (actualHash !== manifest.wasm_hash) {
@@ -713,7 +723,7 @@ async function main() {
   const initialRender = readInitialRender(instance);
   validateInitialRender(manifest, initialRender);
   if (root && initialRender) {
-    root.innerHTML = initialRender;
+    root.innerHTML = initialRenderMountHtml(initialRender);
   }
   const reactiveDom = bindReactiveDom(reactivePlan, root, reactiveState);
   let reactiveAttrs = { count: 0, update() {} };

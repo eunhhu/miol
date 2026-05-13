@@ -18101,6 +18101,9 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("orv_render_ptr")
         || !source.contains("orv_render_len")
         || !source.contains("TextDecoder")
+        || !source.contains("#orv-root")
+        || !source.contains("initialRenderMountHtml")
+        || !source.contains("DOMParser")
         || !source.contains("root.innerHTML")
     {
         anyhow::bail!("client_js bundle does not decode initial render from wasm");
@@ -38014,6 +38017,9 @@ entry = "src/main.orv"
             "orv_render_ptr",
             "orv_render_len",
             "TextDecoder",
+            "#orv-root",
+            "initialRenderMountHtml",
+            "DOMParser",
             "root.innerHTML",
             "app.wasm",
             "orvReactiveSignals",
@@ -40596,6 +40602,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let page = std::fs::read_to_string(build_out.join("pages").join("index.html"))
             .expect("client page");
         assert!(page.contains("data-orv-client=\"wasm\""));
+        assert!(page.contains("id=\"orv-root\""));
         assert!(page.contains("type=\"module\""));
         assert!(page.contains("../client/app.js"));
         cmd_verify_build(&build_out).expect("verify build");
