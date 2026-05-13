@@ -18032,6 +18032,11 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("reactivePlanUrl")
         || !source.contains("./reactive-plan.json")
         || !source.contains("loadReactivePlan")
+        || !source.contains("embeddedReactivePlan")
+        || !source.contains("embeddedReactivePlanHash")
+        || !source.contains("loadEmbeddedReactivePlan")
+        || !source.contains("validateReactivePlan")
+        || !source.contains("client embedded reactive plan hash mismatch")
         || !source.contains("validateReactiveBindings")
         || !source.contains("client reactive plan fetch failed")
         || !source.contains("client reactive plan hash mismatch")
@@ -22087,11 +22092,7 @@ fn write_client_bundle_artifacts(
         binding.source_bundle_hash,
         binding.initial_render,
     )?;
-    write_client_js_loader(
-        &out.join(js_path),
-        binding.source_bundle,
-        binding.source_bundle_hash,
-    )?;
+    write_client_js_loader(&out.join(js_path), entry, binding)?;
     let loader_src = relative_bundle_path(page_path, js_path);
     write_client_page_shell(&out.join(page_path), entry, &loader_src)?;
     write_client_reactive_plan(out, reactive_plan_path, entry, binding)?;
@@ -22120,6 +22121,11 @@ fn write_client_reactive_plan(
     entry: &Path,
     binding: &ClientSourceBinding<'_>,
 ) -> anyhow::Result<()> {
+    let plan = client_reactive_plan_json(entry, binding);
+    write_json(&out.join(path), &plan)
+}
+
+fn client_reactive_plan_json(entry: &Path, binding: &ClientSourceBinding<'_>) -> serde_json::Value {
     let signals = client_reactive_plan_signals(binding);
     let mut bindings = vec![serde_json::json!({
         "kind": "initial_render",
@@ -22137,7 +22143,7 @@ fn write_client_reactive_plan(
         })
     }));
     bindings.extend(client_reactive_dom_bindings(binding));
-    let plan = serde_json::json!({
+    serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.reactive_plan",
         "entry": entry.display().to_string(),
@@ -22148,8 +22154,7 @@ fn write_client_reactive_plan(
         "bindings": bindings,
         "blocked_by": ["reactive-dom-diff", "dynamic-client-codegen"],
         "blockers": client_reactive_plan_blockers_json(),
-    });
-    write_json(&out.join(path), &plan)
+    })
 }
 
 fn client_reactive_plan_blockers_json() -> Vec<serde_json::Value> {
@@ -24664,9 +24669,11 @@ fn push_wasm_i32_leb(out: &mut Vec<u8>, mut value: i32) {
 
 fn write_client_js_loader(
     path: &Path,
-    source_bundle: &orv_compiler::SourceBundleArtifact,
-    source_bundle_hash: &str,
+    entry: &Path,
+    binding: &ClientSourceBinding<'_>,
 ) -> anyhow::Result<()> {
+    let reactive_plan = client_reactive_plan_json(entry, binding);
+    let reactive_plan_hash = stable_json_hash(&reactive_plan)?;
     let bootstrap = serde_json::to_string_pretty(&serde_json::json!({
         "schemaVersion": 1,
         "runtimeFeatures": ["client_wasm"],
@@ -24677,8 +24684,10 @@ fn write_client_js_loader(
         "manifestWasm": CLIENT_WASM_PATH,
         "sourceBundleUrl": "../source-bundle.json",
         "manifestSourceBundle": SOURCE_BUNDLE_PATH,
-        "sourceBundleHash": source_bundle_hash,
-        "entry": &source_bundle.entry,
+        "sourceBundleHash": binding.source_bundle_hash,
+        "entry": &binding.source_bundle.entry,
+        "embeddedReactivePlan": reactive_plan,
+        "embeddedReactivePlanHash": reactive_plan_hash,
         "exports": {
             "start": CLIENT_WASM_START_EXPORT,
             "renderPtr": CLIENT_WASM_RENDER_PTR_EXPORT,
@@ -37952,6 +37961,11 @@ entry = "src/main.orv"
             "client wasm hash mismatch",
             "reactivePlanUrl",
             "loadReactivePlan",
+            "embeddedReactivePlan",
+            "embeddedReactivePlanHash",
+            "loadEmbeddedReactivePlan",
+            "validateReactivePlan",
+            "client embedded reactive plan hash mismatch",
             "validateReactiveBindings",
             "client reactive plan hash mismatch",
             "client reactive plan initial_render binding mismatch",
@@ -38015,6 +38029,16 @@ entry = "src/main.orv"
                 "missing loader snippet {expected}"
             );
         }
+    }
+
+    fn client_loader_bootstrap_json(loader: &str) -> serde_json::Value {
+        let start_marker = "Object.freeze(";
+        let start = loader.find(start_marker).expect("bootstrap start") + start_marker.len();
+        let end = loader[start..]
+            .find(");\n\nconst manifestUrl")
+            .expect("bootstrap end")
+            + start;
+        serde_json::from_str(&loader[start..end]).expect("bootstrap json")
     }
 
     #[test]
@@ -41926,6 +41950,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert_eq!(
             client_manifest["reactive_plan"],
             "client/reactive-plan.json"
+        );
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        let bootstrap = client_loader_bootstrap_json(&loader);
+        assert_eq!(bootstrap["embeddedReactivePlan"], reactive_plan);
+        assert_eq!(
+            bootstrap["embeddedReactivePlanHash"],
+            stable_json_hash(&reactive_plan).expect("reactive plan hash")
         );
 
         cmd_verify_build(&build_out).expect("verify build artifacts");

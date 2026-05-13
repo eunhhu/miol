@@ -56,11 +56,34 @@ async function loadClientManifest() {
 }
 
 async function loadReactivePlan(manifest) {
+  const embedded = loadEmbeddedReactivePlan(manifest);
+  if (embedded) {
+    return embedded;
+  }
   const response = await fetch(reactivePlanUrl);
   if (!response.ok) {
     throw new Error(`orv client reactive plan fetch failed: ${response.status}`);
   }
   const plan = await response.json();
+  validateReactivePlan(plan, manifest);
+  return plan;
+}
+
+function loadEmbeddedReactivePlan(manifest) {
+  const plan = ORV_CLIENT_BOOTSTRAP.embeddedReactivePlan;
+  if (!plan) {
+    return null;
+  }
+  const expectedHash = ORV_CLIENT_BOOTSTRAP.embeddedReactivePlanHash;
+  const actualHash = stableJsonHash(plan);
+  if (expectedHash && actualHash !== expectedHash) {
+    throw new Error(`orv client embedded reactive plan hash mismatch: expected ${expectedHash}, got ${actualHash}`);
+  }
+  validateReactivePlan(plan, manifest);
+  return plan;
+}
+
+function validateReactivePlan(plan, manifest) {
   if (plan.schema_version !== 1 || plan.kind !== "orv.client.reactive_plan") {
     throw new Error("orv client reactive plan schema mismatch");
   }
@@ -86,7 +109,6 @@ async function loadReactivePlan(manifest) {
     throw new Error("orv client reactive plan signal metadata mismatch");
   }
   validateReactiveBindings(plan, manifest);
-  return plan;
 }
 
 function validateReactiveBindings(plan, manifest) {
