@@ -10666,7 +10666,7 @@ impl DapSession {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("scopes.arguments.frameId is required"))?;
         if frame_id != 1 {
-            anyhow::bail!("scopes currently supports current ORV frameId 1");
+            return dap_non_current_scopes_result(launched, frame_id);
         }
         let (source, _) = dap_current_source_and_line(launched);
         let project_variable_count = dap_project_variables(launched).len();
@@ -12454,7 +12454,12 @@ fn dap_current_source_and_line(launched: &DapLaunchState) -> (DapSourceInfo, u64
     if let Some(frame) = launched.frames.get(launched.current_frame_index) {
         return (frame.source.clone(), frame.line);
     }
-    let source = launched
+    let source = dap_entry_source(launched);
+    (source, launched.stopped_line)
+}
+
+fn dap_entry_source(launched: &DapLaunchState) -> DapSourceInfo {
+    launched
         .sources
         .iter()
         .find(|source| dap_normalize_path(&source.path) == dap_normalize_path(&launched.path))
@@ -12465,8 +12470,55 @@ fn dap_current_source_and_line(launched: &DapLaunchState) -> (DapSourceInfo, u64
             path: launched.path.clone(),
             uri: launched.uri.clone(),
             checksum: String::new(),
+        })
+}
+
+fn dap_non_current_scopes_result(
+    launched: &DapLaunchState,
+    frame_id: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let frame = dap_stack_scope_frame(launched, frame_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown ORV frameId {frame_id}"))?;
+    Ok(serde_json::json!({
+        "scopes": [
+            {
+                "name": frame.name,
+                "variablesReference": 0,
+                "namedVariables": 0,
+                "expensive": false,
+                "source": dap_source_json_with_reference(&frame.source, 0),
+                "line": frame.line,
+                "column": 1,
+            },
+        ],
+    }))
+}
+
+struct DapScopeFrame {
+    name: String,
+    source: DapSourceInfo,
+    line: u64,
+}
+
+fn dap_stack_scope_frame(launched: &DapLaunchState, frame_id: u64) -> Option<DapScopeFrame> {
+    if frame_id <= 1 {
+        return None;
+    }
+    let current_frame = launched.frames.get(launched.current_frame_index)?;
+    let stack_index = usize::try_from(frame_id.saturating_sub(2)).ok()?;
+    if let Some(stack_frame) = current_frame.stack.iter().rev().skip(1).nth(stack_index) {
+        return Some(DapScopeFrame {
+            name: format!("Frame {}", stack_frame.name),
+            source: stack_frame.source.clone(),
+            line: stack_frame.line,
         });
-    (source, launched.stopped_line)
+    }
+    let entry_id = u64::try_from(current_frame.stack.len().saturating_add(1)).ok()?;
+    (frame_id == entry_id && !current_frame.stack.is_empty()).then(|| DapScopeFrame {
+        name: "Frame orv entry".to_string(),
+        source: dap_entry_source(launched),
+        line: 1,
+    })
 }
 
 fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
@@ -12491,17 +12543,11 @@ fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
             ));
         }
         if !current_frame.stack.is_empty() {
-            let entry_source = launched
-                .sources
-                .iter()
-                .find(|source| {
-                    dap_normalize_path(&source.path) == dap_normalize_path(&launched.path)
-                })
-                .unwrap_or(&current_source);
+            let entry_source = dap_entry_source(launched);
             frames.push(dap_stack_frame_json(
                 u64::try_from(frames.len() + 1).unwrap_or(u64::MAX),
                 "orv entry",
-                entry_source,
+                &entry_source,
                 1,
             ));
         }
@@ -29371,6 +29417,22 @@ let total: int = add(2, 3)
                 },
             }))
             .expect("stack response");
+        let caller_frame_id = stack["body"]["stackFrames"]
+            .as_array()
+            .expect("stack frames")
+            .get(1)
+            .and_then(|frame| frame["id"].as_u64())
+            .expect("caller frame id");
+        let caller_scopes = session
+            .message_response(&serde_json::json!({
+                "seq": 202,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": caller_frame_id,
+                },
+            }))
+            .expect("caller scopes response");
 
         assert_eq!(targets["success"], true, "{targets}");
         assert_eq!(
@@ -29382,6 +29444,15 @@ let total: int = add(2, 3)
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
         assert_eq!(
             stack["body"]["stackFrames"][0]["source"]["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(source_text.as_bytes()))
+        );
+        assert_eq!(caller_scopes["success"], true, "{caller_scopes}");
+        assert_eq!(
+            caller_scopes["body"]["scopes"][0]["variablesReference"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            caller_scopes["body"]["scopes"][0]["source"]["checksums"][0]["checksum"],
             serde_json::json!(sha256_hex(source_text.as_bytes()))
         );
         assert!(events.iter().any(|event| {
@@ -30468,7 +30539,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["success"], false, "{response}");
         assert!(response["message"]
             .as_str()
-            .is_some_and(|message| message.contains("current ORV frameId 1")));
+            .is_some_and(|message| message.contains("unknown ORV frameId 99")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
