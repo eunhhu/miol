@@ -10710,7 +10710,7 @@ impl DapSession {
                 .map(dap_variable_json)
                 .collect::<Vec<_>>();
             return Ok(serde_json::json!({
-                "variables": dap_paginate_json_values(variables, request, "start", "count"),
+                "variables": dap_filter_and_paginate_variables(variables, request),
             }));
         }
         if variables_reference != 1 {
@@ -10718,7 +10718,7 @@ impl DapSession {
         }
         let variables = dap_project_variables(launched);
         Ok(serde_json::json!({
-            "variables": dap_paginate_json_values(variables, request, "start", "count"),
+            "variables": dap_filter_and_paginate_variables(variables, request),
         }))
     }
 
@@ -12522,6 +12522,23 @@ fn dap_paginate_json_values(
     let count =
         dap_usize_argument(request, count_name).unwrap_or_else(|| total.saturating_sub(start));
     values.into_iter().skip(start).take(count).collect()
+}
+
+fn dap_filter_and_paginate_variables(
+    values: Vec<serde_json::Value>,
+    request: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    if dap_str_argument(request, "filter") == Some("indexed") {
+        return Vec::new();
+    }
+    dap_paginate_json_values(values, request, "start", "count")
+}
+
+fn dap_str_argument<'a>(request: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    request
+        .get("arguments")
+        .and_then(|arguments| arguments.get(name))
+        .and_then(serde_json::Value::as_str)
 }
 
 fn dap_usize_argument(request: &serde_json::Value, name: &str) -> Option<usize> {
@@ -30536,6 +30553,61 @@ function greet(user: User): string -> "hello"
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0]["name"], "greeting");
         assert_eq!(vars[0]["value"], "\"hello\"");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_variables_honor_named_and_indexed_filters() {
+        let dir = temp_output_dir("dap-variables-filter");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 211,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let named = session
+            .message_response(&serde_json::json!({
+                "seq": 212,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 2,
+                    "filter": "named",
+                },
+            }))
+            .expect("named locals response");
+        let indexed = session
+            .message_response(&serde_json::json!({
+                "seq": 213,
+                "type": "request",
+                "command": "variables",
+                "arguments": {
+                    "variablesReference": 2,
+                    "filter": "indexed",
+                },
+            }))
+            .expect("indexed locals response");
+
+        assert_eq!(named["success"], true, "{named}");
+        assert_eq!(indexed["success"], true, "{indexed}");
+        assert!(named["body"]["variables"]
+            .as_array()
+            .expect("named locals")
+            .iter()
+            .any(|var| var["name"] == "answer"));
+        assert!(indexed["body"]["variables"]
+            .as_array()
+            .expect("indexed locals")
+            .is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
