@@ -14634,17 +14634,20 @@ fn lsp_diagnostic_edit_code_actions_json(
     uri: &str,
     range: &serde_json::Value,
 ) -> Vec<serde_json::Value> {
-    match diagnostic.message.as_str() {
-        "expected HTTP method after `@route`" => lsp_insert_text_code_action_json(
-            "Insert default GET route head",
-            uri,
-            range,
-            "GET /path ",
-            diagnostic_json,
-        )
-        .into_iter()
-        .collect(),
-        "expected path starting with `/` or `*` after HTTP method" => {
+    match (diagnostic.code.as_deref(), diagnostic.message.as_str()) {
+        (Some("syntax/route-method"), _) | (None, "expected HTTP method after `@route`") => {
+            lsp_insert_text_code_action_json(
+                "Insert default GET route head",
+                uri,
+                range,
+                "GET /path ",
+                diagnostic_json,
+            )
+            .into_iter()
+            .collect()
+        }
+        (Some("syntax/route-path"), _)
+        | (None, "expected path starting with `/` or `*` after HTTP method") => {
             lsp_insert_text_code_action_json(
                 "Insert default route path",
                 uri,
@@ -30683,6 +30686,7 @@ function greet(user: User): string -> "hello"
             .find(|action| action["title"] == "Insert default GET route head")
             .expect("route method quickfix");
         assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["diagnostics"][0]["code"], "syntax/route-method");
         let change = &action["edit"]["changes"][canonical_uri.as_str()][0];
         assert_eq!(change["newText"], "GET /path ");
         assert_eq!(change["range"]["start"]["line"], 1);
@@ -30731,6 +30735,7 @@ function greet(user: User): string -> "hello"
             .find(|action| action["title"] == "Insert default route path")
             .expect("route path quickfix");
         assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["diagnostics"][0]["code"], "syntax/route-path");
         let change = &action["edit"]["changes"][canonical_uri.as_str()][0];
         assert_eq!(change["newText"], "/path ");
         assert_eq!(change["range"]["start"]["line"], 1);

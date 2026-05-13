@@ -2712,6 +2712,7 @@ impl Parser {
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error("expected HTTP method after `@route`")
+                        .with_code("syntax/route-method")
                         .with_primary(self.peek().span, ""),
                 );
                 return None;
@@ -2725,6 +2726,7 @@ impl Parser {
         if !matches!(self.peek_kind(), TokenKind::Slash | TokenKind::Star) {
             self.diagnostics.push(
                 Diagnostic::error("expected path starting with `/` or `*` after HTTP method")
+                    .with_code("syntax/route-path")
                     .with_primary(self.peek().span, ""),
             );
             return None;
