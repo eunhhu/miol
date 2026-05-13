@@ -1977,7 +1977,12 @@ fn native_int_operation_is_direct(
             Some(kind),
             Some(name),
         ) => native_captured_int_operand_is_direct(kind, name, route_params),
-        (Some("add_scaled" | "sub_scaled"), Some(operand), Some(kind), Some(name)) => {
+        (
+            Some("add_scaled" | "sub_scaled" | "rsub_scaled"),
+            Some(operand),
+            Some(kind),
+            Some(name),
+        ) => {
             operand.parse::<i64>().is_ok()
                 && native_captured_int_operand_is_direct(kind, name, route_params)
         }
@@ -2012,7 +2017,12 @@ fn native_float_operation_is_direct(
             Some(kind),
             Some(name),
         ) => native_captured_float_operand_is_direct(kind, name, route_params),
-        (Some("add_scaled" | "sub_scaled"), Some(operand), Some(kind), Some(name)) => {
+        (
+            Some("add_scaled" | "sub_scaled" | "rsub_scaled"),
+            Some(operand),
+            Some(kind),
+            Some(name),
+        ) => {
             operand.parse::<f64>().ok().is_some_and(f64::is_finite)
                 && native_captured_float_operand_is_direct(kind, name, route_params)
         }
@@ -3491,7 +3501,7 @@ fn push_native_float_success_arm(
             true
         }
         (
-            Some(op @ ("add_scaled" | "sub_scaled")),
+            Some(op @ ("add_scaled" | "sub_scaled" | "rsub_scaled")),
             Some(scale_json),
             Some(
                 operand_kind @ ("route_param_float"
@@ -3507,14 +3517,19 @@ fn push_native_float_success_arm(
             else {
                 return false;
             };
-            let operator = if op == "add_scaled" { "+" } else { "-" };
+            let value_expr = match op {
+                "add_scaled" => "value + operand",
+                "sub_scaled" => "value - operand",
+                "rsub_scaled" => "operand - value",
+                _ => return false,
+            };
             let _ = writeln!(
                 source,
                 "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
             );
             let _ = writeln!(
                 source,
-                "                Ok(operand) if operand.is_finite() => {{\n                    let operand = operand * {scale};\n                    let value = value {operator} operand;"
+                "                Ok(operand) if operand.is_finite() => {{\n                    let operand = operand * {scale};\n                    let value = {value_expr};"
             );
             push_native_float_arithmetic_result(source, error_prefix, response_origin_id);
             source.push_str("                },\n                _ => {\n");
@@ -3788,7 +3803,7 @@ fn push_native_int_success_arm(
             true
         }
         (
-            Some(op @ ("add_scaled" | "sub_scaled")),
+            Some(op @ ("add_scaled" | "sub_scaled" | "rsub_scaled")),
             Some(scale_json),
             Some(operand_kind @ ("route_param_int" | "query_param_int" | "request_body_field_int")),
             Some(operand_name),
@@ -3800,10 +3815,11 @@ fn push_native_int_success_arm(
             else {
                 return false;
             };
-            let method = if op == "add_scaled" {
-                "checked_add"
-            } else {
-                "checked_sub"
+            let (receiver, method, argument) = match op {
+                "add_scaled" => ("value", "checked_add", "operand"),
+                "sub_scaled" => ("value", "checked_sub", "operand"),
+                "rsub_scaled" => ("operand", "checked_sub", "value"),
+                _ => return false,
             };
             let _ = writeln!(
                 source,
@@ -3815,7 +3831,7 @@ fn push_native_int_success_arm(
             );
             let _ = writeln!(
                 source,
-                "                    Some(operand) => match value.{method}(operand) {{"
+                "                    Some(operand) => match {receiver}.{method}({argument}) {{"
             );
             source.push_str(
                 "                        Some(value) => body.push_str(&value.to_string()),\n                        None => {\n",
@@ -5382,9 +5398,17 @@ fn captured_ordered_arithmetic_response_operation(
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
     if let Some(value) = lhs_value {
-        return captured_arithmetic_response_operation(value, op, rhs);
+        if let Some(value) = captured_arithmetic_response_operation(value, op, rhs) {
+            return Some(value);
+        }
     }
-    captured_static_left_numeric_arithmetic_response_operation(rhs_value()?, op, lhs)
+    let value = rhs_value()?;
+    if matches!(op, BinaryOp::Sub) {
+        if let Some(value) = captured_scaled_left_sub_response_operation(&value, lhs) {
+            return Some(value);
+        }
+    }
+    captured_static_left_numeric_arithmetic_response_operation(value, op, lhs)
 }
 
 fn captured_mul_response_operation(
@@ -5575,6 +5599,36 @@ fn captured_scaled_left_add_response_operation(
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
     value.op = Some("add_scaled".to_string());
+    if value.value_kind.ends_with("_int") {
+        let operand = captured_scaled_integer_operand(lhs)?;
+        value.operand_json = Some(operand.scale.to_string());
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    if value.value_kind.ends_with("_float") {
+        let operand = captured_scaled_float_operand(lhs)?;
+        value.operand_json = Some(operand.scale);
+        value.operand_kind = Some(operand.value_kind);
+        value.operand_name = Some(operand.name);
+        return Some(value);
+    }
+    None
+}
+
+fn captured_scaled_left_sub_response_operation(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.op.is_some()
+        || value.operand_json.is_some()
+        || value.operand_kind.is_some()
+        || value.operand_name.is_some()
+    {
+        return None;
+    }
+    let mut value = captured_response_value(value.name.clone(), &value.value_kind);
+    value.op = Some("rsub_scaled".to_string());
     if value.value_kind.ends_with("_int") {
         let operand = captured_scaled_integer_operand(lhs)?;
         value.operand_json = Some(operand.scale.to_string());
@@ -9409,6 +9463,58 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(handlers.contains("operand.checked_mul(2)"));
         assert!(handlers.contains("value.checked_add(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains("fn orv_native_reference_bridge("));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_scaled_left_int_sub_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { quantity: ((@body.bonus as int) * 2) - (@body.quantity as int) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "quantity");
+        assert_eq!(response.body_request_fields[0].name, "quantity");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("rsub_scaled")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("bonus")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_json.as_deref(),
+            Some("2")
+        );
+        assert!(handlers.contains("operand.checked_mul(2)"));
+        assert!(handlers.contains("operand.checked_sub(value)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains("fn orv_native_reference_bridge("));
