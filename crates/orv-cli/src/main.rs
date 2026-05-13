@@ -9927,7 +9927,7 @@ impl DapSession {
                 ],
             })),
             "stackTrace" => self.stack_trace_result(request),
-            "scopes" => self.scopes_result(),
+            "scopes" => self.scopes_result(request),
             "variables" => self.variables_result(request),
             "setVariable" => self.set_variable_result(request),
             "evaluate" => self.evaluate_result(request),
@@ -10657,11 +10657,18 @@ impl DapSession {
         }))
     }
 
-    fn scopes_result(&self) -> anyhow::Result<serde_json::Value> {
+    fn scopes_result(&self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let launched = self
             .launched
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("launch is required before scopes"))?;
+        let frame_id = request
+            .pointer("/arguments/frameId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("scopes.arguments.frameId is required"))?;
+        if frame_id != 1 {
+            anyhow::bail!("scopes currently supports current ORV frameId 1");
+        }
         let (source_name, source_path, source_uri, _) = dap_current_source_and_line(launched);
         let project_variable_count = dap_project_variables(launched).len();
         let local_variable_count = dap_current_locals(launched).len();
@@ -30405,6 +30412,42 @@ function greet(user: User): string -> "hello"
         assert!(vars
             .iter()
             .any(|var| var["name"] == "diagnostics" && var["value"] == "0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_scopes_rejects_unknown_frame_id() {
+        let dir = temp_output_dir("dap-scopes-frame-id");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let answer: int = 42\n").expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 214,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let response = session
+            .message_response(&serde_json::json!({
+                "seq": 215,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {
+                    "frameId": 99,
+                },
+            }))
+            .expect("scopes response");
+
+        assert_eq!(response["success"], false, "{response}");
+        assert!(response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("current ORV frameId 1")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
