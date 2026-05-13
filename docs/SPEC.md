@@ -3028,7 +3028,7 @@ test "API 응답 확인" async {
 
 ### 14.4 테스트 실행
 
-> 구현 상태: 부분 구현. 현재 `orv test <path> --filter <name>`은 파일/디렉터리에서 `.orv` 파일을 찾고, `test "name"` 선언이 있는 파일을 기존 reference runtime 으로 실행한다. `orv test --list <path> --filter <name>`은 실행 없이 발견된 test 이름/path 목록을 JSON으로 출력한다. `assert` 실패는 runtime throw 로 실패 처리된다. filter 는 test 이름 기준으로 파일을 선택하지만, 현재 parser 가 test 이름을 AST/HIR에 보존하지 않기 때문에 선택된 파일 안의 test block 은 함께 실행된다. test case 단위 isolation, async test scheduler, fixture lifecycle, rich reporter 는 로드맵이다.
+> 구현 상태: 부분 구현. 현재 `orv test <path> --filter <name>`은 파일/디렉터리에서 `.orv` 파일을 찾고, `test "name"` 선언이 있는 파일을 기존 reference runtime 으로 실행한다. `orv test --list <path> --filter <name>`은 실행 없이 발견된 test 이름/path 목록을 JSON으로 출력한다. `assert` 실패는 runtime throw 로 실패 처리된다. filter 는 test 이름 기준으로 test block 을 선택하고, CLI는 선택되지 않은 test block 을 whitespace overlay로 제거한 entry source를 실행해 같은 파일 안의 실패 테스트를 함께 실행하지 않는다. test case 단위 isolation, async test scheduler, fixture lifecycle, rich reporter 는 로드맵이다.
 
 ```
 orv test              # 전체 테스트 실행

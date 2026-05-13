@@ -2377,10 +2377,11 @@ struct OrvTestSummary {
     files: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OrvTestCase {
     file: PathBuf,
     name: String,
+    span: ByteRange,
 }
 
 fn cmd_test(path: &Path, filter: Option<&str>, list: bool) -> anyhow::Result<()> {
@@ -2416,11 +2417,11 @@ fn orv_test_cases(path: &Path, filter: Option<&str>) -> anyhow::Result<Vec<OrvTe
     for file in files {
         let source = std::fs::read_to_string(&file)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
-        for name in orv_test_names(&source) {
-            if filter.is_none_or(|filter| name.contains(filter)) {
+        for case in orv_test_blocks(&source) {
+            if filter.is_none_or(|filter| case.name.contains(filter)) {
                 cases.push(OrvTestCase {
                     file: file.clone(),
-                    name,
+                    ..case
                 });
             }
         }
@@ -2439,23 +2440,25 @@ fn orv_test_summary(path: &Path, filter: Option<&str>) -> anyhow::Result<OrvTest
     for file in files {
         let source = std::fs::read_to_string(&file)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
-        let names = orv_test_names(&source);
-        let selected = names
-            .iter()
-            .filter(|name| filter.is_none_or(|filter| name.contains(filter)))
-            .count();
-        if selected == 0 {
+        let selected_cases = orv_test_blocks(&source)
+            .into_iter()
+            .filter(|case| filter.is_none_or(|filter| case.name.contains(filter)))
+            .collect::<Vec<_>>();
+        if selected_cases.is_empty() {
             continue;
         }
-        summary.selected += selected;
+        summary.selected += selected_cases.len();
         summary.files.push(file.clone());
-        let lowered = load_checked_hir(&file)?;
-        let mut output = Vec::new();
-        if let Err(err) = orv_runtime::run_with_writer(&lowered.program, &mut output) {
-            summary.failed += selected;
-            anyhow::bail!("test: {} failed: {err}", file.display());
+        for case in selected_cases {
+            let test_source = orv_test_source_with_only_case(&source, case.span);
+            let lowered = load_checked_hir_from_sources(&file, &test_source)?;
+            let mut output = Vec::new();
+            if let Err(err) = orv_runtime::run_with_writer(&lowered.program, &mut output) {
+                summary.failed += 1;
+                anyhow::bail!("test: {} `{}` failed: {err}", file.display(), case.name);
+            }
+            summary.passed += 1;
         }
-        summary.passed += selected;
     }
     Ok(summary)
 }
@@ -2493,20 +2496,133 @@ fn is_orv_file(path: &Path) -> bool {
     path.extension().and_then(std::ffi::OsStr::to_str) == Some("orv")
 }
 
-fn orv_test_names(source: &str) -> Vec<String> {
+fn orv_test_blocks(source: &str) -> Vec<OrvTestCase> {
     let lexed = orv_syntax::lex(source, FileId(0));
-    let mut names = Vec::new();
-    for window in lexed.tokens.windows(2) {
-        let [head, tail] = window else {
+    let mut blocks = Vec::new();
+    for index in 0..lexed.tokens.len().saturating_sub(1) {
+        let head = &lexed.tokens[index];
+        if !matches!(&head.kind, orv_syntax::TokenKind::Ident(name) if name == "test") {
+            continue;
+        }
+        let name_token = &lexed.tokens[index + 1];
+        let orv_syntax::TokenKind::String(name) = &name_token.kind else {
             continue;
         };
-        if matches!(&head.kind, orv_syntax::TokenKind::Ident(name) if name == "test") {
-            if let orv_syntax::TokenKind::String(name) = &tail.kind {
-                names.push(name.clone());
+        if !matches!(
+            lexed.tokens.get(index + 2).map(|token| &token.kind),
+            Some(orv_syntax::TokenKind::LBrace)
+        ) {
+            continue;
+        }
+        let Some(end) = orv_test_block_end(&lexed.tokens[index + 2..]) else {
+            continue;
+        };
+        blocks.push(OrvTestCase {
+            file: PathBuf::new(),
+            name: name.clone(),
+            span: ByteRange::new(head.span.range.start, end),
+        });
+    }
+    blocks
+}
+
+fn orv_test_block_end(tokens: &[orv_syntax::Token]) -> Option<u32> {
+    let mut depth = 0usize;
+    let mut saw_block = false;
+    for token in tokens {
+        match token.kind {
+            orv_syntax::TokenKind::LBrace => {
+                saw_block = true;
+                depth += 1;
             }
+            orv_syntax::TokenKind::RBrace if saw_block => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(token.span.range.end);
+                }
+            }
+            orv_syntax::TokenKind::Eof => return None,
+            _ => {}
         }
     }
-    names
+    None
+}
+
+fn orv_test_source_with_only_case(source: &str, selected: ByteRange) -> String {
+    let mut filtered = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for case in orv_test_blocks(source) {
+        let start = usize::try_from(case.span.start).unwrap_or(usize::MAX);
+        let end = usize::try_from(case.span.end).unwrap_or(usize::MAX);
+        if start > source.len() || end > source.len() || start > end {
+            continue;
+        }
+        filtered.push_str(&source[cursor..start]);
+        if case.span == selected {
+            filtered.push_str(&source[start..end]);
+        } else {
+            filtered.push_str(&orv_blank_source_slice(&source[start..end]));
+        }
+        cursor = end;
+    }
+    filtered.push_str(&source[cursor..]);
+    filtered
+}
+
+fn orv_blank_source_slice(source: &str) -> String {
+    source
+        .bytes()
+        .map(|byte| match byte {
+            b'\n' | b'\r' => char::from(byte),
+            _ => ' ',
+        })
+        .collect()
+}
+
+fn orv_test_source_bundle(
+    entry: &Path,
+    entry_source: &str,
+) -> anyhow::Result<Vec<(PathBuf, String)>> {
+    let root = entry.parent().unwrap_or_else(|| Path::new("."));
+    let mut sources = BTreeMap::new();
+    sources.insert(entry.to_path_buf(), entry_source.to_string());
+    let mut stack = orv_test_import_paths(root, entry_source);
+    while let Some(path) = stack.pop() {
+        if sources.contains_key(&path) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+        stack.extend(orv_test_import_paths(root, &source));
+        sources.insert(path, source);
+    }
+    Ok(sources.into_iter().collect())
+}
+
+fn orv_test_import_paths(root: &Path, source: &str) -> Vec<PathBuf> {
+    let lexed = orv_syntax::lex(source, FileId(0));
+    let parsed = orv_syntax::parse_with_newlines(lexed.tokens, FileId(0), lexed.newlines);
+    parsed
+        .program
+        .items
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Import(import) => orv_test_import_candidates(root, import)
+                .into_iter()
+                .find(|candidate| candidate.is_file()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn orv_test_import_candidates(root: &Path, import: &orv_syntax::ast::ImportStmt) -> Vec<PathBuf> {
+    let mut path = root.to_path_buf();
+    for segment in &import.path {
+        path.push(&segment.name);
+    }
+    let mut mod_path = path.clone();
+    mod_path.push("mod.orv");
+    vec![path.with_extension("orv"), mod_path]
 }
 
 fn cmd_db_plan(path: &Path, applied: Option<&Path>) -> anyhow::Result<()> {
@@ -25071,6 +25187,22 @@ fn load_checked_hir(path: &Path) -> anyhow::Result<orv_analyzer::LowerResult> {
     // B3: entry 파일에서 시작해 import 를 따라 multi-file 을 하나의 Program 으로
     // 병합한다. import 가 없으면 entry 한 파일만 로드되므로 기존 동작과 동일.
     let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lower_loaded_project(&loaded)
+}
+
+fn load_checked_hir_from_sources(
+    path: &Path,
+    source: &str,
+) -> anyhow::Result<orv_analyzer::LowerResult> {
+    let sources = orv_test_source_bundle(path, source)?;
+    let loaded = orv_project::load_project_from_sources(path, sources)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lower_loaded_project(&loaded)
+}
+
+fn lower_loaded_project(
+    loaded: &orv_project::LoadedProject,
+) -> anyhow::Result<orv_analyzer::LowerResult> {
     report_diagnostics(&loaded.diagnostics, &loaded.files)?;
 
     let resolved = orv_resolve::resolve(&loaded.program);
@@ -25646,6 +25778,33 @@ test "checkout failing runtime body" {
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.failed, 0);
         assert!(summary.files.iter().any(|file| file == &source));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_summary_runs_only_matching_test_blocks() {
+        let dir = temp_output_dir("test-runner-filter-isolation");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("checkout_test.orv");
+        std::fs::write(
+            &source,
+            r#"test "checkout only" {
+  assert true
+}
+
+test "checkout excluded failure" {
+  assert false
+}
+"#,
+        )
+        .expect("write test source");
+
+        let summary = orv_test_summary(&dir, Some("only")).expect("test summary");
+
+        assert_eq!(summary.selected, 1);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.files, vec![source.clone()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
