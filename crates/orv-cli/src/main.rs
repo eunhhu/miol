@@ -15865,6 +15865,7 @@ fn client_reactive_plan_signal_text_binding_is_valid(
         && client_signal_text_state_keys_are_valid(signals, binding)
         && client_signal_text_sources_are_valid(signals, binding)
         && client_signal_text_template_is_valid(signals, binding)
+        && client_signal_text_condition_is_valid(signals, binding)
 }
 
 fn client_signal_text_binding_state_keys(binding: &serde_json::Value) -> Option<Vec<&str>> {
@@ -15971,6 +15972,16 @@ fn client_signal_text_template_is_valid(
         })
 }
 
+fn client_signal_text_condition_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+) -> bool {
+    let Some(condition) = binding.get("text_condition") else {
+        return true;
+    };
+    client_signal_condition_binding_is_valid(signals, binding, condition)
+}
+
 fn client_reactive_plan_signal_attr_bindings_are_valid(
     signals: &[serde_json::Value],
     bindings: &[serde_json::Value],
@@ -16071,6 +16082,14 @@ fn client_signal_attr_condition_is_valid(
     let Some(condition) = binding.get("attr_condition") else {
         return true;
     };
+    client_signal_condition_binding_is_valid(signals, binding, condition)
+}
+
+fn client_signal_condition_binding_is_valid(
+    signals: &[serde_json::Value],
+    binding: &serde_json::Value,
+    condition: &serde_json::Value,
+) -> bool {
     let state_key = condition
         .get("state_key")
         .and_then(serde_json::Value::as_str)
@@ -16220,6 +16239,8 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         || !source.contains("client reactive plan signal_event binding mismatch")
         || !source.contains("renderSignalTextBinding")
         || !source.contains("text_template")
+        || !source.contains("renderSignalTextCondition")
+        || !source.contains("text_condition")
         || !source.contains("signalTextBindingStateKeys")
         || !source.contains("state_keys")
         || !source.contains("renderSignalAttrBinding")
@@ -20376,6 +20397,7 @@ struct ClientSignalTextBinding {
     origin_id: String,
     state_key: String,
     text_template: Option<Vec<serde_json::Value>>,
+    text_condition: Option<serde_json::Value>,
     signal_sources: Vec<ClientSignalDomSource>,
 }
 
@@ -21003,6 +21025,12 @@ fn collect_client_dom_bindings_for_tag(
                     serde_json::Value::Array(text_template),
                 );
         }
+        if let Some(text_condition) = binding.text_condition {
+            value
+                .as_object_mut()
+                .expect("signal text binding is an object")
+                .insert("text_condition".to_string(), text_condition);
+        }
         out.push(value);
     }
 }
@@ -21018,11 +21046,19 @@ fn client_signal_text_binding(
                 origin_id: signal.origin_id.clone(),
                 state_key: signal.state_key.clone(),
                 text_template: None,
+                text_condition: None,
                 signal_sources: vec![signal.clone()],
             })
         }
         orv_hir::HirExprKind::String(segments) => {
             client_signal_text_template_binding(segments, signals)
+        }
+        orv_hir::HirExprKind::If { .. } => client_signal_text_condition_binding(expr, signals),
+        orv_hir::HirExprKind::Block(block) => {
+            let [orv_hir::HirStmt::Expr(expr)] = block.stmts.as_slice() else {
+                return None;
+            };
+            client_signal_text_binding(expr, signals)
         }
         _ => None,
     }
@@ -21067,7 +21103,35 @@ fn client_signal_text_template_binding(
         origin_id: signal.origin_id.clone(),
         state_key: signal.state_key.clone(),
         text_template: Some(text_template),
+        text_condition: None,
         signal_sources: sources,
+    })
+}
+
+fn client_signal_text_condition_binding(
+    expr: &orv_hir::HirExpr,
+    signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
+) -> Option<ClientSignalTextBinding> {
+    let orv_hir::HirExprKind::If {
+        cond,
+        then,
+        else_branch,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let (signal, mut text_condition) = client_signal_condition_json(cond, signals)?;
+    let truthy = client_plain_string_block(then)?;
+    let falsy = client_plain_string_expr(else_branch.as_deref()?)?;
+    let condition = text_condition.as_object_mut()?;
+    condition.insert("truthy".to_string(), serde_json::json!(truthy));
+    condition.insert("falsy".to_string(), serde_json::json!(falsy));
+    Some(ClientSignalTextBinding {
+        origin_id: signal.origin_id.clone(),
+        state_key: signal.state_key.clone(),
+        text_template: None,
+        text_condition: Some(text_condition),
+        signal_sources: vec![signal.clone()],
     })
 }
 
@@ -21075,6 +21139,9 @@ fn client_signal_attr_binding(
     expr: &orv_hir::HirExpr,
     signals: &HashMap<orv_hir::NameId, ClientSignalDomSource>,
 ) -> Option<ClientSignalAttrBinding> {
+    if let Some(binding) = client_signal_attr_condition_binding(expr, signals) {
+        return Some(binding);
+    }
     if let Some(binding) = client_signal_text_binding(expr, signals) {
         return Some(ClientSignalAttrBinding {
             origin_id: binding.origin_id,
@@ -21084,7 +21151,7 @@ fn client_signal_attr_binding(
             signal_sources: binding.signal_sources,
         });
     }
-    client_signal_attr_condition_binding(expr, signals)
+    None
 }
 
 fn client_signal_attr_condition_binding(
@@ -34087,6 +34154,8 @@ entry = "src/main.orv"
             "client reactive plan signal_event binding mismatch",
             "renderSignalTextBinding",
             "text_template",
+            "renderSignalTextCondition",
+            "text_condition",
             "signalTextBindingStateKeys",
             "state_keys",
             "renderSignalAttrBinding",
@@ -37482,6 +37551,40 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_reactive_plan_invalid_text_condition() {
+        let out = temp_output_dir("verify-build-client-reactive-text-condition");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p { count > 0 ? "has items" : "empty" } } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
+        let mut plan = read_json_value(&plan_path).expect("reactive plan");
+        let binding = plan["bindings"]
+            .as_array_mut()
+            .expect("bindings")
+            .iter_mut()
+            .find(|binding| binding["kind"] == "signal_text")
+            .expect("signal text binding");
+        binding["text_condition"]["truthy"] = serde_json::json!(true);
+        write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
+
+        assert!(
+            err.to_string().contains("signal_text binding"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_client_manifest_without_blocker_detail() {
         let out = temp_output_dir("verify-build-client-manifest-blocker-detail");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -38068,6 +38171,46 @@ let sig count: int = 0
             std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
         assert!(loader.contains("signalTextBindingStateKeys"));
         assert!(loader.contains("state_keys"));
+        cmd_verify_build(&build_out).expect("verify build artifacts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_writes_client_signal_text_condition_binding_contract() {
+        let out = temp_output_dir("client-reactive-text-condition-binding");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            r#"let sig count: int = 0
+@out @html { @body { @p { count > 0 ? "has items" : "empty" } } }"#,
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        assert!(reactive_plan["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .any(|binding| binding["kind"] == "signal_text"
+                && binding["target"] == CLIENT_PAGE_PATH
+                && binding["state_key"] == "count"
+                && binding["selector"] == "p"
+                && binding["text_condition"]["state_key"] == "count"
+                && binding["text_condition"]["op"] == "gt"
+                && binding["text_condition"]["rhs"]["kind"] == "int"
+                && binding["text_condition"]["rhs"]["value"] == "0"
+                && binding["text_condition"]["truthy"] == "has items"
+                && binding["text_condition"]["falsy"] == "empty"
+                && binding["source"].as_str().is_some_and(|id| !id.is_empty())));
+        let loader =
+            std::fs::read_to_string(build_out.join(CLIENT_JS_PATH)).expect("client loader");
+        assert!(loader.contains("renderSignalTextCondition"));
+        assert!(loader.contains("text_condition"));
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
     }

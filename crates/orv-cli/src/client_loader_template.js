@@ -124,7 +124,8 @@ function validateReactiveBindings(plan, manifest) {
       ) &&
       signalTextBindingStateKeysAreValid(binding, plan.signals) &&
       signalTextSourcesAreValid(binding, plan.signals) &&
-      signalTextTemplateIsValid(binding, plan.signals)
+      signalTextTemplateIsValid(binding, plan.signals) &&
+      signalTextConditionIsValid(binding, plan.signals)
     );
   if (!signalTextBindingsAreValid) {
     throw new Error("orv client reactive plan signal_text binding mismatch");
@@ -200,6 +201,13 @@ function signalTextTemplateIsValid(binding, signals) {
       }
       return false;
     });
+}
+
+function signalTextConditionIsValid(binding, signals) {
+  if (binding.text_condition === undefined) {
+    return true;
+  }
+  return signalConditionIsValidForBinding(binding, signals, binding.text_condition);
 }
 
 function signalTextBindingStateKeys(binding) {
@@ -294,13 +302,17 @@ function signalAttrConditionIsValid(binding, signals) {
   if (binding.attr_condition === undefined) {
     return true;
   }
-  return binding.attr_condition &&
-    typeof binding.attr_condition.state_key === "string" &&
-    binding.attr_condition.state_key === binding.state_key &&
-    typeof binding.attr_condition.truthy === "string" &&
-    typeof binding.attr_condition.falsy === "string" &&
-    signalAttrConditionComparisonIsValid(binding.attr_condition) &&
-    signals.some((signal) => signal.state_key === binding.attr_condition.state_key);
+  return signalConditionIsValidForBinding(binding, signals, binding.attr_condition);
+}
+
+function signalConditionIsValidForBinding(binding, signals, condition) {
+  return condition &&
+    typeof condition.state_key === "string" &&
+    condition.state_key === binding.state_key &&
+    typeof condition.truthy === "string" &&
+    typeof condition.falsy === "string" &&
+    signalAttrConditionComparisonIsValid(condition) &&
+    signals.some((signal) => signal.state_key === condition.state_key);
 }
 
 function signalAttrConditionComparisonIsValid(condition) {
@@ -360,6 +372,9 @@ function displaySignalValue(value) {
 }
 
 function renderSignalTextBinding(binding, reactiveState) {
+  if (binding.text_condition) {
+    return renderSignalTextCondition(binding.text_condition, reactiveState);
+  }
   if (!Array.isArray(binding.text_template)) {
     return displaySignalValue(reactiveState[binding.state_key]?.value);
   }
@@ -372,6 +387,10 @@ function renderSignalTextBinding(binding, reactiveState) {
     }
     return "";
   }).join("");
+}
+
+function renderSignalTextCondition(condition, reactiveState) {
+  return renderSignalAttrCondition(condition, reactiveState);
 }
 
 function bindReactiveDom(plan, root, reactiveState) {
