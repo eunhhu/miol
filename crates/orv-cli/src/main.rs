@@ -9173,7 +9173,7 @@ impl LspSession {
         };
         Ok(serde_json::json!({
             "isIncomplete": false,
-            "items": lsp_completion_items_json(&loaded.graph, context),
+            "items": lsp_completion_items_json(&loaded.graph, &loaded.files, context),
         }))
     }
 
@@ -14919,6 +14919,10 @@ enum LspCompletionContext {
     General,
     Directive,
     RouteMethod,
+    BodyField,
+    ParamField,
+    QueryField,
+    EnvField,
 }
 
 struct LspStaticCompletion {
@@ -15261,10 +15265,18 @@ const LSP_ROUTE_METHOD_COMPLETIONS: &[LspStaticCompletion] = &[
 
 fn lsp_completion_items_json(
     graph: &ProjectGraph,
+    files: &[SourceFile],
     context: LspCompletionContext,
 ) -> Vec<serde_json::Value> {
-    let mut items = lsp_static_completion_items_json(context);
-    if context == LspCompletionContext::RouteMethod {
+    let mut items = lsp_context_completion_items_json(files, context);
+    if matches!(
+        context,
+        LspCompletionContext::RouteMethod
+            | LspCompletionContext::BodyField
+            | LspCompletionContext::ParamField
+            | LspCompletionContext::QueryField
+            | LspCompletionContext::EnvField
+    ) {
         return items;
     }
     for node in &graph.nodes {
@@ -15286,11 +15298,84 @@ fn lsp_completion_items_json(
     items
 }
 
+fn lsp_context_completion_items_json(
+    files: &[SourceFile],
+    context: LspCompletionContext,
+) -> Vec<serde_json::Value> {
+    match context {
+        LspCompletionContext::BodyField => {
+            lsp_domain_field_completion_items_json(files, "body", 10, "@body field")
+        }
+        LspCompletionContext::ParamField => {
+            lsp_domain_field_completion_items_json(files, "param", 10, "@param field")
+        }
+        LspCompletionContext::QueryField => {
+            lsp_domain_field_completion_items_json(files, "query", 10, "@query field")
+        }
+        LspCompletionContext::EnvField => {
+            lsp_domain_field_completion_items_json(files, "env", 21, "@env value")
+        }
+        LspCompletionContext::General
+        | LspCompletionContext::Directive
+        | LspCompletionContext::RouteMethod => lsp_static_completion_items_json(context),
+    }
+}
+
+fn lsp_domain_field_completion_items_json(
+    files: &[SourceFile],
+    domain: &str,
+    kind: u8,
+    detail: &str,
+) -> Vec<serde_json::Value> {
+    lsp_domain_field_names(files, domain)
+        .into_iter()
+        .map(|label| {
+            serde_json::json!({
+                "label": label,
+                "kind": kind,
+                "detail": detail,
+            })
+        })
+        .collect()
+}
+
+fn lsp_domain_field_names(files: &[SourceFile], domain: &str) -> Vec<String> {
+    let marker = format!("@{domain}.");
+    let mut names = Vec::new();
+    for file in files {
+        let mut search_from = 0usize;
+        while let Some(offset) = file.source[search_from..].find(marker.as_str()) {
+            let name_start = search_from + offset + marker.len();
+            let mut name_end = name_start;
+            let bytes = file.source.as_bytes();
+            while bytes
+                .get(name_end)
+                .is_some_and(|byte| is_identifier_byte(*byte))
+            {
+                name_end += 1;
+            }
+            if let Some(name) = file.source.get(name_start..name_end) {
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+            search_from = name_end.max(name_start.saturating_add(1));
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn lsp_static_completion_items_json(context: LspCompletionContext) -> Vec<serde_json::Value> {
     let specs = match context {
         LspCompletionContext::General => LSP_GENERAL_COMPLETIONS,
         LspCompletionContext::Directive => LSP_DIRECTIVE_COMPLETIONS,
         LspCompletionContext::RouteMethod => LSP_ROUTE_METHOD_COMPLETIONS,
+        LspCompletionContext::BodyField
+        | LspCompletionContext::ParamField
+        | LspCompletionContext::QueryField
+        | LspCompletionContext::EnvField => &[],
     };
     let mut items = Vec::new();
     for spec in specs {
@@ -15323,6 +15408,9 @@ fn lsp_completion_context(source: &str, byte: usize) -> LspCompletionContext {
     let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
     let line_prefix = &prefix[line_start..];
     let trimmed = line_prefix.trim_start();
+    if let Some(context) = lsp_domain_field_completion_context(line_prefix) {
+        return context;
+    }
     if lsp_is_route_method_completion(trimmed) {
         return LspCompletionContext::RouteMethod;
     }
@@ -15330,6 +15418,25 @@ fn lsp_completion_context(source: &str, byte: usize) -> LspCompletionContext {
         return LspCompletionContext::Directive;
     }
     LspCompletionContext::General
+}
+
+fn lsp_domain_field_completion_context(line_prefix: &str) -> Option<LspCompletionContext> {
+    let token = line_prefix
+        .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '{' | '[' | ',' | ':' | '='))
+        .next()?;
+    if token.starts_with("@body.") {
+        return Some(LspCompletionContext::BodyField);
+    }
+    if token.starts_with("@param.") {
+        return Some(LspCompletionContext::ParamField);
+    }
+    if token.starts_with("@query.") {
+        return Some(LspCompletionContext::QueryField);
+    }
+    if token.starts_with("@env.") {
+        return Some(LspCompletionContext::EnvField);
+    }
+    None
 }
 
 fn lsp_is_route_method_completion(trimmed_line_prefix: &str) -> bool {
@@ -32430,6 +32537,101 @@ function greet(user: User): string -> "hello"
             .iter()
             .any(|item| item["label"] == "POST" && item["kind"] == 14));
         assert!(!items.iter().any(|item| item["label"] == "@route"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_domain_field_names_after_dot() {
+        let dir = temp_output_dir("lsp-completion-domain-fields");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"@server {
+  let db = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
+  @route POST /checkout {
+    let sku = @body.sku
+    let quantity = @body.quantity
+    let id = @param.orderId
+    let page = @query.page
+    let next = @body.
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 7,
+                    "character": 21,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 21);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "sku" && item["kind"] == 10));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "quantity" && item["kind"] == 10));
+        assert!(!items.iter().any(|item| item["label"] == "@route"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_env_names_after_dot() {
+        let dir = temp_output_dir("lsp-completion-env-fields");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"@server {
+  let db = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")
+  let current = @env.
+}
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 3,
+                    "character": 21,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 22);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "SHOP_DATABASE_URL" && item["kind"] == 21));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "PAYMENT_ADAPTER_URL" && item["kind"] == 21));
+        assert!(!items.iter().any(|item| item["label"] == "@env"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
