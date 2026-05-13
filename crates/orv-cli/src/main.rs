@@ -6292,9 +6292,7 @@ fn editor_dap_sources(files: &[SourceFile]) -> Vec<DapSourceInfo> {
     files
         .iter()
         .enumerate()
-        .map(|(index, file)| {
-            dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
-        })
+        .map(|(index, file)| dap_source_info(file, u64::try_from(index + 1).unwrap_or(u64::MAX)))
         .collect()
 }
 
@@ -7452,7 +7450,7 @@ fn editor_debug_breakpoint_sources_json(files: &[SourceFile]) -> Vec<serde_json:
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let source = dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX));
+            let source = dap_source_info(file, u64::try_from(index + 1).unwrap_or(u64::MAX));
             let lines = dap_verified_breakpoint_lines(&file.path).unwrap_or_default();
             let breakpoints = lines
                 .iter()
@@ -9700,6 +9698,7 @@ struct DapSourceInfo {
     name: String,
     path: PathBuf,
     uri: String,
+    checksum: String,
 }
 
 #[derive(Clone)]
@@ -10006,7 +10005,7 @@ impl DapSession {
             .iter()
             .enumerate()
             .map(|(index, file)| {
-                dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
+                dap_source_info(file, u64::try_from(index + 1).unwrap_or(u64::MAX))
             })
             .collect();
         let live_requested = dap_launch_live(request);
@@ -13393,8 +13392,9 @@ fn dap_following_executable_line(lines: &[u64], current: u64) -> Option<u64> {
     lines.iter().copied().find(|line| *line > current)
 }
 
-fn dap_source_info(path: &Path, reference: u64) -> DapSourceInfo {
-    let name = path
+fn dap_source_info(file: &SourceFile, reference: u64) -> DapSourceInfo {
+    let name = file
+        .path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("source.orv")
@@ -13402,8 +13402,9 @@ fn dap_source_info(path: &Path, reference: u64) -> DapSourceInfo {
     DapSourceInfo {
         reference,
         name,
-        path: path.to_path_buf(),
-        uri: lsp_file_uri_for_path(path),
+        path: file.path.clone(),
+        uri: lsp_file_uri_for_path(&file.path),
+        checksum: sha256_hex(file.source.as_bytes()),
     }
 }
 
@@ -13413,6 +13414,12 @@ fn dap_source_json(source: &DapSourceInfo) -> serde_json::Value {
         "path": source.path.display().to_string(),
         "sourceReference": source.reference,
         "uri": source.uri,
+        "checksums": [
+            {
+                "algorithm": "SHA256",
+                "checksum": source.checksum,
+            },
+        ],
     })
 }
 
@@ -28378,7 +28385,7 @@ let total: int = add(2, 3)
             .iter()
             .enumerate()
             .map(|(index, file)| {
-                dap_source_info(&file.path, u64::try_from(index + 1).unwrap_or(u64::MAX))
+                dap_source_info(file, u64::try_from(index + 1).unwrap_or(u64::MAX))
             })
             .collect::<Vec<_>>();
 
@@ -29904,12 +29911,10 @@ let total: int = add(2, 3)
         std::fs::create_dir_all(&models).expect("create models dir");
         let source = dir.join("app.orv");
         let imported = models.join("user.orv");
-        std::fs::write(
-            &source,
-            "import models.user.User\nlet u: User = { id: 1 }\n",
-        )
-        .expect("write source");
-        std::fs::write(&imported, "pub struct User { id: int }\n").expect("write imported");
+        let source_text = "import models.user.User\nlet u: User = { id: 1 }\n";
+        let imported_source = "pub struct User { id: int }\n";
+        std::fs::write(&source, source_text).expect("write source");
+        std::fs::write(&imported, imported_source).expect("write imported");
         let mut session = DapSession::default();
 
         let launch = session
@@ -29937,9 +29942,18 @@ let total: int = add(2, 3)
         assert!(sources
             .iter()
             .any(|item| item["name"] == "app.orv" && item["path"].as_str().is_some()));
-        assert!(sources
+        let imported_item = sources
             .iter()
-            .any(|item| item["name"] == "user.orv" && item["path"].as_str().is_some()));
+            .find(|item| item["name"] == "user.orv" && item["path"].as_str().is_some())
+            .expect("imported source");
+        assert_eq!(
+            imported_item["checksums"][0]["algorithm"],
+            serde_json::json!("SHA256")
+        );
+        assert_eq!(
+            imported_item["checksums"][0]["checksum"],
+            serde_json::json!(sha256_hex(imported_source.as_bytes()))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
