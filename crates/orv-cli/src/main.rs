@@ -37194,6 +37194,9 @@ entry = "src/main.orv"
   @route POST /orders/product-plus-static-fee {
     @respond 201 { total: ((@body.quantity as int) * (@body.unit_price as int)) + 25 }
   }
+  @route POST /orders/product-plus-product-fee {
+    @respond 201 { total: ((@body.quantity as int) * (@body.unit_price as int)) + ((@body.fee_units as int) * (@body.fee_value as int)) }
+  }
   @route POST /orders/static-minus-product {
     @respond 201 { remaining: 1000 - ((@body.quantity as int) * (@body.unit_price as int)) }
   }
@@ -37244,6 +37247,9 @@ entry = "src/main.orv"
   }
   @route POST /orders/product-covered-static {
     @respond 201 { covered: ((@body.quantity as int) * (@body.unit_price as int)) <= 1000 }
+  }
+  @route POST /orders/product-covered-product {
+    @respond 201 { covered: ((@body.quantity as int) * (@body.unit_price as int)) <= ((@body.stock as int) * (@body.reserve_price as int)) }
   }
 }
 "#,
@@ -37319,6 +37325,11 @@ entry = "src/main.orv"
             address,
             "/orders/product-plus-static-fee",
             r#"{"quantity":"7","unit_price":"125"}"#,
+        );
+        let product_plus_product_fee_response = send_raw_http_json_post(
+            address,
+            "/orders/product-plus-product-fee",
+            r#"{"quantity":"7","unit_price":"125","fee_units":"2","fee_value":"50"}"#,
         );
         let static_minus_product_response = send_raw_http_json_post(
             address,
@@ -37396,6 +37407,11 @@ entry = "src/main.orv"
             "/orders/product-covered-static",
             r#"{"quantity":"7","unit_price":"125"}"#,
         );
+        let product_covered_product_response = send_raw_http_json_post(
+            address,
+            "/orders/product-covered-product",
+            r#"{"quantity":"7","unit_price":"125","stock":"8","reserve_price":"125"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -37415,6 +37431,8 @@ entry = "src/main.orv"
         assert!(total_with_fee_response.contains(r#"{"total":900}"#));
         assert!(product_plus_static_fee_response.starts_with("HTTP/1.1 201"));
         assert!(product_plus_static_fee_response.contains(r#"{"total":900}"#));
+        assert!(product_plus_product_fee_response.starts_with("HTTP/1.1 201"));
+        assert!(product_plus_product_fee_response.contains(r#"{"total":975}"#));
         assert!(static_minus_product_response.starts_with("HTTP/1.1 201"));
         assert!(static_minus_product_response.contains(r#"{"remaining":125}"#));
         assert!(bundles_response.starts_with("HTTP/1.1 201"));
@@ -37450,6 +37468,8 @@ entry = "src/main.orv"
         assert!(covered_total_response.contains(r#"{"covered":true}"#));
         assert!(product_covered_static_response.starts_with("HTTP/1.1 201"));
         assert!(product_covered_static_response.contains(r#"{"covered":true}"#));
+        assert!(product_covered_product_response.starts_with("HTTP/1.1 201"));
+        assert!(product_covered_product_response.contains(r#"{"covered":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -37488,6 +37508,12 @@ entry = "src/main.orv"
   }
   @route POST /payments/product-under-static-limit {
     @respond 201 { under_limit: ((@body.price as float) * (@body.quantity as float)) <= 40.0 }
+  }
+  @route POST /payments/product-plus-product-fee {
+    @respond 201 { total: ((@body.price as float) * (@body.quantity as float)) + ((@body.fee as float) * (@body.fee_units as float)) }
+  }
+  @route POST /payments/product-under-product-limit {
+    @respond 201 { under_limit: ((@body.price as float) * (@body.quantity as float)) <= ((@body.limit_price as float) * (@body.limit_units as float)) }
   }
 }
 "#,
@@ -37564,6 +37590,16 @@ entry = "src/main.orv"
             "/payments/product-under-static-limit",
             r#"{"price":"12.5","quantity":"3"}"#,
         );
+        let product_plus_product_fee_response = send_raw_http_json_post(
+            address,
+            "/payments/product-plus-product-fee",
+            r#"{"price":"12.5","quantity":"3","fee":"1.25","fee_units":"2"}"#,
+        );
+        let product_under_product_limit_response = send_raw_http_json_post(
+            address,
+            "/payments/product-under-product-limit",
+            r#"{"price":"12.5","quantity":"3","limit_price":"20.0","limit_units":"2"}"#,
+        );
 
         let assert_created = |response: &str, body: &str| {
             assert!(response.starts_with("HTTP/1.1 201"));
@@ -37578,6 +37614,11 @@ entry = "src/main.orv"
         assert_created(&under_limit_response, r#"{"under_limit":true}"#);
         assert_created(
             &product_under_static_limit_response,
+            r#"{"under_limit":true}"#,
+        );
+        assert_created(&product_plus_product_fee_response, r#"{"total":40}"#);
+        assert_created(
+            &product_under_product_limit_response,
             r#"{"under_limit":true}"#,
         );
 
