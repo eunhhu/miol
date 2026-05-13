@@ -7398,6 +7398,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "configuration_count": configuration_count,
             "control_commands": control_commands,
             "breakpoint_commands": breakpoint_commands,
+            "panel_contract": editor_native_host_debug_panel_contract_json(),
             "control_count": controls,
             "breakpoint_argument": runner
                 .pointer("/session/breakpoint_argument")
@@ -7431,6 +7432,45 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "production_adapters": production_adapters,
             "trace_navigation": trace_enabled,
         },
+    })
+}
+
+fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": "debug",
+        "sections": [
+            {
+                "name": "adapter",
+                "path": "debug.adapter_command",
+                "kind": "array",
+            },
+            {
+                "name": "capabilities",
+                "path": "debug.capabilities",
+                "kind": "object",
+            },
+            {
+                "name": "configurations",
+                "path": "debug.configurations",
+                "kind": "array",
+            },
+            {
+                "name": "control_commands",
+                "path": "debug.control_commands",
+                "kind": "array",
+            },
+            {
+                "name": "breakpoint_commands",
+                "path": "debug.breakpoint_commands",
+                "kind": "array",
+            },
+            {
+                "name": "result_artifact",
+                "path": "debug.result_artifact",
+                "kind": "object",
+            },
+        ],
     })
 }
 
@@ -38868,6 +38908,24 @@ define Auth() -> { @out "auth" }
             native_host["debug"]["result_artifact"],
             state["debug"]["result_artifact"]
         );
+        assert_eq!(native_host["debug"]["panel_contract"]["root"], "debug");
+        let debug_sections = native_host["debug"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("native host debug panel sections");
+        assert!(debug_sections
+            .iter()
+            .any(|section| section["name"] == "configurations"
+                && section["path"] == "debug.configurations"));
+        assert!(debug_sections.iter().any(|section| {
+            section["name"] == "control_commands" && section["path"] == "debug.control_commands"
+        }));
+        assert!(debug_sections.iter().any(|section| {
+            section["name"] == "breakpoint_commands"
+                && section["path"] == "debug.breakpoint_commands"
+        }));
+        assert!(debug_sections.iter().any(|section| {
+            section["name"] == "result_artifact" && section["path"] == "debug.result_artifact"
+        }));
         assert!(
             native_host["debug"]["result_artifact"]["panel_contract"]["sections"]
                 .as_array()
