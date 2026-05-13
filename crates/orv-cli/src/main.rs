@@ -8909,6 +8909,11 @@ impl LspSession {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         let byte = lsp_position_to_byte(&file.source, position);
+        if let Some(field) = lsp_domain_field_at_byte(&file.source, byte) {
+            return Ok(serde_json::Value::Array(
+                lsp_domain_field_reference_locations_json(&loaded.files, field.kind, field.name),
+            ));
+        }
         let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
@@ -8930,6 +8935,23 @@ impl LspSession {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         let byte = lsp_position_to_byte(&file.source, position);
+        if let Some(field) = lsp_domain_field_at_byte(&file.source, byte) {
+            return Ok(serde_json::Value::Array(
+                lsp_domain_field_occurrences(&file.source, field.kind, field.name)
+                    .into_iter()
+                    .map(|(start, end)| {
+                        serde_json::json!({
+                            "range": lsp_range_for_source(
+                                &file.source,
+                                u32::try_from(start).unwrap_or(u32::MAX),
+                                u32::try_from(end).unwrap_or(u32::MAX),
+                            ),
+                            "kind": 1,
+                        })
+                    })
+                    .collect(),
+            ));
+        }
         let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
@@ -14155,36 +14177,87 @@ fn lsp_hover_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serd
     })
 }
 
+#[derive(Clone, Copy)]
+struct LspDomainFieldKind {
+    domain: &'static str,
+    marker: &'static str,
+    label: &'static str,
+}
+
+struct LspDomainField<'a> {
+    kind: LspDomainFieldKind,
+    start: usize,
+    end: usize,
+    name: &'a str,
+}
+
+const LSP_DOMAIN_FIELD_KINDS: &[LspDomainFieldKind] = &[
+    LspDomainFieldKind {
+        domain: "body",
+        marker: "@body.",
+        label: "Request body field",
+    },
+    LspDomainFieldKind {
+        domain: "param",
+        marker: "@param.",
+        label: "Route parameter",
+    },
+    LspDomainFieldKind {
+        domain: "query",
+        marker: "@query.",
+        label: "Query parameter",
+    },
+    LspDomainFieldKind {
+        domain: "env",
+        marker: "@env.",
+        label: "Environment value",
+    },
+];
+
 fn lsp_domain_field_hover_json(source: &str, byte: usize) -> Option<serde_json::Value> {
-    let (start, end, name) = identifier_span_at_byte(source, byte)?;
-    let label = lsp_domain_field_hover_label(source, start)?;
+    let field = lsp_domain_field_at_byte(source, byte)?;
     Some(serde_json::json!({
         "contents": {
             "kind": "markdown",
-            "value": format!("**{label}** `{name}`"),
+            "value": format!("**{}** `{}`", field.kind.label, field.name),
         },
         "range": lsp_range_for_source(
             source,
-            u32::try_from(start).unwrap_or(u32::MAX),
-            u32::try_from(end).unwrap_or(u32::MAX),
+            u32::try_from(field.start).unwrap_or(u32::MAX),
+            u32::try_from(field.end).unwrap_or(u32::MAX),
         ),
     }))
 }
 
-fn lsp_domain_field_hover_label(source: &str, name_start: usize) -> Option<&'static str> {
-    for (prefix, label) in [
-        ("@body.", "Request body field"),
-        ("@param.", "Route parameter"),
-        ("@query.", "Query parameter"),
-        ("@env.", "Environment value"),
-    ] {
-        if name_start >= prefix.len()
-            && source.get(name_start - prefix.len()..name_start) == Some(prefix)
-        {
-            return Some(label);
-        }
-    }
-    None
+fn lsp_domain_field_at_byte(source: &str, byte: usize) -> Option<LspDomainField<'_>> {
+    let (start, end, name) = identifier_span_at_byte(source, byte)?;
+    let kind = lsp_domain_field_kind_at_name_start(source, start)?;
+    Some(LspDomainField {
+        kind,
+        start,
+        end,
+        name,
+    })
+}
+
+fn lsp_domain_field_kind_at_name_start(
+    source: &str,
+    name_start: usize,
+) -> Option<LspDomainFieldKind> {
+    LSP_DOMAIN_FIELD_KINDS.iter().copied().find(|kind| {
+        name_start >= kind.marker.len()
+            && source
+                .as_bytes()
+                .get(name_start - kind.marker.len()..name_start)
+                == Some(kind.marker.as_bytes())
+    })
+}
+
+fn lsp_domain_field_kind_for_domain(domain: &str) -> Option<LspDomainFieldKind> {
+    LSP_DOMAIN_FIELD_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.domain == domain)
 }
 
 fn lsp_signature_help_json(function: &FunctionStmt, active_parameter: usize) -> serde_json::Value {
@@ -14432,7 +14505,9 @@ fn lsp_renamable_identifier_span_at_byte(
     byte: usize,
 ) -> Option<(usize, usize, &str)> {
     let (start, end, name) = identifier_span_at_byte(source, byte)?;
-    if !lsp_renamable_identifier_name(name) || lsp_is_builtin_domain_identifier(source, start, name)
+    if !lsp_renamable_identifier_name(name)
+        || lsp_is_builtin_domain_identifier(source, start, name)
+        || lsp_domain_field_kind_at_name_start(source, start).is_some()
     {
         return None;
     }
@@ -14449,6 +14524,30 @@ fn lsp_reference_locations_json(files: &[SourceFile], name: &str) -> Vec<serde_j
                     serde_json::json!({
                         "uri": lsp_file_uri_for_path(&file.path),
                         "range": range,
+                    })
+                })
+        })
+        .collect()
+}
+
+fn lsp_domain_field_reference_locations_json(
+    files: &[SourceFile],
+    kind: LspDomainFieldKind,
+    name: &str,
+) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .flat_map(|file| {
+            lsp_domain_field_occurrences(&file.source, kind, name)
+                .into_iter()
+                .map(move |(start, end)| {
+                    serde_json::json!({
+                        "uri": lsp_file_uri_for_path(&file.path),
+                        "range": lsp_range_for_source(
+                            &file.source,
+                            u32::try_from(start).unwrap_or(u32::MAX),
+                            u32::try_from(end).unwrap_or(u32::MAX),
+                        ),
                     })
                 })
         })
@@ -14473,6 +14572,47 @@ fn lsp_identifier_ranges_json(source: &str, name: &str) -> Vec<serde_json::Value
             )
         })
         .collect()
+}
+
+fn lsp_domain_field_occurrences(
+    source: &str,
+    kind: LspDomainFieldKind,
+    name: &str,
+) -> Vec<(usize, usize)> {
+    lsp_domain_field_spans(source, kind)
+        .into_iter()
+        .filter_map(|(start, end, candidate)| (candidate == name).then_some((start, end)))
+        .collect()
+}
+
+fn lsp_domain_field_spans(source: &str, kind: LspDomainFieldKind) -> Vec<(usize, usize, &str)> {
+    let marker = kind.marker.as_bytes();
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index <= bytes.len().saturating_sub(marker.len()) {
+        if bytes.get(index..index + marker.len()) != Some(marker) {
+            index += 1;
+            continue;
+        }
+        let name_start = index + marker.len();
+        let mut name_end = name_start;
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            name_end += 1;
+        }
+        if name_end > name_start {
+            if let Some(name) = source.get(name_start..name_end) {
+                out.push((name_start, name_end, name));
+            }
+            index = name_end;
+        } else {
+            index = name_start.saturating_add(1);
+        }
+    }
+    out
 }
 
 fn identifier_occurrences(source: &str, name: &str) -> Vec<(usize, usize)> {
@@ -15517,30 +15657,19 @@ fn lsp_domain_field_completion_items_json(
 }
 
 fn lsp_domain_field_names(files: &[SourceFile], domain: &str) -> Vec<String> {
-    let marker = format!("@{domain}.");
+    let Some(kind) = lsp_domain_field_kind_for_domain(domain) else {
+        return Vec::new();
+    };
     let mut names = Vec::new();
     for file in files {
         if domain == "param" {
             names.extend(lsp_route_path_param_names(&file.source));
         }
-        let mut search_from = 0usize;
-        while let Some(offset) = file.source[search_from..].find(marker.as_str()) {
-            let name_start = search_from + offset + marker.len();
-            let mut name_end = name_start;
-            let bytes = file.source.as_bytes();
-            while bytes
-                .get(name_end)
-                .is_some_and(|byte| is_identifier_byte(*byte))
-            {
-                name_end += 1;
-            }
-            if let Some(name) = file.source.get(name_start..name_end) {
-                if !name.is_empty() {
-                    names.push(name.to_string());
-                }
-            }
-            search_from = name_end.max(name_start.saturating_add(1));
-        }
+        names.extend(
+            lsp_domain_field_spans(&file.source, kind)
+                .into_iter()
+                .map(|(_, _, name)| name.to_string()),
+        );
     }
     names.sort();
     names.dedup();
@@ -31345,6 +31474,41 @@ function greet(user: User): string -> {
     }
 
     #[test]
+    fn lsp_prepare_rename_rejects_domain_field_names() {
+        let dir = temp_output_dir("lsp-prepare-rename-domain-field");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r#"@server {
+  @route POST /checkout {
+    let sku = @body.sku
+  }
+}
+"#;
+        std::fs::write(&source, source_text).expect("write source");
+        let body_line = source_text.lines().nth(2).expect("body line");
+        let character = body_line.rfind("sku").expect("body field");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 32);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"].is_null());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lsp_rename_returns_workspace_edit_for_project_references() {
         let dir = temp_output_dir("lsp-rename");
         let models = dir.join("models");
@@ -31476,6 +31640,56 @@ let v: User = u
         assert!(highlights
             .iter()
             .any(|highlight| highlight["range"]["start"]["line"] == 3));
+        assert!(highlights.iter().all(|highlight| highlight["kind"] == 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_document_highlight_returns_domain_field_occurrences() {
+        let dir = temp_output_dir("lsp-document-highlight-domain-field");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r#"@server {
+  @route POST /checkout {
+    let sku = @body.sku
+    let label = sku
+    let again = @body.sku
+  }
+}
+"#;
+        std::fs::write(&source, source_text).expect("write source");
+        let first_body_line = source_text.lines().nth(2).expect("first body line");
+        let second_body_line = source_text.lines().nth(4).expect("second body line");
+        let first_character = first_body_line.rfind("sku").expect("first body field");
+        let second_character = second_body_line.rfind("sku").expect("second body field");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "textDocument/documentHighlight",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": first_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 31);
+        assert!(response.get("error").is_none(), "{response}");
+        let highlights = response["result"].as_array().expect("highlights");
+        assert_eq!(highlights.len(), 2);
+        assert!(highlights.iter().any(|highlight| {
+            highlight["range"]["start"]["line"] == 2
+                && highlight["range"]["start"]["character"] == first_character
+        }));
+        assert!(highlights.iter().any(|highlight| {
+            highlight["range"]["start"]["line"] == 4
+                && highlight["range"]["start"]["character"] == second_character
+        }));
         assert!(highlights.iter().all(|highlight| highlight["kind"] == 1));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -32726,6 +32940,54 @@ let u: User = { id: 1 }
         }));
         assert!(locations.iter().any(|location| {
             location["range"]["start"]["line"] == 6 && location["range"]["start"]["character"] == 7
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_references_returns_domain_field_locations() {
+        let dir = temp_output_dir("lsp-references-domain-field");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r#"@server {
+  @route POST /checkout {
+    let sku = @body.sku
+    let label = sku
+    let again = @body.sku
+  }
+}
+"#;
+        std::fs::write(&source, source_text).expect("write source");
+        let first_body_line = source_text.lines().nth(2).expect("first body line");
+        let second_body_line = source_text.lines().nth(4).expect("second body line");
+        let first_character = first_body_line.rfind("sku").expect("first body field");
+        let second_character = second_body_line.rfind("sku").expect("second body field");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": first_character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 21);
+        assert!(response.get("error").is_none(), "{response}");
+        let locations = response["result"].as_array().expect("reference locations");
+        assert_eq!(locations.len(), 2);
+        assert!(locations.iter().any(|location| {
+            location["range"]["start"]["line"] == 2
+                && location["range"]["start"]["character"] == first_character
+        }));
+        assert!(locations.iter().any(|location| {
+            location["range"]["start"]["line"] == 4
+                && location["range"]["start"]["character"] == second_character
         }));
         let _ = std::fs::remove_dir_all(dir);
     }
