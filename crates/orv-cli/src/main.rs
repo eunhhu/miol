@@ -11120,13 +11120,18 @@ impl DapSession {
             .pointer("/arguments/frameId")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("stepInTargets.arguments.frameId is required"))?;
-        if frame_id != 1 {
-            anyhow::bail!("stepInTargets currently supports current ORV frameId 1");
-        }
         let launched = self
             .launched
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("launch is required before stepInTargets"))?;
+        if frame_id != 1 {
+            if dap_stack_scope_frame(launched, frame_id).is_none() {
+                anyhow::bail!("unknown ORV frameId {frame_id}");
+            }
+            return Ok(serde_json::json!({
+                "targets": [],
+            }));
+        }
         Ok(serde_json::json!({
             "targets": dap_step_in_targets_json(launched),
         }))
@@ -29483,6 +29488,16 @@ let total: int = add(2, 3)
                 },
             }))
             .expect("caller scopes response");
+        let caller_targets = session
+            .message_response(&serde_json::json!({
+                "seq": 203,
+                "type": "request",
+                "command": "stepInTargets",
+                "arguments": {
+                    "frameId": caller_frame_id,
+                },
+            }))
+            .expect("caller stepInTargets response");
 
         assert_eq!(targets["success"], true, "{targets}");
         assert_eq!(
@@ -29505,6 +29520,8 @@ let total: int = add(2, 3)
             caller_scopes["body"]["scopes"][0]["source"]["checksums"][0]["checksum"],
             serde_json::json!(sha256_hex(source_text.as_bytes()))
         );
+        assert_eq!(caller_targets["success"], true, "{caller_targets}");
+        assert_eq!(caller_targets["body"]["targets"], serde_json::json!([]));
         assert!(events.iter().any(|event| {
             event["type"] == "event"
                 && event["event"] == "stopped"
