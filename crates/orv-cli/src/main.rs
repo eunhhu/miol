@@ -36823,6 +36823,12 @@ entry = "src/main.orv"
     }
     @respond 409 { err: "out_of_stock" }
   }
+  @route POST /inventory-value {
+    if (@body.total as int) <= ((@body.quantity as int) * (@body.unit_price as int)) {
+      @respond 201 { accepted: true, total: @body.total as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
   @route POST /ifelse-inventory {
     if (@body.quantity as int) <= (@body.stock as int) {
       @respond 201 { accepted: true, quantity: @body.quantity as int }
@@ -36983,6 +36989,16 @@ entry = "src/main.orv"
             "/inventory-bulk",
             r#"{"quantity":"51","stock":"5"}"#,
         );
+        let accepted_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value",
+            r#"{"total":"875","quantity":"7","unit_price":"125"}"#,
+        );
+        let rejected_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value",
+            r#"{"total":"901","quantity":"7","unit_price":"125"}"#,
+        );
         let accepted_ifelse_inventory = send_raw_http_json_post(
             address,
             "/ifelse-inventory",
@@ -37076,6 +37092,10 @@ entry = "src/main.orv"
         assert!(accepted_bulk_inventory.contains(r#"{"accepted":true,"quantity":30}"#));
         assert!(rejected_bulk_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_bulk_inventory.contains(r#"{"err":"out_of_stock"}"#));
+        assert!(accepted_value_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_value_inventory.contains(r#"{"accepted":true,"total":875}"#));
+        assert!(rejected_value_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_value_inventory.contains(r#"{"err":"over_total"}"#));
         assert!(accepted_ifelse_inventory.starts_with("HTTP/1.1 201"));
         assert!(accepted_ifelse_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_ifelse_inventory.starts_with("HTTP/1.1 409"));
@@ -37186,6 +37206,9 @@ entry = "src/main.orv"
   }
   @route POST /orders/covered-min {
     @respond 201 { covered: ((@body.minimum as int) * 100) <= (@body.total as int) }
+  }
+  @route POST /orders/covered-total {
+    @respond 201 { covered: (@body.total as int) <= ((@body.quantity as int) * (@body.unit_price as int)) }
   }
 }
 "#,
@@ -37308,6 +37331,11 @@ entry = "src/main.orv"
             "/orders/covered-min",
             r#"{"minimum":"10","total":"1000"}"#,
         );
+        let covered_total_response = send_raw_http_json_post(
+            address,
+            "/orders/covered-total",
+            r#"{"total":"875","quantity":"7","unit_price":"125"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -37350,6 +37378,8 @@ entry = "src/main.orv"
         assert!(available_bulk_response.contains(r#"{"available":true}"#));
         assert!(covered_min_response.starts_with("HTTP/1.1 201"));
         assert!(covered_min_response.contains(r#"{"covered":true}"#));
+        assert!(covered_total_response.starts_with("HTTP/1.1 201"));
+        assert!(covered_total_response.contains(r#"{"covered":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
