@@ -7423,6 +7423,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
                 .cloned()
                 .unwrap_or(serde_json::json!(true)),
         },
+        "runtime": editor_native_host_runtime_json(state),
         "production": production,
         "trace": editor_native_host_trace_json(state),
         "capabilities": {
@@ -7432,6 +7433,70 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "production_adapters": production_adapters,
             "trace_navigation": trace_enabled,
         },
+    })
+}
+
+fn editor_native_host_runtime_json(state: &serde_json::Value) -> serde_json::Value {
+    let runtime_state = state.get("runtime").unwrap_or(&serde_json::Value::Null);
+    let runtime = runtime_state
+        .get("runtime")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let frames = runtime_state
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let panel = runtime_state
+        .pointer("/panels/runtime")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "schema_version": 1,
+        "status": runtime
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unknown")),
+        "stdout": runtime
+            .get("stdout")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+        "error": runtime
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+        "async": runtime
+            .get("async")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "frame_count": frames.len(),
+        "frames": frames,
+        "panel": panel,
+        "panel_contract": editor_native_host_runtime_panel_contract_json(),
+    })
+}
+
+fn editor_native_host_runtime_panel_contract_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": "runtime",
+        "sections": [
+            {
+                "name": "panel",
+                "path": "runtime.panel",
+                "kind": "object",
+            },
+            {
+                "name": "frames",
+                "path": "runtime.frames",
+                "kind": "array",
+            },
+            {
+                "name": "async",
+                "path": "runtime.async",
+                "kind": "object",
+            },
+        ],
     })
 }
 
@@ -38707,6 +38772,8 @@ define Auth() -> { @out "auth" }
 
         let html = std::fs::read_to_string(out.join("index.html")).expect("editor html");
         let state = read_json_value(&out.join("state.json")).expect("editor state");
+        let native_host =
+            read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
         assert!(html.contains("id=\"orv-editor\""));
         assert!(html.contains("id=\"routes-list\""));
         assert!(html.contains("renderEditorState"));
@@ -38722,6 +38789,20 @@ define Auth() -> { @out "auth" }
             state["runtime"]["runtime"]["stdout"],
             "editor-export-ready\n"
         );
+        assert_eq!(native_host["runtime"]["status"], "ok");
+        assert!(native_host["runtime"]["frame_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(native_host["runtime"]["panel_contract"]["root"], "runtime");
+        let runtime_sections = native_host["runtime"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("runtime panel sections");
+        assert!(runtime_sections
+            .iter()
+            .any(|section| section["name"] == "panel" && section["path"] == "runtime.panel"));
+        assert!(runtime_sections
+            .iter()
+            .any(|section| section["name"] == "frames" && section["path"] == "runtime.frames"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
