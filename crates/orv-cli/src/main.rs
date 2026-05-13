@@ -37222,6 +37222,9 @@ entry = "src/main.orv"
   @route POST /orders/covered-total {
     @respond 201 { covered: (@body.total as int) <= ((@body.quantity as int) * (@body.unit_price as int)) }
   }
+  @route POST /orders/product-covered-static {
+    @respond 201 { covered: ((@body.quantity as int) * (@body.unit_price as int)) <= 1000 }
+  }
 }
 "#,
         )
@@ -37368,6 +37371,11 @@ entry = "src/main.orv"
             "/orders/covered-total",
             r#"{"total":"875","quantity":"7","unit_price":"125"}"#,
         );
+        let product_covered_static_response = send_raw_http_json_post(
+            address,
+            "/orders/product-covered-static",
+            r#"{"quantity":"7","unit_price":"125"}"#,
+        );
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains(r#"{"quantity":7}"#));
@@ -37420,6 +37428,8 @@ entry = "src/main.orv"
         assert!(covered_min_response.contains(r#"{"covered":true}"#));
         assert!(covered_total_response.starts_with("HTTP/1.1 201"));
         assert!(covered_total_response.contains(r#"{"covered":true}"#));
+        assert!(product_covered_static_response.starts_with("HTTP/1.1 201"));
+        assert!(product_covered_static_response.contains(r#"{"covered":true}"#));
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
@@ -37455,6 +37465,9 @@ entry = "src/main.orv"
   }
   @route POST /payments/under-limit {
     @respond 201 { under_limit: (@body.amount as float) <= (@query.limit as float) }
+  }
+  @route POST /payments/product-under-static-limit {
+    @respond 201 { under_limit: ((@body.price as float) * (@body.quantity as float)) <= 40.0 }
   }
 }
 "#,
@@ -37526,6 +37539,11 @@ entry = "src/main.orv"
             "/payments/under-limit?limit=20.0",
             r#"{"amount":"12.5"}"#,
         );
+        let product_under_static_limit_response = send_raw_http_json_post(
+            address,
+            "/payments/product-under-static-limit",
+            r#"{"price":"12.5","quantity":"3"}"#,
+        );
 
         let assert_created = |response: &str, body: &str| {
             assert!(response.starts_with("HTTP/1.1 201"));
@@ -37538,6 +37556,10 @@ entry = "src/main.orv"
         assert_created(&total_plus_fee_response, r#"{"total":38.75}"#);
         assert_created(&power_response, r#"{"total":6.25}"#);
         assert_created(&under_limit_response, r#"{"under_limit":true}"#);
+        assert_created(
+            &product_under_static_limit_response,
+            r#"{"under_limit":true}"#,
+        );
 
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
