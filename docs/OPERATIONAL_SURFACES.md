@@ -65,7 +65,7 @@ Trace transport is also mirrored for native hosts: when an editor export include
 - editor affordances: `textDocument/codeLens`, `textDocument/codeAction`, `workspace/executeCommand`, `textDocument/documentLink`, `textDocument/documentColor`, `textDocument/colorPresentation`, `textDocument/foldingRange`, `textDocument/selectionRange`, `textDocument/semanticTokens/full`, `textDocument/linkedEditingRange`, `textDocument/formatting`, `textDocument/rangeFormatting`, `textDocument/onTypeFormatting`
 - navigation: `textDocument/definition`, `textDocument/declaration`, `textDocument/typeDefinition`, `textDocument/implementation`, `textDocument/moniker`
 - hierarchy: `textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`, `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes`
-- editing/introspection: `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/signatureHelp`, `textDocument/inlayHint`, `textDocument/completion`
+- editing/introspection: `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/signatureHelp`, `textDocument/inlayHint`, `textDocument/completion` with project symbols plus language/directive/route-method snippets
 
 The LSP session keeps `textDocument/didOpen`, full-sync `textDocument/didChange`, and `textDocument/didSave` text buffers so later file URI requests can run against current editor content, and clears that cache on save-without-text or `textDocument/didClose`.
 

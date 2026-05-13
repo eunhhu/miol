@@ -9161,9 +9161,16 @@ impl LspSession {
         let uri = lsp_text_document_uri(request)?;
         let path = lsp_file_uri_path(uri)?;
         let loaded = self.loaded_project_for_path(&path)?;
+        let context = if let Some(file) = lsp_source_file_for_path(&loaded.files, &path) {
+            let position = lsp_text_document_position(request)?;
+            let byte = lsp_position_to_byte(&file.source, position);
+            lsp_completion_context(&file.source, byte)
+        } else {
+            LspCompletionContext::General
+        };
         Ok(serde_json::json!({
             "isIncomplete": false,
-            "items": lsp_completion_items_json(&loaded.graph),
+            "items": lsp_completion_items_json(&loaded.graph, context),
         }))
     }
 
@@ -14769,16 +14776,364 @@ const fn lsp_semantic_token_type(kind: ProjectNodeKind) -> Option<u32> {
     }
 }
 
-fn lsp_completion_items_json(graph: &ProjectGraph) -> Vec<serde_json::Value> {
-    let mut items = Vec::new();
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LspCompletionContext {
+    General,
+    Directive,
+    RouteMethod,
+}
+
+struct LspStaticCompletion {
+    label: &'static str,
+    kind: u8,
+    detail: &'static str,
+    insert_text: Option<&'static str>,
+}
+
+const LSP_GENERAL_COMPLETIONS: &[LspStaticCompletion] = &[
+    LspStaticCompletion {
+        label: "import",
+        kind: 14,
+        detail: "Keyword",
+        insert_text: Some("import \"${1:path}\""),
+    },
+    LspStaticCompletion {
+        label: "pub",
+        kind: 14,
+        detail: "Keyword",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "struct",
+        kind: 15,
+        detail: "Struct declaration",
+        insert_text: Some("struct ${1:Name} {\n  ${2:id}: ${3:int}\n}"),
+    },
+    LspStaticCompletion {
+        label: "enum",
+        kind: 15,
+        detail: "Enum declaration",
+        insert_text: Some("enum ${1:Name} {\n  ${2:Variant}\n}"),
+    },
+    LspStaticCompletion {
+        label: "type",
+        kind: 15,
+        detail: "Type alias",
+        insert_text: Some("type ${1:Name} = ${2:int}"),
+    },
+    LspStaticCompletion {
+        label: "let",
+        kind: 15,
+        detail: "Binding",
+        insert_text: Some("let ${1:name} = ${2:value}"),
+    },
+    LspStaticCompletion {
+        label: "let sig",
+        kind: 15,
+        detail: "Reactive signal",
+        insert_text: Some("let sig ${1:name} = ${2:value}"),
+    },
+    LspStaticCompletion {
+        label: "const",
+        kind: 15,
+        detail: "Constant",
+        insert_text: Some("const ${1:name} = ${2:value}"),
+    },
+    LspStaticCompletion {
+        label: "function",
+        kind: 15,
+        detail: "Function declaration",
+        insert_text: Some("function ${1:name}(${2:input}: ${3:int}): ${4:int} -> {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "async function",
+        kind: 15,
+        detail: "Async function declaration",
+        insert_text: Some("async function ${1:name}(${2:input}: ${3:int}): ${4:int} -> {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "define",
+        kind: 15,
+        detail: "Token-aware define declaration",
+        insert_text: Some("define ${1:name}(${2:input}: ${3:int}): ${4:int} -> {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "domain",
+        kind: 15,
+        detail: "Domain declaration",
+        insert_text: Some("domain ${1:Name} {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "if",
+        kind: 15,
+        detail: "Conditional",
+        insert_text: Some("if ${1:condition} {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "for",
+        kind: 15,
+        detail: "Loop",
+        insert_text: Some("for ${1:item} in ${2:items} {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "while",
+        kind: 15,
+        detail: "Loop",
+        insert_text: Some("while ${1:condition} {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "return",
+        kind: 14,
+        detail: "Keyword",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "await",
+        kind: 14,
+        detail: "Keyword",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "test",
+        kind: 15,
+        detail: "Test block",
+        insert_text: Some("test \"${1:name}\" {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "true",
+        kind: 14,
+        detail: "Boolean literal",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "false",
+        kind: 14,
+        detail: "Boolean literal",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "null",
+        kind: 14,
+        detail: "Null literal",
+        insert_text: None,
+    },
+];
+
+const LSP_DIRECTIVE_COMPLETIONS: &[LspStaticCompletion] = &[
+    LspStaticCompletion {
+        label: "@server",
+        kind: 15,
+        detail: "Server block",
+        insert_text: Some("@server {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@listen",
+        kind: 15,
+        detail: "Server listen port",
+        insert_text: Some("@listen ${1:8080}"),
+    },
+    LspStaticCompletion {
+        label: "@route",
+        kind: 15,
+        detail: "HTTP route",
+        insert_text: Some("@route ${1:GET} ${2:/path} {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@respond",
+        kind: 15,
+        detail: "HTTP response",
+        insert_text: Some("@respond ${1:200} ${2:{ ok: true }}"),
+    },
+    LspStaticCompletion {
+        label: "@serve",
+        kind: 15,
+        detail: "HTML response",
+        insert_text: Some("@serve @html {\n  @body {\n    $0\n  }\n}"),
+    },
+    LspStaticCompletion {
+        label: "@db.connect",
+        kind: 15,
+        detail: "Database adapter",
+        insert_text: Some("@db.connect(@env.${1:DATABASE_URL} ?? \"sqlite://data/app.sqlite\")"),
+    },
+    LspStaticCompletion {
+        label: "@payment.connect",
+        kind: 15,
+        detail: "Payment adapter",
+        insert_text: Some(
+            "@payment.connect(@env.PAYMENT_ADAPTER_URL ?? \"file://data/payments.jsonl\")",
+        ),
+    },
+    LspStaticCompletion {
+        label: "@shipping.connect",
+        kind: 15,
+        detail: "Shipping adapter",
+        insert_text: Some(
+            "@shipping.connect(@env.SHIPPING_ADAPTER_URL ?? \"file://data/shipments.jsonl\")",
+        ),
+    },
+    LspStaticCompletion {
+        label: "@env",
+        kind: 6,
+        detail: "Environment value",
+        insert_text: Some("@env.${1:NAME}"),
+    },
+    LspStaticCompletion {
+        label: "@body",
+        kind: 6,
+        detail: "Request body",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "@param",
+        kind: 6,
+        detail: "Route parameter",
+        insert_text: Some("@param.${1:name}"),
+    },
+    LspStaticCompletion {
+        label: "@query",
+        kind: 6,
+        detail: "Query parameter",
+        insert_text: Some("@query.${1:name}"),
+    },
+    LspStaticCompletion {
+        label: "@request.rawBody",
+        kind: 6,
+        detail: "Raw request body",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "@html",
+        kind: 14,
+        detail: "HTML domain",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "@body block",
+        kind: 15,
+        detail: "HTML body",
+        insert_text: Some("@body {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@section",
+        kind: 15,
+        detail: "HTML section",
+        insert_text: Some("@section {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@form",
+        kind: 15,
+        detail: "HTML form",
+        insert_text: Some("@form action=\"${1:/path}\" method=post {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@input",
+        kind: 15,
+        detail: "HTML input",
+        insert_text: Some("@input type=${1:text} name=${2:name}"),
+    },
+    LspStaticCompletion {
+        label: "@button",
+        kind: 15,
+        detail: "HTML button",
+        insert_text: Some("@button type=submit \"${1:Submit}\""),
+    },
+    LspStaticCompletion {
+        label: "@a",
+        kind: 15,
+        detail: "HTML anchor",
+        insert_text: Some("@a href=\"${1:/}\" \"${2:Link}\""),
+    },
+    LspStaticCompletion {
+        label: "@h1",
+        kind: 15,
+        detail: "HTML heading",
+        insert_text: Some("@h1 \"${1:Heading}\""),
+    },
+    LspStaticCompletion {
+        label: "@p",
+        kind: 15,
+        detail: "HTML paragraph",
+        insert_text: Some("@p \"${1:Text}\""),
+    },
+    LspStaticCompletion {
+        label: "@ul",
+        kind: 15,
+        detail: "HTML list",
+        insert_text: Some("@ul {\n  $0\n}"),
+    },
+    LspStaticCompletion {
+        label: "@li",
+        kind: 15,
+        detail: "HTML list item",
+        insert_text: Some("@li \"${1:Item}\""),
+    },
+    LspStaticCompletion {
+        label: "@label",
+        kind: 15,
+        detail: "HTML label",
+        insert_text: Some("@label \"${1:Label}\""),
+    },
+];
+
+const LSP_ROUTE_METHOD_COMPLETIONS: &[LspStaticCompletion] = &[
+    LspStaticCompletion {
+        label: "GET",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "POST",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "PUT",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "PATCH",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "DELETE",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "OPTIONS",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+    LspStaticCompletion {
+        label: "HEAD",
+        kind: 14,
+        detail: "HTTP method",
+        insert_text: None,
+    },
+];
+
+fn lsp_completion_items_json(
+    graph: &ProjectGraph,
+    context: LspCompletionContext,
+) -> Vec<serde_json::Value> {
+    let mut items = lsp_static_completion_items_json(context);
+    if context == LspCompletionContext::RouteMethod {
+        return items;
+    }
     for node in &graph.nodes {
         let Some(kind) = lsp_completion_item_kind_code(node.kind) else {
             continue;
         };
-        if items.iter().any(|item: &serde_json::Value| {
-            item.get("label").and_then(serde_json::Value::as_str) == Some(node.name.as_str())
-                && item.get("kind").and_then(serde_json::Value::as_u64) == Some(u64::from(kind))
-        }) {
+        if lsp_completion_item_exists(&items, node.name.as_str(), kind) {
             continue;
         }
         items.push(serde_json::json!({
@@ -14791,6 +15146,70 @@ fn lsp_completion_items_json(graph: &ProjectGraph) -> Vec<serde_json::Value> {
         }));
     }
     items
+}
+
+fn lsp_static_completion_items_json(context: LspCompletionContext) -> Vec<serde_json::Value> {
+    let specs = match context {
+        LspCompletionContext::General => LSP_GENERAL_COMPLETIONS,
+        LspCompletionContext::Directive => LSP_DIRECTIVE_COMPLETIONS,
+        LspCompletionContext::RouteMethod => LSP_ROUTE_METHOD_COMPLETIONS,
+    };
+    let mut items = Vec::new();
+    for spec in specs {
+        if lsp_completion_item_exists(&items, spec.label, spec.kind) {
+            continue;
+        }
+        let mut item = serde_json::json!({
+            "label": spec.label,
+            "kind": spec.kind,
+            "detail": spec.detail,
+        });
+        if let Some(insert_text) = spec.insert_text {
+            item["insertText"] = serde_json::json!(insert_text);
+            item["insertTextFormat"] = serde_json::json!(2);
+        }
+        items.push(item);
+    }
+    items
+}
+
+fn lsp_completion_item_exists(items: &[serde_json::Value], label: &str, kind: u8) -> bool {
+    items.iter().any(|item| {
+        item.get("label").and_then(serde_json::Value::as_str) == Some(label)
+            && item.get("kind").and_then(serde_json::Value::as_u64) == Some(u64::from(kind))
+    })
+}
+
+fn lsp_completion_context(source: &str, byte: usize) -> LspCompletionContext {
+    let prefix = &source[..byte.min(source.len())];
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let line_prefix = &prefix[line_start..];
+    let trimmed = line_prefix.trim_start();
+    if lsp_is_route_method_completion(trimmed) {
+        return LspCompletionContext::RouteMethod;
+    }
+    if lsp_line_has_open_at_token(line_prefix) {
+        return LspCompletionContext::Directive;
+    }
+    LspCompletionContext::General
+}
+
+fn lsp_is_route_method_completion(trimmed_line_prefix: &str) -> bool {
+    let Some(rest) = trimmed_line_prefix.strip_prefix("@route") else {
+        return false;
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let after_route = rest.trim_start();
+    after_route.is_empty() || !after_route.contains(char::is_whitespace)
+}
+
+fn lsp_line_has_open_at_token(line_prefix: &str) -> bool {
+    line_prefix
+        .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '{' | '[' | ',' | ':' | '='))
+        .next()
+        .is_some_and(|token| token.starts_with('@'))
 }
 
 fn lsp_workspace_symbols_json(
@@ -31512,6 +31931,94 @@ function greet(user: User): string -> "hello"
         assert!(items
             .iter()
             .any(|item| item["label"] == "route" && item["kind"] == 23));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "function" && item["kind"] == 15));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_directive_snippets_at_at_prefix() {
+        let dir = temp_output_dir("lsp-completion-directives");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"@server {
+  @
+}
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": 3,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 19);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        let route = items
+            .iter()
+            .find(|item| item["label"] == "@route")
+            .expect("@route completion");
+        assert_eq!(route["kind"], 15);
+        assert_eq!(route["insertTextFormat"], 2);
+        assert_eq!(route["insertText"], "@route ${1:GET} ${2:/path} {\n  $0\n}");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "@payment.connect" && item["kind"] == 15));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "@shipping.connect" && item["kind"] == 15));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_route_methods_inside_route_head() {
+        let dir = temp_output_dir("lsp-completion-route-methods");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@server {\n  @route \n}\n").expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": 9,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 20);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "GET" && item["kind"] == 14));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "POST" && item["kind"] == 14));
+        assert!(!items.iter().any(|item| item["label"] == "@route"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
