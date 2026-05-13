@@ -37122,6 +37122,9 @@ entry = "src/main.orv"
   @route POST /orders/cents {
     @respond 201 { cents: (@body.quantity as int) * 100 }
   }
+  @route POST /orders/cents-total {
+    @respond 201 { cents: (@body.quantity as int) * ((@body.unit_price as int) * 100) }
+  }
   @route POST /orders/total {
     @respond 201 { total: (@body.quantity as int) * (@body.unit_price as int) }
   }
@@ -37198,6 +37201,11 @@ entry = "src/main.orv"
         let neg_response = send_raw_http_json_post(address, "/orders/neg", r#"{"quantity":"7"}"#);
         let cents_response =
             send_raw_http_json_post(address, "/orders/cents", r#"{"quantity":"7"}"#);
+        let cents_total_response = send_raw_http_json_post(
+            address,
+            "/orders/cents-total",
+            r#"{"quantity":"2","unit_price":"125"}"#,
+        );
         let total_response = send_raw_http_json_post(
             address,
             "/orders/total",
@@ -37235,6 +37243,8 @@ entry = "src/main.orv"
         assert!(neg_response.contains(r#"{"quantity":-7}"#));
         assert!(cents_response.starts_with("HTTP/1.1 201"));
         assert!(cents_response.contains(r#"{"cents":700}"#));
+        assert!(cents_total_response.starts_with("HTTP/1.1 201"));
+        assert!(cents_total_response.contains(r#"{"cents":25000}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":875}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
