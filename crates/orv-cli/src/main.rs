@@ -36829,6 +36829,12 @@ entry = "src/main.orv"
     }
     @respond 409 { err: "over_total" }
   }
+  @route POST /inventory-value-static {
+    if ((@body.quantity as int) * (@body.unit_price as int)) <= 1000 {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
   @route POST /ifelse-inventory {
     if (@body.quantity as int) <= (@body.stock as int) {
       @respond 201 { accepted: true, quantity: @body.quantity as int }
@@ -36999,6 +37005,16 @@ entry = "src/main.orv"
             "/inventory-value",
             r#"{"total":"901","quantity":"7","unit_price":"125"}"#,
         );
+        let accepted_static_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-static",
+            r#"{"quantity":"7","unit_price":"125"}"#,
+        );
+        let rejected_static_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-static",
+            r#"{"quantity":"9","unit_price":"125"}"#,
+        );
         let accepted_ifelse_inventory = send_raw_http_json_post(
             address,
             "/ifelse-inventory",
@@ -37096,6 +37112,10 @@ entry = "src/main.orv"
         assert!(accepted_value_inventory.contains(r#"{"accepted":true,"total":875}"#));
         assert!(rejected_value_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_value_inventory.contains(r#"{"err":"over_total"}"#));
+        assert!(accepted_static_value_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_static_value_inventory.contains(r#"{"accepted":true,"quantity":7}"#));
+        assert!(rejected_static_value_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_static_value_inventory.contains(r#"{"err":"over_total"}"#));
         assert!(accepted_ifelse_inventory.starts_with("HTTP/1.1 201"));
         assert!(accepted_ifelse_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_ifelse_inventory.starts_with("HTTP/1.1 409"));

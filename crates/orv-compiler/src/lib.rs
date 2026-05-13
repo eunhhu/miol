@@ -5407,6 +5407,27 @@ fn push_native_float_response_condition(
             return false;
         };
         let operand_name = condition.operand_name.as_deref().unwrap_or_default();
+        if !condition.value.is_empty()
+            && condition.operand_scale_json.is_none()
+            && condition.secondary_operand_name.is_none()
+            && condition.secondary_operand_kind.is_none()
+        {
+            let Some(static_value) = static_float_operand_value(condition.value.as_str()) else {
+                return false;
+            };
+            let _ = writeln!(
+                source,
+                "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
+                rust_string_literal(&condition.name),
+                rust_string_literal(operand_name)
+            );
+            let _ = writeln!(
+                source,
+                "            (Ok(value), Ok(product_right)) if value.is_finite() && product_right.is_finite() => {{\n                let product = value * product_right;\n                product.is_finite() && product {operator} {static_value}\n            }},"
+            );
+            source.push_str("            _ => false,\n        } {\n");
+            return true;
+        }
         if let Some(secondary_operand_name) = condition.secondary_operand_name.as_deref() {
             let Some(secondary_operand_lookup) = condition
                 .secondary_operand_kind
@@ -5532,6 +5553,28 @@ fn push_native_int_response_condition(
             return false;
         };
         let operand_name = condition.operand_name.as_deref().unwrap_or_default();
+        if !condition.value.is_empty()
+            && condition.operand_scale_json.is_none()
+            && condition.secondary_operand_name.is_none()
+            && condition.secondary_operand_kind.is_none()
+        {
+            let Some(static_value) = condition.value.parse::<i64>().ok() else {
+                return false;
+            };
+            let static_value = static_value.to_string();
+            let _ = writeln!(
+                source,
+                "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
+                rust_string_literal(&condition.name),
+                rust_string_literal(operand_name)
+            );
+            let _ = writeln!(
+                source,
+                "            (Ok(value), Ok(product_right)) => match value.checked_mul(product_right) {{\n                Some(product) => product {operator} {static_value},\n                None => false,\n            }},"
+            );
+            source.push_str("            _ => false,\n        } {\n");
+            return true;
+        }
         if let Some(secondary_operand_name) = condition.secondary_operand_name.as_deref() {
             let Some(secondary_operand_lookup) = condition
                 .secondary_operand_kind
@@ -8202,6 +8245,9 @@ fn native_captured_float_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
+    if let Some(condition) = native_captured_product_static_float_response_condition(op, lhs, rhs) {
+        return Some(condition);
+    }
     if let Some(left) = captured_condition_float_operand(lhs) {
         if let Some(value) = static_float(rhs) {
             return Some(ServerResponseConditionArtifact {
@@ -8320,6 +8366,38 @@ fn captured_product_condition_float_operand(
     })
 }
 
+fn native_captured_product_static_float_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    if let Some(left) = captured_product_condition_float_operand(lhs) {
+        if let Some(value) = static_float(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_float_operand(op, left.lhs_kind)?,
+                name: left.lhs_name,
+                value,
+                operand_name: Some(left.rhs_name),
+                operand_kind: Some(left.rhs_kind.to_string()),
+                operand_scale_json: None,
+                secondary_operand_kind: None,
+                secondary_operand_name: None,
+            });
+        }
+    }
+    let right = captured_product_condition_float_operand(rhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_float_operand(reverse_comparison_op(op)?, right.lhs_kind)?,
+        name: right.lhs_name,
+        value: static_float(lhs)?,
+        operand_name: Some(right.rhs_name),
+        operand_kind: Some(right.rhs_kind.to_string()),
+        operand_scale_json: None,
+        secondary_operand_kind: None,
+        secondary_operand_name: None,
+    })
+}
+
 fn condition_float_operand_kind(value_kind: &str) -> Option<&'static str> {
     match value_kind {
         "request_body_field_float" => Some("request_body_field_float"),
@@ -8334,6 +8412,9 @@ fn native_captured_int_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
+    if let Some(condition) = native_captured_product_static_int_response_condition(op, lhs, rhs) {
+        return Some(condition);
+    }
     if let Some(left) = captured_condition_int_operand(lhs) {
         if let Some(value) = static_integer(rhs) {
             return Some(ServerResponseConditionArtifact {
@@ -8414,6 +8495,38 @@ fn native_captured_int_response_condition(
         value: static_integer(lhs)?.to_string(),
         operand_name: None,
         operand_kind: None,
+        operand_scale_json: None,
+        secondary_operand_kind: None,
+        secondary_operand_name: None,
+    })
+}
+
+fn native_captured_product_static_int_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    if let Some(left) = captured_product_condition_int_operand(lhs) {
+        if let Some(value) = static_integer(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_int_operand(op, left.lhs_kind)?,
+                name: left.lhs_name,
+                value: value.to_string(),
+                operand_name: Some(left.rhs_name),
+                operand_kind: Some(left.rhs_kind.to_string()),
+                operand_scale_json: None,
+                secondary_operand_kind: None,
+                secondary_operand_name: None,
+            });
+        }
+    }
+    let right = captured_product_condition_int_operand(rhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_int_operand(reverse_comparison_op(op)?, right.lhs_kind)?,
+        name: right.lhs_name,
+        value: static_integer(lhs)?.to_string(),
+        operand_name: Some(right.rhs_name),
+        operand_kind: Some(right.rhs_kind.to_string()),
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
@@ -15052,6 +15165,51 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_product_static_int_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if ((@body.quantity as int) * (@body.unit_price as int)) <= 1000 {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_int_le");
+        assert_eq!(condition.name, "quantity");
+        assert_eq!(condition.value, "1000");
+        assert_eq!(condition.operand_name.as_deref(), Some("unit_price"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert!(condition.secondary_operand_kind.is_none());
+        assert!(condition.secondary_operand_name.is_none());
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains("value.checked_mul(product_right)"));
+        assert!(handlers.contains("Some(product) => product <= 1000"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_request_body_float_comparison_guard() {
         let src = r#"@server {
   @listen 8080
@@ -15134,6 +15292,51 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers.contains(
             "(Ok(value), Ok(operand)) if value.is_finite() && operand.is_finite() => value <= operand"
         ));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_product_static_float_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    if ((@body.price as float) * (@body.quantity as float)) <= 40.0 {
+      @respond 201 { accepted: true, amount: @body.price as float }
+    }
+    @respond 409 { err: "amount_over_limit" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_float_le");
+        assert_eq!(condition.name, "price");
+        assert_eq!(condition.value, "40.0");
+        assert_eq!(condition.operand_name.as_deref(), Some("quantity"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert!(condition.secondary_operand_kind.is_none());
+        assert!(condition.secondary_operand_name.is_none());
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains("let product = value * product_right;"));
+        assert!(handlers.contains("product.is_finite() && product <= 40.0"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
