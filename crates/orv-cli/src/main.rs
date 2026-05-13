@@ -18018,6 +18018,9 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
     if !source.contains("sourceBundleHash") {
         anyhow::bail!("client_js bundle does not declare source bundle hash metadata");
     }
+    if !source.contains("sourceFileCount") {
+        anyhow::bail!("client_js bundle does not declare source bundle file count metadata");
+    }
     if !source.contains("manifestUrl")
         || !source.contains("./manifest.json")
         || !source.contains("loadClientManifest")
@@ -18085,7 +18088,7 @@ fn verify_client_js_target(target: &Path) -> anyhow::Result<()> {
         anyhow::bail!("client_js bundle does not verify client reactive plan contract");
     }
     if !source.contains("loadSourceBundle")
-        || !source.contains("stableJsonHash(sourceBundle)")
+        || !source.contains("sourceFileCount")
         || !source.contains("fnv1a64")
         || !source.contains("source bundle hash mismatch")
     {
@@ -24688,6 +24691,7 @@ fn write_client_js_loader(
         "sourceBundleUrl": "../source-bundle.json",
         "manifestSourceBundle": SOURCE_BUNDLE_PATH,
         "sourceBundleHash": binding.source_bundle_hash,
+        "sourceFileCount": binding.source_bundle.files.len(),
         "entry": &binding.source_bundle.entry,
         "embeddedReactivePlan": reactive_plan,
         "embeddedReactivePlanHash": reactive_plan_hash,
@@ -37957,6 +37961,7 @@ entry = "src/main.orv"
             "sourceBundleUrl",
             "../source-bundle.json",
             "sourceBundleHash",
+            "sourceFileCount",
             "manifestUrl",
             "loadClientManifest",
             "client manifest hash mismatch",
@@ -38005,7 +38010,7 @@ entry = "src/main.orv"
             "assign_event_target_value_int",
             "setSignal",
             "loadSourceBundle",
-            "stableJsonHash(sourceBundle)",
+            "sourceFileCount",
             "fnv1a64",
             "source bundle hash mismatch",
             "runtimeFeatures",
@@ -41208,7 +41213,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let loader_path = build_out.join("client").join("app.js");
         let loader = std::fs::read_to_string(&loader_path)
             .expect("client loader")
-            .replace("stableJsonHash(sourceBundle)", "\"tampered\"");
+            .replace("source bundle hash mismatch", "source bundle hash skipped");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");

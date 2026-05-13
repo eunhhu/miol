@@ -654,17 +654,16 @@ function bindReactiveEvents(plan, root, reactiveState, setSignal) {
   return { count };
 }
 
-async function loadSourceBundle(manifest) {
-  const response = await fetch(sourceBundleUrl);
-  if (!response.ok) {
-    throw new Error(`orv source bundle fetch failed: ${response.status}`);
+function loadSourceBundle(manifest) {
+  const hash = ORV_CLIENT_BOOTSTRAP.sourceBundleHash;
+  if (hash !== manifest.source_bundle_hash) {
+    throw new Error(`orv source bundle hash mismatch: expected ${manifest.source_bundle_hash}, got ${hash}`);
   }
-  const sourceBundle = await response.json();
-  const actualHash = stableJsonHash(sourceBundle);
-  if (actualHash !== manifest.source_bundle_hash) {
-    throw new Error(`orv source bundle hash mismatch: expected ${manifest.source_bundle_hash}, got ${actualHash}`);
-  }
-  return sourceBundle;
+  return {
+    fileCount: Number(ORV_CLIENT_BOOTSTRAP.sourceFileCount ?? 0),
+    hash,
+    url: sourceBundleUrl.href,
+  };
 }
 
 function readInitialRender(instance) {
@@ -715,7 +714,7 @@ async function main() {
   const manifest = await loadClientManifest();
   const reactivePlan = await loadReactivePlan(manifest);
   const reactiveState = createReactiveState(reactivePlan);
-  const sourceBundle = await loadSourceBundle(manifest);
+  const sourceBundle = loadSourceBundle(manifest);
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
   validateWasmBundle(manifest, bytes);
@@ -747,10 +746,10 @@ async function main() {
   if (root) {
     root.dataset.orvStatus = "ready";
     root.dataset.orvClientManifest = manifestUrl.href;
-    root.dataset.orvSourceBundle = sourceBundleUrl.href;
+    root.dataset.orvSourceBundle = sourceBundle.url;
     root.dataset.orvSourceBundleHash = manifest.source_bundle_hash;
     root.dataset.orvEntry = ORV_CLIENT_BOOTSTRAP.entry;
-    root.dataset.orvSourceCount = String(sourceBundle.files?.length ?? 0);
+    root.dataset.orvSourceCount = String(sourceBundle.fileCount);
     root.dataset.orvReactiveSignals = String(reactivePlan.signals.length);
     root.dataset.orvReactiveBindings = String(reactivePlan.bindings.filter((binding) => binding.kind === "signal_state").length);
     root.dataset.orvReactiveDomBindings = String(reactiveDom.count);
