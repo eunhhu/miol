@@ -37140,8 +37140,20 @@ entry = "src/main.orv"
   @route POST /orders/share {
     @respond 201 { share: (@body.total as int) / (@body.parts as int) }
   }
+  @route POST /orders/unit-bundle {
+    @respond 201 { unit: (@body.total as int) / ((@body.parts as int) * 100) }
+  }
+  @route POST /orders/unit-bundle-left {
+    @respond 201 { unit: ((@body.total as int) * 100) / (@body.parts as int) }
+  }
   @route POST /orders/remainder {
     @respond 201 { remainder: (@body.total as int) % (@body.parts as int) }
+  }
+  @route POST /orders/remainder-scaled {
+    @respond 201 { remainder: (@body.total as int) % ((@body.parts as int) * 10) }
+  }
+  @route POST /orders/remainder-scaled-left {
+    @respond 201 { remainder: ((@body.total as int) * 10) % (@body.parts as int) }
   }
   @route POST /orders/available {
     @respond 201 { available: (@body.quantity as int) <= (@body.stock as int) }
@@ -37222,10 +37234,30 @@ entry = "src/main.orv"
         );
         let share_response =
             send_raw_http_json_post(address, "/orders/share", r#"{"total":"875","parts":"7"}"#);
+        let unit_bundle_response = send_raw_http_json_post(
+            address,
+            "/orders/unit-bundle",
+            r#"{"total":"1000","parts":"2"}"#,
+        );
+        let unit_bundle_left_response = send_raw_http_json_post(
+            address,
+            "/orders/unit-bundle-left",
+            r#"{"total":"5","parts":"2"}"#,
+        );
         let remainder_response = send_raw_http_json_post(
             address,
             "/orders/remainder",
             r#"{"total":"875","parts":"6"}"#,
+        );
+        let remainder_scaled_response = send_raw_http_json_post(
+            address,
+            "/orders/remainder-scaled",
+            r#"{"total":"101","parts":"3"}"#,
+        );
+        let remainder_scaled_left_response = send_raw_http_json_post(
+            address,
+            "/orders/remainder-scaled-left",
+            r#"{"total":"3","parts":"7"}"#,
         );
         let available_response = send_raw_http_json_post(
             address,
@@ -37256,8 +37288,16 @@ entry = "src/main.orv"
         assert!(due_response.contains(r#"{"due":750}"#));
         assert!(share_response.starts_with("HTTP/1.1 201"));
         assert!(share_response.contains(r#"{"share":125}"#));
+        assert!(unit_bundle_response.starts_with("HTTP/1.1 201"));
+        assert!(unit_bundle_response.contains(r#"{"unit":5}"#));
+        assert!(unit_bundle_left_response.starts_with("HTTP/1.1 201"));
+        assert!(unit_bundle_left_response.contains(r#"{"unit":250}"#));
         assert!(remainder_response.starts_with("HTTP/1.1 201"));
         assert!(remainder_response.contains(r#"{"remainder":5}"#));
+        assert!(remainder_scaled_response.starts_with("HTTP/1.1 201"));
+        assert!(remainder_scaled_response.contains(r#"{"remainder":11}"#));
+        assert!(remainder_scaled_left_response.starts_with("HTTP/1.1 201"));
+        assert!(remainder_scaled_left_response.contains(r#"{"remainder":2}"#));
         assert!(available_response.starts_with("HTTP/1.1 201"));
         assert!(available_response.contains(r#"{"available":true}"#));
 
