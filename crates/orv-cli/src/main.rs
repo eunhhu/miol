@@ -10663,11 +10663,14 @@ impl DapSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("launch is required before scopes"))?;
         let (source_name, source_path, source_uri, _) = dap_current_source_and_line(launched);
+        let project_variable_count = dap_project_variables(launched).len();
+        let local_variable_count = dap_current_locals(launched).len();
         Ok(serde_json::json!({
             "scopes": [
                 {
                     "name": "Project",
                     "variablesReference": 1,
+                    "namedVariables": project_variable_count,
                     "expensive": false,
                     "source": {
                         "name": source_name,
@@ -10679,6 +10682,7 @@ impl DapSession {
                 {
                     "name": "Locals",
                     "variablesReference": 2,
+                    "namedVariables": local_variable_count,
                     "expensive": false,
                     "source": {
                         "name": source_name,
@@ -10712,47 +10716,7 @@ impl DapSession {
         if variables_reference != 1 {
             anyhow::bail!("unknown variablesReference {variables_reference}");
         }
-        let mut variables = vec![
-            serde_json::json!({
-                "name": "entry",
-                "value": launched.path.display().to_string(),
-                "type": "source",
-                "variablesReference": 0,
-            }),
-            serde_json::json!({
-                "name": "projectGraphNodes",
-                "value": launched.node_count.to_string(),
-                "type": "usize",
-                "variablesReference": 0,
-            }),
-            serde_json::json!({
-                "name": "diagnostics",
-                "value": launched.diagnostic_count.to_string(),
-                "type": "usize",
-                "variablesReference": 0,
-            }),
-            serde_json::json!({
-                "name": "runtimeStatus",
-                "value": launched.runtime.status,
-                "type": "string",
-                "variablesReference": 0,
-            }),
-            serde_json::json!({
-                "name": "stdout",
-                "value": launched.runtime.stdout,
-                "type": "string",
-                "variablesReference": 0,
-            }),
-            serde_json::json!({
-                "name": "runtimeError",
-                "value": launched.runtime.error,
-                "type": "string",
-                "variablesReference": 0,
-            }),
-        ];
-        if let Some(async_runtime) = &launched.async_runtime {
-            variables.extend(dap_async_runtime_variables(launched, async_runtime));
-        }
+        let variables = dap_project_variables(launched);
         Ok(serde_json::json!({
             "variables": dap_paginate_json_values(variables, request, "start", "count"),
         }))
@@ -12155,6 +12119,51 @@ fn dap_async_transport_display(transport: &DapAsyncTransportState) -> String {
         return format!("{} {} pid {pid}", transport.kind, transport.state);
     }
     format!("{} {}", transport.kind, transport.state)
+}
+
+fn dap_project_variables(launched: &DapLaunchState) -> Vec<serde_json::Value> {
+    let mut variables = vec![
+        serde_json::json!({
+            "name": "entry",
+            "value": launched.path.display().to_string(),
+            "type": "source",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "projectGraphNodes",
+            "value": launched.node_count.to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "diagnostics",
+            "value": launched.diagnostic_count.to_string(),
+            "type": "usize",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeStatus",
+            "value": launched.runtime.status,
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "stdout",
+            "value": launched.runtime.stdout,
+            "type": "string",
+            "variablesReference": 0,
+        }),
+        serde_json::json!({
+            "name": "runtimeError",
+            "value": launched.runtime.error,
+            "type": "string",
+            "variablesReference": 0,
+        }),
+    ];
+    if let Some(async_runtime) = &launched.async_runtime {
+        variables.extend(dap_async_runtime_variables(launched, async_runtime));
+    }
+    variables
 }
 
 fn dap_async_runtime_variables(
@@ -30358,9 +30367,18 @@ function greet(user: User): string -> "hello"
         assert_eq!(scopes["success"], true, "{scopes}");
         assert_eq!(scopes["body"]["scopes"][0]["name"], "Project");
         assert_eq!(scopes["body"]["scopes"][0]["variablesReference"], 1);
+        assert_eq!(scopes["body"]["scopes"][0]["namedVariables"], 6);
+        assert_eq!(scopes["body"]["scopes"][1]["name"], "Locals");
+        assert!(scopes["body"]["scopes"][1]["namedVariables"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
         let vars = variables["body"]["variables"]
             .as_array()
             .expect("variables");
+        assert_eq!(
+            scopes["body"]["scopes"][0]["namedVariables"],
+            serde_json::json!(vars.len())
+        );
         assert!(vars.iter().any(|var| {
             var["name"] == "entry" && var["value"] == canonical_source.display().to_string()
         }));
