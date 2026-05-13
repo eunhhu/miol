@@ -18850,6 +18850,7 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
     verify_client_manifest_paths(dir, manifest)?;
     verify_client_manifest_source_binding(dir, manifest)?;
     verify_client_manifest_artifact_hashes(dir, manifest)?;
+    verify_client_manifest_capabilities(dir, manifest)?;
     verify_client_manifest_wasm_hash(dir, manifest)?;
     verify_client_manifest_exports(manifest)?;
     verify_client_manifest_initial_render(dir, manifest)?;
@@ -18927,6 +18928,20 @@ fn verify_client_manifest_artifact_hashes(
     let expected_reactive_plan_hash = stable_json_hash(&reactive_plan)?;
     if json_str(manifest, "reactive_plan_hash", "client manifest")? != expected_reactive_plan_hash {
         anyhow::bail!("client_manifest reactive_plan_hash does not match reactive plan");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_capabilities(
+    dir: &Path,
+    manifest: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let reactive_plan = json_str(manifest, "reactive_plan", "client manifest")?;
+    let reactive_plan = read_json_value(&dir.join(reactive_plan))?;
+    verify_client_reactive_plan_value(dir, &reactive_plan)?;
+    let expected = client_bundle_capabilities_json(&reactive_plan);
+    if manifest.get("capabilities") != Some(&expected) {
+        anyhow::bail!("client_manifest capabilities do not match reactive plan");
     }
     Ok(())
 }
@@ -24782,10 +24797,99 @@ fn write_client_bundle_manifest(
             "html_hash": format!("{:016x}", fnv1a64(binding.initial_render.as_bytes())),
             "byte_length": binding.initial_render.len(),
         },
+        "capabilities": client_bundle_capabilities_json(&reactive_plan_value),
         "blocked_by": ["dynamic-client-codegen", "reactive-dom-diff"],
         "blockers": client_manifest_blockers_json(),
     });
     write_json(&out.join(path), &manifest)
+}
+
+fn client_bundle_capabilities_json(reactive_plan: &serde_json::Value) -> serde_json::Value {
+    let empty = Vec::new();
+    let bindings = reactive_plan
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let signals = reactive_plan
+        .get("signals")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let mut surfaces = BTreeSet::new();
+    if client_binding_count(bindings, "initial_render") > 0 {
+        surfaces.insert("wasm_initial_render");
+    }
+    surfaces.insert("embedded_reactive_plan");
+    surfaces.insert("source_bundle_validation");
+    if client_binding_count(bindings, "signal_state") > 0 {
+        surfaces.insert("signal_state");
+    }
+    if client_binding_count(bindings, "signal_text") > 0 {
+        surfaces.insert("signal_text");
+    }
+    if client_binding_has_field(bindings, "signal_text", "text_template") {
+        surfaces.insert("signal_text_template");
+    }
+    if client_binding_has_field(bindings, "signal_text", "text_condition") {
+        surfaces.insert("signal_text_condition");
+    }
+    if client_binding_count(bindings, "signal_attr") > 0 {
+        surfaces.insert("signal_attr");
+    }
+    if client_binding_has_field(bindings, "signal_attr", "attr_template") {
+        surfaces.insert("signal_attr_template");
+    }
+    if client_binding_has_field(bindings, "signal_attr", "attr_condition") {
+        surfaces.insert("signal_attr_condition");
+    }
+    if client_binding_count(bindings, "signal_event") > 0 {
+        surfaces.insert("signal_event");
+    }
+    serde_json::json!({
+        "schema_version": 1,
+        "runtime": "client_wasm",
+        "source": CLIENT_REACTIVE_PLAN_PATH,
+        "signals": signals.len(),
+        "bindings": {
+            "total": bindings.len(),
+            "initial_render": client_binding_count(bindings, "initial_render"),
+            "signal_state": client_binding_count(bindings, "signal_state"),
+            "signal_text": client_binding_count(bindings, "signal_text"),
+            "signal_attr": client_binding_count(bindings, "signal_attr"),
+            "signal_event": client_binding_count(bindings, "signal_event"),
+        },
+        "surfaces": surfaces.into_iter().collect::<Vec<_>>(),
+        "event_actions": client_event_action_kinds(bindings),
+    })
+}
+
+fn client_binding_count(bindings: &[serde_json::Value], kind: &str) -> usize {
+    bindings
+        .iter()
+        .filter(|binding| binding.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+        .count()
+}
+
+fn client_binding_has_field(bindings: &[serde_json::Value], kind: &str, field: &str) -> bool {
+    bindings.iter().any(|binding| {
+        binding.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+            && binding.get(field).is_some()
+    })
+}
+
+fn client_event_action_kinds(bindings: &[serde_json::Value]) -> Vec<String> {
+    let mut actions = BTreeSet::new();
+    for binding in bindings {
+        if binding.get("kind").and_then(serde_json::Value::as_str) != Some("signal_event") {
+            continue;
+        }
+        if let Some(kind) = binding
+            .pointer("/action/kind")
+            .and_then(serde_json::Value::as_str)
+        {
+            actions.insert(kind.to_string());
+        }
+    }
+    actions.into_iter().collect()
 }
 
 fn client_manifest_blockers_json() -> Vec<serde_json::Value> {
@@ -43252,6 +43356,34 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_manifest_capability_drift() {
+        let out = temp_output_dir("verify-build-client-manifest-capability-drift");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["capabilities"]["bindings"]["signal_text"] = serde_json::json!(0);
+        write_json(&manifest_path, &manifest).expect("write corrupt client manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client manifest capabilities");
+
+        assert!(
+            err.to_string()
+                .contains("client_manifest capabilities do not match reactive plan"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_client_reactive_plan_without_blocker_detail() {
         let out = temp_output_dir("verify-build-client-reactive-plan-blocker-detail");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -43631,6 +43763,29 @@ models = { path = "../../shared/models", version = "2.0.0" }
             client_manifest["exports"]["render_len"],
             CLIENT_WASM_RENDER_LEN_EXPORT
         );
+        assert_eq!(client_manifest["capabilities"]["runtime"], "client_wasm");
+        assert_eq!(
+            client_manifest["capabilities"]["source"],
+            CLIENT_REACTIVE_PLAN_PATH
+        );
+        assert_eq!(client_manifest["capabilities"]["signals"], 1);
+        assert_eq!(
+            client_manifest["capabilities"]["bindings"]["signal_state"],
+            1
+        );
+        assert_eq!(
+            client_manifest["capabilities"]["bindings"]["signal_text"],
+            1
+        );
+        let capability_surfaces = client_manifest["capabilities"]["surfaces"]
+            .as_array()
+            .expect("capability surfaces");
+        assert!(capability_surfaces
+            .iter()
+            .any(|surface| surface == "signal_text"));
+        assert!(capability_surfaces
+            .iter()
+            .any(|surface| surface == "embedded_reactive_plan"));
         assert!(client_manifest["blocked_by"]
             .as_array()
             .expect("blocked_by")
