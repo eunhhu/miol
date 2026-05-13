@@ -8317,6 +8317,11 @@ fn captured_add_response_operation(
     if let Some(value) = captured_product_left_add_response_operation(&value, lhs) {
         return Some(value);
     }
+    if let Some(value) =
+        captured_triple_product_left_response_operation(&value, lhs, "add_triple_product")
+    {
+        return Some(value);
+    }
     if let Some(value) = captured_product_static_left_response_operation(&value, BinaryOp::Add, lhs)
     {
         return Some(value);
@@ -8377,6 +8382,11 @@ fn captured_mul_response_operation(
         return Some(value);
     }
     if let Some(value) = captured_product_left_response_operation(&value, lhs, "mul_product") {
+        return Some(value);
+    }
+    if let Some(value) =
+        captured_triple_product_left_response_operation(&value, lhs, "mul_triple_product")
+    {
         return Some(value);
     }
     if let Some(value) = captured_product_static_left_response_operation(&value, BinaryOp::Mul, lhs)
@@ -8659,6 +8669,33 @@ fn captured_product_left_response_operation(
     None
 }
 
+fn captured_triple_product_left_response_operation(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+    op_name: &str,
+) -> Option<CapturedResponseValue> {
+    if value.has_operation() {
+        return None;
+    }
+    if value.value_kind.ends_with("_int") {
+        let operand = captured_triple_product_integer_operand(lhs)?;
+        return Some(captured_response_value_with_triple_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            op_name,
+            operand,
+        ));
+    }
+    if value.value_kind.ends_with("_float") {
+        let operand = captured_triple_product_float_operand(lhs)?;
+        return Some(captured_response_value_with_triple_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            op_name,
+            operand,
+        ));
+    }
+    None
+}
+
 fn captured_scaled_left_mul_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
@@ -8868,6 +8905,14 @@ fn captured_response_comparison_operation(
     if let Some(value) =
         captured_product_left_comparison_response_operation(&value, reverse_comparison_op(op)?, lhs)
     {
+        return Some(value);
+    }
+    let reverse_op_name = captured_numeric_comparison_op_name(reverse_comparison_op(op)?)?;
+    if let Some(value) = captured_triple_product_left_response_operation(
+        &value,
+        lhs,
+        &format!("{reverse_op_name}_triple_product"),
+    ) {
         return Some(value);
     }
     if !captured_static_comparison_lhs_is_supported(&value, lhs) {
@@ -14594,6 +14639,43 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_left_triple_product_int_add_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: (((@body.quantity as int) * (@body.unit_price as int)) * (@body.bundle_count as int)) + (@body.base as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "base");
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_triple_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert!(handlers.contains("value.checked_add(triple_product)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_triple_product_int_comparison_response_body() {
         let src = r"@server {
   @listen 8080
@@ -14638,6 +14720,43 @@ function greet(name: string): string -> "hi {name}""#,
         );
         assert!(handlers.contains("partial_product.checked_mul(third_product)"));
         assert!(handlers.contains("value <= triple_product"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_left_triple_product_int_comparison_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { covered: (((@body.quantity as int) * (@body.unit_price as int)) * (@body.bundle_count as int)) <= (@body.total as int) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].field, "covered");
+        assert_eq!(response.body_request_fields[0].name, "total");
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("ge_triple_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert!(handlers.contains("value >= triple_product"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -15736,6 +15855,47 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers
             .contains("let triple_product = first_product * second_product * third_product;"));
         assert!(handlers.contains("value <= triple_product"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_left_triple_product_float_comparison_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { under_limit: (((@body.price as float) * (@body.quantity as float)) * (@body.multiplier as float)) <= (@body.total as float) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].field, "under_limit");
+        assert_eq!(response.body_request_fields[0].name, "total");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("ge_triple_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("price")
+        );
+        assert!(handlers.contains("value >= triple_product"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
