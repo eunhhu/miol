@@ -8889,6 +8889,9 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         let byte = lsp_position_to_byte(&file.source, position);
+        if let Some(hover) = lsp_domain_field_hover_json(&file.source, byte) {
+            return Ok(hover);
+        }
         let Some(name) = identifier_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Null);
         };
@@ -14008,6 +14011,38 @@ fn lsp_hover_json(node: &orv_project::ProjectNode, files: &[SourceFile]) -> serd
         },
         "range": lsp_range_json(node.span, files),
     })
+}
+
+fn lsp_domain_field_hover_json(source: &str, byte: usize) -> Option<serde_json::Value> {
+    let (start, end, name) = identifier_span_at_byte(source, byte)?;
+    let label = lsp_domain_field_hover_label(source, start)?;
+    Some(serde_json::json!({
+        "contents": {
+            "kind": "markdown",
+            "value": format!("**{label}** `{name}`"),
+        },
+        "range": lsp_range_for_source(
+            source,
+            u32::try_from(start).unwrap_or(u32::MAX),
+            u32::try_from(end).unwrap_or(u32::MAX),
+        ),
+    }))
+}
+
+fn lsp_domain_field_hover_label(source: &str, name_start: usize) -> Option<&'static str> {
+    for (prefix, label) in [
+        ("@body.", "Request body field"),
+        ("@param.", "Route parameter"),
+        ("@query.", "Query parameter"),
+        ("@env.", "Environment value"),
+    ] {
+        if name_start >= prefix.len()
+            && source.get(name_start - prefix.len()..name_start) == Some(prefix)
+        {
+            return Some(label);
+        }
+    }
+    None
 }
 
 fn lsp_signature_help_json(function: &FunctionStmt, active_parameter: usize) -> serde_json::Value {
@@ -32087,6 +32122,94 @@ let u: User = { id: 1 }
         assert_eq!(response["result"]["contents"]["value"], "**Struct** `User`");
         assert_eq!(response["result"]["range"]["start"]["line"], 0);
         assert_eq!(response["result"]["range"]["start"]["character"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_hover_returns_request_body_field_summary() {
+        let dir = temp_output_dir("lsp-hover-body-field");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r#"@server {
+  @route POST /checkout {
+    let sku = @body.sku
+  }
+}
+"#;
+        std::fs::write(&source, source_text).expect("write source");
+        let body_line = source_text.lines().nth(2).expect("body line");
+        let character = body_line.rfind("sku").expect("body field");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 18,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 18);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["contents"]["kind"], "markdown");
+        assert_eq!(
+            response["result"]["contents"]["value"],
+            "**Request body field** `sku`"
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 2);
+        assert_eq!(response["result"]["range"]["start"]["character"], character);
+        assert_eq!(
+            response["result"]["range"]["end"]["character"],
+            character + "sku".len()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_hover_returns_env_value_summary() {
+        let dir = temp_output_dir("lsp-hover-env-field");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = r#"@server {
+  let db = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
+}
+"#;
+        std::fs::write(&source, source_text).expect("write source");
+        let env_line = source_text.lines().nth(1).expect("env line");
+        let character = env_line.find("SHOP_DATABASE_URL").expect("env field name");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": character,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 19);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["contents"]["kind"], "markdown");
+        assert_eq!(
+            response["result"]["contents"]["value"],
+            "**Environment value** `SHOP_DATABASE_URL`"
+        );
+        assert_eq!(response["result"]["range"]["start"]["line"], 1);
+        assert_eq!(response["result"]["range"]["start"]["character"], character);
+        assert_eq!(
+            response["result"]["range"]["end"]["character"],
+            character + "SHOP_DATABASE_URL".len()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
