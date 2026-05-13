@@ -6491,6 +6491,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
                 "kind": "array",
             },
             {
+                "name": "scopes",
+                "path": "panels.debug.scopes",
+                "kind": "object",
+            },
+            {
                 "name": "locals",
                 "path": "panels.debug.locals",
                 "kind": "array",
@@ -6593,6 +6598,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let scopes = value
+        .pointer("/panels/debug/scopes/scopes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let project_variables = value
         .pointer("/panels/debug/project_variables")
         .and_then(serde_json::Value::as_array)
@@ -6650,6 +6660,15 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
             &mut html,
             "<li>{}</li>",
             html_escape_text(&editor_debug_frame_summary(&frame))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel\"><h2>Scopes</h2><ul class=\"list\">");
+    for scope in scopes {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_scope_summary(&scope))
         )?;
     }
     html.push_str("</ul></section>\n");
@@ -6835,6 +6854,31 @@ fn editor_debug_frame_summary(frame: &serde_json::Value) -> String {
         })
         .unwrap_or("");
     [name.to_string(), line, source.to_string()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn editor_debug_scope_summary(scope: &serde_json::Value) -> String {
+    let name = scope
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("scope");
+    let reference = scope
+        .get("variablesReference")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(String::new, |reference| format!("ref {reference}"));
+    let source = scope
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            scope
+                .pointer("/source/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+    [name.to_string(), reference, source.to_string()]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -39889,6 +39933,7 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("Selected Frame"));
         assert!(result_html.contains("Session Summary"));
         assert!(result_html.contains("Stack Frames"));
+        assert!(result_html.contains("Scopes"));
         assert!(result_html.contains("Locals"));
         assert!(result_html.contains("Project Variables"));
         assert!(result_html.contains("Executed Controls"));
@@ -39936,6 +39981,13 @@ define Auth() -> { @out "auth" }
             .expect("panel sections")
             .iter()
             .any(|section| {
+                section["name"] == "scopes" && section["path"] == "panels.debug.scopes"
+            }));
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
                 section["name"] == "controls" && section["path"] == "panels.debug.controls"
             }));
         assert!(result["runner"]["result"]["panel_contract"]["sections"]
@@ -39970,6 +40022,11 @@ define Auth() -> { @out "auth" }
             .expect("stack frames")
             .iter()
             .any(|frame| frame["line"] == 3));
+        assert!(result["panels"]["debug"]["scopes"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .any(|scope| scope["name"] == "Locals" || scope["name"] == "Project"));
         assert!(result["panels"]["debug"]["locals"]
             .as_array()
             .expect("locals")
