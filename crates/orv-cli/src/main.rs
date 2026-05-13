@@ -15343,6 +15343,9 @@ fn lsp_domain_field_names(files: &[SourceFile], domain: &str) -> Vec<String> {
     let marker = format!("@{domain}.");
     let mut names = Vec::new();
     for file in files {
+        if domain == "param" {
+            names.extend(lsp_route_path_param_names(&file.source));
+        }
         let mut search_from = 0usize;
         while let Some(offset) = file.source[search_from..].find(marker.as_str()) {
             let name_start = search_from + offset + marker.len();
@@ -15364,6 +15367,54 @@ fn lsp_domain_field_names(files: &[SourceFile], domain: &str) -> Vec<String> {
     }
     names.sort();
     names.dedup();
+    names
+}
+
+fn lsp_route_path_param_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(offset) = source[search_from..].find("@route") {
+        let route_start = search_from + offset;
+        let route_tail = &source[route_start..];
+        let head_end = route_tail
+            .find('{')
+            .or_else(|| route_tail.find('\n'))
+            .unwrap_or(route_tail.len());
+        names.extend(lsp_route_head_param_names(&route_tail[..head_end]));
+        search_from = route_start + "@route".len();
+    }
+    names
+}
+
+fn lsp_route_head_param_names(route_head: &str) -> Vec<String> {
+    let bytes = route_head.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+        let name_start = index + 1;
+        let Some(first) = bytes.get(name_start) else {
+            break;
+        };
+        if !(first.is_ascii_alphabetic() || *first == b'_') {
+            index = name_start;
+            continue;
+        }
+        let mut name_end = name_start + 1;
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            name_end += 1;
+        }
+        if let Some(name) = route_head.get(name_start..name_end) {
+            names.push(name.to_string());
+        }
+        index = name_end;
+    }
     names
 }
 
@@ -32587,6 +32638,51 @@ function greet(user: User): string -> "hello"
             .iter()
             .any(|item| item["label"] == "quantity" && item["kind"] == 10));
         assert!(!items.iter().any(|item| item["label"] == "@route"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_completion_returns_route_path_params_after_param_dot() {
+        let dir = temp_output_dir("lsp-completion-route-param-fields");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r#"@server {
+  @route GET /orders/:orderId/items/:itemId {
+    let current = @param.
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 2,
+                    "character": 25,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 22);
+        assert!(response.get("error").is_none(), "{response}");
+        let items = response["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "orderId" && item["kind"] == 10));
+        assert!(items
+            .iter()
+            .any(|item| item["label"] == "itemId" && item["kind"] == 10));
+        assert!(!items.iter().any(|item| item["label"] == "@param"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
