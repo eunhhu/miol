@@ -10999,15 +10999,12 @@ impl DapSession {
             .pointer("/arguments/frameId")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("restartFrame.arguments.frameId is required"))?;
-        if frame_id != 1 {
-            anyhow::bail!("restartFrame currently supports current ORV frameId 1");
-        }
         let target_frame = {
             let launched = self
                 .launched
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("launch is required before restartFrame"))?;
-            dap_restart_frame_target_index(launched)
+            dap_restart_frame_target_index(launched, frame_id)
                 .ok_or_else(|| anyhow::anyhow!("no restartable runtime frame"))?
         };
         let launched = self
@@ -12504,21 +12501,43 @@ fn dap_stack_scope_frame(launched: &DapLaunchState, frame_id: u64) -> Option<Dap
     if frame_id <= 1 {
         return None;
     }
-    let current_frame = launched.frames.get(launched.current_frame_index)?;
-    let stack_index = usize::try_from(frame_id.saturating_sub(2)).ok()?;
-    if let Some(stack_frame) = current_frame.stack.iter().rev().skip(1).nth(stack_index) {
+    if let Some(stack_frame) = dap_stack_call_for_frame_id(launched, frame_id) {
         return Some(DapScopeFrame {
             name: format!("Frame {}", stack_frame.name),
-            source: stack_frame.source.clone(),
+            source: stack_frame.source,
             line: stack_frame.line,
         });
     }
-    let entry_id = u64::try_from(current_frame.stack.len().saturating_add(1)).ok()?;
-    (frame_id == entry_id && !current_frame.stack.is_empty()).then(|| DapScopeFrame {
+    (dap_stack_entry_frame_id(launched) == Some(frame_id)).then(|| DapScopeFrame {
         name: "Frame orv entry".to_string(),
         source: dap_entry_source(launched),
         line: 1,
     })
+}
+
+fn dap_stack_call_for_frame_id(
+    launched: &DapLaunchState,
+    frame_id: u64,
+) -> Option<DapStackFrameState> {
+    if frame_id <= 1 {
+        return None;
+    }
+    let current_frame = launched.frames.get(launched.current_frame_index)?;
+    let stack_index = usize::try_from(frame_id.saturating_sub(2)).ok()?;
+    current_frame
+        .stack
+        .iter()
+        .rev()
+        .skip(1)
+        .nth(stack_index)
+        .cloned()
+}
+
+fn dap_stack_entry_frame_id(launched: &DapLaunchState) -> Option<u64> {
+    let current_frame = launched.frames.get(launched.current_frame_index)?;
+    (!current_frame.stack.is_empty())
+        .then(|| u64::try_from(current_frame.stack.len().saturating_add(1)).ok())
+        .flatten()
 }
 
 fn dap_stack_frames_json(launched: &DapLaunchState) -> Vec<serde_json::Value> {
@@ -12742,7 +12761,10 @@ fn dap_step_in_targets_json(launched: &DapLaunchState) -> Vec<serde_json::Value>
         .collect()
 }
 
-fn dap_restart_frame_target_index(launched: &DapLaunchState) -> Option<usize> {
+fn dap_restart_frame_target_index(launched: &DapLaunchState, frame_id: u64) -> Option<usize> {
+    if frame_id != 1 {
+        return dap_non_current_restart_frame_target_index(launched, frame_id);
+    }
     let current_index = launched.current_frame_index;
     let current_frame = launched.frames.get(current_index)?;
     let Some(current_call) = current_frame.stack.last() else {
@@ -12766,6 +12788,34 @@ fn dap_restart_frame_target_index(launched: &DapLaunchState) -> Option<usize> {
         }
     }
     Some(target)
+}
+
+fn dap_non_current_restart_frame_target_index(
+    launched: &DapLaunchState,
+    frame_id: u64,
+) -> Option<usize> {
+    if dap_stack_entry_frame_id(launched) == Some(frame_id) {
+        return Some(0);
+    }
+    let target_call = dap_stack_call_for_frame_id(launched, frame_id)?;
+    let current_index = launched.current_frame_index;
+    let mut target = None;
+    for index in (0..=current_index).rev() {
+        let frame = launched.frames.get(index)?;
+        let Some(call) = frame.stack.last() else {
+            continue;
+        };
+        if dap_same_stack_call(call, &target_call) {
+            target = Some(index);
+        }
+    }
+    target
+}
+
+fn dap_same_stack_call(left: &DapStackFrameState, right: &DapStackFrameState) -> bool {
+    left.name == right.name
+        && left.source.reference == right.source.reference
+        && left.line == right.line
 }
 
 fn dap_current_locals(launched: &DapLaunchState) -> &[DapVariable] {
@@ -29552,6 +29602,97 @@ let total: int = add(2, 3)
                 && event["event"] == "stopped"
                 && event["body"]["reason"] == "restart"
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_restart_frame_accepts_reported_entry_frame_id() {
+        let dir = temp_output_dir("dap-restart-entry-frame");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            r"function add(a: int, b: int): int -> {
+  let result: int = a + b
+  result
+}
+let total: int = add(2, 3)
+",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 216,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 217,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("first stepIn response");
+        session
+            .message_response(&serde_json::json!({
+                "seq": 218,
+                "type": "request",
+                "command": "stepIn",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("second stepIn response");
+        let before = session
+            .message_response(&serde_json::json!({
+                "seq": 219,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("before stack response");
+        let entry_frame_id = before["body"]["stackFrames"]
+            .as_array()
+            .expect("stack frames")
+            .iter()
+            .find(|frame| frame["name"] == "orv entry")
+            .and_then(|frame| frame["id"].as_u64())
+            .expect("entry frame id");
+        let restart_frame = session
+            .message_response(&serde_json::json!({
+                "seq": 220,
+                "type": "request",
+                "command": "restartFrame",
+                "arguments": {
+                    "frameId": entry_frame_id,
+                },
+            }))
+            .expect("restartFrame response");
+        let after = session
+            .message_response(&serde_json::json!({
+                "seq": 221,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("after stack response");
+
+        assert_eq!(restart_frame["success"], true, "{restart_frame}");
+        assert_eq!(after["body"]["stackFrames"][0]["name"], "orv entry");
+        assert_eq!(after["body"]["stackFrames"][0]["line"], 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
