@@ -26417,7 +26417,8 @@ test "checkout excluded failure" {
         assert!(native_routes.contains("pub struct OrvNativeRouteMatch"));
         assert!(native_routes.contains("pub struct OrvNativeParam"));
         assert!(native_routes.contains("orv_native_route_path_params(route.path, path)"));
-        assert!(native_routes.contains("pattern_segment.strip_prefix(':')"));
+        assert!(native_routes.contains("orv_native_match_route_segment(pattern_segment"));
+        assert!(native_routes.contains("fn orv_native_route_param_segment(segment: &str)"));
         assert_eq!(
             deploy["server"]["persistence"]["db_paths"][0],
             serde_json::json!("data/shop.sqlite")
@@ -37131,6 +37132,9 @@ entry = "src/main.orv"
             &path,
             r#"@server {
   @listen 8080
+  @route GET /products/:id.json {
+    @respond 200 { id: @param.id as int }
+  }
   @route GET /products/:id {
     @respond 200 { id: @param.id as int }
   }
@@ -37234,6 +37238,7 @@ entry = "src/main.orv"
             .expect("native listen address");
 
         let route_response = send_raw_http(address, "/products/42");
+        let route_suffix_response = send_raw_http(address, "/products/42.json");
         let route_math_response = send_raw_http(address, "/products/13/math");
         let route_shift_response = send_raw_http(address, "/products/13/shift/4");
         let route_float_response = send_raw_http(address, "/products/12.5/float-math/1.25");
@@ -37248,6 +37253,8 @@ entry = "src/main.orv"
 
         assert!(route_response.starts_with("HTTP/1.1 200"));
         assert!(route_response.contains(r#"{"id":42}"#));
+        assert!(route_suffix_response.starts_with("HTTP/1.1 200"));
+        assert!(route_suffix_response.contains(r#"{"id":42}"#));
         assert!(route_math_response.starts_with("HTTP/1.1 200"));
         assert!(route_math_response.contains(r#"{"prev":12,"doubled":26,"half":6,"parity":1}"#));
         assert!(route_shift_response.starts_with("HTTP/1.1 200"));
@@ -44351,6 +44358,39 @@ define Auth() -> { @out "auth" }
         assert!(rendered.contains("models/user.orv"), "{rendered}");
         assert!(rendered.contains("let bad: int = \"wrong\""), "{rendered}");
         assert!(!rendered.contains("let ok: int = 1"), "{rendered}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_diagnostics_report_unknown_route_param_source() {
+        let dir = temp_output_dir("unknown-route-param-diagnostic-source");
+        std::fs::create_dir_all(&dir).expect("create source dir");
+        let entry = dir.join("main.orv");
+        std::fs::write(
+            &entry,
+            r#"@server {
+  @listen 8080
+  @route GET /users/:id {
+    @respond 200 { name: @param.name }
+  }
+}
+"#,
+        )
+        .expect("write entry");
+        let loaded = orv_project::load_project(&entry).expect("load project");
+        let resolved = orv_resolve::resolve(&loaded.program);
+        let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
+        let rendered = render_diagnostics_for_test(&lowered.diagnostics, &loaded.files);
+
+        assert!(
+            rendered.contains("unknown route param `name`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("declared route params: id"), "{rendered}");
+        assert!(
+            rendered.contains("@respond 200 { name: @param.name }"),
+            "{rendered}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -160,6 +160,8 @@ Final unconditional `@respond` 앞에 놓인 `if ... else if ...` guard chain도
 
 `else { if ... }`처럼 block이 single nested `if`를 감싼 response chain도 같은 ordered response artifact로 낮춘다.
 
+Route path-param matcher는 `:id`, `:rest*`, `:id.json` 같은 static suffix segment를 같은 param inventory로 다루고, analyzer는 현재 route path에 없는 `@param.<name>` 참조를 진단한다.
+
 ### 로드맵: 의미 기반 프로젝트 그래프 확장
 
 ```

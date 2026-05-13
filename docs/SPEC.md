@@ -1874,7 +1874,7 @@ let lines = buf2.lines(from=1000, to=1100)   // O(log N)로 임의 줄 접근
 @route GET * { @respond 404 { error: "Not Found" } }
 ```
 
-경로 매개변수는 `:param` 형태로 선언한다.
+경로 매개변수는 `:param` 형태로 선언한다. 정적 suffix가 붙은 segment도 `:param.suffix`로 선언할 수 있으며, 예를 들어 `/calendar/:userId.ics`는 `/calendar/42.ics`에서 `@param.userId == "42"`로 캡처한다. analyzer는 route path에 없는 `@param.<name>` 참조를 진단한다.
 
 **현재 구현:** MVP 런타임의 `@route`는 hyper 기반 HTTP/1.1 서버로 실행된다. HTTP/2, HTTP/3, QUIC, 내부 바이너리 RPC 전송은 아직 구현되어 있지 않다.
 

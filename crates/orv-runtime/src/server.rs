@@ -1316,9 +1316,7 @@ pub(crate) fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, S
             }
             let mut params = HashMap::new();
             for (pp, ap) in pat_parts.iter().take(prefix_len).zip(path_parts.iter()) {
-                if let Some(pname) = pp.strip_prefix(':') {
-                    params.insert(pname.to_string(), (*ap).to_string());
-                } else if pp != ap {
+                if !match_route_segment(pp, ap, &mut params) {
                     return None;
                 }
             }
@@ -1333,13 +1331,39 @@ pub(crate) fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, S
     }
     let mut params = HashMap::new();
     for (pp, ap) in pat_parts.iter().zip(path_parts.iter()) {
-        if let Some(name) = pp.strip_prefix(':') {
-            params.insert(name.to_string(), (*ap).to_string());
-        } else if pp != ap {
+        if !match_route_segment(pp, ap, &mut params) {
             return None;
         }
     }
     Some(params)
+}
+
+fn match_route_segment(
+    pattern_segment: &str,
+    path_segment: &str,
+    params: &mut HashMap<String, String>,
+) -> bool {
+    let Some((name, suffix)) = route_param_segment(pattern_segment) else {
+        return pattern_segment == path_segment;
+    };
+    let Some(value) = path_segment.strip_suffix(suffix) else {
+        return false;
+    };
+    params.insert(name.to_string(), value.to_string());
+    true
+}
+
+fn route_param_segment(segment: &str) -> Option<(&str, &str)> {
+    let body = segment.strip_prefix(':')?;
+    let end = body
+        .char_indices()
+        .find_map(|(index, ch)| (!route_param_name_char(ch)).then_some(index))
+        .unwrap_or(body.len());
+    (end > 0).then_some((&body[..end], &body[end..]))
+}
+
+const fn route_param_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 /// orv [`Value`] → `serde_json::Value`.
@@ -1508,6 +1532,13 @@ mod tests {
     fn match_route_param_captures_value() {
         let m = match_route("/users/:id", "/users/42").unwrap();
         assert_eq!(m.get("id"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn match_route_param_captures_value_with_static_suffix() {
+        let m = match_route("/calendar/:userId.ics", "/calendar/42.ics").unwrap();
+        assert_eq!(m.get("userId"), Some(&"42".to_string()));
+        assert!(match_route("/calendar/:userId.ics", "/calendar/42.json").is_none());
     }
 
     #[test]

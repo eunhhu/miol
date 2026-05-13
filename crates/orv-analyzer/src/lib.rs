@@ -45,6 +45,7 @@ pub fn lower_with_diagnostics(program: &ast::Program, resolved: &ResolveResult) 
         name_types: RefCell::new(HashMap::new()),
         alias_scopes: RefCell::new(vec![HashMap::new()]),
         struct_scopes: RefCell::new(vec![HashMap::new()]),
+        route_param_scopes: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
     };
     lowerer.predeclare_type_aliases(&program.items);
@@ -79,6 +80,8 @@ struct Lowerer<'a> {
     alias_scopes: RefCell<Vec<HashMap<String, ast::TypeAliasStmt>>>,
     /// struct 이름 → 필드 shape. 가장 안쪽 스코프가 뒤에 온다.
     struct_scopes: RefCell<Vec<HashMap<String, hir::Type>>>,
+    /// 현재 lowering 중인 route handler의 path parameter 이름.
+    route_param_scopes: RefCell<Vec<Vec<String>>>,
     /// 누적 진단.
     diagnostics: RefCell<Vec<Diagnostic>>,
 }
@@ -1072,6 +1075,39 @@ impl<'a> Lowerer<'a> {
         self.with_alias_scope(&b.stmts, || self.block_inner(b))
     }
 
+    fn route_handler_block(&self, b: &ast::Block, route_params: Vec<String>) -> hir::HirBlock {
+        self.route_param_scopes.borrow_mut().push(route_params);
+        let block = self.block(b);
+        self.route_param_scopes.borrow_mut().pop();
+        block
+    }
+
+    fn validate_route_param_field(&self, target: &ast::Expr, field: &ast::Ident) {
+        if !ast_domain_is(target, "param") {
+            return;
+        }
+        let scopes = self.route_param_scopes.borrow();
+        let Some(route_params) = scopes.last() else {
+            return;
+        };
+        if route_params.iter().any(|param| param == &field.name) {
+            return;
+        }
+        let declared = if route_params.is_empty() {
+            "none".to_string()
+        } else {
+            route_params.join(", ")
+        };
+        self.diagnostics.borrow_mut().push(
+            Diagnostic::error(format!(
+                "unknown route param `{}` in this route",
+                field.name
+            ))
+            .with_primary(field.span, "not declared by the route path")
+            .with_note(format!("declared route params: {declared}")),
+        );
+    }
+
     fn expr(&self, e: &ast::Expr) -> hir::HirExpr {
         // B5 Stage 1: ty 슬롯을 단방향 추론으로 채운다. 실패 케이스는 Unknown.
         let ty = self.infer_type(e);
@@ -1230,11 +1266,14 @@ impl<'a> Lowerer<'a> {
                 start: start.as_ref().map(|s| Box::new(self.expr(s))),
                 end: end.as_ref().map(|e| Box::new(self.expr(e))),
             },
-            ast::ExprKind::Field { target, field } => hir::HirExprKind::Field {
-                target: Box::new(self.expr(target)),
-                field: field.name.clone(),
-                field_span: field.span,
-            },
+            ast::ExprKind::Field { target, field } => {
+                self.validate_route_param_field(target, field);
+                hir::HirExprKind::Field {
+                    target: Box::new(self.expr(target)),
+                    field: field.name.clone(),
+                    field_span: field.span,
+                }
+            }
             ast::ExprKind::OptionalField { target, field } => hir::HirExprKind::OptionalField {
                 target: Box::new(self.expr(target)),
                 field: field.name.clone(),
@@ -1522,6 +1561,7 @@ impl<'a> Lowerer<'a> {
                 span: start.join(block.span),
             }
         };
+        let route_params = route_param_names_from_path(&joined);
 
         // Leaf.
         vec![hir::HirExpr {
@@ -1530,7 +1570,7 @@ impl<'a> Lowerer<'a> {
                 method_span: method_expr.span,
                 path: joined,
                 path_span: path_expr.span,
-                handler: self.block(&handler_block),
+                handler: self.route_handler_block(&handler_block, route_params),
             },
             ty: hir::Type::Unknown,
             span,
@@ -1564,12 +1604,13 @@ impl<'a> Lowerer<'a> {
         let ast::ExprKind::Block(block) = &body_expr.kind else {
             return None;
         };
+        let route_params = route_param_names_from_path(&path);
         Some(hir::HirExprKind::Route {
             method,
             method_span: method_expr.span,
             path,
             path_span: path_expr.span,
-            handler: self.block(block),
+            handler: self.route_handler_block(block, route_params),
         })
     }
 
@@ -1669,6 +1710,34 @@ fn join_route_paths(prefix: &str, suffix: &str) -> String {
         "/".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+fn route_param_names_from_path(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|segment| route_param_name_from_segment(segment).map(str::to_string))
+        .collect()
+}
+
+fn route_param_name_from_segment(segment: &str) -> Option<&str> {
+    let body = segment.strip_prefix(':')?;
+    let body = body.strip_suffix('*').unwrap_or(body);
+    let end = body
+        .char_indices()
+        .find_map(|(index, ch)| (!route_param_name_char(ch)).then_some(index))
+        .unwrap_or(body.len());
+    (end > 0).then_some(&body[..end])
+}
+
+const fn route_param_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn ast_domain_is(expr: &ast::Expr, expected: &str) -> bool {
+    match &expr.kind {
+        ast::ExprKind::Domain { name, args } => name.name == expected && args.is_empty(),
+        ast::ExprKind::Paren(expr) => ast_domain_is(expr, expected),
+        _ => false,
     }
 }
 
@@ -2412,6 +2481,29 @@ mod tests {
         };
         assert_eq!(method, "POST");
         assert_eq!(path, "/users/:id");
+    }
+
+    #[test]
+    fn route_param_field_must_exist_in_route_path() {
+        let r = lower_diag(r#"@route GET /users/:id { @respond 200 { name: @param.name } }"#);
+        assert_eq!(r.diagnostics.len(), 1);
+        assert!(r.diagnostics[0].message.contains("unknown route param"));
+        assert!(r.diagnostics[0].message.contains("name"));
+        assert!(r.diagnostics[0].notes[0].contains("id"));
+    }
+
+    #[test]
+    fn route_rest_param_field_uses_stripped_name() {
+        let r = lower_diag(r#"@route GET /files/:rest* { @respond 200 { path: @param.rest } }"#);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn route_param_field_allows_static_suffix_segment() {
+        let r = lower_diag(
+            r#"@route GET /calendar/:userId.ics { @respond 200 { id: @param.userId } }"#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
     }
 
     #[test]

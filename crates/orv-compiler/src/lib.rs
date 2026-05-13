@@ -2077,12 +2077,22 @@ fn native_value_kind_uses_json_string(value_kind: &str) -> bool {
 
 fn native_server_route_param_names(path: &str) -> Vec<String> {
     path.split('/')
-        .filter_map(|segment| {
-            segment
-                .strip_prefix(':')
-                .map(|name| name.strip_suffix('*').unwrap_or(name).to_string())
-        })
+        .filter_map(|segment| native_route_param_name_from_segment(segment).map(str::to_string))
         .collect()
+}
+
+fn native_route_param_name_from_segment(segment: &str) -> Option<&str> {
+    let body = segment.strip_prefix(':')?;
+    let body = body.strip_suffix('*').unwrap_or(body);
+    let end = body
+        .char_indices()
+        .find_map(|(index, ch)| (!native_route_param_name_char(ch)).then_some(index))
+        .unwrap_or(body.len());
+    (end > 0).then_some(&body[..end])
+}
+
+const fn native_route_param_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn native_server_default_port(artifact: &ServerRuntimeArtifact) -> u16 {
@@ -2249,13 +2259,7 @@ fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec
                 .take(prefix_len)
                 .zip(path_segments.iter())
             {
-                if let Some(name) = pattern_segment.strip_prefix(':') {
-                    let name = name.to_string();
-                    params.push(OrvNativeParam {
-                        name,
-                        value: (*path_segment).to_string(),
-                    });
-                } else if pattern_segment != path_segment {
+                if !orv_native_match_route_segment(pattern_segment, path_segment, &mut params) {
                     return None;
                 }
             }
@@ -2276,17 +2280,42 @@ fn orv_native_route_path_params(pattern: &'static str, path: &str) -> Option<Vec
     }
     let mut params = Vec::new();
     for (pattern_segment, path_segment) in pattern_segments.iter().zip(path_segments.iter()) {
-        if let Some(name) = pattern_segment.strip_prefix(':') {
-            let name = name.to_string();
-            params.push(OrvNativeParam {
-                name,
-                value: (*path_segment).to_string(),
-            });
-        } else if pattern_segment != path_segment {
+        if !orv_native_match_route_segment(pattern_segment, path_segment, &mut params) {
             return None;
         }
     }
     Some(params)
+}
+
+fn orv_native_match_route_segment(
+    pattern_segment: &str,
+    path_segment: &str,
+    params: &mut Vec<OrvNativeParam>,
+) -> bool {
+    let Some((name, suffix)) = orv_native_route_param_segment(pattern_segment) else {
+        return pattern_segment == path_segment;
+    };
+    let Some(value) = path_segment.strip_suffix(suffix) else {
+        return false;
+    };
+    params.push(OrvNativeParam {
+        name: name.to_string(),
+        value: value.to_string(),
+    });
+    true
+}
+
+fn orv_native_route_param_segment(segment: &str) -> Option<(&str, &str)> {
+    let body = segment.strip_prefix(':')?;
+    let end = body
+        .char_indices()
+        .find_map(|(index, ch)| (!orv_native_route_param_name_char(ch)).then_some(index))
+        .unwrap_or(body.len());
+    (end > 0).then_some((&body[..end], &body[end..]))
+}
+
+const fn orv_native_route_param_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 "#,
     );
@@ -8171,11 +8200,11 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
-    fn native_server_launcher_falls_back_for_unknown_route_param_response() {
+    fn server_runtime_artifact_lowers_route_param_with_static_suffix_response_body() {
         let src = r"@server {
   @listen 8080
-  @route GET /users/:id {
-    @respond 200 { name: @param.name }
+  @route GET /calendar/:userId.ics {
+    @respond 200 { id: @param.userId }
   }
 }";
         let program = lower(src);
@@ -8184,16 +8213,22 @@ function greet(name: string): string -> "hi {name}""#,
         let artifact =
             server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
         let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let routes = native_server_routes_source(&artifact);
         let launcher = native_server_launcher_source(
             "server/app.orv-runtime.json",
             "server/native-server.json",
             &artifact,
         );
 
+        assert_eq!(response.status, Some(200));
         assert_eq!(response.body_kind, "route_param_json");
-        assert!(launcher.contains("fn orv_native_reference_bridge("));
-        assert!(launcher.contains(r#"std::process::Command::new("orv")"#));
-        assert!(!launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert_eq!(response.body_route_params[0].param, "userId");
+        assert!(handlers.contains("routes::orv_native_param_value(route_match, \"userId\")"));
+        assert!(routes.contains("orv_native_route_param_segment"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
     }
 
     #[test]
@@ -11967,7 +12002,8 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(
             source.contains("fn orv_native_route_path_params(pattern: &'static str, path: &str)")
         );
-        assert!(source.contains("pattern_segment.strip_prefix(':')"));
+        assert!(source.contains("orv_native_match_route_segment(pattern_segment"));
+        assert!(source.contains("fn orv_native_route_param_segment(segment: &str)"));
         assert!(source.contains("pattern_segments.len() != path_segments.len()"));
     }
 
@@ -11989,9 +12025,9 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("pub struct OrvNativeParam"));
         assert!(source.contains("pub params: Vec<OrvNativeParam>"));
         assert!(source.contains("OrvNativeParam {"));
-        assert!(source.contains("if let Some(name) = pattern_segment.strip_prefix(':')"));
-        assert!(source.contains("name,"));
-        assert!(source.contains("value: (*path_segment).to_string()"));
+        assert!(source.contains("name: name.to_string()"));
+        assert!(source.contains("value: value.to_string()"));
+        assert!(source.contains("path_segment.strip_suffix(suffix)"));
     }
 
     #[test]
