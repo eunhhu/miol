@@ -169,6 +169,8 @@ Editor native runtime 세부: `native-host.json` now mirrors the exported runtim
 
 Editor native production 세부: build-backed exports now add `production.panel_contract` for DB and commerce adapter sections in `native-host.json`, matching the runtime/debug/trace panel contract shape.
 
+Client blocker 세부: `client/manifest.json` and `client/reactive-plan.json` now include structured `blockers` entries aligned with `blocked_by`, and `orv verify-build` rejects missing blocker detail.
+
 Editor trace native transport 세부: when export trace state has a stable server EventSource endpoint, `native-host.json` exposes it as `trace.transport`, adds `trace.stream_runner.command` for `orv editor trace-stream <build-dir> --events trace/events.sse`, mirrors `trace.status_filters` and `trace.frames[*]` source/production navigation inventory, flattens each source-backed frame's `source`, `production`, and `reveal_command` fields for native host actions, exposes `trace.panel_contract` for status filter/frame/transport/stream runner sections, and the static shell renders Trace Transport plus Trace Stream Runner panes for native UI wiring.
 
 Deploy env 세부: `orv build --prod` server artifact는 `deploy/env.example`도 출력하고, `deploy/manifest.json`의 `server.env_example`과 generated runbook이 이를 참조한다. 파일에는 static/env listen에서 파생된 `PORT` 값과 `SHOP_DATABASE_URL`, `PAYMENT_ADAPTER_URL`, `SHIPPING_ADAPTER_URL` 같은 env-configured DB/commerce adapter 기본값이 들어가 운영자가 source를 수정하지 않고 배포 환경을 바꿀 수 있다.

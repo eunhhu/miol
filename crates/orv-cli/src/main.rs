@@ -15539,7 +15539,8 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
     verify_client_manifest_source_binding(dir, manifest)?;
     verify_client_manifest_wasm_hash(dir, manifest)?;
     verify_client_manifest_exports(manifest)?;
-    verify_client_manifest_initial_render(dir, manifest)
+    verify_client_manifest_initial_render(dir, manifest)?;
+    verify_client_blocker_details(manifest, "client_manifest")
 }
 
 fn verify_client_manifest_paths(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -15742,6 +15743,37 @@ fn verify_client_reactive_plan_value(dir: &Path, plan: &serde_json::Value) -> an
         .is_some_and(|items| items.iter().any(|item| item == "reactive-dom-diff"))
     {
         anyhow::bail!("client_reactive_plan blocked_by must include reactive-dom-diff");
+    }
+    verify_client_blocker_details(plan, "client_reactive_plan")?;
+    Ok(())
+}
+
+fn verify_client_blocker_details(value: &serde_json::Value, context: &str) -> anyhow::Result<()> {
+    let blocked_by = value
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} blocked_by must be an array"))?;
+    let blockers = value
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} blockers must be an array"))?;
+    for blocked in blocked_by {
+        let Some(id) = blocked.as_str() else {
+            anyhow::bail!("{context} blocked_by entries must be strings");
+        };
+        if !blockers.iter().any(|blocker| {
+            blocker.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                && blocker
+                    .get("artifact")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|artifact| !artifact.is_empty())
+                && blocker
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+        }) {
+            anyhow::bail!("{context} blockers must describe blocked_by entry {id}");
+        }
     }
     Ok(())
 }
@@ -18590,6 +18622,10 @@ fn add_client_manifest_reveal_fields(
         .get("blocked_by")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
+    target["blockers"] = manifest
+        .get("blockers")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     Ok(())
 }
 
@@ -18620,6 +18656,10 @@ fn add_client_reactive_plan_reveal_fields(
         );
     target["blocked_by"] = plan
         .get("blocked_by")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    target["blockers"] = plan
+        .get("blockers")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
     Ok(())
@@ -20279,8 +20319,24 @@ fn write_client_reactive_plan(
         "signals": signals,
         "bindings": bindings,
         "blocked_by": ["reactive-dom-diff", "dynamic-client-codegen"],
+        "blockers": client_reactive_plan_blockers_json(),
     });
     write_json(&out.join(path), &plan)
+}
+
+fn client_reactive_plan_blockers_json() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": "reactive-dom-diff",
+            "artifact": CLIENT_REACTIVE_PLAN_PATH,
+            "reason": "full DOM diff codegen is not emitted yet",
+        }),
+        serde_json::json!({
+            "id": "dynamic-client-codegen",
+            "artifact": CLIENT_JS_PATH,
+            "reason": "generated loader still uses the checked reactive plan bootstrap",
+        }),
+    ]
 }
 
 fn client_reactive_plan_signals(binding: &ClientSourceBinding<'_>) -> Vec<serde_json::Value> {
@@ -21316,8 +21372,24 @@ fn write_client_bundle_manifest(
             "byte_length": binding.initial_render.len(),
         },
         "blocked_by": ["dynamic-client-codegen", "reactive-dom-diff"],
+        "blockers": client_manifest_blockers_json(),
     });
     write_json(&out.join(path), &manifest)
+}
+
+fn client_manifest_blockers_json() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": "dynamic-client-codegen",
+            "artifact": CLIENT_JS_PATH,
+            "reason": "optimized source-to-JS client codegen is not emitted yet",
+        }),
+        serde_json::json!({
+            "id": "reactive-dom-diff",
+            "artifact": CLIENT_REACTIVE_PLAN_PATH,
+            "reason": "full DOM diff codegen is not emitted yet",
+        }),
+    ]
 }
 
 fn validate_prod_server_listen(
@@ -37410,6 +37482,64 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_manifest_without_blocker_detail() {
+        let out = temp_output_dir("verify-build-client-manifest-blocker-detail");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["blockers"] = serde_json::json!([]);
+        write_json(&manifest_path, &manifest).expect("write corrupt client manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client manifest");
+
+        assert!(
+            err.to_string().contains(
+                "client_manifest blockers must describe blocked_by entry dynamic-client-codegen"
+            ),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_reactive_plan_without_blocker_detail() {
+        let out = temp_output_dir("verify-build-client-reactive-plan-blocker-detail");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let plan_path = build_out.join(CLIENT_REACTIVE_PLAN_PATH);
+        let mut plan = read_json_value(&plan_path).expect("reactive plan");
+        plan["blockers"] = serde_json::json!([]);
+        write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
+
+        assert!(
+            err.to_string().contains(
+                "client_reactive_plan blockers must describe blocked_by entry reactive-dom-diff"
+            ),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_missing_static_page_output() {
         let out = temp_output_dir("verify-build-missing-static");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -37652,6 +37782,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["wasm_hash"]
                     .as_str()
                     .is_some_and(|hash| !hash.is_empty())
+                && target["blockers"]
+                    .as_array()
+                    .expect("manifest blockers")
+                    .iter()
+                    .any(|blocker| {
+                        blocker["id"] == "dynamic-client-codegen"
+                            && blocker["artifact"] == CLIENT_JS_PATH
+                    })
         }));
         assert!(client.iter().any(|target| {
             target["kind"] == "client_reactive_plan"
@@ -37660,6 +37798,14 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["source_bundle_hash"]
                     .as_str()
                     .is_some_and(|hash| !hash.is_empty())
+                && target["blockers"]
+                    .as_array()
+                    .expect("reactive blockers")
+                    .iter()
+                    .any(|blocker| {
+                        blocker["id"] == "reactive-dom-diff"
+                            && blocker["artifact"] == CLIENT_REACTIVE_PLAN_PATH
+                    })
         }));
         assert!(client
             .iter()
@@ -37737,6 +37883,13 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("blocked_by")
             .iter()
             .any(|item| item == "dynamic-client-codegen"));
+        assert!(client_manifest["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(
+                |item| item["id"] == "dynamic-client-codegen" && item["artifact"] == CLIENT_JS_PATH
+            ));
 
         cmd_verify_build(&build_out).expect("verify build artifacts");
         let _ = std::fs::remove_dir_all(&out);
@@ -37819,6 +37972,12 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("blocked_by")
             .iter()
             .any(|item| item == "reactive-dom-diff"));
+        assert!(reactive_plan["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(|item| item["id"] == "reactive-dom-diff"
+                && item["artifact"] == CLIENT_REACTIVE_PLAN_PATH));
         let client_manifest =
             read_json_value(&build_out.join(CLIENT_MANIFEST_PATH)).expect("client manifest");
         assert_eq!(
