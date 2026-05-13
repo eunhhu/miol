@@ -9196,6 +9196,7 @@ impl LspSession {
         match request.get("method").and_then(serde_json::Value::as_str) {
             Some("textDocument/didOpen") => self.handle_did_open(request),
             Some("textDocument/didChange") => self.handle_did_change(request),
+            Some("textDocument/didClose") => self.handle_did_close(request),
             _ => {}
         }
     }
@@ -9217,6 +9218,19 @@ impl LspSession {
             return;
         };
         self.open_documents.insert(path, text.to_string());
+    }
+
+    fn handle_did_close(&mut self, request: &serde_json::Value) {
+        let Some(uri) = request
+            .pointer("/params/textDocument/uri")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Ok(path) = lsp_file_uri_path(uri) else {
+            return;
+        };
+        self.open_documents.remove(&path);
     }
 
     fn handle_did_change(&mut self, request: &serde_json::Value) {
@@ -31650,6 +31664,55 @@ entry = "src/main.orv"
         assert_eq!(response["id"], 15);
         assert!(response.get("error").is_none(), "{response}");
         assert!(symbols.iter().any(|symbol| symbol["name"] == "Changed"));
+        assert!(!symbols.iter().any(|symbol| symbol["name"] == "Draft"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_did_close_drops_unsaved_content() {
+        let dir = temp_output_dir("lsp-did-close-symbol");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "struct Disk { id: int }\n").expect("write source");
+        let uri = format!("file://{}", source.display());
+        let mut session = LspSession::default();
+        session.handle_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "orv",
+                    "version": 1,
+                    "text": "struct Draft { id: int }\n",
+                },
+            },
+        }));
+        session.handle_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+
+        let response = session.jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+            },
+        }));
+        let symbols = response["result"].as_array().expect("document symbols");
+
+        assert_eq!(response["id"], 16);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(symbols.iter().any(|symbol| symbol["name"] == "Disk"));
         assert!(!symbols.iter().any(|symbol| symbol["name"] == "Draft"));
         let _ = std::fs::remove_dir_all(dir);
     }
