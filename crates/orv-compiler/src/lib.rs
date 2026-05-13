@@ -18,6 +18,10 @@ use orv_hir::{
 };
 use serde::{Deserialize, Serialize};
 
+// Internal condition value marker used when three dynamic operands mean
+// base-vs-triple-product rather than product-vs-product.
+const NATIVE_CONDITION_TRIPLE_PRODUCT: &str = "__orv_triple_product";
+
 /// Current origin map schema version.
 pub const ORIGIN_MAP_VERSION: u32 = 2;
 
@@ -1655,7 +1659,8 @@ fn native_server_response_condition_is_direct(
                         .tertiary_operand_kind
                         .as_deref()
                         .is_some_and(|kind| {
-                            condition.value.is_empty()
+                            (condition.value.is_empty()
+                                || condition.value == NATIVE_CONDITION_TRIPLE_PRODUCT)
                                 && condition.operand_name.is_some()
                                 && condition.operand_scale_json.is_none()
                                 && condition.secondary_operand_name.is_some()
@@ -2091,6 +2096,12 @@ fn native_int_operation_is_direct(
                     | "mul_triple_product"
                     | "div_triple_product"
                     | "rem_triple_product"
+                    | "eq_triple_product"
+                    | "ne_triple_product"
+                    | "lt_triple_product"
+                    | "le_triple_product"
+                    | "gt_triple_product"
+                    | "ge_triple_product"
                     | "eq_product_product"
                     | "ne_product_product"
                     | "lt_product_product"
@@ -2231,6 +2242,12 @@ fn native_float_operation_is_direct(
                     | "mul_triple_product"
                     | "div_triple_product"
                     | "rem_triple_product"
+                    | "eq_triple_product"
+                    | "ne_triple_product"
+                    | "lt_triple_product"
+                    | "le_triple_product"
+                    | "gt_triple_product"
+                    | "ge_triple_product"
                     | "eq_product_product"
                     | "ne_product_product"
                     | "lt_product_product"
@@ -3778,6 +3795,24 @@ fn push_native_float_success_arm(
     if matches!(
         op,
         Some(
+            "eq_triple_product"
+                | "ne_triple_product"
+                | "lt_triple_product"
+                | "le_triple_product"
+                | "gt_triple_product"
+                | "ge_triple_product"
+        )
+    ) {
+        return push_native_float_triple_product_comparison_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
+    if matches!(
+        op,
+        Some(
             "eq_product_static"
                 | "ne_product_static"
                 | "lt_product_static"
@@ -4634,6 +4669,112 @@ fn push_native_float_product_product_comparison_success_arm(
     true
 }
 
+fn push_native_float_triple_product_comparison_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+        tertiary_operand_kind,
+        tertiary_operand_name,
+    } = operation;
+    let (
+        Some(
+            op @ ("eq_triple_product" | "ne_triple_product" | "lt_triple_product"
+            | "le_triple_product" | "gt_triple_product" | "ge_triple_product"),
+        ),
+        None,
+        Some(operand_kind),
+        Some(operand_name),
+        Some(secondary_operand_kind),
+        Some(secondary_operand_name),
+        Some(tertiary_operand_kind),
+        Some(tertiary_operand_name),
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+        tertiary_operand_kind,
+        tertiary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(operator) = native_comparison_operator(Some(op)) else {
+        return false;
+    };
+    let Some(first_operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name)
+    else {
+        return false;
+    };
+    let Some(second_operand_lookup) =
+        native_float_operand_lookup_expr(secondary_operand_kind, secondary_operand_name)
+    else {
+        return false;
+    };
+    let Some(third_operand_lookup) =
+        native_float_operand_lookup_expr(tertiary_operand_kind, tertiary_operand_name)
+    else {
+        return false;
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} float arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) if value.is_finite() => match {first_operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                Ok(first_product) if first_product.is_finite() => match {second_operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                    Ok(second_product) if second_product.is_finite() => match {third_operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    source
+        .push_str("                        Ok(third_product) if third_product.is_finite() => {\n");
+    source.push_str(
+        "                            let triple_product = first_product * second_product * third_product;\n",
+    );
+    source.push_str("                            if triple_product.is_finite() {\n");
+    push_native_comparison_json_result(
+        source,
+        "value",
+        operator,
+        "triple_product",
+        "                                ",
+    );
+    source.push_str("                            } else {\n");
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str(
+        "                            }\n                        },\n                        _ => {\n",
+    );
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str(
+        "                        },\n                    },\n                    _ => {\n",
+    );
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                    },\n                },\n                _ => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
 fn push_native_float_product_comparison_success_arm(
     source: &mut String,
     operation: NativeCapturedJsonOperation<'_>,
@@ -4879,6 +5020,24 @@ fn push_native_int_success_arm(
         )
     ) {
         return push_native_int_product_comparison_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
+    if matches!(
+        op,
+        Some(
+            "eq_triple_product"
+                | "ne_triple_product"
+                | "lt_triple_product"
+                | "le_triple_product"
+                | "gt_triple_product"
+                | "ge_triple_product"
+        )
+    ) {
+        return push_native_int_triple_product_comparison_success_arm(
             source,
             operation,
             error_prefix,
@@ -5832,6 +5991,111 @@ fn push_native_int_product_product_comparison_success_arm(
     true
 }
 
+fn push_native_int_triple_product_comparison_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+        tertiary_operand_kind,
+        tertiary_operand_name,
+    } = operation;
+    let (
+        Some(
+            op @ ("eq_triple_product" | "ne_triple_product" | "lt_triple_product"
+            | "le_triple_product" | "gt_triple_product" | "ge_triple_product"),
+        ),
+        None,
+        Some(operand_kind),
+        Some(operand_name),
+        Some(secondary_operand_kind),
+        Some(secondary_operand_name),
+        Some(tertiary_operand_kind),
+        Some(tertiary_operand_name),
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+        tertiary_operand_kind,
+        tertiary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(operator) = native_comparison_operator(Some(op)) else {
+        return false;
+    };
+    let Some(first_operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name)
+    else {
+        return false;
+    };
+    let Some(second_operand_lookup) =
+        native_int_operand_lookup_expr(secondary_operand_kind, secondary_operand_name)
+    else {
+        return false;
+    };
+    let Some(third_operand_lookup) =
+        native_int_operand_lookup_expr(tertiary_operand_kind, tertiary_operand_name)
+    else {
+        return false;
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) => match {first_operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                Ok(first_product) => match {second_operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                    Ok(second_product) => match {third_operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    source.push_str("                        Ok(third_product) => match first_product.checked_mul(second_product) {\n");
+    source.push_str("                            Some(partial_product) => match partial_product.checked_mul(third_product) {\n");
+    source.push_str("                                Some(triple_product) => {\n");
+    push_native_comparison_json_result(
+        source,
+        "value",
+        operator,
+        "triple_product",
+        "                                    ",
+    );
+    source.push_str(
+        "                                },\n                                None => {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                                },\n                            },\n                            None => {\n");
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                            },\n                        },\n                        Err(_) => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str(
+        "                        },\n                    },\n                    Err(_) => {\n",
+    );
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                    },\n                },\n                Err(_) => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
 fn push_native_int_product_comparison_success_arm(
     source: &mut String,
     operation: NativeCapturedJsonOperation<'_>,
@@ -6043,24 +6307,30 @@ fn native_static_left_int_arithmetic_method(op: Option<&str>) -> Option<&'static
 
 fn native_comparison_operator(op: Option<&str>) -> Option<&'static str> {
     match op {
-        Some("eq" | "eq_scaled" | "eq_product" | "eq_product_static" | "eq_product_product") => {
-            Some("==")
-        }
-        Some("ne" | "ne_scaled" | "ne_product" | "ne_product_static" | "ne_product_product") => {
-            Some("!=")
-        }
-        Some("lt" | "lt_scaled" | "lt_product" | "lt_product_static" | "lt_product_product") => {
-            Some("<")
-        }
-        Some("le" | "le_scaled" | "le_product" | "le_product_static" | "le_product_product") => {
-            Some("<=")
-        }
-        Some("gt" | "gt_scaled" | "gt_product" | "gt_product_static" | "gt_product_product") => {
-            Some(">")
-        }
-        Some("ge" | "ge_scaled" | "ge_product" | "ge_product_static" | "ge_product_product") => {
-            Some(">=")
-        }
+        Some(
+            "eq" | "eq_scaled" | "eq_product" | "eq_product_static" | "eq_product_product"
+            | "eq_triple_product",
+        ) => Some("=="),
+        Some(
+            "ne" | "ne_scaled" | "ne_product" | "ne_product_static" | "ne_product_product"
+            | "ne_triple_product",
+        ) => Some("!="),
+        Some(
+            "lt" | "lt_scaled" | "lt_product" | "lt_product_static" | "lt_product_product"
+            | "lt_triple_product",
+        ) => Some("<"),
+        Some(
+            "le" | "le_scaled" | "le_product" | "le_product_static" | "le_product_product"
+            | "le_triple_product",
+        ) => Some("<="),
+        Some(
+            "gt" | "gt_scaled" | "gt_product" | "gt_product_static" | "gt_product_product"
+            | "gt_triple_product",
+        ) => Some(">"),
+        Some(
+            "ge" | "ge_scaled" | "ge_product" | "ge_product_static" | "ge_product_product"
+            | "ge_triple_product",
+        ) => Some(">="),
         _ => None,
     }
 }
@@ -6396,6 +6666,22 @@ fn push_native_float_response_condition(
                 else {
                     return false;
                 };
+                if condition.value == NATIVE_CONDITION_TRIPLE_PRODUCT {
+                    let _ = writeln!(
+                        source,
+                        "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
+                        rust_string_literal(&condition.name),
+                        rust_string_literal(operand_name),
+                        rust_string_literal(secondary_operand_name),
+                        rust_string_literal(tertiary_operand_name)
+                    );
+                    let _ = writeln!(
+                        source,
+                        "            (Ok(value), Ok(first_product), Ok(second_product), Ok(third_product)) if value.is_finite() && first_product.is_finite() && second_product.is_finite() && third_product.is_finite() => {{\n                let triple_product = first_product * second_product * third_product;\n                triple_product.is_finite() && value {operator} triple_product\n            }},"
+                    );
+                    source.push_str("            _ => false,\n        } {\n");
+                    return true;
+                }
                 let _ = writeln!(
                     source,
                     "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
@@ -6566,6 +6852,22 @@ fn push_native_int_response_condition(
                 else {
                     return false;
                 };
+                if condition.value == NATIVE_CONDITION_TRIPLE_PRODUCT {
+                    let _ = writeln!(
+                        source,
+                        "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
+                        rust_string_literal(&condition.name),
+                        rust_string_literal(operand_name),
+                        rust_string_literal(secondary_operand_name),
+                        rust_string_literal(tertiary_operand_name)
+                    );
+                    let _ = writeln!(
+                        source,
+                        "            (Ok(value), Ok(first_product), Ok(second_product), Ok(third_product)) => match first_product.checked_mul(second_product) {{\n                Some(partial_product) => match partial_product.checked_mul(third_product) {{\n                    Some(triple_product) => value {operator} triple_product,\n                    None => false,\n                }},\n                None => false,\n            }},"
+                    );
+                    source.push_str("            _ => false,\n        } {\n");
+                    return true;
+                }
                 let _ = writeln!(
                     source,
                     "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
@@ -7790,6 +8092,16 @@ fn captured_product_product_comparison_response_operation(
     captured_product_product_response_operation(value, &op_name, rhs)
 }
 
+fn captured_triple_product_comparison_response_operation(
+    value: &CapturedResponseValue,
+    op: BinaryOp,
+    rhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    let op_name = captured_numeric_comparison_op_name(op)?;
+    let op_name = format!("{op_name}_triple_product");
+    captured_triple_product_response_operation(value, &op_name, rhs)
+}
+
 fn captured_triple_product_response_operation(
     value: &CapturedResponseValue,
     op_name: &str,
@@ -8529,6 +8841,10 @@ fn captured_response_comparison_operation(
             return Some(value);
         }
         if let Some(value) = captured_product_static_comparison_response_operation(&value, op, rhs)
+        {
+            return Some(value);
+        }
+        if let Some(value) = captured_triple_product_comparison_response_operation(&value, op, rhs)
         {
             return Some(value);
         }
@@ -9551,6 +9867,20 @@ fn native_captured_float_response_condition(
                 tertiary_operand_name: None,
             });
         }
+        if let Some(right) = captured_triple_product_condition_float_operand(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_float_operand(op, left.kind)?,
+                name: left.name,
+                value: NATIVE_CONDITION_TRIPLE_PRODUCT.to_string(),
+                operand_name: Some(right.first_name),
+                operand_kind: Some(right.first_value_kind),
+                operand_scale_json: None,
+                secondary_operand_kind: Some(right.second_value_kind),
+                secondary_operand_name: Some(right.second_name),
+                tertiary_operand_kind: Some(right.third_value_kind),
+                tertiary_operand_name: Some(right.third_name),
+            });
+        }
         let right = captured_condition_float_operand(rhs)?;
         return Some(ServerResponseConditionArtifact {
             kind: condition_kind_for_float_operand(op, left.kind)?,
@@ -9592,6 +9922,20 @@ fn native_captured_float_response_condition(
             secondary_operand_name: Some(left.rhs_name),
             tertiary_operand_kind: None,
             tertiary_operand_name: None,
+        });
+    }
+    if let Some(left) = captured_triple_product_condition_float_operand(lhs) {
+        return Some(ServerResponseConditionArtifact {
+            kind: condition_kind_for_float_operand(reverse_comparison_op(op)?, right.kind)?,
+            name: right.name,
+            value: NATIVE_CONDITION_TRIPLE_PRODUCT.to_string(),
+            operand_name: Some(left.first_name),
+            operand_kind: Some(left.first_value_kind),
+            operand_scale_json: None,
+            secondary_operand_kind: Some(left.second_value_kind),
+            secondary_operand_name: Some(left.second_name),
+            tertiary_operand_kind: Some(left.third_value_kind),
+            tertiary_operand_name: Some(left.third_name),
         });
     }
     Some(ServerResponseConditionArtifact {
@@ -9637,6 +9981,23 @@ fn captured_product_condition_float_operand(
         lhs_name: operand.lhs_name,
         rhs_kind: condition_float_operand_kind(operand.rhs_value_kind.as_str())?,
         rhs_name: operand.rhs_name,
+    })
+}
+
+fn captured_triple_product_condition_float_operand(
+    expr: &HirExpr,
+) -> Option<CapturedTripleProductOperand> {
+    let operand = captured_triple_product_float_operand(expr)?;
+    Some(CapturedTripleProductOperand {
+        first_value_kind: condition_float_operand_kind(operand.first_value_kind.as_str())?
+            .to_string(),
+        first_name: operand.first_name,
+        second_value_kind: condition_float_operand_kind(operand.second_value_kind.as_str())?
+            .to_string(),
+        second_name: operand.second_name,
+        third_value_kind: condition_float_operand_kind(operand.third_value_kind.as_str())?
+            .to_string(),
+        third_name: operand.third_name,
     })
 }
 
@@ -9760,6 +10121,20 @@ fn native_captured_int_response_condition(
                 tertiary_operand_name: None,
             });
         }
+        if let Some(right) = captured_triple_product_condition_int_operand(rhs) {
+            return Some(ServerResponseConditionArtifact {
+                kind: condition_kind_for_int_operand(op, left.kind)?,
+                name: left.name,
+                value: NATIVE_CONDITION_TRIPLE_PRODUCT.to_string(),
+                operand_name: Some(right.first_name),
+                operand_kind: Some(right.first_value_kind),
+                operand_scale_json: None,
+                secondary_operand_kind: Some(right.second_value_kind),
+                secondary_operand_name: Some(right.second_name),
+                tertiary_operand_kind: Some(right.third_value_kind),
+                tertiary_operand_name: Some(right.third_name),
+            });
+        }
         let right = captured_condition_int_operand(rhs)?;
         return Some(ServerResponseConditionArtifact {
             kind: condition_kind_for_int_operand(op, left.kind)?,
@@ -9801,6 +10176,20 @@ fn native_captured_int_response_condition(
             secondary_operand_name: Some(left.rhs_name),
             tertiary_operand_kind: None,
             tertiary_operand_name: None,
+        });
+    }
+    if let Some(left) = captured_triple_product_condition_int_operand(lhs) {
+        return Some(ServerResponseConditionArtifact {
+            kind: condition_kind_for_int_operand(reverse_comparison_op(op)?, right.kind)?,
+            name: right.name,
+            value: NATIVE_CONDITION_TRIPLE_PRODUCT.to_string(),
+            operand_name: Some(left.first_name),
+            operand_kind: Some(left.first_value_kind),
+            operand_scale_json: None,
+            secondary_operand_kind: Some(left.second_value_kind),
+            secondary_operand_name: Some(left.second_name),
+            tertiary_operand_kind: Some(left.third_value_kind),
+            tertiary_operand_name: Some(left.third_name),
         });
     }
     Some(ServerResponseConditionArtifact {
@@ -9901,6 +10290,23 @@ fn captured_product_condition_int_operand(
         lhs_name: operand.lhs_name,
         rhs_kind: condition_int_operand_kind(operand.rhs_value_kind.as_str())?,
         rhs_name: operand.rhs_name,
+    })
+}
+
+fn captured_triple_product_condition_int_operand(
+    expr: &HirExpr,
+) -> Option<CapturedTripleProductOperand> {
+    let operand = captured_triple_product_integer_operand(expr)?;
+    Some(CapturedTripleProductOperand {
+        first_value_kind: condition_int_operand_kind(operand.first_value_kind.as_str())?
+            .to_string(),
+        first_name: operand.first_name,
+        second_value_kind: condition_int_operand_kind(operand.second_value_kind.as_str())?
+            .to_string(),
+        second_name: operand.second_name,
+        third_value_kind: condition_int_operand_kind(operand.third_value_kind.as_str())?
+            .to_string(),
+        third_name: operand.third_name,
     })
 }
 
@@ -14188,6 +14594,56 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_triple_product_int_comparison_response_body() {
+        let src = r"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { covered: (@body.total as int) <= (((@body.quantity as int) * (@body.unit_price as int)) * (@body.bundle_count as int)) }
+  }
+}";
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].field, "covered");
+        assert_eq!(response.body_request_fields[0].name, "total");
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("le_triple_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .secondary_operand_name
+                .as_deref(),
+            Some("unit_price")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .tertiary_operand_name
+                .as_deref(),
+            Some("bundle_count")
+        );
+        assert!(handlers.contains("partial_product.checked_mul(third_product)"));
+        assert!(handlers.contains("value <= triple_product"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_product_product_int_comparison_response_body() {
         let src = r"@server {
   @listen 8080
@@ -15225,6 +15681,61 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(handlers
             .contains("let triple_product = first_product * second_product * third_product;"));
         assert!(handlers.contains("let value = value + triple_product;"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_triple_product_float_comparison_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    @respond 201 { under_limit: (@body.total as float) <= (((@body.price as float) * (@body.quantity as float)) * (@body.multiplier as float)) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_request_fields[0].field, "under_limit");
+        assert_eq!(response.body_request_fields[0].name, "total");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_float"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("le_triple_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("price")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .secondary_operand_name
+                .as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .tertiary_operand_name
+                .as_deref(),
+            Some("multiplier")
+        );
+        assert!(handlers
+            .contains("let triple_product = first_product * second_product * third_product;"));
+        assert!(handlers.contains("value <= triple_product"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
@@ -16833,6 +17344,57 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_request_body_int_triple_product_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if (@body.total as int) <= (((@body.quantity as int) * (@body.unit_price as int)) * (@body.bundle_count as int)) {
+      @respond 201 { accepted: true, total: @body.total as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_int_le");
+        assert_eq!(condition.name, "total");
+        assert_eq!(condition.value, NATIVE_CONDITION_TRIPLE_PRODUCT);
+        assert_eq!(condition.operand_name.as_deref(), Some("quantity"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            condition.secondary_operand_name.as_deref(),
+            Some("unit_price")
+        );
+        assert_eq!(
+            condition.tertiary_operand_name.as_deref(),
+            Some("bundle_count")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains("partial_product.checked_mul(third_product)"));
+        assert!(handlers.contains("Some(triple_product) => value <= triple_product"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_product_product_int_comparison_guard() {
         let src = r#"@server {
   @listen 8080
@@ -17061,6 +17623,58 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.routes[0].responses[1].condition.is_none());
         assert!(handlers.contains("let product = value * product_right;"));
         assert!(handlers.contains("product.is_finite() && product <= 40.0"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_request_body_float_triple_product_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    if (@body.total as float) <= (((@body.price as float) * (@body.quantity as float)) * (@body.multiplier as float)) {
+      @respond 201 { accepted: true, amount: @body.total as float }
+    }
+    @respond 409 { err: "amount_over_limit" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_float_le");
+        assert_eq!(condition.name, "total");
+        assert_eq!(condition.value, NATIVE_CONDITION_TRIPLE_PRODUCT);
+        assert_eq!(condition.operand_name.as_deref(), Some("price"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            condition.secondary_operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(
+            condition.tertiary_operand_name.as_deref(),
+            Some("multiplier")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers
+            .contains("let triple_product = first_product * second_product * third_product;"));
+        assert!(handlers.contains("value <= triple_product"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
