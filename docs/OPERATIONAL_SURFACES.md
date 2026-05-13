@@ -62,7 +62,7 @@ Trace transport is also mirrored for native hosts: when an editor export include
 
 - lifecycle: `initialize`, `shutdown`, notifications, unknown-method errors
 - document/project: `textDocument/documentSymbol`, `workspace/symbol`, `textDocument/diagnostic`, `workspace/diagnostic`
-- editor affordances: `textDocument/codeLens`, `textDocument/codeAction`, `workspace/executeCommand`, `textDocument/documentLink`, `textDocument/documentColor`, `textDocument/colorPresentation`, `textDocument/foldingRange`, `textDocument/selectionRange`, `textDocument/semanticTokens/full`, `textDocument/linkedEditingRange`
+- editor affordances: `textDocument/codeLens`, `textDocument/codeAction`, `workspace/executeCommand`, `textDocument/documentLink`, `textDocument/documentColor`, `textDocument/colorPresentation`, `textDocument/foldingRange`, `textDocument/selectionRange`, `textDocument/semanticTokens/full`, `textDocument/linkedEditingRange`, `textDocument/formatting`
 - navigation: `textDocument/definition`, `textDocument/declaration`, `textDocument/typeDefinition`, `textDocument/implementation`, `textDocument/moniker`
 - hierarchy: `textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`, `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes`
 - editing/introspection: `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/signatureHelp`, `textDocument/inlayHint`, `textDocument/completion`
