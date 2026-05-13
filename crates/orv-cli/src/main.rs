@@ -7946,6 +7946,7 @@ fn editor_native_host_trace_json(state: &serde_json::Value) -> serde_json::Value
         "trace_path": trace.pointer("/trace/path").cloned().unwrap_or_else(|| serde_json::json!("")),
         "frame_count": trace.pointer("/trace/frame_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
         "status_counts": trace.pointer("/trace/status_counts").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "summary": editor_native_host_trace_summary_json(trace),
         "status_filters": editor_native_host_trace_status_filters_json(trace),
         "frames": editor_native_host_trace_frames_json(trace, build_dir),
         "live_refresh": live_refresh,
@@ -7960,6 +7961,11 @@ fn editor_native_host_trace_panel_contract_json() -> serde_json::Value {
         "schema_version": 1,
         "root": "trace",
         "sections": [
+            {
+                "name": "summary",
+                "path": "trace.summary",
+                "kind": "object",
+            },
             {
                 "name": "status_filters",
                 "path": "trace.status_filters",
@@ -7981,6 +7987,45 @@ fn editor_native_host_trace_panel_contract_json() -> serde_json::Value {
                 "kind": "object",
             },
         ],
+    })
+}
+
+fn editor_native_host_trace_summary_json(trace: &serde_json::Value) -> serde_json::Value {
+    let frames = trace
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let first_request = frames
+        .first()
+        .and_then(|frame| frame.get("summary"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_request = frames
+        .last()
+        .and_then(|frame| frame.get("summary"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "schema_version": 1,
+        "build_dir": trace
+            .get("build_dir")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+        "trace_path": trace
+            .pointer("/trace/path")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+        "frame_count": trace
+            .pointer("/trace/frame_count")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(frames.len())),
+        "status_counts": trace
+            .pointer("/trace/status_counts")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        "first_request": first_request,
+        "last_request": last_request,
     })
 }
 
@@ -43660,6 +43705,23 @@ define Auth() -> { @out "auth" }
         let frames = native_host["trace"]["frames"]
             .as_array()
             .expect("native trace frames");
+        assert_eq!(
+            native_host["trace"]["summary"]["schema_version"],
+            serde_json::json!(1)
+        );
+        assert_eq!(native_host["trace"]["summary"]["frame_count"], 2);
+        assert_eq!(
+            native_host["trace"]["summary"]["status_counts"]["client_error"],
+            1
+        );
+        assert_eq!(
+            native_host["trace"]["summary"]["first_request"]["label"],
+            "GET /ping -> 200"
+        );
+        assert_eq!(
+            native_host["trace"]["summary"]["last_request"]["label"],
+            "GET /missing -> 404"
+        );
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["index"], 0);
         assert_eq!(frames[0]["origin_id"], route.id);
@@ -43702,6 +43764,9 @@ define Auth() -> { @out "auth" }
         let sections = native_host["trace"]["panel_contract"]["sections"]
             .as_array()
             .expect("native trace panel sections");
+        assert!(sections
+            .iter()
+            .any(|section| section["name"] == "summary" && section["path"] == "trace.summary"));
         assert!(sections
             .iter()
             .any(|section| section["name"] == "status_filters"
