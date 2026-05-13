@@ -69,7 +69,7 @@ Trace transport is also mirrored for native hosts: when an editor export include
 
 Code actions include diagnostic reveal commands plus edit quickfixes for incomplete `@route` heads, inserting default HTTP method/path text where the parser diagnostic lands.
 
-Rename/prepare-rename returns workspace edits for project identifiers but rejects reserved language tokens and lowercase built-in `@` directives, so editor rename cannot rewrite syntax keywords or core route/server directives.
+Identifier edit/introspection surfaces (`references`, `documentHighlight`, `linkedEditingRange`, `prepareRename`, and `rename`) reject reserved language tokens and lowercase built-in `@` directives, so editor actions cannot rewrite or spotlight syntax keywords and core route/server directives as user symbols.
 
 The LSP session keeps `textDocument/didOpen`, full-sync `textDocument/didChange`, and `textDocument/didSave` text buffers so later file URI requests can run against current editor content, and clears that cache on save-without-text or `textDocument/didClose`.
 

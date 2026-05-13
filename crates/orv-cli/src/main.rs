@@ -8752,7 +8752,7 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some(name) = identifier_at_byte(&file.source, byte) else {
+        let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Null);
         };
         Ok(lsp_linked_editing_range_json(&file.source, name))
@@ -8767,7 +8767,7 @@ impl LspSession {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some(name) = identifier_at_byte(&file.source, byte) else {
+        let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         Ok(serde_json::Value::Array(lsp_reference_locations_json(
@@ -8788,7 +8788,7 @@ impl LspSession {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some(name) = identifier_at_byte(&file.source, byte) else {
+        let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::Value::Array(Vec::new()));
         };
         Ok(serde_json::Value::Array(
@@ -8820,14 +8820,10 @@ impl LspSession {
             return Ok(serde_json::Value::Null);
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some((start, end, name)) = identifier_span_at_byte(&file.source, byte) else {
+        let Some((start, end, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte)
+        else {
             return Ok(serde_json::Value::Null);
         };
-        if !lsp_renamable_identifier_name(name)
-            || lsp_is_builtin_domain_identifier(&file.source, start, name)
-        {
-            return Ok(serde_json::Value::Null);
-        }
         Ok(serde_json::json!({
             "range": lsp_range_for_source(
                 &file.source,
@@ -8856,14 +8852,9 @@ impl LspSession {
             return Ok(serde_json::json!({ "changes": {} }));
         };
         let byte = lsp_position_to_byte(&file.source, position);
-        let Some((start, _, name)) = identifier_span_at_byte(&file.source, byte) else {
+        let Some((_, _, name)) = lsp_renamable_identifier_span_at_byte(&file.source, byte) else {
             return Ok(serde_json::json!({ "changes": {} }));
         };
-        if !lsp_renamable_identifier_name(name)
-            || lsp_is_builtin_domain_identifier(&file.source, start, name)
-        {
-            return Ok(serde_json::json!({ "changes": {} }));
-        }
         let mut changes = serde_json::Map::new();
         for file in &loaded.files {
             let edits: Vec<_> = identifier_occurrences(&file.source, name)
@@ -14257,6 +14248,18 @@ fn identifier_span_at_byte(source: &str, byte: usize) -> Option<(usize, usize, &
         return None;
     }
     source.get(start..end).map(|name| (start, end, name))
+}
+
+fn lsp_renamable_identifier_span_at_byte(
+    source: &str,
+    byte: usize,
+) -> Option<(usize, usize, &str)> {
+    let (start, end, name) = identifier_span_at_byte(source, byte)?;
+    if !lsp_renamable_identifier_name(name) || lsp_is_builtin_domain_identifier(source, start, name)
+    {
+        return None;
+    }
+    Some((start, end, name))
 }
 
 fn lsp_reference_locations_json(files: &[SourceFile], name: &str) -> Vec<serde_json::Value> {
@@ -31093,6 +31096,37 @@ let v: User = u
     }
 
     #[test]
+    fn lsp_document_highlight_ignores_language_keywords() {
+        let dir = temp_output_dir("lsp-document-highlight-keyword");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "let total = 1\nlet next = total + 1\n").expect("write source");
+
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "textDocument/documentHighlight",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 0,
+                    "character": 1,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 30);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]
+            .as_array()
+            .expect("highlight result")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lsp_semantic_tokens_returns_project_graph_declaration_tokens() {
         let dir = temp_output_dir("lsp-semantic-tokens");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -31695,6 +31729,33 @@ let u: User = { id: 1 }
     }
 
     #[test]
+    fn lsp_linked_editing_range_ignores_builtin_directives() {
+        let dir = temp_output_dir("lsp-linked-editing-range-directive");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(&source, "@server {\n  @route GET /ping {\n  }\n}\n").expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 35,
+            "method": "textDocument/linkedEditingRange",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 1,
+                    "character": 4,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 35);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"].is_null());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lsp_prepare_call_hierarchy_returns_function_item() {
         let dir = temp_output_dir("lsp-call-hierarchy-prepare");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -32193,6 +32254,40 @@ let u: User = { id: 1 }
         assert!(locations.iter().any(|location| {
             location["range"]["start"]["line"] == 6 && location["range"]["start"]["character"] == 7
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_references_ignore_language_keywords() {
+        let dir = temp_output_dir("lsp-references-keyword");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "struct User { id: int }\nstruct Post { id: int }\n",
+        )
+        .expect("write source");
+        let response = lsp_jsonrpc_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {
+                    "uri": format!("file://{}", source.display()),
+                },
+                "position": {
+                    "line": 0,
+                    "character": 1,
+                },
+            },
+        }));
+
+        assert_eq!(response["id"], 20);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]
+            .as_array()
+            .expect("reference result")
+            .is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
