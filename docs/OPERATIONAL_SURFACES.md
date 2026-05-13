@@ -67,7 +67,7 @@ Trace transport is also mirrored for native hosts: when an editor export include
 - hierarchy: `textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`, `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes`
 - editing/introspection: `textDocument/references`, `textDocument/documentHighlight`, `textDocument/prepareRename`, `textDocument/rename`, `textDocument/hover`, `textDocument/signatureHelp`, `textDocument/inlayHint`, `textDocument/completion`
 
-The LSP session keeps `textDocument/didOpen` and full-sync `textDocument/didChange` buffers so later file URI requests can run against unsaved content, and clears that cache on `textDocument/didClose`.
+The LSP session keeps `textDocument/didOpen`, full-sync `textDocument/didChange`, and `textDocument/didSave` text buffers so later file URI requests can run against current editor content, and clears that cache on save-without-text or `textDocument/didClose`.
 
 ## Tree-sitter
 
