@@ -36614,6 +36614,14 @@ entry = "src/main.orv"
       @respond 409 { err: "out_of_stock" }
     }
   }
+  @route POST /tiered-fallback-inventory {
+    if (@body.quantity as int) <= 0 {
+      @respond 400 { err: "bad_quantity" }
+    } else if (@body.quantity as int) <= (@body.stock as int) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "out_of_stock" }
+  }
   @route POST /amount {
     if (@body.amount as float) > 0.0 {
       @respond 201 { accepted: true, amount: @body.amount as float }
@@ -36738,6 +36746,21 @@ entry = "src/main.orv"
             "/tiered-inventory",
             r#"{"quantity":"7","stock":"5"}"#,
         );
+        let invalid_tiered_fallback_inventory = send_raw_http_json_post(
+            address,
+            "/tiered-fallback-inventory",
+            r#"{"quantity":"0","stock":"5"}"#,
+        );
+        let accepted_tiered_fallback_inventory = send_raw_http_json_post(
+            address,
+            "/tiered-fallback-inventory",
+            r#"{"quantity":"3","stock":"5"}"#,
+        );
+        let rejected_tiered_fallback_inventory = send_raw_http_json_post(
+            address,
+            "/tiered-fallback-inventory",
+            r#"{"quantity":"7","stock":"5"}"#,
+        );
         let accepted_amount = send_raw_http_json_post(address, "/amount", r#"{"amount":"12.5"}"#);
         let rejected_amount = send_raw_http_json_post(address, "/amount", r#"{"amount":"0.0"}"#);
         let accepted_limit =
@@ -36779,6 +36802,12 @@ entry = "src/main.orv"
         assert!(accepted_tiered_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_tiered_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_tiered_inventory.contains(r#"{"err":"out_of_stock"}"#));
+        assert!(invalid_tiered_fallback_inventory.starts_with("HTTP/1.1 400"));
+        assert!(invalid_tiered_fallback_inventory.contains(r#"{"err":"bad_quantity"}"#));
+        assert!(accepted_tiered_fallback_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_tiered_fallback_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
+        assert!(rejected_tiered_fallback_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_tiered_fallback_inventory.contains(r#"{"err":"out_of_stock"}"#));
         assert!(accepted_amount.starts_with("HTTP/1.1 201"));
         assert!(accepted_amount.contains(r#"{"accepted":true,"amount":12.5}"#));
         assert!(rejected_amount.starts_with("HTTP/1.1 400"));
