@@ -17340,6 +17340,7 @@ fn verify_client_manifest_value(dir: &Path, manifest: &serde_json::Value) -> any
     }
     verify_client_manifest_paths(dir, manifest)?;
     verify_client_manifest_source_binding(dir, manifest)?;
+    verify_client_manifest_artifact_hashes(dir, manifest)?;
     verify_client_manifest_wasm_hash(dir, manifest)?;
     verify_client_manifest_exports(manifest)?;
     verify_client_manifest_initial_render(dir, manifest)?;
@@ -17399,6 +17400,24 @@ fn verify_client_manifest_wasm_hash(
     let expected_hash = file_content_hash(&dir.join(wasm))?;
     if json_str(manifest, "wasm_hash", "client manifest")? != expected_hash {
         anyhow::bail!("client_manifest wasm_hash does not match wasm bundle");
+    }
+    Ok(())
+}
+
+fn verify_client_manifest_artifact_hashes(
+    dir: &Path,
+    manifest: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let loader = json_str(manifest, "loader", "client manifest")?;
+    let expected_loader_hash = file_content_hash(&dir.join(loader))?;
+    if json_str(manifest, "loader_hash", "client manifest")? != expected_loader_hash {
+        anyhow::bail!("client_manifest loader_hash does not match loader");
+    }
+    let reactive_plan = json_str(manifest, "reactive_plan", "client manifest")?;
+    let reactive_plan = read_json_value(&dir.join(reactive_plan))?;
+    let expected_reactive_plan_hash = stable_json_hash(&reactive_plan)?;
+    if json_str(manifest, "reactive_plan_hash", "client manifest")? != expected_reactive_plan_hash {
+        anyhow::bail!("client_manifest reactive_plan_hash does not match reactive plan");
     }
     Ok(())
 }
@@ -23224,14 +23243,19 @@ fn write_client_bundle_manifest(
     let reactive_plan = targets
         .reactive_plan
         .ok_or_else(|| anyhow::anyhow!("missing client_reactive_plan bundle target"))?;
+    let loader_hash = file_content_hash(&out.join(loader))?;
+    let reactive_plan_value = read_json_value(&out.join(reactive_plan))?;
+    let reactive_plan_hash = stable_json_hash(&reactive_plan_value)?;
     let wasm_hash = file_content_hash(&out.join(wasm))?;
     let manifest = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.client.bundle",
         "entry": entry.display().to_string(),
         "reactive_plan": reactive_plan,
+        "reactive_plan_hash": reactive_plan_hash,
         "page": page,
         "loader": loader,
+        "loader_hash": loader_hash,
         "wasm": wasm,
         "wasm_hash": wasm_hash,
         "source_bundle": SOURCE_BUNDLE_PATH,
@@ -41052,6 +41076,61 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn verify_build_rejects_client_manifest_loader_hash_mismatch() {
+        let out = temp_output_dir("verify-build-client-manifest-loader-hash");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["loader_hash"] = serde_json::json!("fnv1a64:bad");
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid client manifest loader hash");
+
+        assert!(
+            err.to_string().contains("loader_hash"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_client_manifest_reactive_plan_hash_mismatch() {
+        let out = temp_output_dir("verify-build-client-manifest-reactive-plan-hash");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        manifest["reactive_plan_hash"] = serde_json::json!("fnv1a64:bad");
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest");
+
+        let err =
+            cmd_verify_build(&build_out).expect_err("invalid client manifest reactive plan hash");
+
+        assert!(
+            err.to_string().contains("reactive_plan_hash"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_client_manifest_initial_render_mismatch() {
         let out = temp_output_dir("verify-build-client-manifest-render-mismatch");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -41156,6 +41235,25 @@ models = { path = "../../shared/models", version = "2.0.0" }
         write_json(&manifest_path, &manifest).expect("rewrite client manifest wasm hash");
     }
 
+    fn refresh_client_manifest_loader_hash(build_out: &Path) {
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        let loader_hash =
+            file_content_hash(&build_out.join(CLIENT_JS_PATH)).expect("client loader hash");
+        manifest["loader_hash"] = serde_json::json!(loader_hash);
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest loader hash");
+    }
+
+    fn refresh_client_manifest_reactive_plan_hash(build_out: &Path) {
+        let manifest_path = build_out.join(CLIENT_MANIFEST_PATH);
+        let mut manifest = read_json_value(&manifest_path).expect("client manifest");
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        let reactive_plan_hash = stable_json_hash(&reactive_plan).expect("reactive plan hash");
+        manifest["reactive_plan_hash"] = serde_json::json!(reactive_plan_hash);
+        write_json(&manifest_path, &manifest).expect("rewrite client manifest reactive plan hash");
+    }
+
     #[test]
     fn verify_build_rejects_client_js_without_start_call() {
         let out = temp_output_dir("verify-build-client-js-start");
@@ -41180,6 +41278,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 "",
             );
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41208,6 +41307,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("client loader")
             .replace("source bundle hash mismatch", "source bundle hash skipped");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41236,6 +41336,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("client loader")
             .replace("loadClientManifest", "loadClientContract");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41264,6 +41365,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("client loader")
             .replace("loadReactivePlan", "loadReactiveContract");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41293,6 +41395,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .replace("assign_add", "assign_plus")
             .replace("assign_sub", "assign_minus");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41321,6 +41424,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("client loader")
             .replace("validateInitialRender", "skipInitialRenderValidation");
         std::fs::write(&loader_path, loader).expect("rewrite loader");
+        refresh_client_manifest_loader_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid client loader");
 
@@ -41348,6 +41452,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let mut plan = read_json_value(&plan_path).expect("reactive plan");
         plan["bindings"] = serde_json::json!([]);
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+        refresh_client_manifest_reactive_plan_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
 
@@ -41381,6 +41486,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("initial render binding");
         binding["byte_length"] = serde_json::json!(0);
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+        refresh_client_manifest_reactive_plan_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
 
@@ -41409,6 +41515,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let bindings = plan["bindings"].as_array_mut().expect("bindings");
         bindings.retain(|binding| binding["kind"] != "signal_state");
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+        refresh_client_manifest_reactive_plan_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
 
@@ -41443,6 +41550,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("signal text binding");
         binding["text_condition"]["truthy"] = serde_json::json!(true);
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+        refresh_client_manifest_reactive_plan_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
 
@@ -41499,6 +41607,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let mut plan = read_json_value(&plan_path).expect("reactive plan");
         plan["blockers"] = serde_json::json!([]);
         write_json(&plan_path, &plan).expect("write corrupt reactive plan");
+        refresh_client_manifest_reactive_plan_hash(&build_out);
 
         let err = cmd_verify_build(&build_out).expect_err("invalid reactive plan");
 
@@ -41821,6 +41930,12 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let expected_source_hash = stable_json_hash(&source_bundle).expect("source hash");
         let expected_wasm_hash =
             file_content_hash(&build_out.join(CLIENT_WASM_PATH)).expect("wasm hash");
+        let expected_loader_hash =
+            file_content_hash(&build_out.join(CLIENT_JS_PATH)).expect("loader hash");
+        let reactive_plan =
+            read_json_value(&build_out.join(CLIENT_REACTIVE_PLAN_PATH)).expect("reactive plan");
+        let expected_reactive_plan_hash =
+            stable_json_hash(&reactive_plan).expect("reactive plan hash");
         assert_manifest_artifact(
             &build_out.join("build-manifest.json"),
             "client_manifest",
@@ -41834,6 +41949,11 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert_eq!(client_manifest["kind"], "orv.client.bundle");
         assert_eq!(client_manifest["page"], "pages/index.html");
         assert_eq!(client_manifest["loader"], "client/app.js");
+        assert_eq!(client_manifest["loader_hash"], expected_loader_hash);
+        assert_eq!(
+            client_manifest["reactive_plan_hash"],
+            expected_reactive_plan_hash
+        );
         assert_eq!(client_manifest["wasm"], "client/app.wasm");
         assert_eq!(client_manifest["wasm_hash"], expected_wasm_hash);
         assert_eq!(client_manifest["source_bundle"], "source-bundle.json");
