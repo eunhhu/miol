@@ -383,6 +383,12 @@ pub struct ServerResponseConditionArtifact {
     /// Secondary captured operand name for product-shaped dynamic comparison operands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_operand_name: Option<String>,
+    /// Tertiary captured operand source for product-product dynamic comparison operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tertiary_operand_kind: Option<String>,
+    /// Tertiary captured operand name for product-product dynamic comparison operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tertiary_operand_name: Option<String>,
 }
 
 /// One ordered JSON object field backed by a static value or request domain.
@@ -1641,6 +1647,28 @@ fn native_server_response_condition_is_direct(
             })
             && (condition.secondary_operand_kind.is_some()
                 == condition.secondary_operand_name.is_some())
+            && condition
+                .tertiary_operand_name
+                .as_deref()
+                .is_none_or(|name| {
+                    condition
+                        .tertiary_operand_kind
+                        .as_deref()
+                        .is_some_and(|kind| {
+                            condition.value.is_empty()
+                                && condition.operand_name.is_some()
+                                && condition.operand_scale_json.is_none()
+                                && condition.secondary_operand_name.is_some()
+                                && condition.secondary_operand_kind.is_some()
+                                && native_response_condition_operand_is_direct(
+                                    kind,
+                                    name,
+                                    route_params,
+                                )
+                        })
+                })
+            && (condition.tertiary_operand_kind.is_some()
+                == condition.tertiary_operand_name.is_some())
             && matches!(
                 condition.kind.as_str(),
                 "request_body_field_eq"
@@ -6094,6 +6122,29 @@ fn push_native_float_response_condition(
             else {
                 return false;
             };
+            if let Some(tertiary_operand_name) = condition.tertiary_operand_name.as_deref() {
+                let Some(tertiary_operand_lookup) = condition
+                    .tertiary_operand_kind
+                    .as_deref()
+                    .and_then(native_response_condition_float_operand_lookup)
+                else {
+                    return false;
+                };
+                let _ = writeln!(
+                    source,
+                    "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
+                    rust_string_literal(&condition.name),
+                    rust_string_literal(operand_name),
+                    rust_string_literal(secondary_operand_name),
+                    rust_string_literal(tertiary_operand_name)
+                );
+                let _ = writeln!(
+                    source,
+                    "            (Ok(value), Ok(left_right), Ok(right_left), Ok(right_right)) if value.is_finite() && left_right.is_finite() && right_left.is_finite() && right_right.is_finite() => {{\n                let left_product = value * left_right;\n                let right_product = right_left * right_right;\n                left_product.is_finite() && right_product.is_finite() && left_product {operator} right_product\n            }},"
+                );
+                source.push_str("            _ => false,\n        } {\n");
+                return true;
+            }
             let _ = writeln!(
                 source,
                 "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<f64>()) {{",
@@ -6241,6 +6292,29 @@ fn push_native_int_response_condition(
             else {
                 return false;
             };
+            if let Some(tertiary_operand_name) = condition.tertiary_operand_name.as_deref() {
+                let Some(tertiary_operand_lookup) = condition
+                    .tertiary_operand_kind
+                    .as_deref()
+                    .and_then(native_response_condition_int_operand_lookup)
+                else {
+                    return false;
+                };
+                let _ = writeln!(
+                    source,
+                    "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {tertiary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
+                    rust_string_literal(&condition.name),
+                    rust_string_literal(operand_name),
+                    rust_string_literal(secondary_operand_name),
+                    rust_string_literal(tertiary_operand_name)
+                );
+                let _ = writeln!(
+                    source,
+                    "            (Ok(value), Ok(left_right), Ok(right_left), Ok(right_right)) => match value.checked_mul(left_right) {{\n                Some(left_product) => match right_left.checked_mul(right_right) {{\n                    Some(right_product) => left_product {operator} right_product,\n                    None => false,\n                }},\n                None => false,\n            }},"
+                );
+                source.push_str("            _ => false,\n        } {\n");
+                return true;
+            }
             let _ = writeln!(
                 source,
                 "        if match ({lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>(), {secondary_operand_lookup}(route_match, {}).unwrap_or(\"\").trim().parse::<i64>()) {{",
@@ -8867,6 +8941,8 @@ fn native_captured_bool_negated_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -8883,6 +8959,8 @@ fn native_captured_bool_truthy_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -8909,6 +8987,8 @@ fn native_captured_bool_response_condition(
                     operand_scale_json: None,
                     secondary_operand_kind: None,
                     secondary_operand_name: None,
+                    tertiary_operand_kind: None,
+                    tertiary_operand_name: None,
                 });
             }
             let right = captured_condition_bool_operand(rhs)?;
@@ -8921,6 +9001,8 @@ fn native_captured_bool_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
     }
@@ -8935,6 +9017,8 @@ fn native_captured_bool_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -8948,6 +9032,8 @@ fn native_captured_bool_response_condition(
                     operand_scale_json: None,
                     secondary_operand_kind: None,
                     secondary_operand_name: None,
+                    tertiary_operand_kind: None,
+                    tertiary_operand_name: None,
                 });
             }
         }
@@ -8961,6 +9047,8 @@ fn native_captured_bool_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     let right = captured_condition_bool_operand(rhs)?;
@@ -8973,6 +9061,8 @@ fn native_captured_bool_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -9006,6 +9096,10 @@ fn native_captured_float_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
+    if let Some(condition) = native_captured_product_product_float_response_condition(op, lhs, rhs)
+    {
+        return Some(condition);
+    }
     if let Some(condition) = native_captured_product_static_float_response_condition(op, lhs, rhs) {
         return Some(condition);
     }
@@ -9020,6 +9114,8 @@ fn native_captured_float_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         if let Some(right) = captured_scaled_condition_float_operand(rhs) {
@@ -9032,6 +9128,8 @@ fn native_captured_float_response_condition(
                 operand_scale_json: Some(right.scale_json),
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         if let Some(right) = captured_product_condition_float_operand(rhs) {
@@ -9044,6 +9142,8 @@ fn native_captured_float_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: Some(right.rhs_kind.to_string()),
                 secondary_operand_name: Some(right.rhs_name),
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         let right = captured_condition_float_operand(rhs)?;
@@ -9056,6 +9156,8 @@ fn native_captured_float_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     let right = captured_condition_float_operand(rhs)?;
@@ -9069,6 +9171,8 @@ fn native_captured_float_response_condition(
             operand_scale_json: Some(left.scale_json),
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     if let Some(left) = captured_product_condition_float_operand(lhs) {
@@ -9081,6 +9185,8 @@ fn native_captured_float_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: Some(left.rhs_kind.to_string()),
             secondary_operand_name: Some(left.rhs_name),
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     Some(ServerResponseConditionArtifact {
@@ -9092,6 +9198,8 @@ fn native_captured_float_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -9143,6 +9251,8 @@ fn native_captured_product_static_float_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
     }
@@ -9156,6 +9266,29 @@ fn native_captured_product_static_float_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
+    })
+}
+
+fn native_captured_product_product_float_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    let left = captured_product_condition_float_operand(lhs)?;
+    let right = captured_product_condition_float_operand(rhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_float_operand(op, left.lhs_kind)?,
+        name: left.lhs_name,
+        value: String::new(),
+        operand_name: Some(left.rhs_name),
+        operand_kind: Some(left.rhs_kind.to_string()),
+        operand_scale_json: None,
+        secondary_operand_kind: Some(right.lhs_kind.to_string()),
+        secondary_operand_name: Some(right.lhs_name),
+        tertiary_operand_kind: Some(right.rhs_kind.to_string()),
+        tertiary_operand_name: Some(right.rhs_name),
     })
 }
 
@@ -9173,6 +9306,9 @@ fn native_captured_int_response_condition(
     lhs: &HirExpr,
     rhs: &HirExpr,
 ) -> Option<ServerResponseConditionArtifact> {
+    if let Some(condition) = native_captured_product_product_int_response_condition(op, lhs, rhs) {
+        return Some(condition);
+    }
     if let Some(condition) = native_captured_product_static_int_response_condition(op, lhs, rhs) {
         return Some(condition);
     }
@@ -9187,6 +9323,8 @@ fn native_captured_int_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         if let Some(right) = captured_scaled_condition_int_operand(rhs) {
@@ -9199,6 +9337,8 @@ fn native_captured_int_response_condition(
                 operand_scale_json: Some(right.scale_json),
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         if let Some(right) = captured_product_condition_int_operand(rhs) {
@@ -9211,6 +9351,8 @@ fn native_captured_int_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: Some(right.rhs_kind.to_string()),
                 secondary_operand_name: Some(right.rhs_name),
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         let right = captured_condition_int_operand(rhs)?;
@@ -9223,6 +9365,8 @@ fn native_captured_int_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     let right = captured_condition_int_operand(rhs)?;
@@ -9236,6 +9380,8 @@ fn native_captured_int_response_condition(
             operand_scale_json: Some(left.scale_json),
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     if let Some(left) = captured_product_condition_int_operand(lhs) {
@@ -9248,6 +9394,8 @@ fn native_captured_int_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: Some(left.rhs_kind.to_string()),
             secondary_operand_name: Some(left.rhs_name),
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     Some(ServerResponseConditionArtifact {
@@ -9259,6 +9407,8 @@ fn native_captured_int_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -9278,6 +9428,8 @@ fn native_captured_product_static_int_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
     }
@@ -9291,6 +9443,29 @@ fn native_captured_product_static_int_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
+    })
+}
+
+fn native_captured_product_product_int_response_condition(
+    op: BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<ServerResponseConditionArtifact> {
+    let left = captured_product_condition_int_operand(lhs)?;
+    let right = captured_product_condition_int_operand(rhs)?;
+    Some(ServerResponseConditionArtifact {
+        kind: condition_kind_for_int_operand(op, left.lhs_kind)?,
+        name: left.lhs_name,
+        value: String::new(),
+        operand_name: Some(left.rhs_name),
+        operand_kind: Some(left.rhs_kind.to_string()),
+        operand_scale_json: None,
+        secondary_operand_kind: Some(right.lhs_kind.to_string()),
+        secondary_operand_name: Some(right.lhs_name),
+        tertiary_operand_kind: Some(right.rhs_kind.to_string()),
+        tertiary_operand_name: Some(right.rhs_name),
     })
 }
 
@@ -9361,6 +9536,8 @@ fn native_captured_response_condition(
                 operand_scale_json: None,
                 secondary_operand_kind: None,
                 secondary_operand_name: None,
+                tertiary_operand_kind: None,
+                tertiary_operand_name: None,
             });
         }
         let right = captured_condition_operand(rhs)?;
@@ -9373,6 +9550,8 @@ fn native_captured_response_condition(
             operand_scale_json: None,
             secondary_operand_kind: None,
             secondary_operand_name: None,
+            tertiary_operand_kind: None,
+            tertiary_operand_name: None,
         });
     }
     let right = captured_condition_operand(rhs)?;
@@ -9386,6 +9565,8 @@ fn native_captured_response_condition(
         operand_scale_json: None,
         secondary_operand_kind: None,
         secondary_operand_name: None,
+        tertiary_operand_kind: None,
+        tertiary_operand_name: None,
     })
 }
 
@@ -16140,6 +16321,62 @@ function greet(name: string): string -> "hi {name}""#,
     }
 
     #[test]
+    fn native_server_launcher_lowers_product_product_int_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    if ((@body.quantity as int) * (@body.unit_price as int)) <= ((@body.stock as int) * (@body.reserve_price as int)) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_int_le");
+        assert_eq!(condition.name, "quantity");
+        assert_eq!(condition.operand_name.as_deref(), Some("unit_price"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            condition.secondary_operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(condition.secondary_operand_name.as_deref(), Some("stock"));
+        assert_eq!(
+            condition.tertiary_operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            condition.tertiary_operand_name.as_deref(),
+            Some("reserve_price")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains("value.checked_mul(left_right)"));
+        assert!(handlers.contains("right_left.checked_mul(right_right)"));
+        assert!(handlers.contains("Some(right_product) => left_product <= right_product"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
     fn native_server_launcher_lowers_product_static_int_comparison_guard() {
         let src = r#"@server {
   @listen 8080
@@ -16312,6 +16549,65 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.routes[0].responses[1].condition.is_none());
         assert!(handlers.contains("let product = value * product_right;"));
         assert!(handlers.contains("product.is_finite() && product <= 40.0"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_product_product_float_comparison_guard() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /payments {
+    if ((@body.price as float) * (@body.quantity as float)) <= ((@body.limit_price as float) * (@body.limit_units as float)) {
+      @respond 201 { accepted: true, amount: @body.price as float }
+    }
+    @respond 409 { err: "amount_over_limit" }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        let condition = artifact.routes[0].responses[0]
+            .condition
+            .as_ref()
+            .expect("guard condition");
+        assert_eq!(condition.kind, "request_body_field_float_le");
+        assert_eq!(condition.name, "price");
+        assert_eq!(condition.operand_name.as_deref(), Some("quantity"));
+        assert_eq!(
+            condition.operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            condition.secondary_operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            condition.secondary_operand_name.as_deref(),
+            Some("limit_price")
+        );
+        assert_eq!(
+            condition.tertiary_operand_kind.as_deref(),
+            Some("request_body_field_float")
+        );
+        assert_eq!(
+            condition.tertiary_operand_name.as_deref(),
+            Some("limit_units")
+        );
+        assert!(artifact.routes[0].responses[1].condition.is_none());
+        assert!(handlers.contains("let left_product = value * left_right;"));
+        assert!(handlers.contains("let right_product = right_left * right_right;"));
+        assert!(handlers.contains("left_product <= right_product"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
         assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));

@@ -36835,6 +36835,12 @@ entry = "src/main.orv"
     }
     @respond 409 { err: "over_total" }
   }
+  @route POST /inventory-value-product {
+    if ((@body.quantity as int) * (@body.unit_price as int)) <= ((@body.stock as int) * (@body.reserve_price as int)) {
+      @respond 201 { accepted: true, quantity: @body.quantity as int }
+    }
+    @respond 409 { err: "over_total" }
+  }
   @route POST /ifelse-inventory {
     if (@body.quantity as int) <= (@body.stock as int) {
       @respond 201 { accepted: true, quantity: @body.quantity as int }
@@ -36879,6 +36885,12 @@ entry = "src/main.orv"
   @route POST /limit {
     if (@body.amount as float) <= (@query.limit as float) {
       @respond 201 { accepted: true, amount: @body.amount as float }
+    }
+    @respond 409 { err: "amount_over_limit" }
+  }
+  @route POST /limit-product {
+    if ((@body.price as float) * (@body.quantity as float)) <= ((@body.limit_price as float) * (@body.limit_units as float)) {
+      @respond 201 { accepted: true, amount: @body.price as float }
     }
     @respond 409 { err: "amount_over_limit" }
   }
@@ -37015,6 +37027,16 @@ entry = "src/main.orv"
             "/inventory-value-static",
             r#"{"quantity":"9","unit_price":"125"}"#,
         );
+        let accepted_product_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-product",
+            r#"{"quantity":"7","unit_price":"125","stock":"8","reserve_price":"125"}"#,
+        );
+        let rejected_product_value_inventory = send_raw_http_json_post(
+            address,
+            "/inventory-value-product",
+            r#"{"quantity":"9","unit_price":"125","stock":"8","reserve_price":"125"}"#,
+        );
         let accepted_ifelse_inventory = send_raw_http_json_post(
             address,
             "/ifelse-inventory",
@@ -37071,6 +37093,16 @@ entry = "src/main.orv"
             send_raw_http_json_post(address, "/limit?limit=20.0", r#"{"amount":"12.5"}"#);
         let rejected_limit =
             send_raw_http_json_post(address, "/limit?limit=10.0", r#"{"amount":"12.5"}"#);
+        let accepted_product_limit = send_raw_http_json_post(
+            address,
+            "/limit-product",
+            r#"{"price":"12.5","quantity":"3","limit_price":"20.0","limit_units":"2"}"#,
+        );
+        let rejected_product_limit = send_raw_http_json_post(
+            address,
+            "/limit-product",
+            r#"{"price":"12.5","quantity":"4","limit_price":"12.5","limit_units":"3"}"#,
+        );
         let sale = send_raw_http(address, "/catalog/sale");
         let regular = send_raw_http(address, "/catalog/full");
         let expanded = send_raw_http(address, "/search?mode=expanded");
@@ -37116,6 +37148,10 @@ entry = "src/main.orv"
         assert!(accepted_static_value_inventory.contains(r#"{"accepted":true,"quantity":7}"#));
         assert!(rejected_static_value_inventory.starts_with("HTTP/1.1 409"));
         assert!(rejected_static_value_inventory.contains(r#"{"err":"over_total"}"#));
+        assert!(accepted_product_value_inventory.starts_with("HTTP/1.1 201"));
+        assert!(accepted_product_value_inventory.contains(r#"{"accepted":true,"quantity":7}"#));
+        assert!(rejected_product_value_inventory.starts_with("HTTP/1.1 409"));
+        assert!(rejected_product_value_inventory.contains(r#"{"err":"over_total"}"#));
         assert!(accepted_ifelse_inventory.starts_with("HTTP/1.1 201"));
         assert!(accepted_ifelse_inventory.contains(r#"{"accepted":true,"quantity":3}"#));
         assert!(rejected_ifelse_inventory.starts_with("HTTP/1.1 409"));
@@ -37144,6 +37180,10 @@ entry = "src/main.orv"
         assert!(accepted_limit.contains(r#"{"accepted":true,"amount":12.5}"#));
         assert!(rejected_limit.starts_with("HTTP/1.1 409"));
         assert!(rejected_limit.contains(r#"{"err":"amount_over_limit"}"#));
+        assert!(accepted_product_limit.starts_with("HTTP/1.1 201"));
+        assert!(accepted_product_limit.contains(r#"{"accepted":true,"amount":12.5}"#));
+        assert!(rejected_product_limit.starts_with("HTTP/1.1 409"));
+        assert!(rejected_product_limit.contains(r#"{"err":"amount_over_limit"}"#));
         assert!(sale.starts_with("HTTP/1.1 200"));
         assert!(sale.contains(r#"{"kind":"sale"}"#));
         assert!(regular.starts_with("HTTP/1.1 200"));

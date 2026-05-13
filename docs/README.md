@@ -157,6 +157,8 @@ Native request-body captured product arithmetic/comparison 보충: `{ total: (@b
 
 Product-product response 보충: `{ total: ((@body.quantity as int) * (@body.unit_price as int)) + ((@body.fee_units as int) * (@body.fee_value as int)) }`와 `{ covered: ((@body.quantity as int) * (@body.unit_price as int)) <= ((@body.stock as int) * (@body.reserve_price as int)) }` 같은 int/float response field는 `add_product_product`/`sub_product_product`/`mul_product_product`/`div_product_product`/`rem_product_product` 및 `*_product_product` comparison metadata로 직접 lowering한다. Artifact는 우변 product의 두 captured operand를 `secondary_operand_*`와 `tertiary_operand_*`로 기록하고, generated handler는 좌/우 product를 각각 계산한 뒤 checked arithmetic 또는 비교를 수행한다.
 
+Product-product guard 보충: `if ((@body.quantity as int) * (@body.unit_price as int)) <= ((@body.stock as int) * (@body.reserve_price as int)) { @respond ... }` 같은 int/float guard도 condition metadata의 `operand_*`, `secondary_operand_*`, `tertiary_operand_*`로 직접 lowering되어 generated handler에서 두 product를 계산한 뒤 분기한다.
+
 단일 `else if` response chain도 같은 native-lowered request-body/route/query slice 안에 있으면 generated handler가 순서 있는 guarded return과 마지막 unconditional response로 직접 dispatch한다.
 
 정적 int `pow` exponent가 runtime 허용 범위인 `0..=63` 밖인 경우도 reference bridge fallback이 아니라 generated native 500 arithmetic-failure response로 처리한다.
