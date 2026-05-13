@@ -37148,6 +37148,9 @@ entry = "src/main.orv"
   @route POST /orders/total {
     @respond 201 { total: (@body.quantity as int) * (@body.unit_price as int) }
   }
+  @route POST /orders/total-with-fee {
+    @respond 201 { total: (@body.fee as int) + ((@body.quantity as int) * (@body.unit_price as int)) }
+  }
   @route POST /orders/power {
     @respond 201 { total: (@body.quantity as int) ** (@body.bonus as int) }
   }
@@ -37249,6 +37252,11 @@ entry = "src/main.orv"
             "/orders/total",
             r#"{"quantity":"7","unit_price":"125"}"#,
         );
+        let total_with_fee_response = send_raw_http_json_post(
+            address,
+            "/orders/total-with-fee",
+            r#"{"fee":"25","quantity":"7","unit_price":"125"}"#,
+        );
         let power_response =
             send_raw_http_json_post(address, "/orders/power", r#"{"quantity":"2","bonus":"6"}"#);
         let invalid_power_response =
@@ -37315,6 +37323,8 @@ entry = "src/main.orv"
         assert!(cents_total_response.contains(r#"{"cents":25000}"#));
         assert!(total_response.starts_with("HTTP/1.1 201"));
         assert!(total_response.contains(r#"{"total":875}"#));
+        assert!(total_with_fee_response.starts_with("HTTP/1.1 201"));
+        assert!(total_with_fee_response.contains(r#"{"total":900}"#));
         assert!(power_response.starts_with("HTTP/1.1 201"));
         assert!(power_response.contains(r#"{"total":64}"#));
         assert!(invalid_power_response.starts_with("HTTP/1.1 500"));
@@ -37652,7 +37662,7 @@ entry = "src/main.orv"
             r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * (@body.scale as int)) }
+    @respond 201 { received: (@body.id as int) + (((@body.bonus as int) * (@body.scale as int)) * (@body.extra as int)) }
   }
 }
 ",

@@ -404,6 +404,12 @@ pub struct ServerResponseObjectFieldArtifact {
     /// Captured operand field name for dynamic numeric arithmetic operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
+    /// Secondary captured operand value class for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_kind: Option<String>,
+    /// Secondary captured operand field name for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_name: Option<String>,
 }
 
 /// One JSON object field backed by a captured route param.
@@ -431,6 +437,12 @@ pub struct ServerResponseRouteParamArtifact {
     /// Captured operand field name for dynamic numeric arithmetic operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
+    /// Secondary captured operand value class for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_kind: Option<String>,
+    /// Secondary captured operand field name for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_name: Option<String>,
 }
 
 /// One JSON object field backed by a captured query param.
@@ -458,6 +470,12 @@ pub struct ServerResponseQueryParamArtifact {
     /// Captured operand field name for dynamic numeric arithmetic operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
+    /// Secondary captured operand value class for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_kind: Option<String>,
+    /// Secondary captured operand field name for product-shaped dynamic numeric arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_name: Option<String>,
 }
 
 /// One JSON object field backed by the request body JSON value.
@@ -492,6 +510,12 @@ pub struct ServerResponseRequestBodyFieldArtifact {
     /// Captured operand field name for dynamic arithmetic operands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operand_name: Option<String>,
+    /// Secondary captured operand class for product-shaped dynamic arithmetic operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_kind: Option<String>,
+    /// Secondary captured operand field name for product-shaped dynamic arithmetic operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_operand_name: Option<String>,
 }
 
 fn default_request_body_field_value_kind() -> String {
@@ -1761,10 +1785,7 @@ fn native_server_response_uses_object_fields(
                         route_params.iter().any(|route_param| route_param == name)
                     }) && native_captured_field_operation_is_direct(
                         &field.value_kind,
-                        field.op.as_deref(),
-                        field.operand_json.as_deref(),
-                        field.operand_kind.as_deref(),
-                        field.operand_name.as_deref(),
+                        native_response_object_field_operation(field),
                         route_params,
                     )
                 }
@@ -1779,10 +1800,7 @@ fn native_server_response_uses_object_fields(
                     field.name.is_some()
                         && native_captured_field_operation_is_direct(
                             &field.value_kind,
-                            field.op.as_deref(),
-                            field.operand_json.as_deref(),
-                            field.operand_kind.as_deref(),
-                            field.operand_name.as_deref(),
+                            native_response_object_field_operation(field),
                             route_params,
                         )
                 }
@@ -1805,10 +1823,7 @@ fn native_server_response_uses_route_params(
                 .any(|route_param| route_param == &field.param)
                 && native_captured_field_operation_is_direct(
                     &field.value_kind,
-                    field.op.as_deref(),
-                    field.operand_json.as_deref(),
-                    field.operand_kind.as_deref(),
-                    field.operand_name.as_deref(),
+                    native_route_param_operation(field),
                     route_params,
                 )
         })
@@ -1825,10 +1840,7 @@ fn native_server_response_uses_query_params(
                 "query_param" | "query_param_int" | "query_param_float" | "query_param_bool"
             ) && native_captured_field_operation_is_direct(
                 &field.value_kind,
-                field.op.as_deref(),
-                field.operand_json.as_deref(),
-                field.operand_kind.as_deref(),
-                field.operand_name.as_deref(),
+                native_query_param_operation(field),
                 route_params,
             )
         })
@@ -1848,10 +1860,7 @@ fn native_server_response_uses_request_fields(
                     | "request_body_field_bool"
             ) && native_captured_field_operation_is_direct(
                 &field.value_kind,
-                field.op.as_deref(),
-                field.operand_json.as_deref(),
-                field.operand_kind.as_deref(),
-                field.operand_name.as_deref(),
+                native_response_field_operation(field),
                 route_params,
             )
         })
@@ -1859,19 +1868,33 @@ fn native_server_response_uses_request_fields(
 
 fn native_captured_field_operation_is_direct(
     value_kind: &str,
-    op: Option<&str>,
-    operand_json: Option<&str>,
-    operand_kind: Option<&str>,
-    operand_name: Option<&str>,
+    operation: NativeCapturedJsonOperation<'_>,
     route_params: &[String],
 ) -> bool {
-    if op.is_none() && operand_json.is_none() && operand_kind.is_none() && operand_name.is_none() {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    } = operation;
+    if op.is_none()
+        && operand_json.is_none()
+        && operand_kind.is_none()
+        && operand_name.is_none()
+        && secondary_operand_kind.is_none()
+        && secondary_operand_name.is_none()
+    {
         return true;
     }
     if matches!(
         value_kind,
         "route_param" | "query_param" | "request_body_field"
     ) {
+        if secondary_operand_kind.is_some() || secondary_operand_name.is_some() {
+            return false;
+        }
         return native_string_operation_is_direct(
             op,
             operand_json,
@@ -1884,6 +1907,9 @@ fn native_captured_field_operation_is_direct(
         value_kind,
         "route_param_bool" | "query_param_bool" | "request_body_field_bool"
     ) {
+        if secondary_operand_kind.is_some() || secondary_operand_name.is_some() {
+            return false;
+        }
         return native_bool_operation_is_direct(
             op,
             operand_json,
@@ -1901,6 +1927,8 @@ fn native_captured_field_operation_is_direct(
             operand_json,
             operand_kind,
             operand_name,
+            secondary_operand_kind,
+            secondary_operand_name,
             route_params,
         );
     }
@@ -1912,6 +1940,8 @@ fn native_captured_field_operation_is_direct(
         operand_json,
         operand_kind,
         operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
         route_params,
     )
 }
@@ -1968,8 +1998,22 @@ fn native_int_operation_is_direct(
     operand_json: Option<&str>,
     operand_kind: Option<&str>,
     operand_name: Option<&str>,
+    secondary_operand_kind: Option<&str>,
+    secondary_operand_name: Option<&str>,
     route_params: &[String],
 ) -> bool {
+    if secondary_operand_kind.is_some() || secondary_operand_name.is_some() {
+        return matches!(op, Some("add_product" | "sub_product" | "rsub_product"))
+            && operand_json.is_none()
+            && operand_kind.zip(operand_name).is_some_and(|(kind, name)| {
+                native_captured_int_operand_is_direct(kind, name, route_params)
+            })
+            && secondary_operand_kind
+                .zip(secondary_operand_name)
+                .is_some_and(|(kind, name)| {
+                    native_captured_int_operand_is_direct(kind, name, route_params)
+                });
+    }
     match (op, operand_json, operand_kind, operand_name) {
         (Some("neg"), None, None, None) => true,
         (
@@ -2012,8 +2056,22 @@ fn native_float_operation_is_direct(
     operand_json: Option<&str>,
     operand_kind: Option<&str>,
     operand_name: Option<&str>,
+    secondary_operand_kind: Option<&str>,
+    secondary_operand_name: Option<&str>,
     route_params: &[String],
 ) -> bool {
+    if secondary_operand_kind.is_some() || secondary_operand_name.is_some() {
+        return matches!(op, Some("add_product" | "sub_product" | "rsub_product"))
+            && operand_json.is_none()
+            && operand_kind.zip(operand_name).is_some_and(|(kind, name)| {
+                native_captured_float_operand_is_direct(kind, name, route_params)
+            })
+            && secondary_operand_kind
+                .zip(secondary_operand_name)
+                .is_some_and(|(kind, name)| {
+                    native_captured_float_operand_is_direct(kind, name, route_params)
+                });
+    }
     match (op, operand_json, operand_kind, operand_name) {
         (Some("neg"), None, None, None) => true,
         (
@@ -2951,6 +3009,8 @@ struct NativeCapturedJsonOperation<'a> {
     operand_json: Option<&'a str>,
     operand_kind: Option<&'a str>,
     operand_name: Option<&'a str>,
+    secondary_operand_kind: Option<&'a str>,
+    secondary_operand_name: Option<&'a str>,
 }
 
 fn native_response_field_operation(
@@ -2961,6 +3021,8 @@ fn native_response_field_operation(
         operand_json: field.operand_json.as_deref(),
         operand_kind: field.operand_kind.as_deref(),
         operand_name: field.operand_name.as_deref(),
+        secondary_operand_kind: field.secondary_operand_kind.as_deref(),
+        secondary_operand_name: field.secondary_operand_name.as_deref(),
     }
 }
 
@@ -2972,6 +3034,8 @@ fn native_response_object_field_operation(
         operand_json: field.operand_json.as_deref(),
         operand_kind: field.operand_kind.as_deref(),
         operand_name: field.operand_name.as_deref(),
+        secondary_operand_kind: field.secondary_operand_kind.as_deref(),
+        secondary_operand_name: field.secondary_operand_name.as_deref(),
     }
 }
 
@@ -2983,6 +3047,8 @@ fn native_route_param_operation(
         operand_json: field.operand_json.as_deref(),
         operand_kind: field.operand_kind.as_deref(),
         operand_name: field.operand_name.as_deref(),
+        secondary_operand_kind: field.secondary_operand_kind.as_deref(),
+        secondary_operand_name: field.secondary_operand_name.as_deref(),
     }
 }
 
@@ -2994,6 +3060,8 @@ fn native_query_param_operation(
         operand_json: field.operand_json.as_deref(),
         operand_kind: field.operand_kind.as_deref(),
         operand_name: field.operand_name.as_deref(),
+        secondary_operand_kind: field.secondary_operand_kind.as_deref(),
+        secondary_operand_name: field.secondary_operand_name.as_deref(),
     }
 }
 
@@ -3093,6 +3161,7 @@ fn native_bool_json_outputs(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let invert = match (op, operand_json, operand_kind, operand_name) {
         (None, None, None, None) => false,
@@ -3149,6 +3218,7 @@ fn push_native_bool_captured_operand_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let (
         Some(op @ ("eq" | "ne" | "and" | "or" | "not_and" | "not_or" | "and_not" | "or_not")),
@@ -3225,6 +3295,7 @@ fn push_native_string_comparison_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let Some(operator) = native_comparison_operator(op) else {
         return false;
@@ -3268,6 +3339,7 @@ fn push_native_string_concat_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     if op != Some("concat") {
         return false;
@@ -3312,6 +3384,7 @@ fn push_native_string_prefix_concat_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let (Some("concat_prefix"), Some(prefix), None, None) =
         (op, operand_json, operand_kind, operand_name)
@@ -3343,6 +3416,7 @@ fn push_native_string_affix_concat_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let (Some("concat_affix"), Some(operand), None, None) =
         (op, operand_json, operand_kind, operand_name)
@@ -3382,6 +3456,7 @@ fn push_native_string_join_concat_json_value(
         operand_json,
         operand_kind,
         operand_name,
+        ..
     } = operation;
     let (Some("concat_join"), Some(separator), Some(kind), Some(name)) =
         (op, operand_json, operand_kind, operand_name)
@@ -3432,7 +3507,20 @@ fn push_native_float_success_arm(
         operand_json,
         operand_kind,
         operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
     } = operation;
+    if matches!(op, Some("add_product" | "sub_product" | "rsub_product"))
+        || secondary_operand_kind.is_some()
+        || secondary_operand_name.is_some()
+    {
+        return push_native_float_product_arithmetic_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
     match (op, operand_json, operand_kind, operand_name) {
         (None, None, None, None) => {
             source.push_str(
@@ -3593,6 +3681,90 @@ fn push_native_float_success_arm(
     }
 }
 
+fn push_native_float_product_arithmetic_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    } = operation;
+    let (
+        Some(op @ ("add_product" | "sub_product" | "rsub_product")),
+        None,
+        Some(operand_kind),
+        Some(operand_name),
+        Some(secondary_operand_kind),
+        Some(secondary_operand_name),
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(operand_lookup) = native_float_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let Some(secondary_operand_lookup) =
+        native_float_operand_lookup_expr(secondary_operand_kind, secondary_operand_name)
+    else {
+        return false;
+    };
+    let value_expr = match op {
+        "add_product" => "value + operand",
+        "sub_product" => "value - operand",
+        "rsub_product" => "operand - value",
+        _ => return false,
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} float arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} float operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) if value.is_finite() => match {operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                Ok(product_left) if product_left.is_finite() => match {secondary_operand_lookup}.unwrap_or(\"\").trim().parse::<f64>() {{"
+    );
+    source.push_str("                    Ok(product_right) if product_right.is_finite() => {\n");
+    source.push_str("                        let operand = product_left * product_right;\n");
+    source.push_str("                        if operand.is_finite() {\n");
+    let _ = writeln!(
+        source,
+        "                            let value = {value_expr};"
+    );
+    source.push_str(
+        "                            if value.is_finite() {\n                                body.push_str(&value.to_string());\n                            } else {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                            }\n                        } else {\n");
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str(
+        "                        }\n                    },\n                    _ => {\n",
+    );
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                    },\n                },\n                _ => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
+}
+
 fn push_native_float_static_comparison_success_arm(
     source: &mut String,
     op: Option<&str>,
@@ -3739,7 +3911,20 @@ fn push_native_int_success_arm(
         operand_json,
         operand_kind,
         operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
     } = operation;
+    if matches!(op, Some("add_product" | "sub_product" | "rsub_product"))
+        || secondary_operand_kind.is_some()
+        || secondary_operand_name.is_some()
+    {
+        return push_native_int_product_arithmetic_success_arm(
+            source,
+            operation,
+            error_prefix,
+            response_origin_id,
+        );
+    }
     match (op, operand_json, operand_kind, operand_name) {
         (None, None, None, None) => {
             source.push_str("            Ok(value) => body.push_str(&value.to_string()),\n");
@@ -3975,6 +4160,88 @@ fn push_native_int_success_arm(
         }
         _ => false,
     }
+}
+
+fn push_native_int_product_arithmetic_success_arm(
+    source: &mut String,
+    operation: NativeCapturedJsonOperation<'_>,
+    error_prefix: &str,
+    response_origin_id: &str,
+) -> bool {
+    let NativeCapturedJsonOperation {
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    } = operation;
+    let (
+        Some(op @ ("add_product" | "sub_product" | "rsub_product")),
+        None,
+        Some(operand_kind),
+        Some(operand_name),
+        Some(secondary_operand_kind),
+        Some(secondary_operand_name),
+    ) = (
+        op,
+        operand_json,
+        operand_kind,
+        operand_name,
+        secondary_operand_kind,
+        secondary_operand_name,
+    )
+    else {
+        return false;
+    };
+    let Some(operand_lookup) = native_int_operand_lookup_expr(operand_kind, operand_name) else {
+        return false;
+    };
+    let Some(secondary_operand_lookup) =
+        native_int_operand_lookup_expr(secondary_operand_kind, secondary_operand_name)
+    else {
+        return false;
+    };
+    let (receiver, method, argument) = match op {
+        "add_product" => ("value", "checked_add", "operand"),
+        "sub_product" => ("value", "checked_sub", "operand"),
+        "rsub_product" => ("operand", "checked_sub", "value"),
+        _ => return false,
+    };
+    let arithmetic_error_body = format!(r#"{{"error":"{error_prefix} int arithmetic failed"}}"#);
+    let arithmetic_body_expr = format!(
+        "{}.to_string()",
+        rust_string_literal(&arithmetic_error_body)
+    );
+    let cast_error_body = format!(r#"{{"error":"{error_prefix} int operand cast failed"}}"#);
+    let cast_body_expr = format!("{}.to_string()", rust_string_literal(&cast_error_body));
+    let _ = writeln!(
+        source,
+        "            Ok(value) => match {operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    let _ = writeln!(
+        source,
+        "                Ok(product_left) => match {secondary_operand_lookup}.unwrap_or(\"\").trim().parse::<i64>() {{"
+    );
+    source.push_str("                    Ok(product_right) => match product_left.checked_mul(product_right) {\n");
+    let _ = writeln!(
+        source,
+        "                        Some(operand) => match {receiver}.{method}({argument}) {{"
+    );
+    source.push_str(
+        "                            Some(value) => body.push_str(&value.to_string()),\n                            None => {\n",
+    );
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str("                            },\n                        },\n                        None => {\n");
+    push_native_handler_response_return(source, 500, &arithmetic_body_expr, response_origin_id);
+    source.push_str(
+        "                        },\n                    },\n                    Err(_) => {\n",
+    );
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                    },\n                },\n                Err(_) => {\n");
+    push_native_handler_response_return(source, 500, &cast_body_expr, response_origin_id);
+    source.push_str("                },\n            },\n");
+    true
 }
 
 fn push_native_int_static_comparison_success_arm(
@@ -5035,6 +5302,8 @@ fn route_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseRoutePar
                     operand_json: value.operand_json,
                     operand_kind: value.operand_kind,
                     operand_name: value.operand_name,
+                    secondary_operand_kind: value.secondary_operand_kind,
+                    secondary_operand_name: value.secondary_operand_name,
                 });
             }
             Some(out)
@@ -5061,6 +5330,8 @@ fn query_param_json_payload(expr: &HirExpr) -> Option<Vec<ServerResponseQueryPar
                     operand_json: value.operand_json,
                     operand_kind: value.operand_kind,
                     operand_name: value.operand_name,
+                    secondary_operand_kind: value.secondary_operand_kind,
+                    secondary_operand_name: value.secondary_operand_name,
                 });
             }
             Some(out)
@@ -5108,6 +5379,8 @@ fn request_body_field_json_payload(
                     operand_json: value.operand_json,
                     operand_kind: value.operand_kind,
                     operand_name: value.operand_name,
+                    secondary_operand_kind: value.secondary_operand_kind,
+                    secondary_operand_name: value.secondary_operand_name,
                 });
             }
             Some(out)
@@ -5171,6 +5444,8 @@ fn mixed_response_object_field(
                 operand_json: None,
                 operand_kind: None,
                 operand_name: None,
+                secondary_operand_kind: None,
+                secondary_operand_name: None,
             },
             ResponseObjectFieldSource::Static,
         ));
@@ -5187,6 +5462,8 @@ fn mixed_response_object_field(
                 operand_json: value.operand_json,
                 operand_kind: value.operand_kind,
                 operand_name: value.operand_name,
+                secondary_operand_kind: value.secondary_operand_kind,
+                secondary_operand_name: value.secondary_operand_name,
             },
             ResponseObjectFieldSource::RouteParam,
         ));
@@ -5203,6 +5480,8 @@ fn mixed_response_object_field(
                 operand_json: value.operand_json,
                 operand_kind: value.operand_kind,
                 operand_name: value.operand_name,
+                secondary_operand_kind: value.secondary_operand_kind,
+                secondary_operand_name: value.secondary_operand_name,
             },
             ResponseObjectFieldSource::QueryParam,
         ));
@@ -5219,6 +5498,8 @@ fn mixed_response_object_field(
                 operand_json: None,
                 operand_kind: None,
                 operand_name: None,
+                secondary_operand_kind: None,
+                secondary_operand_name: None,
             },
             ResponseObjectFieldSource::RequestBody,
         ));
@@ -5235,6 +5516,8 @@ fn mixed_response_object_field(
                 operand_json: value.operand_json,
                 operand_kind: value.operand_kind,
                 operand_name: value.operand_name,
+                secondary_operand_kind: value.secondary_operand_kind,
+                secondary_operand_name: value.secondary_operand_name,
             },
             ResponseObjectFieldSource::RequestBodyField,
         ));
@@ -5449,6 +5732,19 @@ struct CapturedResponseValue {
     operand_json: Option<String>,
     operand_kind: Option<String>,
     operand_name: Option<String>,
+    secondary_operand_kind: Option<String>,
+    secondary_operand_name: Option<String>,
+}
+
+impl CapturedResponseValue {
+    fn has_operation(&self) -> bool {
+        self.op.is_some()
+            || self.operand_json.is_some()
+            || self.operand_kind.is_some()
+            || self.operand_name.is_some()
+            || self.secondary_operand_kind.is_some()
+            || self.secondary_operand_name.is_some()
+    }
 }
 
 fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseValue {
@@ -5459,7 +5755,25 @@ fn captured_response_value(name: String, value_kind: &str) -> CapturedResponseVa
         operand_json: None,
         operand_kind: None,
         operand_name: None,
+        secondary_operand_kind: None,
+        secondary_operand_name: None,
     }
+}
+
+fn captured_response_value_with_product_operand(
+    mut value: CapturedResponseValue,
+    op: &str,
+    operand_kind: String,
+    operand_name: String,
+    secondary_operand_kind: String,
+    secondary_operand_name: String,
+) -> CapturedResponseValue {
+    value.op = Some(op.to_string());
+    value.operand_kind = Some(operand_kind);
+    value.operand_name = Some(operand_name);
+    value.secondary_operand_kind = Some(secondary_operand_kind);
+    value.secondary_operand_name = Some(secondary_operand_name);
+    value
 }
 
 fn captured_numeric_response_operation(
@@ -5467,7 +5781,7 @@ fn captured_numeric_response_operation(
     op: BinaryOp,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some() {
+    if value.has_operation() {
         return None;
     }
     value.op = Some(
@@ -5509,6 +5823,23 @@ fn captured_numeric_response_operation(
                 return Some(value);
             }
         }
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            if let Some(operand) = captured_product_integer_operand(rhs) {
+                let op_name = match op {
+                    BinaryOp::Add => "add_product",
+                    BinaryOp::Sub => "sub_product",
+                    _ => return None,
+                };
+                return Some(captured_response_value_with_product_operand(
+                    value,
+                    op_name,
+                    operand.lhs_value_kind,
+                    operand.lhs_name,
+                    operand.rhs_value_kind,
+                    operand.rhs_name,
+                ));
+            }
+        }
         let operand = captured_integer_operand(rhs)?;
         value.operand_kind = Some(operand.value_kind);
         value.operand_name = Some(operand.name);
@@ -5539,6 +5870,23 @@ fn captured_numeric_response_operation(
                 value.operand_kind = Some(operand.value_kind);
                 value.operand_name = Some(operand.name);
                 return Some(value);
+            }
+        }
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            if let Some(operand) = captured_product_float_operand(rhs) {
+                let op_name = match op {
+                    BinaryOp::Add => "add_product",
+                    BinaryOp::Sub => "sub_product",
+                    _ => return None,
+                };
+                return Some(captured_response_value_with_product_operand(
+                    value,
+                    op_name,
+                    operand.lhs_value_kind,
+                    operand.lhs_name,
+                    operand.rhs_value_kind,
+                    operand.rhs_name,
+                ));
             }
         }
         let operand = captured_float_operand(rhs)?;
@@ -5586,6 +5934,9 @@ fn captured_add_response_operation(
     if let Some(value) = captured_scaled_left_add_response_operation(&value, lhs) {
         return Some(value);
     }
+    if let Some(value) = captured_product_left_add_response_operation(&value, lhs) {
+        return Some(value);
+    }
     captured_static_left_numeric_arithmetic_response_operation(value, BinaryOp::Add, lhs)
 }
 
@@ -5610,6 +5961,11 @@ fn captured_ordered_arithmetic_response_operation(
     };
     if let Some(value) = scaled_left {
         return Some(value);
+    }
+    if matches!(op, BinaryOp::Sub) {
+        if let Some(value) = captured_product_left_sub_response_operation(&value, lhs) {
+            return Some(value);
+        }
     }
     captured_static_left_numeric_arithmetic_response_operation(value, op, lhs)
 }
@@ -5636,7 +5992,7 @@ fn captured_string_concat_response_operation(
     mut value: CapturedResponseValue,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+    if value.has_operation() {
         return None;
     }
     value.op = Some("concat".to_string());
@@ -5654,9 +6010,7 @@ fn captured_string_prefix_concat_response_operation(
     mut value: CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
+    if value.has_operation()
         || !matches!(
             value.value_kind.as_str(),
             "route_param" | "query_param" | "request_body_field"
@@ -5692,9 +6046,7 @@ fn captured_string_interpolation_response_operation(
         }
     }
     let mut value = value?;
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
+    if value.has_operation()
         || !matches!(
             value.value_kind.as_str(),
             "route_param" | "query_param" | "request_body_field"
@@ -5745,10 +6097,7 @@ fn captured_joined_string_interpolation_response_operation(
         return None;
     }
     let mut value = captured_value(captures[0])?;
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
+    if value.has_operation()
         || !matches!(
             value.value_kind.as_str(),
             "route_param" | "query_param" | "request_body_field"
@@ -5769,7 +6118,7 @@ fn captured_static_left_numeric_arithmetic_response_operation(
     op: BinaryOp,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+    if value.has_operation() {
         return None;
     }
     value.op = Some(
@@ -5799,11 +6148,7 @@ fn captured_scaled_left_add_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
@@ -5825,15 +6170,43 @@ fn captured_scaled_left_add_response_operation(
     None
 }
 
+fn captured_product_left_add_response_operation(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.has_operation() {
+        return None;
+    }
+    if value.value_kind.ends_with("_int") {
+        let operand = captured_product_integer_operand(lhs)?;
+        return Some(captured_response_value_with_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            "add_product",
+            operand.lhs_value_kind,
+            operand.lhs_name,
+            operand.rhs_value_kind,
+            operand.rhs_name,
+        ));
+    }
+    if value.value_kind.ends_with("_float") {
+        let operand = captured_product_float_operand(lhs)?;
+        return Some(captured_response_value_with_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            "add_product",
+            operand.lhs_value_kind,
+            operand.lhs_name,
+            operand.rhs_value_kind,
+            operand.rhs_name,
+        ));
+    }
+    None
+}
+
 fn captured_scaled_left_sub_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
@@ -5855,15 +6228,43 @@ fn captured_scaled_left_sub_response_operation(
     None
 }
 
+fn captured_product_left_sub_response_operation(
+    value: &CapturedResponseValue,
+    lhs: &HirExpr,
+) -> Option<CapturedResponseValue> {
+    if value.has_operation() {
+        return None;
+    }
+    if value.value_kind.ends_with("_int") {
+        let operand = captured_product_integer_operand(lhs)?;
+        return Some(captured_response_value_with_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            "rsub_product",
+            operand.lhs_value_kind,
+            operand.lhs_name,
+            operand.rhs_value_kind,
+            operand.rhs_name,
+        ));
+    }
+    if value.value_kind.ends_with("_float") {
+        let operand = captured_product_float_operand(lhs)?;
+        return Some(captured_response_value_with_product_operand(
+            captured_response_value(value.name.clone(), &value.value_kind),
+            "rsub_product",
+            operand.lhs_value_kind,
+            operand.lhs_name,
+            operand.rhs_value_kind,
+            operand.rhs_name,
+        ));
+    }
+    None
+}
+
 fn captured_scaled_left_mul_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
@@ -5889,11 +6290,7 @@ fn captured_scaled_left_div_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
@@ -5919,11 +6316,7 @@ fn captured_scaled_left_rem_response_operation(
     value: &CapturedResponseValue,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let mut value = captured_response_value(value.name.clone(), &value.value_kind);
@@ -5950,11 +6343,7 @@ fn captured_scaled_left_comparison_response_operation(
     op: BinaryOp,
     lhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-    {
+    if value.has_operation() {
         return None;
     }
     let op_name = captured_numeric_comparison_op_name(op)?;
@@ -5980,10 +6369,7 @@ fn captured_scaled_left_comparison_response_operation(
 fn captured_numeric_neg_response_operation(
     mut value: CapturedResponseValue,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
+    if value.has_operation()
         || !(value.value_kind.ends_with("_int") || value.value_kind.ends_with("_float"))
     {
         return None;
@@ -6057,7 +6443,7 @@ fn captured_string_comparison_response_operation(
     op: BinaryOp,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+    if value.has_operation() {
         return None;
     }
     value.op = Some(
@@ -6083,7 +6469,7 @@ fn captured_numeric_comparison_response_operation(
     op: BinaryOp,
     rhs: &HirExpr,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some() || value.operand_json.is_some() || value.operand_kind.is_some() {
+    if value.has_operation() {
         return None;
     }
     let op_name = captured_numeric_comparison_op_name(op)?;
@@ -6140,12 +6526,7 @@ fn captured_numeric_comparison_op_name(op: BinaryOp) -> Option<&'static str> {
 fn captured_bool_response_operation(
     mut value: CapturedResponseValue,
 ) -> Option<CapturedResponseValue> {
-    if value.op.is_some()
-        || value.operand_json.is_some()
-        || value.operand_kind.is_some()
-        || value.operand_name.is_some()
-        || !value.value_kind.ends_with("_bool")
-    {
+    if value.has_operation() || !value.value_kind.ends_with("_bool") {
         return None;
     }
     value.op = Some("not".to_string());
@@ -6160,6 +6541,8 @@ fn captured_bool_comparison_response_operation(
     if value.operand_json.is_some()
         || value.operand_kind.is_some()
         || value.operand_name.is_some()
+        || value.secondary_operand_kind.is_some()
+        || value.secondary_operand_name.is_some()
         || !value.value_kind.ends_with("_bool")
     {
         return None;
@@ -6217,6 +6600,13 @@ struct CapturedScaledIntegerOperand {
     scale: i64,
 }
 
+struct CapturedProductIntegerOperand {
+    lhs_value_kind: String,
+    lhs_name: String,
+    rhs_value_kind: String,
+    rhs_name: String,
+}
+
 struct CapturedFloatOperand {
     value_kind: String,
     name: String,
@@ -6226,6 +6616,13 @@ struct CapturedScaledFloatOperand {
     value_kind: String,
     name: String,
     scale: String,
+}
+
+struct CapturedProductFloatOperand {
+    lhs_value_kind: String,
+    lhs_name: String,
+    rhs_value_kind: String,
+    rhs_name: String,
 }
 
 struct CapturedBoolOperand {
@@ -6306,6 +6703,27 @@ fn captured_scaled_integer_operand(expr: &HirExpr) -> Option<CapturedScaledInteg
     }
 }
 
+fn captured_product_integer_operand(expr: &HirExpr) -> Option<CapturedProductIntegerOperand> {
+    match &expr.kind {
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            let lhs = captured_integer_operand(lhs)?;
+            let rhs = captured_integer_operand(rhs)?;
+            Some(CapturedProductIntegerOperand {
+                lhs_value_kind: lhs.value_kind,
+                lhs_name: lhs.name,
+                rhs_value_kind: rhs.value_kind,
+                rhs_name: rhs.name,
+            })
+        }
+        HirExprKind::Paren(expr) => captured_product_integer_operand(expr),
+        _ => None,
+    }
+}
+
 fn captured_float_operand(expr: &HirExpr) -> Option<CapturedFloatOperand> {
     if let Some(name) = captured_route_param_float_name(expr) {
         return Some(CapturedFloatOperand {
@@ -6351,6 +6769,27 @@ fn captured_scaled_float_operand(expr: &HirExpr) -> Option<CapturedScaledFloatOp
             })
         }
         HirExprKind::Paren(expr) => captured_scaled_float_operand(expr),
+        _ => None,
+    }
+}
+
+fn captured_product_float_operand(expr: &HirExpr) -> Option<CapturedProductFloatOperand> {
+    match &expr.kind {
+        HirExprKind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            let lhs = captured_float_operand(lhs)?;
+            let rhs = captured_float_operand(rhs)?;
+            Some(CapturedProductFloatOperand {
+                lhs_value_kind: lhs.value_kind,
+                lhs_name: lhs.name,
+                rhs_value_kind: rhs.value_kind,
+                rhs_name: rhs.name,
+            })
+        }
+        HirExprKind::Paren(expr) => captured_product_float_operand(expr),
         _ => None,
     }
 }
@@ -9855,6 +10294,70 @@ function greet(name: string): string -> "hi {name}""#,
             Some("2")
         );
         assert!(handlers.contains("operand.checked_mul(2)"));
+        assert!(handlers.contains("value.checked_add(operand)"));
+        assert!(!handlers.contains("native route body lowering pending"));
+        assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
+        assert!(!launcher.contains("fn orv_native_reference_bridge("));
+        assert!(!launcher.contains(r#"std::process::Command::new("orv")"#));
+    }
+
+    #[test]
+    fn native_server_launcher_lowers_nested_product_int_add_response_body() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /orders {
+    @respond 201 { total: (@body.fee as int) + ((@body.quantity as int) * (@body.unit_price as int)) }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let response = &artifact.routes[0].responses[0];
+        let handlers = native_server_handlers_source(&artifact);
+        let launcher = native_server_launcher_source(
+            "server/app.orv-runtime.json",
+            "server/native-server.json",
+            &artifact,
+        );
+
+        assert_eq!(response.body_kind, "request_body_field_json");
+        assert_eq!(response.body_request_fields[0].field, "total");
+        assert_eq!(response.body_request_fields[0].name, "fee");
+        assert_eq!(
+            response.body_request_fields[0].value_kind,
+            "request_body_field_int"
+        );
+        assert_eq!(
+            response.body_request_fields[0].op.as_deref(),
+            Some("add_product")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_kind.as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0].operand_name.as_deref(),
+            Some("quantity")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .secondary_operand_kind
+                .as_deref(),
+            Some("request_body_field_int")
+        );
+        assert_eq!(
+            response.body_request_fields[0]
+                .secondary_operand_name
+                .as_deref(),
+            Some("unit_price")
+        );
+        assert!(handlers.contains("routes::orv_native_body_field_value(route_match, \"quantity\")"));
+        assert!(
+            handlers.contains("routes::orv_native_body_field_value(route_match, \"unit_price\")")
+        );
+        assert!(handlers.contains("product_left.checked_mul(product_right)"));
         assert!(handlers.contains("value.checked_add(operand)"));
         assert!(!handlers.contains("native route body lowering pending"));
         assert!(launcher.contains("fn orv_native_serve() -> std::io::Result<()>"));
@@ -13392,7 +13895,7 @@ function greet(name: string): string -> "hi {name}""#,
         let src = r"@server {
   @listen 8080
   @route POST /echo {
-    @respond 201 { received: (@body.id as int) + ((@body.bonus as int) * (@body.scale as int)) }
+    @respond 201 { received: (@body.id as int) + (((@body.bonus as int) * (@body.scale as int)) * (@body.extra as int)) }
   }
 }";
         let program = lower(src);
