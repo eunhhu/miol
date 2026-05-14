@@ -150,7 +150,7 @@ For interactive client entries, `client/manifest.json` binds the page, reactive 
 
 Reveal/editor/LSP client-origin production payloads also forward the manifest capability inventory, so native editor and LSP surfaces can show supported client runtime surfaces without rereading `client/manifest.json`.
 Production deploy manifests mirror that same inventory as `client.capabilities` plus `client.blocked_by`/`client.blockers`, and `orv verify-build` rejects deploy/client manifest drift for both capability and blocker metadata.
-For server+client production builds, static/client initial render filters out top-level `@server` declarations so build does not bind the production listen socket, the generated deploy runbook documents the client manifest/page/loader/WASM paths, runtime, capability surfaces, and blocker summary, and the generated deploy smoke test checks those client files plus page marker, loader reference, manifest capabilities, and loader bootstrap strings. `orv verify-build` rejects smoke-test drift from that client bundle contract.
+For server+client production builds, static/client initial render filters out top-level `@server` declarations so build does not bind the production listen socket, the generated deploy runbook documents the client manifest/page/loader/WASM paths, runtime, capability surfaces, and blocker summary, and the generated deploy smoke test changes to its own build directory before checking those client files plus page marker, loader reference, manifest capabilities, and loader bootstrap strings. `orv verify-build` rejects smoke-test drift from that client bundle contract.
 
 ## DB Operations
 

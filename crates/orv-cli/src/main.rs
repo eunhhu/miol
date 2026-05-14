@@ -21029,6 +21029,9 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must check curl availability");
     }
+    if !smoke.contains("ORV_SMOKE_BUILD_DIR=") || !smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#) {
+        anyhow::bail!("deploy smoke test must run from its build directory");
+    }
     if !smoke.contains("orv_smoke_curl()") || !smoke.contains("orv deploy smoke test failed: %s") {
         anyhow::bail!("deploy smoke test must label failed curl steps");
     }
@@ -27024,6 +27027,9 @@ fn write_prod_smoke_test_artifact(
     let mut script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+ORV_SMOKE_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+ORV_SMOKE_BUILD_DIR=$(CDPATH= cd "$ORV_SMOKE_SCRIPT_DIR/.." && pwd)
+cd "$ORV_SMOKE_BUILD_DIR"
 BASE_URL="${{ORV_BASE_URL:-{}}}"
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -40396,6 +40402,8 @@ let sig count: int = 0
         let smoke_path = out.join("deploy").join("smoke-test.sh");
         let smoke = std::fs::read_to_string(&smoke_path).expect("deploy smoke test");
 
+        assert!(smoke.contains("ORV_SMOKE_BUILD_DIR="));
+        assert!(smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#));
         assert!(smoke.contains("orv_smoke_file()"));
         assert!(smoke.contains("orv_smoke_grep()"));
         assert!(smoke.contains(r#"orv_smoke_file "client/manifest.json""#));
