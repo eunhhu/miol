@@ -66,6 +66,8 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 | `orv init <dir> --template shop`, `orv dev`, `orv build --prod` | full native compiler and optimized client runtime |
 | `orv deploy-env-check`, generated smoke-test | advanced cloud object storage/provider matrix |
 
+Generated smoke tests are part of the MVP contract: production builds should check reachable server routes, the reference shop checkout/admin flow, and interactive client bundle files/markers before a non-developer treats a build as deployable.
+
 ## 통합 플랫폼의 네 레이어
 
 ```

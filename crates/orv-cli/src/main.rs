@@ -20735,7 +20735,13 @@ fn verify_deploy_server_target(
     verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
     verify_deploy_db_adapters_artifact(dir, db_adapters, artifact_path, &persistence)?;
     verify_deploy_commerce_adapters_artifact(dir, commerce_adapters, artifact_path, &persistence)?;
-    verify_deploy_smoke_test_artifact(dir, smoke_test, artifact.listen.as_ref(), &artifact)?;
+    verify_deploy_smoke_test_artifact(
+        dir,
+        smoke_test,
+        artifact.listen.as_ref(),
+        &artifact,
+        client,
+    )?;
     verify_deploy_runbook_artifact(
         dir,
         runbook,
@@ -21004,6 +21010,7 @@ fn verify_deploy_smoke_test_artifact(
     path: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
     artifact: &orv_compiler::ServerRuntimeArtifact,
+    client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let smoke_path = dir.join(path);
     if !smoke_path.is_file() {
@@ -21025,6 +21032,7 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke.contains("orv_smoke_curl()") || !smoke.contains("orv deploy smoke test failed: %s") {
         anyhow::bail!("deploy smoke test must label failed curl steps");
     }
+    verify_deploy_smoke_client_contract(&smoke, client)?;
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
         if !smoke.contains(&ready_assignment) {
@@ -21061,6 +21069,39 @@ fn verify_deploy_smoke_test_artifact(
         }
         if !smoke.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke member handle");
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_smoke_client_contract(
+    smoke: &str,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(client) = client.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if !smoke.contains("orv_smoke_file()") || !smoke.contains("orv_smoke_grep()") {
+        anyhow::bail!("deploy smoke test must include client file contract helpers");
+    }
+    for key in ["manifest", "page", "loader", "wasm"] {
+        let path = json_str(client, key, "deploy client")?;
+        let command = format!(r#"orv_smoke_file "{path}""#);
+        if !smoke.contains(&command) {
+            anyhow::bail!("deploy smoke test must check client {key} {path}");
+        }
+    }
+    let page = json_str(client, "page", "deploy client")?;
+    let loader = json_str(client, "loader", "deploy client")?;
+    let manifest = json_str(client, "manifest", "deploy client")?;
+    for required in [
+        format!(r#"orv_smoke_grep "client page marker" "{page}" 'data-orv-client="wasm"'"#),
+        format!(r#"orv_smoke_grep "client loader reference" "{page}" 'app.js'"#),
+        format!(r#"orv_smoke_grep "client manifest capabilities" "{manifest}" '"capabilities"'"#),
+        format!(r#"orv_smoke_grep "client loader bootstrap" "{loader}" 'ORV_CLIENT_BOOTSTRAP'"#),
+    ] {
+        if !smoke.contains(&required) {
+            anyhow::bail!("deploy smoke test must include {required}");
         }
     }
     Ok(())
@@ -26758,7 +26799,7 @@ fn write_prod_deploy_artifacts(
             targets.server_artifact,
             &persistence,
         )?;
-        write_prod_smoke_test_artifact(out, smoke_test, server_artifact)?;
+        write_prod_smoke_test_artifact(out, smoke_test, server_artifact, &client)?;
         write_prod_deploy_runbook(
             out,
             &DeployRunbookArtifacts {
@@ -26978,6 +27019,7 @@ fn write_prod_smoke_test_artifact(
     out: &Path,
     path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    client: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let mut script = format!(
         r#"#!/usr/bin/env sh
@@ -27001,6 +27043,7 @@ orv_smoke_curl() {{
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
+    script.push_str(&deploy_smoke_client_contract_section(client));
     if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
         let _ = writeln!(
             script,
@@ -27049,6 +27092,46 @@ orv_smoke_curl "GET /admin/summary" "$BASE_URL/admin/summary"
     let target = out.join(path);
     write_text(&target, &script)?;
     set_executable_if_supported(&target)
+}
+
+fn deploy_smoke_client_contract_section(client: &serde_json::Value) -> String {
+    if client.is_null() {
+        return String::new();
+    }
+    let manifest = json_str_or_empty(client, "manifest");
+    let page = json_str_or_empty(client, "page");
+    let loader = json_str_or_empty(client, "loader");
+    let wasm = json_str_or_empty(client, "wasm");
+    format!(
+        r#"orv_smoke_file() {{
+  path="$1"
+  if [ ! -f "$path" ]; then
+    printf 'orv deploy smoke test missing file: %s\n' "$path" >&2
+    exit 1
+  fi
+}}
+
+orv_smoke_grep() {{
+  label="$1"
+  path="$2"
+  pattern="$3"
+  if ! grep -F "$pattern" "$path" >/dev/null; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
+orv_smoke_file "{manifest}"
+orv_smoke_file "{page}"
+orv_smoke_file "{loader}"
+orv_smoke_file "{wasm}"
+orv_smoke_grep "client page marker" "{page}" 'data-orv-client="wasm"'
+orv_smoke_grep "client loader reference" "{page}" 'app.js'
+orv_smoke_grep "client manifest capabilities" "{manifest}" '"capabilities"'
+orv_smoke_grep "client loader bootstrap" "{loader}" 'ORV_CLIENT_BOOTSTRAP'
+
+"#
+    )
 }
 
 fn write_prod_deploy_runbook(
@@ -40282,6 +40365,64 @@ let sig count: int = 0
         assert!(
             err.to_string()
                 .contains("deploy runbook must document client capability surface signal_text"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn build_prod_smoke_test_documents_client_bundle_contract() {
+        let dir = temp_output_dir("build-prod-client-smoke-source");
+        std::fs::create_dir_all(&dir).expect("create temp root");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}
+
+let sig count: int = 0
+@out @html { @body { @p count } }
+"#,
+        )
+        .expect("write source");
+        let out = temp_output_dir("build-prod-client-smoke");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("deploy smoke test");
+
+        assert!(smoke.contains("orv_smoke_file()"));
+        assert!(smoke.contains("orv_smoke_grep()"));
+        assert!(smoke.contains(r#"orv_smoke_file "client/manifest.json""#));
+        assert!(smoke.contains(r#"orv_smoke_file "pages/index.html""#));
+        assert!(smoke.contains(r#"orv_smoke_file "client/app.js""#));
+        assert!(smoke.contains(r#"orv_smoke_file "client/app.wasm""#));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client page marker" "pages/index.html" 'data-orv-client="wasm"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest capabilities" "client/manifest.json" '"capabilities"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader bootstrap" "client/app.js" 'ORV_CLIENT_BOOTSTRAP'"#
+        ));
+        cmd_verify_build(&out).expect("verify client smoke test");
+
+        write_text(
+            &smoke_path,
+            &smoke.replace("ORV_CLIENT_BOOTSTRAP", "ORV_CLIENT_BOOT"),
+        )
+        .expect("write corrupt smoke test");
+        let err = cmd_verify_build(&out).expect_err("client smoke test mismatch");
+        assert!(
+            err.to_string().contains(
+                r#"deploy smoke test must include orv_smoke_grep "client loader bootstrap""#
+            ),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);
