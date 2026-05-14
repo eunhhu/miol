@@ -20,7 +20,7 @@
 | UI | `@html` 정적 렌더, 일부 `let sig` 기반 client bundle artifact |
 | DB | in-memory table map, JSON snapshot, WAL, SQLite row JSON reference adapter |
 | Commerce | local/file payment and shipping reference adapter, HTTP checked stub, Stripe webhook verification reference path |
-| Shop scaffold | member, cart, catalog, checkout, payment, shipping, admin read models, deploy runbook |
+| Shop scaffold | member, cart, catalog, checkout, payment, shipping, audit rows, admin read models, deploy runbook |
 | Build contract | source bundle, project graph, origin map, server runtime artifact, deploy manifest |
 | Verification | `orv verify-build`, `orv deploy-env-check`, generated smoke-test |
 | Reveal | `orv origins`, `orv graph`, `orv reveal`, LSP/editor reveal payload |

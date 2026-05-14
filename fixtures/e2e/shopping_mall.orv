@@ -156,6 +156,7 @@
             @li { @a href="/admin/payments" "Payment read model" }
             @li { @a href="/admin/shipments" "Shipment read model" }
             @li { @a href="/admin/webhooks" "Webhook read model" }
+            @li { @a href="/admin/audit" "Audit read model" }
             @li { @a href="/products" "Catalog API" }
             @li { @a href="/orders/demo" "Orders by customer" }
             @li { @a href="/shipments/1" "Shipment lookup" }
@@ -170,6 +171,7 @@
             @li "Payment records: data/payments.jsonl"
             @li "Shipment records: data/shipments.jsonl"
             @li "Webhook events: WebhookEvent rows"
+            @li "Audit events: AuditEvent rows"
           }
         }
       }
@@ -183,13 +185,15 @@
     let payments = await shopdb.count("Payment", {})
     let shipments = await shopdb.count("Shipment", {})
     let webhookEvents = await shopdb.count("WebhookEvent", {})
+    let auditEvents = await shopdb.count("AuditEvent", {})
     @respond 200 {
       products: products,
       members: members,
       orders: orders,
       payments: payments,
       shipments: shipments,
-      webhookEvents: webhookEvents
+      webhookEvents: webhookEvents,
+      auditEvents: auditEvents
     }
   }
 
@@ -305,6 +309,20 @@
     }
   }
 
+  @route GET /admin/audit {
+    let auditEvents = await shopdb.findAll("AuditEvent", {})
+    @serve @html {
+      @body {
+        @h1 "Audit Events"
+        @ul {
+          for auditEvent in auditEvents {
+            @li "#{auditEvent.id}: {auditEvent.kind} / {auditEvent.entity} / {auditEvent.status}"
+          }
+        }
+      }
+    }
+  }
+
   @route POST /products {
     let price: int = @body.price as int
     let stock: int = @body.stock as int
@@ -313,6 +331,13 @@
       name: @body.name,
       price: price,
       stock: stock
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "product.create",
+      entity: "Product",
+      entityId: product.id,
+      actor: "admin",
+      status: "recorded"
     })
     @respond 201 { product: product }
   }
@@ -329,6 +354,13 @@
 
   @route POST /members {
     let member = await shopdb.create("Member", @body)
+    await shopdb.create("AuditEvent", {
+      kind: "member.create",
+      entity: "Member",
+      entityId: member.id,
+      actor: member.handle,
+      status: "recorded"
+    })
     @respond 201 { member: member }
   }
 
@@ -349,6 +381,13 @@
       memberId: member.id,
       handle: member.handle,
       status: "active"
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "session.login",
+      entity: "Session",
+      entityId: session.id,
+      actor: member.handle,
+      status: "recorded"
     })
     @respond 201 { session: session, member: member }
   }
@@ -373,6 +412,13 @@
       quantity: quantity,
       status: "active"
     })
+    await shopdb.create("AuditEvent", {
+      kind: "cart.add",
+      entity: "CartItem",
+      entityId: cartItem.id,
+      actor: member.handle,
+      status: "recorded"
+    })
     @respond 201 { cartItem: cartItem, member: member, product: product }
   }
 
@@ -394,6 +440,13 @@
       quantity: quantity,
       total: total,
       status: "reserved"
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "order.reserve",
+      entity: "Order",
+      entityId: order.id,
+      actor: @body.customer,
+      status: "recorded"
     })
     @respond 201 { order: order, remainingStock: remainingStock }
   }
@@ -459,6 +512,27 @@
     })
     await shopdb.update("Order", { id: order.id }, { status: "shipped" })
     let checkoutOrder = await shopdb.find("Order", { id: order.id })
+    await shopdb.create("AuditEvent", {
+      kind: "checkout.complete",
+      entity: "Order",
+      entityId: order.id,
+      actor: member.handle,
+      status: checkoutOrder.status
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "payment.capture",
+      entity: "Payment",
+      entityId: payment.id,
+      actor: member.handle,
+      status: payment.status
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "shipment.book",
+      entity: "Shipment",
+      entityId: shipment.id,
+      actor: member.handle,
+      status: shipment.status
+    })
     @respond 201 {
       order: checkoutOrder,
       payment: payment,
@@ -498,6 +572,13 @@
     })
     await shopdb.update("Order", { id: orderId }, { status: "paid" })
     let paidOrder = await shopdb.find("Order", { id: orderId })
+    await shopdb.create("AuditEvent", {
+      kind: "payment.capture",
+      entity: "Payment",
+      entityId: payment.id,
+      actor: order.customer,
+      status: payment.status
+    })
     @respond 201 { payment: payment, order: paidOrder }
   }
 
@@ -525,6 +606,13 @@
         eventId: eventId
       })
       if existing != void {
+        await shopdb.create("AuditEvent", {
+          kind: "webhook.duplicate",
+          entity: "WebhookEvent",
+          entityId: existing.id,
+          actor: verification.provider,
+          status: existing.status
+        })
         @respond 200 { webhook: existing, verification: verification, duplicate: true }
       }
     }
@@ -533,6 +621,13 @@
       provider: verification.provider,
       status: verification.status,
       signatureScheme: verification.signatureScheme
+    })
+    await shopdb.create("AuditEvent", {
+      kind: "webhook.received",
+      entity: "WebhookEvent",
+      entityId: event.id,
+      actor: verification.provider,
+      status: verification.status
     })
     if verification.status != "verified" {
       @respond 400 { webhook: event, verification: verification, duplicate: false }
@@ -583,6 +678,13 @@
     })
     await shopdb.update("Order", { id: orderId }, { status: "shipped" })
     let shippedOrder = await shopdb.find("Order", { id: orderId })
+    await shopdb.create("AuditEvent", {
+      kind: "shipment.book",
+      entity: "Shipment",
+      entityId: shipment.id,
+      actor: payment.provider,
+      status: shipment.status
+    })
     @respond 201 { shipment: shipment, order: shippedOrder }
   }
 

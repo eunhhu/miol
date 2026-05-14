@@ -2396,9 +2396,9 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
-Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook read-model links, operations summary, and persistent storage paths.\n\
+Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths.\n\
 \n\
-Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, and shipment rows in the SQLite file.\n\
+Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, shipment, webhook, and audit rows in the SQLite file.\n\
 \n\
 Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to point the generated shop at a different supported DB adapter URL without editing source.\n\
 \n\
@@ -2472,6 +2472,7 @@ docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n
 - `GET /admin/payments`\n\
 - `GET /admin/shipments`\n\
 - `GET /admin/webhooks`\n\
+- `GET /admin/audit`\n\
 - `GET /health`\n\
 - `POST /products`\n\
 - `GET /products`\n\
@@ -28378,12 +28379,16 @@ test "checkout excluded failure" {
         assert!(source.contains("@route GET /admin/shipments"));
         assert!(source.contains("@a href=\"/admin/webhooks\" \"Webhook read model\""));
         assert!(source.contains("@route GET /admin/webhooks"));
+        assert!(source.contains("@a href=\"/admin/audit\" \"Audit read model\""));
+        assert!(source.contains("@route GET /admin/audit"));
         assert!(source.contains(r#"shopdb.count("Product", {})"#));
         assert!(source.contains(r#"shopdb.count("WebhookEvent", {})"#));
+        assert!(source.contains(r#"shopdb.count("AuditEvent", {})"#));
         assert!(source.contains(r#"shopdb.findAll("Order", {})"#));
         assert!(source.contains(r#"shopdb.findAll("Payment", {})"#));
         assert!(source.contains(r#"shopdb.findAll("Shipment", {})"#));
         assert!(source.contains(r#"shopdb.findAll("WebhookEvent", {})"#));
+        assert!(source.contains(r#"shopdb.findAll("AuditEvent", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
@@ -28408,6 +28413,11 @@ test "checkout excluded failure" {
         assert!(source.contains(r#"shopdb.update("Order", { id: reconciledOrderId }"#));
         assert!(source.contains("reconciledPayment: reconciledPayment"));
         assert!(source.contains(r#"shopdb.create("WebhookEvent""#));
+        assert!(source.contains(r#"shopdb.create("AuditEvent""#));
+        assert!(source.contains("checkout.complete"));
+        assert!(source.contains("payment.capture"));
+        assert!(source.contains("shipment.book"));
+        assert!(source.contains("webhook.received"));
         assert!(source.contains("@route POST /shipments"));
         assert!(source.contains(
             r#"@payment.connect(@env.PAYMENT_ADAPTER_URL ?? "file://data/payments.jsonl")"#
@@ -28485,6 +28495,7 @@ test "checkout excluded failure" {
         assert!(guide.contains("GET /admin/payments"));
         assert!(guide.contains("GET /admin/shipments"));
         assert!(guide.contains("GET /admin/webhooks"));
+        assert!(guide.contains("GET /admin/audit"));
         assert!(guide.contains("POST /members"));
         assert!(guide.contains("POST /members/login"));
         assert!(guide.contains("POST /checkout"));
@@ -28533,6 +28544,7 @@ test "checkout excluded failure" {
             ("GET", "/admin/payments"),
             ("GET", "/admin/shipments"),
             ("GET", "/admin/webhooks"),
+            ("GET", "/admin/audit"),
             ("GET", "/products/:sku"),
             ("GET", "/members/:handle"),
             ("GET", "/orders/:customer"),

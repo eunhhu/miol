@@ -2901,6 +2901,7 @@ mod tests {
             assert!(admin_html.contains("<a href=\"/admin/payments\">Payment read model</a>"));
             assert!(admin_html.contains("<a href=\"/admin/shipments\">Shipment read model</a>"));
             assert!(admin_html.contains("<a href=\"/admin/webhooks\">Webhook read model</a>"));
+            assert!(admin_html.contains("<a href=\"/admin/audit\">Audit read model</a>"));
             assert!(admin_html.contains("Stripe webhook events: POST /webhooks/stripe"));
             assert!(admin_html.contains("data/shop.sqlite"));
 
@@ -3274,6 +3275,15 @@ mod tests {
             assert!(admin_webhooks_html.contains("evt_checkout_paid"));
             assert!(admin_webhooks_html.contains("verified"));
 
+            let (admin_audit_status, _, admin_audit_body) =
+                send_request(addr, "GET", "/admin/audit", None).await;
+            assert_eq!(admin_audit_status, 200);
+            let admin_audit_html = String::from_utf8(admin_audit_body).expect("audit html utf8");
+            assert!(admin_audit_html.contains("checkout.complete"));
+            assert!(admin_audit_html.contains("payment.capture"));
+            assert!(admin_audit_html.contains("shipment.book"));
+            assert!(admin_audit_html.contains("webhook.received"));
+
             let (summary_status, _, summary_body) =
                 send_request(addr, "GET", "/admin/summary", None).await;
             assert_eq!(summary_status, 200);
@@ -3285,6 +3295,7 @@ mod tests {
             assert_eq!(summary["payments"], serde_json::json!(2));
             assert_eq!(summary["shipments"], serde_json::json!(2));
             assert_eq!(summary["webhookEvents"], serde_json::json!(2));
+            assert_eq!(summary["auditEvents"], serde_json::json!(15));
 
             handle.abort();
 
@@ -3324,6 +3335,16 @@ mod tests {
             assert_eq!(
                 snapshot["tables"]["WebhookEvent"]["rows"][0]["eventId"],
                 serde_json::json!("evt_1")
+            );
+            assert_eq!(
+                snapshot["tables"]["AuditEvent"]["rows"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(15)
+            );
+            assert_eq!(
+                snapshot["tables"]["AuditEvent"]["rows"][0]["kind"],
+                serde_json::json!("product.create")
             );
             let payment_records =
                 std::fs::read_to_string(&payment_path).expect("payment record log");
