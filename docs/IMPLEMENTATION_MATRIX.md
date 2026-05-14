@@ -1,0 +1,96 @@
+# orv Implementation Matrix
+
+이 문서는 구현 중인 orv의 **상태 + 계약 레벨 + 검증 기준 + 담당 crate**를 한 번에 보여준다. 단순히 "구현됨"인지보다 "제품 표면으로 안정 계약을 걸 수 있는지"를 구분하는 것이 목적이다.
+
+언어 의미론은 [SPEC.md](SPEC.md), 현재 MVP 경계는 [MVP.md](MVP.md), 구현 구조는 [ARCHITECTURE.md](ARCHITECTURE.md), 운영 command/method 세부는 [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md)를 따른다.
+
+## Core Spine
+
+현재 안정화의 중심축은 다음 네 가지다.
+
+```text
+ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
+```
+
+이 축이 깨지면 editor, deploy, native optimizer, shop scaffold 모두 신뢰를 잃는다. 따라서 feature 추가보다 먼저 다음 연결을 안정 계약으로 올린다.
+
+- `Span -> AST node -> HIR node -> runtime event -> origin id`
+- `orv graph`, `orv origins`, `x-orv-origin-id`, trace JSON의 origin schema 정합성
+- route, DB query, HTML node, function call, domain invocation의 동일 reveal 모델
+- first-party editor 없이도 CLI/static graph view만으로 production output에서 source로 돌아가는 경로
+
+## Status Terms
+
+| Status | 의미 |
+|--------|------|
+| implemented | 현재 코드 경로가 동작하고 검증 대상으로 볼 수 있음 |
+| reference stub | 레퍼런스 런타임/scaffold에서 제한적으로 동작함 |
+| artifact only | 실행 기능보다 산출물/계약/manifest가 먼저 고정됨 |
+| planned | 설계 방향은 있으나 구현 경로가 아직 없음 |
+| not started | 문서상 아이디어 수준 |
+
+## Contract Terms
+
+| Contract | 의미 |
+|----------|------|
+| stable | 외부 사용자와 문서가 의존해도 되는 계약. 변경 시 migration/release note 필요 |
+| stable-ish | MVP 내부 기준으로 안정화 중. 이름/JSON shape 변경 가능성 낮음 |
+| experimental | 구현은 있으나 edge case와 문서 계약이 아직 흔들릴 수 있음 |
+| reference | production provider가 아니라 reference/runtime/scaffold 기준 계약 |
+| unstable | 개발 중인 내부 surface. 사용자는 직접 의존하지 않는 것이 좋음 |
+| non-binding | 로드맵/디자인 방향. 구현 의무 없음 |
+
+## Milestone Terms
+
+| Milestone | 목적 |
+|-----------|------|
+| M0 | compiler/runtime foundation: parse, resolve, analyze, HIR, graph, origin, reference runtime, basic CLI |
+| M1 | web app foundation: `@server`, `@route`, `@html`, form/body parse, schema validation, SQLite reference adapter, static serve, smoke test |
+| M2 | shop foundation: auth/session, cart, order, mock payment, mock shipping, admin page, deploy artifact |
+| M3 | reveal/editor foundation: graph view, origin reveal, runtime trace, LSP/DAP/bootstrap, editor protocol |
+| M4+ | native optimizer, custom DB engine, advanced editor, production providers, advanced deploy |
+
+## Matrix
+
+| Feature | Status | Contract | Milestone | Crate | Test / Fixture | CLI | Notes |
+|---------|--------|----------|-----------|-------|----------------|-----|-------|
+| Source load / import DFS | implemented | stable-ish | M0 | `orv-project` | `fixtures/e2e/hello.orv` | `orv check` | Merged program + source map |
+| Lexer / parser / AST | implemented | stable-ish | M0 | `orv-syntax` | `fixtures/e2e/hello.orv` | `orv check` | Span-backed AST |
+| Name resolution | implemented | experimental | M0 | `orv-resolve` | `fixtures/plan/models/*.orv` | `orv check` | Scope/binding map |
+| Semantic analysis / HIR lowering | implemented | experimental | M0 | `orv-analyzer`, `orv-hir` | `fixtures/e2e/hello.orv` | `orv check`, `orv run` | Runtime/compiler consume HIR |
+| Diagnostics | implemented | stable-ish | M0 | `orv-diagnostics` | compiler fixture suite | `orv check` | Span-backed structured diagnostics |
+| AST ProjectGraph v1 | implemented | experimental | M0/M3 | `orv-project`, `orv-cli` | CLI graph tests | `orv graph` | File/import/declaration/domain graph |
+| HIR origin map | implemented | experimental | M0/M3 | `orv-hir`, `orv-compiler` | origin/graph CLI tests | `orv origins`, `orv graph` | Contains/calls semantic edges |
+| Reference tree-walking runtime | implemented | experimental | M0 | `orv-runtime` | `fixtures/e2e/hello.orv` | `orv run` | Main execution path |
+| HTTP/1.1 `@server` / `@route` | implemented | experimental | M1 | `orv-runtime` | `fixtures/e2e/hello.orv`, `fixtures/e2e/path_param.orv` | `orv run` | Hyper reference server |
+| Route origin header | implemented | experimental | M1/M3 | `orv-runtime`, `orv-compiler` | origin runtime tests | `orv run` | Emits `x-orv-origin-id` |
+| Request body parsing | implemented | experimental | M1 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | JSON/form-urlencoded into `@body`; raw body available |
+| Typed body/form validation | planned | non-binding | M1 | `orv-analyzer`, `orv-runtime` | planned e2e fixture | `orv check`, `orv run` | SPEC target; needs HTTP error contract tests |
+| `@html` static render | implemented | experimental | M1 | `orv-runtime`, `orv-compiler` | `fixtures/e2e/shopping_mall.orv` | `orv run`, `orv build` | HTML page/static build path |
+| Client reactive bundle | artifact only | unstable | M4+ | `orv-compiler`, `orv-cli` | build artifact tests | `orv build`, `orv verify-build` | Manifest/reactive plan/JS/WASM bootstrap; full DOM diff roadmap |
+| In-memory `@db` | implemented | reference | M1 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | CRUD/filter/sort/limit/reference aggregation |
+| DB snapshot/WAL/checkpoint | implemented | reference | M1 | `orv-runtime`, `orv-cli` | DB CLI/runtime tests | `orv db *` | Reference persistence/recovery path |
+| SQLite row JSON adapter | implemented | reference | M1/M2 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | SQLite file with ORV metadata + row JSON |
+| PostgreSQL/MySQL adapters | planned | non-binding | M4+ | `orv-runtime` | - | - | Current handles expose unsupported/fail query methods |
+| Auth/member session scaffold | reference stub | reference | M2 | `orv-cli`, `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv init`, `orv run` | Member/session rows exist; declarative `@session`/`@Auth` hardening still needed |
+| CSRF/rate-limit/security defaults | planned | non-binding | M2 | `orv-runtime`, `orv-cli` | planned security fixtures | `orv check`, `orv run` | Security model target; scaffold should hide low-level token handling |
+| Payment/shipping local adapters | implemented | reference | M2 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | Local/file capture and booking records |
+| Payment/shipping HTTP adapters | reference stub | reference | M2/M4+ | `orv-runtime` | commerce adapter tests | `orv run` | Checked JSON POST contract |
+| Stripe webhook verification | reference stub | reference | M2/M4+ | `orv-runtime`, `orv-cli` | shop scaffold tests | `orv run`, `orv deploy-env-check` | HMAC/idempotency reference path |
+| Provider SDK matrix | planned | non-binding | M4+ | - | - | - | Production hardening later |
+| `orv init <dir> --template shop` | implemented | experimental | M2 | `orv-cli` | `fixtures/e2e/shopping_mall.orv` | `orv init` | Catalog/cart/member/checkout/admin scaffold |
+| Template-to-running-shop smoke path | implemented | experimental | M2 | `orv-cli`, `orv-runtime` | generated smoke-test | `orv init`, `orv build --prod`, smoke-test | First acceptance target before human 5h runs |
+| Build artifacts | implemented | experimental | M1/M3 | `orv-compiler`, `orv-cli` | build artifact tests | `orv build`, `orv verify-build` | Manifest, bundle plan, origin map, graph, source bundle |
+| Native server plan/source | artifact only | unstable | M4+ | `orv-compiler`, `orv-cli` | build artifact tests | `orv build` | Contract first; full native optimizer planned |
+| Deploy artifacts | implemented | experimental | M2 | `orv-cli`, `orv-compiler` | deploy artifact tests | `orv build --prod`, `orv deploy-env-check` | Manifest/container/Compose/runbook/env/smoke-test contracts |
+| `orv reveal` / editor reveal payload | implemented | experimental | M3 | `orv-cli`, `orv-compiler` | reveal CLI tests | `orv reveal`, `orv editor reveal` | Build origin to source/production payload |
+| Runtime trace JSON / trace stream | implemented | experimental | M3 | `orv-runtime`, `orv-cli` | editor trace tests | `orv editor trace`, `orv editor trace-stream` | Shared trace schema for reveal |
+| LSP bootstrap | implemented | experimental | M3 | `orv-cli` | LSP CLI tests | `orv lsp serve` | Symbols/diagnostics/navigation/format/completion subsets |
+| DAP bootstrap | implemented | experimental | M3 | `orv-cli`, `orv-runtime` | DAP CLI tests | `orv dap serve` | Runtime frame/locals/debug control subsets |
+| Static editor export | implemented | experimental | M3 | `orv-cli` | editor export tests | `orv editor export` | Graph/panel/trace HTML artifacts |
+| First-party native editor UI | planned | non-binding | M4+ | - | - | - | Native shell and production reveal UI later |
+| `@gpu` / `@net` / CRDT / broad FFI | reference stub | non-binding | M4+ | `orv-runtime`, `orv-analyzer` | `fixtures/e2e/domains.orv` | `orv run` | Syntax/design pressure, not MVP production path |
+
+## Update Rule
+
+When implementation changes, update this matrix first. Then adjust [MVP.md](MVP.md), [ROADMAP.md](ROADMAP.md), [CHANGELOG.md](CHANGELOG.md), or [SPEC.md](SPEC.md) only if the product boundary, future plan, dated delta, or language contract changed.

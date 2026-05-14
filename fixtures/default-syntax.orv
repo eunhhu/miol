@@ -1,3 +1,8 @@
+// status: reference-only
+// contract: non-binding syntax pressure fixture
+// milestone: M4+ unless a smaller fixture promotes a surface into IMPLEMENTATION_MATRIX.md
+// purpose: broad syntax tour and pressure test
+// note: this file is not the MVP compile contract. See fixtures/e2e for working runtime examples.
 
 // 자료형
 // 원시 타입은 기본 C 타입 사용
@@ -222,40 +227,40 @@ try {
 //   @innerTag prop
 // }
 
-// 도메인은 기본적으로 어떤 액션을 실행시키기 위함
-// 리턴값이 있을수도 있음
+// 도메인은 기본적으로 어떤 액션/값 생성을 실행시키기 위함
+// `key=value`는 property, key가 없으면 token, `{}`는 마지막 content block
 define MyDomain( // 도메인 선언
   prop1: int? // 프로퍼티 정의
   prop2: string? // 여기도 오브젝트랑 마찬가지로 줄바꿈이 있기에 쉼표가 생략 가능
 ) -> {
   token { // 허용되는 타입들
-    size: "{number}px"? // return ("{number}"px)[] typed value
-    others: string // return string[] typed value
+    size: "{number}px"? // matching token values become size[]
+    others: string // remaining string-like token values become others[]
   }
 
   @out "MyDomain created with prop1: {prop1}, prop2: {prop2}"
   @out "and includes {others[0]} and {size[0]}"
 
-  @content // block 안에 내용을 그대로 받아와 실행
+  @content // caller content executes here; names resolve in caller scope
 
   define SubDomain {
     @out "subdomain here"
   }
 
-  // 도메인 내 define, content 라인 위치에 따라 호이스팅되어 실행 시점이 다름
+  // nested define is hoisted for name lookup only; execution order is not changed
   return void
 }
 
 // 사용
-@MyDomain prop1=5 prop2="hey" 23px 54px asdf "spaced string" rewq 11 // prop1, prop2는 property, 나머지는 token
+@MyDomain prop1=5 prop2="hey" 23px 54px asdf "spaced string" rewq 11 // property first two, rest token
 @MyDomain {
-  // 여기 코드랑
+  // caller scope content
   let n = 0
   @out "hello, {n}"
 
   @SubDomain // nested
 
-  // 여기 코드같은 경우에는 도메인 정의 내 @content 위치로 들어가게됨
+  // inserted at the callee's @content position
   @out "it's {n}"
 }
 

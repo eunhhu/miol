@@ -34,15 +34,46 @@
 - 의미론과 타입 규칙
 - 도메인별 동작 정의
 - 컴파일타임 규칙과 공식 예시
-- 구현 상태 표기 (`현재 구현`, `MVP`, `reference stub`, `로드맵`)
+
+다루지 않는 내용:
+
+- 구현 상태 표
+- 날짜형 changelog
+- CLI/LSP/DAP/build/DB 운영 surface의 전체 목록
 
 판정 원칙:
 
-- 문서 간 충돌이 있으면 `docs/SPEC.md`를 우선 기준으로 해석한다.
+- 문서 간 충돌이 있으면 언어 의미론은 `docs/SPEC.md`를 우선 기준으로 해석한다.
 - 예제 파일이 `SPEC.md`와 다르면, 먼저 `SPEC.md`를 맞다고 본다.
 - 예제가 더 나은 방향을 보여준다면, 그것은 사양 변경 후보이지 현재 사양 자체는 아니다.
-- `SPEC.md` 안에서 `로드맵` 또는 `목표`로 표시된 기능은 현재 MVP 구현으로 간주하지 않는다.
-- 구현 상태 판단은 `SPEC.md`의 상태 표기와 `docs/ARCHITECTURE.md`의 현재 파이프라인 설명을 함께 본다.
+- 구현/계약 상태 판단은 `docs/IMPLEMENTATION_MATRIX.md`를 기준으로 한다.
+
+## 2.5 MVP / 상태 / 운영 문서
+
+대상 파일:
+
+- `docs/MVP.md`
+- `docs/IMPLEMENTATION_MATRIX.md`
+- `docs/IMPLEMENTATION_STATUS.md`
+- `docs/OPERATIONAL_SURFACES.md`
+- `docs/ROADMAP.md`
+- `docs/CHANGELOG.md`
+
+다루는 내용:
+
+- `MVP.md`: 지금 되는 것, MVP 포함/제외 범위
+- `IMPLEMENTATION_MATRIX.md`: 상태, 계약 레벨, milestone, crate, fixture, CLI 표
+- `IMPLEMENTATION_STATUS.md`: 상태 용어와 빠른 요약
+- `OPERATIONAL_SURFACES.md`: CLI/LSP/DAP/build/DB 같은 운영 surface 세부
+- `ROADMAP.md`: 미래 기능
+- `CHANGELOG.md`: 날짜가 붙은 구현 델타
+
+판정 원칙:
+
+- 구현/계약 상태는 `IMPLEMENTATION_MATRIX.md`가 기준이다.
+- 운영 command/method 세부는 `OPERATIONAL_SURFACES.md`가 기준이다.
+- 미래 기능은 `ROADMAP.md`에만 둔다.
+- 날짜형 보충은 `CHANGELOG.md`로 보낸다.
 
 ## 3. 실험 사양 / 탐색 예제
 
@@ -97,6 +128,9 @@
 ## 수정 규칙
 
 - 비전과 방향을 바꾸면 `docs/README.md`를 수정한다.
+- MVP 경계가 바뀌면 `docs/MVP.md`를 수정한다.
+- 구현 상태나 계약 레벨이 바뀌면 `docs/IMPLEMENTATION_MATRIX.md`를 먼저 수정한다.
+- 날짜형 구현 보충은 `docs/CHANGELOG.md`에 추가한다.
 - 공식 문법이나 의미론을 바꾸면 `docs/SPEC.md`를 수정한다.
 - 사용감이나 미래 방향을 실험하면 `fixtures/default-syntax.orv` 또는 `fixtures/plan/*.orv`를 수정한다.
 - 구현 구조가 바뀌면 `docs/ARCHITECTURE.md`를 수정한다.
@@ -105,8 +139,12 @@
 ## 권장 읽기 순서
 
 1. `docs/README.md`
-2. `docs/SPEC.md`
-3. `docs/ARCHITECTURE.md`
-4. `fixtures/default-syntax.orv`
-5. `fixtures/plan/*.orv`
-6. `fixtures/e2e/*.orv`
+2. `docs/MVP.md`
+3. `docs/IMPLEMENTATION_MATRIX.md`
+4. `docs/SPEC.md`
+5. `docs/ARCHITECTURE.md`
+6. `docs/OPERATIONAL_SURFACES.md`
+7. `docs/IMPLEMENTATION_STATUS.md`
+8. `fixtures/default-syntax.orv`
+9. `fixtures/plan/*.orv`
+10. `fixtures/e2e/*.orv`
