@@ -20614,7 +20614,7 @@ fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
         anyhow::bail!("deploy manifest profile must be prod");
     }
     verify_deploy_source_bundle(dir, deploy.get("source_bundle"))?;
-    verify_deploy_server_target(dir, deploy.get("server"))?;
+    verify_deploy_server_target(dir, deploy.get("server"), deploy.get("client"))?;
     verify_deploy_static_target(dir, deploy.get("static"))?;
     verify_deploy_client_target(dir, deploy.get("client"))
 }
@@ -20637,6 +20637,7 @@ fn verify_deploy_source_bundle(
 fn verify_deploy_server_target(
     dir: &Path,
     server: Option<&serde_json::Value>,
+    client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let Some(server) = server.filter(|value| !value.is_null()) else {
         return Ok(());
@@ -20748,6 +20749,7 @@ fn verify_deploy_server_target(
         },
         &artifact,
         &persistence,
+        client,
     )?;
     if server.get("runtime").and_then(serde_json::Value::as_str) != Some(artifact.runtime.as_str())
     {
@@ -21200,6 +21202,7 @@ fn verify_deploy_runbook_artifact(
     artifacts: &DeployRunbookArtifacts<'_>,
     artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
+    client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let runbook_path = dir.join(path);
     if !runbook_path.is_file() {
@@ -21259,6 +21262,7 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains("/__orv/trace/events") {
         anyhow::bail!("deploy runbook must document live trace event stream endpoint");
     }
+    verify_deploy_runbook_client_section(&runbook, client)?;
     for path in &persistence.wal_paths {
         if !runbook.contains(path) {
             anyhow::bail!("deploy runbook must document persistent WAL path {path}");
@@ -21340,6 +21344,53 @@ fn verify_deploy_runbook_artifact(
             let method = &route.method;
             let path = &route.path;
             anyhow::bail!("deploy runbook must list route {method} {path}");
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_runbook_client_section(
+    runbook: &str,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(client) = client.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    for key in ["manifest", "page", "loader", "wasm"] {
+        let path = json_str(client, key, "deploy client")?;
+        if !runbook.contains(path) {
+            anyhow::bail!("deploy runbook must document client {key} {path}");
+        }
+    }
+    let runtime = client
+        .pointer("/capabilities/runtime")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("client_wasm");
+    if !runbook.contains(runtime) {
+        anyhow::bail!("deploy runbook must document client runtime {runtime}");
+    }
+    for surface in client
+        .pointer("/capabilities/surfaces")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !runbook.contains(surface) {
+            anyhow::bail!("deploy runbook must document client capability surface {surface}");
+        }
+    }
+    for blocker in client
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for key in ["id", "artifact"] {
+            let value = json_str(blocker, key, "deploy client blocker")?;
+            if !runbook.contains(value) {
+                anyhow::bail!("deploy runbook must document client blocker {value}");
+            }
         }
     }
     Ok(())
@@ -26674,6 +26725,7 @@ fn write_prod_deploy_artifacts(
     server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
     targets: ProdBuildTargets<'_>,
 ) -> anyhow::Result<()> {
+    let client = prod_deploy_client_json(out, manifest.capabilities.client_wasm, targets)?;
     let server = if let Some(server_artifact) = server_artifact {
         let entrypoint = "deploy/server.sh";
         let routes_artifact = "deploy/routes.json";
@@ -26719,6 +26771,7 @@ fn write_prod_deploy_artifacts(
             },
             server_artifact,
             &persistence,
+            &client,
         )?;
         serde_json::json!({
             "runtime": server_artifact.runtime.clone(),
@@ -26754,33 +26807,6 @@ fn write_prod_deploy_artifacts(
             "runtime_features": [],
         })
     });
-    let client = if manifest.capabilities.client_wasm {
-        let client_manifest = targets
-            .client_manifest
-            .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
-        let client_manifest_value = read_json_value(&out.join(client_manifest))?;
-        serde_json::json!({
-            "manifest": client_manifest,
-            "page": targets.client_page.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
-            "loader": targets.client_js.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
-            "wasm": targets.client_wasm.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
-            "runtime_features": ["client_wasm"],
-            "capabilities": client_manifest_value
-                .get("capabilities")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "blocked_by": client_manifest_value
-                .get("blocked_by")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([])),
-            "blockers": client_manifest_value
-                .get("blockers")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([])),
-        })
-    } else {
-        serde_json::Value::Null
-    };
     let deploy = serde_json::json!({
         "schema_version": 1,
         "profile": "prod",
@@ -26793,6 +26819,39 @@ fn write_prod_deploy_artifacts(
         "client": client,
     });
     write_json(&out.join("deploy").join("manifest.json"), &deploy)
+}
+
+fn prod_deploy_client_json(
+    out: &Path,
+    enabled: bool,
+    targets: ProdBuildTargets<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    if !enabled {
+        return Ok(serde_json::Value::Null);
+    }
+    let client_manifest = targets
+        .client_manifest
+        .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
+    let client_manifest_value = read_json_value(&out.join(client_manifest))?;
+    Ok(serde_json::json!({
+        "manifest": client_manifest,
+        "page": targets.client_page.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
+        "loader": targets.client_js.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
+        "wasm": targets.client_wasm.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
+        "runtime_features": ["client_wasm"],
+        "capabilities": client_manifest_value
+            .get("capabilities")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "blocked_by": client_manifest_value
+            .get("blocked_by")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "blockers": client_manifest_value
+            .get("blockers")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    }))
 }
 
 fn write_prod_routes_artifact(
@@ -26997,6 +27056,7 @@ fn write_prod_deploy_runbook(
     artifacts: &DeployRunbookArtifacts<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
     persistence: &DeployPersistence,
+    client: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let compose_path = artifacts.compose;
     let env_example_path = artifacts.env_example;
@@ -27014,6 +27074,7 @@ fn write_prod_deploy_runbook(
         .map(|route| format!("- {} {}\n", route.method, route.path))
         .collect::<String>();
     let persistence_section = deploy_runbook_persistence_section(persistence);
+    let client_section = deploy_runbook_client_section(client);
     let runbook = format!(
         r#"# orv deploy
 
@@ -27067,12 +27128,63 @@ orv deploy-env-check .
 ./{smoke_test_path}
 ```
 
+{client_section}
 {persistence_section}
 ## Routes
 
 {routes}"#
     );
     write_text(&out.join("deploy").join("README.md"), &runbook)
+}
+
+fn deploy_runbook_client_section(client: &serde_json::Value) -> String {
+    if client.is_null() {
+        return String::new();
+    }
+    let manifest = json_str_or_empty(client, "manifest");
+    let page = json_str_or_empty(client, "page");
+    let loader = json_str_or_empty(client, "loader");
+    let wasm = json_str_or_empty(client, "wasm");
+    let runtime = client
+        .pointer("/capabilities/runtime")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("client_wasm");
+    let surfaces = client
+        .pointer("/capabilities/surfaces")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    let mut blockers = String::new();
+    for blocker in client
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = json_str_or_empty(blocker, "id");
+        let artifact = json_str_or_empty(blocker, "artifact");
+        let reason = json_str_or_empty(blocker, "reason");
+        let _ = writeln!(blockers, "- Client blocker: {id} {artifact} {reason}");
+    }
+    format!(
+        r#"## Client Bundle
+
+- Client manifest: {manifest}
+- Client page: {page}
+- Client loader: {loader}
+- Client WASM: {wasm}
+- Client runtime: {runtime}
+- Client capability surfaces: {surfaces}
+{blockers}
+"#
+    )
 }
 
 fn write_prod_server_entrypoint(out: &Path, server_artifact_path: &str) -> anyhow::Result<()> {
@@ -27147,7 +27259,8 @@ fn verify_shell_syntax_if_supported(_path: &Path, _label: &str) -> anyhow::Resul
 
 fn render_static_page(lowered: &orv_analyzer::LowerResult) -> anyhow::Result<String> {
     let mut out = Vec::new();
-    orv_runtime::run_with_writer(&lowered.program, &mut out).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let program = static_page_render_program(&lowered.program);
+    orv_runtime::run_with_writer(&program, &mut out).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut html = String::from_utf8(out).map_err(|e| anyhow::anyhow!("html is not utf-8: {e}"))?;
     if html.ends_with('\n') {
         html.pop();
@@ -27156,6 +27269,28 @@ fn render_static_page(lowered: &orv_analyzer::LowerResult) -> anyhow::Result<Str
         }
     }
     Ok(html)
+}
+
+fn static_page_render_program(program: &orv_hir::HirProgram) -> orv_hir::HirProgram {
+    orv_hir::HirProgram {
+        items: program
+            .items
+            .iter()
+            .filter(|stmt| !is_top_level_server_stmt(stmt))
+            .cloned()
+            .collect(),
+        span: program.span,
+    }
+}
+
+const fn is_top_level_server_stmt(stmt: &orv_hir::HirStmt) -> bool {
+    matches!(
+        stmt,
+        orv_hir::HirStmt::Expr(orv_hir::HirExpr {
+            kind: orv_hir::HirExprKind::Server { .. },
+            ..
+        })
+    )
 }
 
 fn write_text(path: &Path, text: &str) -> anyhow::Result<()> {
@@ -40101,6 +40236,56 @@ entry = "src/main.orv"
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn build_prod_runbook_documents_client_bundle_contract() {
+        let dir = temp_output_dir("build-prod-client-runbook-source");
+        std::fs::create_dir_all(&dir).expect("create temp root");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}
+
+let sig count: int = 0
+@out @html { @body { @p count } }
+"#,
+        )
+        .expect("write source");
+        let out = temp_output_dir("build-prod-client-runbook");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let runbook_path = out.join("deploy").join("README.md");
+        let runbook = std::fs::read_to_string(&runbook_path).expect("deploy runbook");
+
+        assert!(runbook.contains("## Client Bundle"));
+        assert!(runbook.contains("- Client manifest: client/manifest.json"));
+        assert!(runbook.contains("- Client page: pages/index.html"));
+        assert!(runbook.contains("- Client loader: client/app.js"));
+        assert!(runbook.contains("- Client WASM: client/app.wasm"));
+        assert!(runbook.contains("- Client runtime: client_wasm"));
+        assert!(runbook.contains("signal_text"));
+        assert!(runbook.contains("dynamic-client-codegen"));
+        cmd_verify_build(&out).expect("verify client runbook");
+
+        write_text(
+            &runbook_path,
+            &runbook.replace("signal_text", "signal_slot"),
+        )
+        .expect("write corrupt runbook");
+        let err = cmd_verify_build(&out).expect_err("client runbook mismatch");
+        assert!(
+            err.to_string()
+                .contains("deploy runbook must document client capability surface signal_text"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
