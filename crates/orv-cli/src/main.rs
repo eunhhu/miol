@@ -21484,6 +21484,9 @@ fn verify_deploy_client_target(
     }
     let manifest_value = read_json_value(&manifest_target)?;
     verify_client_manifest_value(dir, &manifest_value)?;
+    if client.get("capabilities") != manifest_value.get("capabilities") {
+        anyhow::bail!("deploy client capabilities do not match client manifest");
+    }
     let page = json_str(client, "page", "deploy client")?;
     let page_target = dir.join(page);
     if !page_target.is_file() {
@@ -26746,12 +26749,20 @@ fn write_prod_deploy_artifacts(
         })
     });
     let client = if manifest.capabilities.client_wasm {
+        let client_manifest = targets
+            .client_manifest
+            .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
+        let client_manifest_value = read_json_value(&out.join(client_manifest))?;
         serde_json::json!({
-            "manifest": targets.client_manifest.ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?,
+            "manifest": client_manifest,
             "page": targets.client_page.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
             "loader": targets.client_js.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
             "wasm": targets.client_wasm.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
             "runtime_features": ["client_wasm"],
+            "capabilities": client_manifest_value
+                .get("capabilities")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         })
     } else {
         serde_json::Value::Null
@@ -42490,7 +42501,39 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .expect("runtime features")
             .iter()
             .any(|feature| feature == "client_wasm"));
+        assert_eq!(deploy["client"]["capabilities"]["runtime"], "client_wasm");
+        assert_eq!(
+            deploy["client"]["capabilities"]["bindings"]["signal_text"],
+            1
+        );
         cmd_verify_build(&build_out).expect("verify prod build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_client_capability_drift() {
+        let out = temp_output_dir("verify-build-deploy-client-capabilities");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+        let deploy_path = build_out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_path).expect("deploy manifest");
+        deploy["client"]["capabilities"]["bindings"]["signal_text"] = serde_json::json!(0);
+        write_json(&deploy_path, &deploy).expect("write drifted deploy manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid deploy client capabilities");
+        assert!(
+            err.to_string()
+                .contains("deploy client capabilities do not match client manifest"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 
