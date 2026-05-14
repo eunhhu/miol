@@ -21487,6 +21487,12 @@ fn verify_deploy_client_target(
     if client.get("capabilities") != manifest_value.get("capabilities") {
         anyhow::bail!("deploy client capabilities do not match client manifest");
     }
+    if client.get("blocked_by") != manifest_value.get("blocked_by") {
+        anyhow::bail!("deploy client blocked_by does not match client manifest");
+    }
+    if client.get("blockers") != manifest_value.get("blockers") {
+        anyhow::bail!("deploy client blockers do not match client manifest");
+    }
     let page = json_str(client, "page", "deploy client")?;
     let page_target = dir.join(page);
     if !page_target.is_file() {
@@ -26763,6 +26769,14 @@ fn write_prod_deploy_artifacts(
                 .get("capabilities")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "blocked_by": client_manifest_value
+                .get("blocked_by")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "blockers": client_manifest_value
+                .get("blockers")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
         })
     } else {
         serde_json::Value::Null
@@ -42506,6 +42520,16 @@ models = { path = "../../shared/models", version = "2.0.0" }
             deploy["client"]["capabilities"]["bindings"]["signal_text"],
             1
         );
+        assert!(deploy["client"]["blocked_by"]
+            .as_array()
+            .expect("blocked_by")
+            .iter()
+            .any(|item| item == "dynamic-client-codegen"));
+        assert!(deploy["client"]["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(|item| item["id"] == "dynamic-client-codegen"));
         cmd_verify_build(&build_out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -42532,6 +42556,33 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(
             err.to_string()
                 .contains("deploy client capabilities do not match client manifest"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_client_blocker_drift() {
+        let out = temp_output_dir("verify-build-deploy-client-blockers");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+        let deploy_path = build_out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_path).expect("deploy manifest");
+        deploy["client"]["blockers"] = serde_json::json!([]);
+        write_json(&deploy_path, &deploy).expect("write drifted deploy manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid deploy client blockers");
+        assert!(
+            err.to_string()
+                .contains("deploy client blockers do not match client manifest"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&out);
