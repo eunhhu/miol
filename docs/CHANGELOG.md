@@ -24,6 +24,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Made generated deploy smoke tests compare each `x-orv-origin-id` header against the exact route origin id from the server artifact instead of accepting any `ori_` value.
 - Made DAP `setInstructionBreakpoints` verify `orv:frame:N` pseudo-instruction references after launch and stop `continue` on matching runtime frames.
 - Surfaced DAP `loadedSources`/`source` request inventory and launch-time source snapshot responses through editor export, native-host debug metadata, and run-debug result panels, including imported source SHA256 checksums.
+- Mirrored build graph contracts (`source-bundle.json`, `project-graph.json`, and `origin-map.json`) into editor production export/native-host/panel payloads with artifact hashes and source/origin counts.
 - Exposed CSRF, session cookie, auth role, and default route rate-limit requirements as shared `runtime_features` across build, server, deploy, and native plan artifacts.
 - Added explicit reference `@rateLimit key=... limit=... window=...` route policies plus `@rateLimit exempt`, with runtime enforcement, server artifact descriptors, and native route table fields.
 - Added source-backed `@csrf exempt` so intentional CSRF bypasses can execute without a token while still appearing in route policy artifacts.

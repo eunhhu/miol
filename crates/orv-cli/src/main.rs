@@ -8715,11 +8715,128 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
         "schema_version": 1,
         "kind": "orv.editor.production",
         "build_dir": build.display().to_string(),
+        "graph_contract": editor_production_graph_contract_targets(build)?,
         "client": reveal_client_bundle_targets(build)?,
         "preflight": reveal_preflight_targets(build)?,
         "db_adapters": reveal_db_adapter_targets(build)?,
         "commerce_adapters": reveal_commerce_adapter_targets(build)?,
     }))
+}
+
+fn editor_production_graph_contract_targets(
+    build: &Path,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let specs = [
+        ("source_bundle", SOURCE_BUNDLE_PATH),
+        ("project_graph", "project-graph.json"),
+        ("origin_map", "origin-map.json"),
+    ];
+    specs
+        .into_iter()
+        .map(|(kind, path)| editor_production_graph_contract_target(build, kind, path))
+        .collect()
+}
+
+fn editor_production_graph_contract_target(
+    build: &Path,
+    kind: &str,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let target = build.join(path);
+    let mut value = serde_json::json!({
+        "kind": kind,
+        "path": path,
+        "exists": target.is_file(),
+    });
+    if !target.is_file() {
+        return Ok(value);
+    }
+    let artifact = read_json_value(&target)?;
+    value["artifact_hash"] = serde_json::json!(stable_json_hash(&artifact)?);
+    match kind {
+        "source_bundle" => add_editor_source_bundle_contract_fields(&artifact, &mut value),
+        "project_graph" => add_editor_project_graph_contract_fields(&artifact, &mut value),
+        "origin_map" => add_editor_origin_map_contract_fields(&artifact, &mut value),
+        _ => {}
+    }
+    Ok(value)
+}
+
+fn add_editor_source_bundle_contract_fields(
+    artifact: &serde_json::Value,
+    target: &mut serde_json::Value,
+) {
+    target["schema_version"] = artifact
+        .get("schema_version")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["entry"] = artifact
+        .get("entry")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let files = artifact
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    target["file_count"] = serde_json::json!(files.len());
+    target["files"] = serde_json::Value::Array(
+        files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.get("path").cloned().unwrap_or(serde_json::Value::Null),
+                    "content_hash": file
+                        .get("content_hash")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect(),
+    );
+}
+
+fn add_editor_project_graph_contract_fields(
+    artifact: &serde_json::Value,
+    target: &mut serde_json::Value,
+) {
+    target["schema_version"] = artifact
+        .get("schema_version")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["stats"] = artifact
+        .get("stats")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    target["node_count"] = serde_json::json!(json_array_count(artifact.get("nodes")));
+    target["edge_count"] = serde_json::json!(json_array_count(artifact.get("edges")));
+    target["semantic_origin_count"] = serde_json::json!(json_array_count(
+        artifact.pointer("/semantic/origin_map/entries")
+    ));
+    target["semantic_edge_count"] =
+        serde_json::json!(json_array_count(artifact.pointer("/semantic/origin_edges")));
+    target["semantic_origin_link_count"] =
+        serde_json::json!(json_array_count(artifact.pointer("/semantic/origin_links")));
+}
+
+fn add_editor_origin_map_contract_fields(
+    artifact: &serde_json::Value,
+    target: &mut serde_json::Value,
+) {
+    target["version"] = artifact
+        .get("version")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    target["entry_count"] = serde_json::json!(json_array_count(artifact.get("entries")));
+    target["edge_count"] = serde_json::json!(json_array_count(artifact.get("edges")));
+    let call_edges = artifact
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|edge| edge.get("kind").and_then(serde_json::Value::as_str) == Some("calls"))
+        .count();
+    target["call_edge_count"] = serde_json::json!(call_edges);
 }
 
 fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> serde_json::Value {
@@ -8809,6 +8926,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
     let production_preflight = json_array_count(production_state.get("preflight")) > 0;
     let production_route_policies =
         production_preflight_route_policy_count_from_value(&production_state) > 0;
+    let production_graph_contract = json_array_count(production_state.get("graph_contract")) > 0;
     let production = editor_native_host_production_json(&production_state);
     let runtime = editor_native_host_runtime_json(state);
     let trace = editor_native_host_trace_json(state);
@@ -8931,6 +9049,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "production_adapters": production_adapters,
             "production_preflight": production_preflight,
             "production_route_policies": production_route_policies,
+            "production_graph_contract": production_graph_contract,
             "client_bundles": client_bundles,
             "trace_navigation": trace_enabled,
         },
@@ -9078,6 +9197,11 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
                 "kind": "object",
             },
             {
+                "name": "graph_contract",
+                "path": "production.graph_contract",
+                "kind": "array",
+            },
+            {
                 "name": "db_adapters",
                 "path": "production.db_adapters",
                 "kind": "array",
@@ -9132,6 +9256,11 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let graph_contract = production
+        .get("graph_contract")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let db_adapter_count = production_adapter_entry_count(&db_adapters);
     let commerce_adapter_count = production_adapter_entry_count(&commerce_adapters);
     serde_json::json!({
@@ -9140,6 +9269,22 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
             .get("build_dir")
             .cloned()
             .unwrap_or_else(|| serde_json::json!("")),
+        "graph_contract_count": graph_contract.len(),
+        "source_bundle_file_count": production_graph_contract_number(
+            &graph_contract,
+            "source_bundle",
+            "file_count",
+        ),
+        "project_graph_node_count": production_graph_contract_number(
+            &graph_contract,
+            "project_graph",
+            "node_count",
+        ),
+        "origin_entry_count": production_graph_contract_number(
+            &graph_contract,
+            "origin_map",
+            "entry_count",
+        ),
         "client_target_count": client.len(),
         "client_manifest_count": production_client_manifest_count(&client),
         "client_capability_surface_count": production_client_capability_surface_count(&client),
@@ -9154,11 +9299,22 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         "db_adapter_count": db_adapter_count,
         "commerce_adapter_count": commerce_adapter_count,
         "adapter_count": db_adapter_count + commerce_adapter_count,
-        "missing_artifact_count": production_missing_artifact_count(&db_adapters)
+        "missing_artifact_count": production_missing_artifact_count(&graph_contract)
+            + production_missing_artifact_count(&db_adapters)
             + production_missing_artifact_count(&commerce_adapters)
             + production_missing_artifact_count(&preflight)
             + production_missing_artifact_count(&client),
     })
+}
+
+fn production_graph_contract_number(targets: &[serde_json::Value], kind: &str, key: &str) -> usize {
+    targets
+        .iter()
+        .find(|target| target.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+        .and_then(|target| target.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 fn production_client_manifest_count(targets: &[serde_json::Value]) -> usize {
@@ -9282,8 +9438,14 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     let preflight_target_count = json_usize_field(&summary, "preflight_target_count");
     let route_policy_count = json_usize_field(&summary, "route_policy_count");
     let client_target_count = json_usize_field(&summary, "client_target_count");
+    let graph_contract_count = json_usize_field(&summary, "graph_contract_count");
     let adapter_count = json_usize_field(&summary, "adapter_count");
     let missing_artifact_count = json_usize_field(&summary, "missing_artifact_count");
+    let graph_contract = html_escape_text(&serde_json::to_string_pretty(
+        production
+            .get("graph_contract")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
     let client = html_escape_text(&serde_json::to_string_pretty(
         production.get("client").unwrap_or(&serde_json::Value::Null),
     )?);
@@ -9319,12 +9481,12 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
         if missing_artifact_count == 0 { "" } else { "bad" }
     )?;
     writeln!(
         &mut html,
-        "<main><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>Route Policy Summary</h2><pre>{route_policies}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
+        "<main><section class=\"panel wide\"><h2>Graph Contract</h2><pre>{graph_contract}</pre></section><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>Route Policy Summary</h2><pre>{route_policies}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
     )?;
     writeln!(
         &mut html,
@@ -10374,6 +10536,23 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         .filter(|value| !value.is_empty())
     {
         lines.push(format!("build {build_dir}"));
+    }
+    for target in production
+        .get("graph_contract")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = json_str_or_empty(target, "kind");
+        let path = json_str_or_empty(target, "path");
+        let hash = json_str_or_empty(target, "artifact_hash");
+        let exists = target
+            .get("exists")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        lines.push(format!(
+            "Graph {kind} {path} (exists {exists}, hash {hash})"
+        ));
     }
     for target in production
         .get("client")
@@ -52107,6 +52286,46 @@ define Auth() -> { @out "auth" }
             .expect("editor export state");
         let html = editor_export_html(&state).expect("editor html");
 
+        let graph_contract = state["production"]["graph_contract"]
+            .as_array()
+            .expect("graph contract targets");
+        let source_bundle_target = graph_contract
+            .iter()
+            .find(|target| target["kind"] == "source_bundle")
+            .expect("source bundle target");
+        let project_graph_target = graph_contract
+            .iter()
+            .find(|target| target["kind"] == "project_graph")
+            .expect("project graph target");
+        let origin_map_target = graph_contract
+            .iter()
+            .find(|target| target["kind"] == "origin_map")
+            .expect("origin map target");
+        assert_eq!(source_bundle_target["path"], SOURCE_BUNDLE_PATH);
+        assert_eq!(source_bundle_target["exists"], true);
+        assert_eq!(source_bundle_target["file_count"], 1);
+        assert!(source_bundle_target["artifact_hash"].as_str().is_some());
+        assert!(source_bundle_target["files"]
+            .as_array()
+            .expect("source bundle files")
+            .iter()
+            .any(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("app.orv"))
+                && file["content_hash"].as_str().is_some()));
+        assert_eq!(project_graph_target["path"], "project-graph.json");
+        assert_eq!(project_graph_target["exists"], true);
+        assert!(project_graph_target["node_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert!(project_graph_target["semantic_origin_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(origin_map_target["path"], "origin-map.json");
+        assert_eq!(origin_map_target["exists"], true);
+        assert!(origin_map_target["entry_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
         assert_eq!(
             state["production"]["db_adapters"][0]["path"],
             "deploy/db-adapters.json"
@@ -52226,9 +52445,29 @@ define Auth() -> { @out "auth" }
             "deploy/preflight.json"
         );
         assert_eq!(
+            native_host["production"]["graph_contract"],
+            state["production"]["graph_contract"]
+        );
+        assert_eq!(
             native_host["production"]["summary"]["schema_version"],
             serde_json::json!(1)
         );
+        assert_eq!(
+            native_host["production"]["summary"]["graph_contract_count"],
+            3
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["source_bundle_file_count"],
+            1
+        );
+        assert!(
+            native_host["production"]["summary"]["project_graph_node_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert!(native_host["production"]["summary"]["origin_entry_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
         assert_eq!(
             native_host["production"]["summary"]["preflight_target_count"],
             1
@@ -52283,6 +52522,10 @@ define Auth() -> { @out "auth" }
         );
         assert!(production_sections
             .iter()
+            .any(|section| section["name"] == "graph_contract"
+                && section["path"] == "production.graph_contract"));
+        assert!(production_sections
+            .iter()
             .any(|section| section["name"] == "db_adapters"
                 && section["path"] == "production.db_adapters"));
         assert!(production_sections
@@ -52314,12 +52557,17 @@ define Auth() -> { @out "auth" }
             "orv.editor.production.panel"
         );
         assert_eq!(native_host["capabilities"]["production_adapters"], true);
+        assert_eq!(
+            native_host["capabilities"]["production_graph_contract"],
+            true
+        );
         assert_eq!(native_host["capabilities"]["production_preflight"], true);
         assert_eq!(
             native_host["capabilities"]["production_route_policies"],
             true
         );
         assert!(html.contains("Production"));
+        assert!(html.contains("Graph source_bundle source-bundle.json"));
         assert!(html.contains("Preflight"));
         assert!(html.contains("route_policies 2"));
         assert!(html.contains("DB Adapters"));
@@ -52346,6 +52594,10 @@ define Auth() -> { @out "auth" }
                 && panel["artifact"]["path"] == EDITOR_PRODUCTION_PANEL_HTML_PATH
         }));
         assert!(production_panel.contains("Production Panel"));
+        assert!(production_panel.contains("Graph Contract"));
+        assert!(production_panel.contains("source-bundle.json"));
+        assert!(production_panel.contains("project-graph.json"));
+        assert!(production_panel.contains("origin-map.json"));
         assert!(production_panel.contains("Preflight"));
         assert!(production_panel.contains("Route Policies"));
         assert!(production_panel.contains("Route Policy Summary"));

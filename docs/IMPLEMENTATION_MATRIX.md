@@ -87,7 +87,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 | Runtime trace JSON / trace stream | implemented | experimental | M3 | `orv-runtime`, `orv-cli` | editor trace tests, optional generated smoke trace-stream check | `orv editor trace`, `orv editor trace-stream` | Shared trace schema for reveal; trace-enabled deploy smoke can capture `/__orv/trace/events` and normalize it through editor trace-stream |
 | LSP bootstrap | implemented | experimental | M3 | `orv-cli` | LSP CLI tests | `orv lsp serve` | Symbols/diagnostics/navigation/format/completion subsets |
 | DAP bootstrap | implemented | experimental | M3 | `orv-cli`, `orv-runtime` | DAP CLI tests, editor debug runner tests | `orv dap serve`, `orv editor debug`, `orv editor run-debug` | Runtime frame/locals/debug control subsets; launch-time `loadedSources`/`source` snapshots carry imported source checksums into editor/native-host debug payloads; `orv:frame:N` instruction breakpoints verify against pseudo-instruction frames |
-| Static editor export | implemented | experimental | M3 | `orv-cli` | editor export tests | `orv editor export` | Graph/panel/trace HTML artifacts |
+| Static editor export | implemented | experimental | M3 | `orv-cli` | editor export tests | `orv editor export` | Graph/panel/trace HTML artifacts; production export mirrors source-bundle/project-graph/origin-map graph contract into `state.json`, `native-host.json`, and `production/panel.html` |
 | First-party native editor UI | planned | non-binding | M4+ | - | - | - | Native shell and production reveal UI later |
 | `@gpu` / `@net` / CRDT / broad FFI | reference stub | non-binding | M4+ | `orv-runtime`, `orv-analyzer` | `fixtures/e2e/domains.orv` | `orv run` | Syntax/design pressure, not MVP production path |
 
