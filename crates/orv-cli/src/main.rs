@@ -26256,6 +26256,7 @@ struct DeployDbAdapter {
     default: Option<String>,
     endpoint: Option<String>,
     adapter_status: String,
+    bridge_env: Vec<DeployProviderEnv>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -26466,6 +26467,18 @@ fn deploy_preflight_env_contract(
             provider: None,
         });
     }
+    for adapter in &persistence.db_adapters {
+        for env in &adapter.bridge_env {
+            envs.insert(DeployPreflightEnv {
+                kind: "db".to_string(),
+                env: env.env.clone(),
+                required: env.required,
+                purpose: env.purpose.clone(),
+                default: None,
+                provider: Some(adapter.provider.clone()),
+            });
+        }
+    }
     for adapter in &persistence.commerce_adapters {
         if let Some(env) = &adapter.env {
             envs.insert(DeployPreflightEnv {
@@ -26507,9 +26520,40 @@ fn deploy_db_adapter_value(adapters: &[DeployDbAdapter]) -> Vec<serde_json::Valu
                     "status": adapter.adapter_status,
                     "query_methods": ["create", "find", "update", "delete", "transaction"],
                 },
+                "bridge": deploy_db_adapter_bridge_value(&adapter.bridge_env),
             })
         })
         .collect()
+}
+
+fn deploy_db_adapter_bridge_value(envs: &[DeployProviderEnv]) -> serde_json::Value {
+    serde_json::json!({
+        "contract": "http-json-v1",
+        "method": "POST",
+        "content_type": "application/json",
+        "query_methods": [
+            "create",
+            "find",
+            "findAll",
+            "update",
+            "delete",
+            "upsert",
+            "search",
+            "count",
+            "sum",
+            "transaction",
+            "schema",
+        ],
+        "body": {
+            "kind": "orv.db.adapter",
+            "contract": "http-json-v1",
+            "provider": "adapter provider",
+            "url": "adapter url",
+            "method": "db method",
+            "args": "runtime value array",
+        },
+        "env": deploy_provider_env_value(envs),
+    })
 }
 
 fn deploy_adapter_env_value(envs: &[DeployAdapterEnv]) -> Vec<serde_json::Value> {
@@ -26635,6 +26679,10 @@ fn deploy_compose_volumes(persistence: &DeployPersistence) -> String {
 }
 
 fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String {
+    let has_db_bridge_env = persistence
+        .db_adapters
+        .iter()
+        .any(|adapter| !adapter.bridge_env.is_empty());
     let has_provider_env = persistence
         .commerce_adapters
         .iter()
@@ -26646,6 +26694,7 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
         && persistence.record_paths.is_empty()
         && persistence.commerce_endpoints.is_empty()
         && persistence.commerce_env.is_empty()
+        && !has_db_bridge_env
         && !has_provider_env
     {
         return String::new();
@@ -26668,6 +26717,16 @@ fn deploy_runbook_persistence_section(persistence: &DeployPersistence) -> String
             None => {
                 let _ = writeln!(out, "- DB adapter env: {}", env.env);
             }
+        }
+    }
+    for adapter in &persistence.db_adapters {
+        for env in &adapter.bridge_env {
+            let required = if env.required { "required" } else { "optional" };
+            let _ = writeln!(
+                out,
+                "- DB bridge env: {} {} {required} {}",
+                adapter.provider, env.env, env.purpose
+            );
         }
     }
     for path in &persistence.record_paths {
@@ -26998,6 +27057,7 @@ fn collect_db_adapter_persistence_arg(
                 default: None,
                 endpoint: None,
                 adapter_status: "env_required".to_string(),
+                bridge_env: Vec::new(),
             });
         }
         out.db_env.push(env);
@@ -27025,6 +27085,7 @@ fn collect_db_adapter_url(
             default,
             endpoint: Some(url.to_string()),
             adapter_status: "unsupported_runtime".to_string(),
+            bridge_env: db_adapter_bridge_env(provider),
         });
     }
 }
@@ -27043,6 +27104,28 @@ fn external_db_adapter_provider(url: &str) -> Option<&'static str> {
         return Some("mysql");
     }
     None
+}
+
+fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
+    match provider {
+        "postgres" => vec![
+            deploy_provider_env("ORV_DB_ADAPTER_POSTGRES_ENDPOINT", false, "bridge_endpoint"),
+            deploy_provider_env(
+                "ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN",
+                false,
+                "bridge_auth_token",
+            ),
+        ],
+        "mysql" => vec![
+            deploy_provider_env("ORV_DB_ADAPTER_MYSQL_ENDPOINT", false, "bridge_endpoint"),
+            deploy_provider_env(
+                "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
+                false,
+                "bridge_auth_token",
+            ),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn collect_commerce_adapter_persistence_arg(
@@ -27328,6 +27411,10 @@ fn deploy_compose_environment_lines(
         };
         lines.push(value);
     }
+    for env in deploy_db_bridge_envs(persistence) {
+        let variable = &env.env;
+        lines.push(format!("{variable}: \"${{{variable}}}\""));
+    }
     for env in &persistence.commerce_env {
         let variable = &env.env;
         let value = match &env.default {
@@ -27368,6 +27455,11 @@ fn deploy_env_example_assignments(
     }
     assignments.extend(persistence.db_env.iter().map(deploy_adapter_env_assignment));
     assignments.extend(
+        deploy_db_bridge_envs(persistence)
+            .iter()
+            .map(deploy_provider_env_assignment),
+    );
+    assignments.extend(
         persistence
             .commerce_env
             .iter()
@@ -27405,6 +27497,16 @@ fn deploy_adapter_env_assignment(env: &DeployAdapterEnv) -> String {
 
 fn deploy_provider_env_assignment(env: &DeployProviderEnv) -> String {
     format!("{}=", env.env)
+}
+
+fn deploy_db_bridge_envs(persistence: &DeployPersistence) -> Vec<DeployProviderEnv> {
+    let mut envs = BTreeSet::new();
+    for adapter in &persistence.db_adapters {
+        for env in &adapter.bridge_env {
+            envs.insert(env.clone());
+        }
+    }
+    envs.into_iter().collect()
 }
 
 fn deploy_commerce_provider_envs(persistence: &DeployPersistence) -> Vec<DeployProviderEnv> {
@@ -42554,6 +42656,8 @@ let sig count: int = 0
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         let env_example =
             std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
+        let preflight =
+            read_json_value(&out.join("deploy").join("preflight.json")).expect("preflight");
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("runbook");
 
@@ -42578,6 +42682,44 @@ let sig count: int = 0
                     "runtime": {
                         "status": "unsupported_runtime",
                         "query_methods": ["create", "find", "update", "delete", "transaction"]
+                    },
+                    "bridge": {
+                        "contract": "http-json-v1",
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "query_methods": [
+                            "create",
+                            "find",
+                            "findAll",
+                            "update",
+                            "delete",
+                            "upsert",
+                            "search",
+                            "count",
+                            "sum",
+                            "transaction",
+                            "schema"
+                        ],
+                        "body": {
+                            "kind": "orv.db.adapter",
+                            "contract": "http-json-v1",
+                            "provider": "adapter provider",
+                            "url": "adapter url",
+                            "method": "db method",
+                            "args": "runtime value array"
+                        },
+                        "env": [
+                            {
+                                "env": "ORV_DB_ADAPTER_MYSQL_ENDPOINT",
+                                "required": false,
+                                "purpose": "bridge_endpoint"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
+                                "required": false,
+                                "purpose": "bridge_auth_token"
+                            }
+                        ]
                     }
                 },
                 {
@@ -42591,6 +42733,44 @@ let sig count: int = 0
                     "runtime": {
                         "status": "unsupported_runtime",
                         "query_methods": ["create", "find", "update", "delete", "transaction"]
+                    },
+                    "bridge": {
+                        "contract": "http-json-v1",
+                        "method": "POST",
+                        "content_type": "application/json",
+                        "query_methods": [
+                            "create",
+                            "find",
+                            "findAll",
+                            "update",
+                            "delete",
+                            "upsert",
+                            "search",
+                            "count",
+                            "sum",
+                            "transaction",
+                            "schema"
+                        ],
+                        "body": {
+                            "kind": "orv.db.adapter",
+                            "contract": "http-json-v1",
+                            "provider": "adapter provider",
+                            "url": "adapter url",
+                            "method": "db method",
+                            "args": "runtime value array"
+                        },
+                        "env": [
+                            {
+                                "env": "ORV_DB_ADAPTER_POSTGRES_ENDPOINT",
+                                "required": false,
+                                "purpose": "bridge_endpoint"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN",
+                                "required": false,
+                                "purpose": "bridge_auth_token"
+                            }
+                        ]
                     }
                 }
             ])
@@ -42605,11 +42785,38 @@ let sig count: int = 0
         );
         assert!(compose
             .contains(r#"SHOP_DATABASE_URL: "${SHOP_DATABASE_URL:-mysql://db.internal/shop}""#));
+        assert!(compose
+            .contains(r#"ORV_DB_ADAPTER_MYSQL_ENDPOINT: "${ORV_DB_ADAPTER_MYSQL_ENDPOINT}""#));
+        assert!(compose.contains(
+            r#"ORV_DB_ADAPTER_POSTGRES_ENDPOINT: "${ORV_DB_ADAPTER_POSTGRES_ENDPOINT}""#
+        ));
         assert!(env_example.contains("SHOP_DATABASE_URL=mysql://db.internal/shop"));
+        assert!(env_example.contains("ORV_DB_ADAPTER_MYSQL_ENDPOINT="));
+        assert!(env_example.contains("ORV_DB_ADAPTER_POSTGRES_ENDPOINT="));
+        assert!(preflight["optional_env"]
+            .as_array()
+            .expect("optional preflight env")
+            .iter()
+            .any(|env| env["env"] == "ORV_DB_ADAPTER_MYSQL_ENDPOINT"
+                && env["provider"] == "mysql"
+                && env["purpose"] == "bridge_endpoint"));
+        assert!(preflight["optional_env"]
+            .as_array()
+            .expect("optional preflight env")
+            .iter()
+            .any(|env| env["env"] == "ORV_DB_ADAPTER_POSTGRES_ENDPOINT"
+                && env["provider"] == "postgres"
+                && env["purpose"] == "bridge_endpoint"));
         assert!(runbook.contains("- DB endpoint: mysql://db.internal/shop"));
         assert!(runbook.contains("- DB endpoint: postgres://db.internal/shop"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default mysql://db.internal/shop"));
+        assert!(runbook.contains(
+            "- DB bridge env: mysql ORV_DB_ADAPTER_MYSQL_ENDPOINT optional bridge_endpoint"
+        ));
+        assert!(runbook.contains(
+            "- DB bridge env: postgres ORV_DB_ADAPTER_POSTGRES_ENDPOINT optional bridge_endpoint"
+        ));
         assert!(runbook.contains("deploy/db-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
         let _ = std::fs::remove_dir_all(dir);
@@ -49632,7 +49839,7 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_optional_env_count"],
-            2
+            4
         );
         assert_eq!(native_host["production"]["summary"]["db_target_count"], 1);
         assert_eq!(
