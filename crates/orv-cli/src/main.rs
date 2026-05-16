@@ -22045,6 +22045,28 @@ fn verify_deploy_smoke_test_artifact(
             let path = &route.path;
             anyhow::bail!("deploy smoke test must cover {method} {path}");
         }
+        if deploy_smoke_unique_response_origin(route).is_some() {
+            let response_origin_ref =
+                deploy_smoke_response_origin_var_ref(&route.method, &route.path);
+            for required in [
+                format!(
+                    r#"orv_smoke_reveal_contains "reveal GET {} response source" "{}" '@respond'"#,
+                    route.path, response_origin_ref
+                ),
+                format!(
+                    r#"orv_smoke_reveal_contains "reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
+                    route.path, response_origin_ref
+                ),
+            ] {
+                if !smoke.contains(&required) {
+                    let method = &route.method;
+                    let path = &route.path;
+                    anyhow::bail!(
+                        "deploy smoke test must reveal response origin for {method} {path}"
+                    );
+                }
+            }
+        }
     }
     if deploy_routes_include(artifact, "POST", "/checkout") {
         for path in ["/products", "/members", "/cart/items"] {
@@ -29479,6 +29501,16 @@ done
                 r#"orv_smoke_curl_origin_response "GET {}" "{}" "{}" "$BASE_URL{}""#,
                 route.path, origin_ref, response_origin_ref, route.path
             );
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_reveal_contains "reveal GET {} response source" "{}" '@respond'"#,
+                route.path, response_origin_ref
+            );
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_reveal_contains "reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
+                route.path, response_origin_ref
+            );
         } else {
             let _ = writeln!(
                 script,
@@ -31561,6 +31593,12 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET /health response source" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH" '@respond'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET /health response production" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH" '"response_origin_dispatch": true'"#
         ));
         assert!(smoke_test.contains(r#"ORV_SMOKE_DB_CONNECT_ORIGIN="ori_"#));
         assert!(smoke_test.contains(
@@ -43354,6 +43392,12 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(r#"ORV_SMOKE_RESPONSE_ORIGIN_GET_PING="ori_"#));
         assert!(smoke_test.contains(
             r#"orv_smoke_curl_origin_response "GET /ping" "$ORV_SMOKE_ORIGIN_GET_PING" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" "$BASE_URL/ping""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET /ping response source" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '@respond'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET /ping response production" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '"response_origin_dispatch": true'"#
         ));
         let preflight = read_json_value(&deploy_preflight_path).expect("deploy preflight");
         assert_eq!(preflight["schema_version"], 1);
