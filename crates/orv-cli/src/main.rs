@@ -23086,11 +23086,14 @@ fn verify_deploy_smoke_test_artifact(
             for required in [
                 r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
+                r#"orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
                 r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#,
                 r#"orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
                 r#"orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_lsp_reveal_contains "lsp reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
+                r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -31266,11 +31269,14 @@ orv_smoke_lsp_reveal_contains "lsp reveal GET / production" "__ROOT_ORIGIN__" '"
 if [ -n "$ORV_SMOKE_DB_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
+  orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
   orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'
   orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
+  orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
   orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_lsp_reveal_contains "lsp reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
+  orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
 fi
 if [ -n "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'
@@ -33519,10 +33525,19 @@ test "checkout excluded failure" {
             r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
         ));
         assert!(smoke_test.contains(r#"ORV_SMOKE_PAYMENT_CONNECT_ORIGIN="ori_"#));
         assert!(smoke_test.contains(r#"ORV_SMOKE_SHIPPING_CONNECT_ORIGIN="ori_"#));
