@@ -46,7 +46,7 @@ orv benchmark-report dist
 
 This gate proves the implementation path first. Human 5-hour runs then measure authoring UX, not whether the scaffold can boot.
 
-Production builds mirror this benchmark contract into `deploy/preflight.json` under `benchmark`. They also emit `deploy/benchmark-evidence.json`, a checked evidence template keyed to the same preflight hash. The evidence artifact carries the automated gate, success criteria, time budget, and data-to-record fields so benchmark reports stay tied to the same deploy preflight that `orv verify-build` checks.
+Production builds mirror this benchmark contract into `deploy/preflight.json` under `benchmark`, and the checked preflight command list includes both `orv benchmark-report .` and `orv benchmark-report . --require-pass`. They also emit `deploy/benchmark-evidence.json`, a checked evidence template keyed to the same preflight hash. The evidence artifact carries the automated gate, success criteria, time budget, and data-to-record fields so benchmark reports stay tied to the same deploy preflight that `orv verify-build` checks.
 
 After a human run, fill the recorded fields in `deploy/benchmark-evidence.json` and run `orv benchmark-report dist --require-pass` to turn elapsed task time, required observation data, and the 5-hour limit into a checked JSON report.
 

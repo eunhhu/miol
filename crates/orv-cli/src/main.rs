@@ -23044,6 +23044,18 @@ fn verify_deploy_preflight_artifact(
     )?;
     verify_json_pointer_str(
         &preflight,
+        "/commands/benchmark_report",
+        "orv benchmark-report .",
+        "deploy preflight benchmark_report command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/benchmark_report_require_pass",
+        "orv benchmark-report . --require-pass",
+        "deploy preflight benchmark_report_require_pass command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
         "/commands/compose_up",
         &format!("docker compose -f {} up --build -d", artifacts.compose),
         "deploy preflight compose_up command",
@@ -23588,6 +23600,12 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("## Benchmark Evidence") {
         anyhow::bail!("deploy runbook must document benchmark evidence capture");
+    }
+    if !runbook.contains("orv benchmark-report .") {
+        anyhow::bail!("deploy runbook must document benchmark report command");
+    }
+    if !runbook.contains("orv benchmark-report . --require-pass") {
+        anyhow::bail!("deploy runbook must document benchmark report require-pass command");
     }
     if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document request trace capture command");
@@ -30230,6 +30248,8 @@ fn deploy_preflight_commands_value(artifacts: &DeployRunbookArtifacts<'_>) -> se
         "env_check": "orv deploy-env-check .",
         "run_build": "orv run-build .",
         "smoke_test": format!("./{}", artifacts.smoke_test),
+        "benchmark_report": "orv benchmark-report .",
+        "benchmark_report_require_pass": "orv benchmark-report . --require-pass",
         "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
         "trace": "./deploy/server.sh --trace deploy/request-trace.json",
         "trace_run_build": "orv run-build . --trace deploy/request-trace.json",
@@ -31149,6 +31169,7 @@ ORV_SMOKE_TRACE_STREAM=1 ./{smoke_test_path}
 ```sh
 orv verify-build .
 orv deploy-env-check .
+orv benchmark-report .
 ```
 
 ## Smoke Test
@@ -31160,6 +31181,10 @@ orv deploy-env-check .
 ## Benchmark Evidence
 
 Record human-run timing and observation data in `{benchmark_evidence_path}` after the preflight and smoke commands pass. The file keeps the 5-hour shop benchmark tasks, data-to-record fields, and preflight hash together so benchmark reports stay tied to the checked build contract.
+
+```sh
+orv benchmark-report . --require-pass
+```
 
 {client_section}
 {persistence_section}
@@ -32877,6 +32902,14 @@ test "checkout excluded failure" {
             serde_json::json!("./deploy/smoke-test.sh")
         );
         assert_eq!(
+            preflight["commands"]["benchmark_report"],
+            serde_json::json!("orv benchmark-report .")
+        );
+        assert_eq!(
+            preflight["commands"]["benchmark_report_require_pass"],
+            serde_json::json!("orv benchmark-report . --require-pass")
+        );
+        assert_eq!(
             preflight["commands"]["trace_run_build"],
             serde_json::json!("orv run-build . --trace deploy/request-trace.json")
         );
@@ -33199,6 +33232,8 @@ test "checkout excluded failure" {
         assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
         assert!(runbook.contains("orv verify-build ."));
+        assert!(runbook.contains("orv benchmark-report ."));
+        assert!(runbook.contains("orv benchmark-report . --require-pass"));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
@@ -44854,6 +44889,8 @@ entry = "src/main.orv"
         assert!(runbook.contains("## Benchmark Evidence"));
         assert!(runbook.contains("orv verify-build ."));
         assert!(runbook.contains("orv deploy-env-check ."));
+        assert!(runbook.contains("orv benchmark-report ."));
+        assert!(runbook.contains("orv benchmark-report . --require-pass"));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
@@ -44930,6 +44967,14 @@ entry = "src/main.orv"
         assert_eq!(
             preflight["commands"]["smoke_test"],
             "./deploy/smoke-test.sh"
+        );
+        assert_eq!(
+            preflight["commands"]["benchmark_report"],
+            "orv benchmark-report ."
+        );
+        assert_eq!(
+            preflight["commands"]["benchmark_report_require_pass"],
+            "orv benchmark-report . --require-pass"
         );
         assert_eq!(
             preflight["commands"]["trace_stream_smoke"],
@@ -46985,6 +47030,26 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy preflight smoke_test command must be ./deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_benchmark_report_command_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-benchmark-report-source");
+        let out = temp_output_dir("deploy-preflight-benchmark-report-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["commands"]["benchmark_report"] = serde_json::json!("orv benchmark-report other");
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight benchmark-report mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight benchmark_report command"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
