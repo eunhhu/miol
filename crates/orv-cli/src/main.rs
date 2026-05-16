@@ -8754,7 +8754,7 @@ fn editor_export_state_json_with_trace(
 }
 
 fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::json!({
+    let mut production = serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.production",
         "build_dir": build.display().to_string(),
@@ -8763,7 +8763,13 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
         "preflight": reveal_preflight_targets(build)?,
         "db_adapters": reveal_db_adapter_targets(build)?,
         "commerce_adapters": reveal_commerce_adapter_targets(build)?,
-    }))
+    });
+    let summary = editor_native_host_production_summary_json(&production);
+    production
+        .as_object_mut()
+        .expect("editor production state is object")
+        .insert("summary".to_string(), summary);
+    Ok(production)
 }
 
 fn editor_production_graph_contract_targets(
@@ -54324,6 +54330,24 @@ define Auth() -> { @out "auth" }
                 ["present"],
             false
         );
+        assert_eq!(
+            state["production"]["summary"]["schema_version"],
+            serde_json::json!(1)
+        );
+        assert_eq!(state["production"]["summary"]["graph_contract_count"], 3);
+        assert_eq!(state["production"]["summary"]["preflight_target_count"], 1);
+        assert_eq!(
+            state["production"]["summary"]["preflight_smoke_summary_present_count"],
+            0
+        );
+        assert_eq!(
+            state["production"]["summary"]["preflight_smoke_summary_missing_count"],
+            1
+        );
+        assert_eq!(
+            state["production"]["summary"]["preflight_smoke_summary_missing_marker_count"],
+            0
+        );
         assert!(
             state["production"]["preflight"][0]["benchmark_evidence"]["missing_data"]
                 .as_array()
@@ -54400,6 +54424,10 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             native_host["production"]["graph_contract"],
             state["production"]["graph_contract"]
+        );
+        assert_eq!(
+            native_host["production"]["summary"],
+            state["production"]["summary"]
         );
         assert_eq!(
             native_host["production"]["summary"]["schema_version"],
