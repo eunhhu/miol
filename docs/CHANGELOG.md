@@ -15,6 +15,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Added generated `deploy/preflight.json` so verify-build, deploy-env-check, run-build, smoke-test, runtime features, security features, persistence, env requirements, and linked deploy artifacts share one checked preflight contract.
 - Exposed the checked deploy preflight contract through reveal/editor/LSP production payloads and the native editor production panel.
 - Added per-route security policy descriptors for source-backed auth/session/csrf domains and built-in rate-limit defaults, with verify-build origin containment checks and reveal production payload exposure.
+- Surfaced preflight route-policy counts and kind summaries in editor export/native-host production payloads and the generated production panel.
 
 ## 2026-05-06
 

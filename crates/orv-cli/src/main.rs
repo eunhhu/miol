@@ -8573,6 +8573,8 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
     let production_adapters = production_adapter_count(&production_state) > 0;
     let client_bundles = production_client_bundle_count(&production_state) > 0;
     let production_preflight = json_array_count(production_state.get("preflight")) > 0;
+    let production_route_policies =
+        production_preflight_route_policy_count_from_value(&production_state) > 0;
     let production = editor_native_host_production_json(&production_state);
     let runtime = editor_native_host_runtime_json(state);
     let trace = editor_native_host_trace_json(state);
@@ -8691,6 +8693,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "dap_controls": controls > 0,
             "production_adapters": production_adapters,
             "production_preflight": production_preflight,
+            "production_route_policies": production_route_policies,
             "client_bundles": client_bundles,
             "trace_navigation": trace_enabled,
         },
@@ -8848,6 +8851,11 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
                 "kind": "array",
             },
             {
+                "name": "route_policies",
+                "path": "production.summary.route_policy_kind_counts",
+                "kind": "object",
+            },
+            {
                 "name": "client",
                 "path": "production.client",
                 "kind": "array",
@@ -8899,8 +8907,11 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         "client_manifest_count": production_client_manifest_count(&client),
         "client_capability_surface_count": production_client_capability_surface_count(&client),
         "preflight_target_count": preflight.len(),
+        "preflight_route_count": production_preflight_route_count(&preflight),
         "preflight_required_env_count": production_preflight_env_count(&preflight, "required_env"),
         "preflight_optional_env_count": production_preflight_env_count(&preflight, "optional_env"),
+        "route_policy_count": production_preflight_route_policy_count(&preflight),
+        "route_policy_kind_counts": production_preflight_route_policy_kind_counts(&preflight),
         "db_target_count": db_adapters.len(),
         "commerce_target_count": commerce_adapters.len(),
         "db_adapter_count": db_adapter_count,
@@ -8947,6 +8958,57 @@ fn production_preflight_env_count(targets: &[serde_json::Value], key: &str) -> u
         .sum()
 }
 
+fn production_preflight_route_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(|target| json_array_count(target.get("routes")))
+        .sum()
+}
+
+fn production_preflight_route_policy_count_from_value(production: &serde_json::Value) -> usize {
+    production
+        .get("preflight")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |targets| {
+            production_preflight_route_policy_count(targets)
+        })
+}
+
+fn production_preflight_route_policy_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .flat_map(production_preflight_routes)
+        .map(|route| json_array_count(route.get("policies")))
+        .sum()
+}
+
+fn production_preflight_route_policy_kind_counts(
+    targets: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut counts = BTreeMap::new();
+    for route in targets.iter().flat_map(production_preflight_routes) {
+        for policy in route
+            .get("policies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(kind) = policy.get("kind").and_then(serde_json::Value::as_str) {
+                *counts.entry(kind.to_string()).or_insert(0usize) += 1;
+            }
+        }
+    }
+    serde_json::to_value(counts).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn production_preflight_routes(target: &serde_json::Value) -> Vec<&serde_json::Value> {
+    target
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .map(|routes| routes.iter().collect())
+        .unwrap_or_default()
+}
+
 fn production_missing_artifact_count(targets: &[serde_json::Value]) -> usize {
     targets
         .iter()
@@ -8981,6 +9043,7 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     let db_target_count = json_usize_field(&summary, "db_target_count");
     let commerce_target_count = json_usize_field(&summary, "commerce_target_count");
     let preflight_target_count = json_usize_field(&summary, "preflight_target_count");
+    let route_policy_count = json_usize_field(&summary, "route_policy_count");
     let client_target_count = json_usize_field(&summary, "client_target_count");
     let adapter_count = json_usize_field(&summary, "adapter_count");
     let missing_artifact_count = json_usize_field(&summary, "missing_artifact_count");
@@ -9002,6 +9065,11 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
             .get("preflight")
             .unwrap_or(&serde_json::Value::Null),
     )?);
+    let route_policies = html_escape_text(&serde_json::to_string_pretty(
+        summary
+            .get("route_policy_kind_counts")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
     let panel_contract = html_escape_text(&serde_json::to_string_pretty(
         production
             .get("panel_contract")
@@ -9014,12 +9082,12 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
         if missing_artifact_count == 0 { "" } else { "bad" }
     )?;
     writeln!(
         &mut html,
-        "<main><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
+        "<main><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>Route Policy Summary</h2><pre>{route_policies}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
     )?;
     writeln!(
         &mut html,
@@ -10062,8 +10130,10 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         let path = json_str_or_empty(target, "path");
         let required_env = json_array_count(target.get("required_env"));
         let optional_env = json_array_count(target.get("optional_env"));
+        let route_count = json_array_count(target.get("routes"));
+        let route_policies = production_preflight_route_policy_count(std::slice::from_ref(target));
         lines.push(format!(
-            "Preflight {path} (required_env {required_env}, optional_env {optional_env})"
+            "Preflight {path} (routes {route_count}, route_policies {route_policies}, required_env {required_env}, optional_env {optional_env})"
         ));
     }
     for target in production
@@ -23089,6 +23159,14 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
             .unwrap_or_else(|| serde_json::json!([])),
         "security_features": artifact
             .get("security_features")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "listen": artifact
+            .get("listen")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "routes": artifact
+            .get("routes")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
         "required_env": artifact
@@ -46278,6 +46356,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["commands"]["verify_build"] == "orv verify-build ."
                 && target["commands"]["env_check"] == "orv deploy-env-check ."
                 && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
+                && target["routes"][0]["method"] == "GET"
+                && target["routes"][0]["path"] == "/ping"
                 && target["required_env"][0]["kind"] == "db"
                 && target["required_env"][0]["env"] == "SHOP_DATABASE_URL"
                 && target["required_env"][0]["required"] == true
@@ -49449,6 +49529,7 @@ define Auth() -> { @out "auth" }
   let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
   let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
   @route POST /checkout {
+    @csrf
     let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
     @respond 200 { payment: captured.status }
   }
@@ -49479,6 +49560,28 @@ define Auth() -> { @out "auth" }
             state["production"]["preflight"][0]["commands"]["verify_build"],
             "orv verify-build ."
         );
+        let checkout_route = json_route(
+            &state["production"]["preflight"][0]["routes"],
+            "POST",
+            "/checkout",
+        )
+        .expect("checkout route");
+        assert!(checkout_route["policies"]
+            .as_array()
+            .expect("checkout policies")
+            .iter()
+            .any(|policy| policy["kind"] == "csrf"
+                && policy["required"] == true
+                && policy["origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        assert!(checkout_route["policies"]
+            .as_array()
+            .expect("checkout policies")
+            .iter()
+            .any(|policy| policy["kind"] == "rate_limit"
+                && policy["limit"] == 10
+                && policy["window_seconds"] == 60));
         let native_host = editor_native_host_manifest_json(&path, &state);
         assert_eq!(
             native_host["production"]["db_adapters"][0]["path"],
@@ -49498,6 +49601,22 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_target_count"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["preflight_route_count"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["route_policy_count"],
+            2
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["route_policy_kind_counts"]["csrf"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["route_policy_kind_counts"]["rate_limit"],
             1
         );
         assert_eq!(
@@ -49542,6 +49661,10 @@ define Auth() -> { @out "auth" }
                 && section["path"] == "production.preflight"));
         assert!(production_sections
             .iter()
+            .any(|section| section["name"] == "route_policies"
+                && section["path"] == "production.summary.route_policy_kind_counts"));
+        assert!(production_sections
+            .iter()
             .any(|section| section["name"] == "commerce_adapters"
                 && section["path"] == "production.commerce_adapters"));
         assert!(production_sections
@@ -49562,8 +49685,13 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(native_host["capabilities"]["production_adapters"], true);
         assert_eq!(native_host["capabilities"]["production_preflight"], true);
+        assert_eq!(
+            native_host["capabilities"]["production_route_policies"],
+            true
+        );
         assert!(html.contains("Production"));
         assert!(html.contains("Preflight"));
+        assert!(html.contains("route_policies 2"));
         assert!(html.contains("DB Adapters"));
         assert!(html.contains("Commerce Adapters"));
         assert!(html.contains("deploy/db-adapters.json"));
@@ -49589,6 +49717,10 @@ define Auth() -> { @out "auth" }
         }));
         assert!(production_panel.contains("Production Panel"));
         assert!(production_panel.contains("Preflight"));
+        assert!(production_panel.contains("Route Policies"));
+        assert!(production_panel.contains("Route Policy Summary"));
+        assert!(production_panel.contains("\"csrf\": 1"));
+        assert!(production_panel.contains("\"rate_limit\": 1"));
         assert!(production_panel.contains("DB Adapters"));
         assert!(production_panel.contains("Commerce Adapters"));
         assert!(production_panel.contains("deploy/preflight.json"));
