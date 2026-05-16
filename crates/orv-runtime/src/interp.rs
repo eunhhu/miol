@@ -3834,8 +3834,20 @@ impl<W: Write> Interp<W> {
     }
 
     fn eval_csrf_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if is_exempt_policy_invocation(args)? {
+            return Ok(Value::Object(vec![
+                ("status".to_string(), Value::Str("exempt".to_string())),
+                ("exempt".to_string(), Value::Bool(true)),
+                (
+                    "cookie".to_string(),
+                    Value::Str(ORV_CSRF_COOKIE_NAME.to_string()),
+                ),
+            ]));
+        }
         if !args.is_empty() {
-            return Err(RuntimeError::native("`@csrf` expects no arguments"));
+            return Err(RuntimeError::native(
+                "`@csrf` expects no arguments or `exempt`",
+            ));
         }
         let Some(ctx) = self.request.as_ref() else {
             return Ok(Value::Void);
@@ -4259,6 +4271,21 @@ struct AuthPolicy {
 
 fn is_required_arg(expr: &HirExpr) -> bool {
     matches!(&expr.kind, HirExprKind::Ident(ident) if ident.name == "required")
+}
+
+fn is_exempt_policy_invocation(args: &[HirExpr]) -> Result<bool, RuntimeError> {
+    let [arg] = args else {
+        return Ok(false);
+    };
+    match &arg.kind {
+        HirExprKind::Ident(ident) if ident.name == "exempt" => Ok(true),
+        HirExprKind::Assign { target, value } if target.name == "exempt" => match &value.kind {
+            HirExprKind::True => Ok(true),
+            HirExprKind::False => Ok(false),
+            _ => Err(RuntimeError::native("`exempt` expects a static bool")),
+        },
+        _ => Ok(false),
+    }
 }
 
 fn is_declarative_auth_invocation(args: &[HirExpr]) -> bool {
@@ -8971,6 +8998,17 @@ let third: int = 3
         assert!(fields.iter().any(|(name, value)| {
             name == "err" && matches!(value, Value::Str(err) if err == "csrf_token_required")
         }));
+    }
+
+    #[test]
+    fn csrf_domain_exempt_allows_request_without_token() {
+        let out = eval_handler_src(
+            r#"@csrf exempt
+@out "after""#,
+            RequestCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(out, "after\n");
     }
 
     #[test]

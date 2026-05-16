@@ -37,6 +37,11 @@ Beginner-facing code should prefer declarative security domains:
   @Auth required role="admin"
   @respond 200 await @db.find Order
 }
+
+@route POST /webhooks/provider {
+  @csrf exempt
+  @respond 200 { ok: true }
+}
 ```
 
 Lower-level primitives such as `jwt.verify`, `hash.password`, `crypto.hmac`, and `vault.get` remain available for Systems Surface code, but scaffolds should not force beginners to wire them by hand.

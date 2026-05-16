@@ -2402,6 +2402,9 @@ impl Parser {
         if name_ident.name == "serve" {
             return self.parse_serve_call(name_ident);
         }
+        if name_ident.name == "csrf" {
+            return self.parse_csrf_call(name_ident, at_tok.span);
+        }
         if name_ident.name == "job" {
             return self.parse_job_call(name_ident, at_tok.span);
         }
@@ -2700,6 +2703,21 @@ impl Parser {
                 name: name_ident,
                 args: vec![type_expr],
             },
+        })
+    }
+
+    fn parse_csrf_call(&mut self, name_ident: Ident, at_span: Span) -> Option<Expr> {
+        let mut args = Vec::new();
+        if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "exempt") {
+            args.push(self.parse_expr()?);
+        }
+        let span = args.last().map_or(at_span, |arg| at_span.join(arg.span));
+        Some(Expr {
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args,
+            },
+            span,
         })
     }
 
@@ -5393,6 +5411,36 @@ struct Registration {
         };
         assert_eq!(name.name, "csrf");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn csrf_domain_parses_exempt_flag() {
+        let r = parse_str(
+            r#"
+            @route POST /webhooks/custom {
+              @csrf exempt
+              @respond 200 { ok: true }
+            }
+            "#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let args = route_args(&r.program.items[0]);
+        let ExprKind::Block(body) = &args[2].kind else {
+            panic!("route body must be block");
+        };
+        assert_eq!(body.stmts.len(), 2);
+        let Stmt::Expr(csrf) = &body.stmts[0] else {
+            panic!("expected csrf expr");
+        };
+        let ExprKind::Domain { name, args } = &csrf.kind else {
+            panic!("expected csrf domain");
+        };
+        assert_eq!(name.name, "csrf");
+        assert_eq!(args.len(), 1);
+        let ExprKind::Ident(flag) = &args[0].kind else {
+            panic!("expected exempt flag");
+        };
+        assert_eq!(flag.name, "exempt");
     }
 
     #[test]

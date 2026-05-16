@@ -362,7 +362,8 @@ impl Resolver {
                     if let ExprKind::Assign { value, .. } = &arg.kind {
                         self.resolve_expr(value);
                     } else if is_domain_flag_arg(&name.name, arg) {
-                        // Declarative policy flags such as `@rateLimit exempt`
+                        // Declarative policy flags such as `@csrf exempt`
+                        // or `@rateLimit exempt`
                         // are syntax-level markers, not variable references.
                     } else {
                         self.resolve_expr(arg);
@@ -598,7 +599,7 @@ fn is_builtin_name(name: &str) -> bool {
 fn is_domain_flag_arg(domain: &str, arg: &Expr) -> bool {
     matches!(
         (domain, &arg.kind),
-        ("rateLimit", ExprKind::Ident(ident)) if ident.name == "exempt"
+        ("csrf" | "rateLimit", ExprKind::Ident(ident)) if ident.name == "exempt"
     )
 }
 
@@ -673,6 +674,12 @@ mod tests {
     #[test]
     fn rate_limit_exempt_flag_is_not_variable_reference() {
         let result = resolve_ok("@rateLimit exempt");
+        assert!(result.decls.is_empty());
+    }
+
+    #[test]
+    fn csrf_exempt_flag_is_not_variable_reference() {
+        let result = resolve_ok("@csrf exempt");
         assert!(result.decls.is_empty());
     }
 

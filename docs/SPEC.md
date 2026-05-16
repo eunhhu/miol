@@ -2105,6 +2105,11 @@ App Authoring Surface에서는 직접 bearer token을 자르는 대신 안전한
   @body: CheckoutForm
   @respond 200 await checkout(@body)
 }
+
+@route POST /webhooks/provider {
+  @csrf exempt
+  @respond 200 await handleProviderWebhook(@request.rawBody)
+}
 ```
 
 아래 형태는 Systems Surface에서 커스텀 정책을 만들 때 쓰는 저수준 예시다.

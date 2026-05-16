@@ -11881,7 +11881,38 @@ fn verify_route_policy_artifact(
         return;
     }
     match policy.kind.as_str() {
-        "csrf" | "session" | "auth" => {
+        "csrf" => {
+            if policy.origin_id.as_deref().is_none_or(str::is_empty) {
+                errors.push(format!(
+                    "route {} {} csrf policy has empty origin id",
+                    route.method, route.path
+                ));
+            }
+            if policy.exempt == Some(true) {
+                if policy.required == Some(true) {
+                    errors.push(format!(
+                        "route {} {} csrf exempt policy must not be required",
+                        route.method, route.path
+                    ));
+                }
+            } else if policy.required != Some(true) {
+                errors.push(format!(
+                    "route {} {} csrf policy must be required",
+                    route.method, route.path
+                ));
+            }
+            if policy.key.is_some()
+                || policy.role.is_some()
+                || policy.limit.is_some()
+                || policy.window_seconds.is_some()
+            {
+                errors.push(format!(
+                    "route {} {} csrf policy must not set rate-limit/auth fields",
+                    route.method, route.path
+                ));
+            }
+        }
+        "session" | "auth" => {
             if policy.origin_id.as_deref().is_none_or(str::is_empty) {
                 errors.push(format!(
                     "route {} {} {} policy has empty origin id",
@@ -12280,6 +12311,16 @@ fn route_policy_artifact_from_domain(
             limit: None,
             window_seconds: None,
         }),
+        "csrf" if args.iter().any(is_exempt_policy_arg) => Some(ServerRoutePolicyArtifact {
+            kind: "csrf".to_string(),
+            origin_id,
+            required: Some(false),
+            role: None,
+            key: None,
+            exempt: Some(true),
+            limit: None,
+            window_seconds: None,
+        }),
         "session" if args.iter().any(is_required_policy_arg) => Some(ServerRoutePolicyArtifact {
             kind: "session".to_string(),
             origin_id,
@@ -12444,6 +12485,12 @@ fn is_required_policy_arg(arg: &HirExpr) -> bool {
     matches!(&arg.kind, HirExprKind::Ident(ident) if ident.name == "required")
         || matches!(&arg.kind, HirExprKind::Assign { target, value }
             if target.name == "required" && matches!(&value.kind, HirExprKind::True))
+}
+
+fn is_exempt_policy_arg(arg: &HirExpr) -> bool {
+    matches!(&arg.kind, HirExprKind::Ident(ident) if ident.name == "exempt")
+        || matches!(&arg.kind, HirExprKind::Assign { target, value }
+            if target.name == "exempt" && static_bool(value) == Some(true))
 }
 
 fn auth_policy_args(args: &[HirExpr]) -> (bool, Option<String>) {
@@ -14057,6 +14104,38 @@ function greet(name: string): string -> "hi {name}""#,
         assert_eq!(policy.limit, None);
         assert_eq!(policy.window_seconds, None);
         verify_server_runtime_artifact(&artifact).expect("exempt policy verifies");
+    }
+
+    #[test]
+    fn server_runtime_artifact_records_csrf_exemption_policy() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /webhooks/custom {
+    @csrf exempt
+    @respond 200 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let route = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/webhooks/custom")
+            .expect("webhook route");
+
+        assert_eq!(route.policies.len(), 1);
+        let policy = &route.policies[0];
+        assert_eq!(policy.kind, "csrf");
+        assert!(policy
+            .origin_id
+            .as_deref()
+            .is_some_and(|origin_id| origin_id.starts_with("ori_")));
+        assert_eq!(policy.required, Some(false));
+        assert_eq!(policy.exempt, Some(true));
+        verify_server_runtime_artifact(&artifact).expect("csrf exempt policy verifies");
     }
 
     #[test]
@@ -20218,6 +20297,28 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("exempt: None"));
         assert!(source.contains("limit: Some(2)"));
         assert!(source.contains("window_seconds: Some(60)"));
+    }
+
+    #[test]
+    fn native_server_routes_source_declares_csrf_exemption_policy_fields() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /webhooks/custom {
+    @csrf exempt
+    @respond 200 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("kind: \"csrf\""));
+        assert!(source.contains("origin_id: Some(\"ori_"));
+        assert!(source.contains("required: Some(false)"));
+        assert!(source.contains("exempt: Some(true)"));
     }
 
     #[test]
