@@ -63,6 +63,7 @@ use crate::interp::{
 /// 다룬다.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const ORV_ORIGIN_ID_HEADER: &str = "x-orv-origin-id";
+const ORV_RESPONSE_ORIGIN_ID_HEADER: &str = "x-orv-response-origin-id";
 const ORV_RUNTIME_REQUEST_TRACE_PATH_ENV: &str = "ORV_RUNTIME_REQUEST_TRACE_PATH";
 const ORV_TRACE_EVENTS_PATH: &str = "/__orv/trace/events";
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -762,6 +763,8 @@ pub struct ServerRequestFrame {
     pub route_path: Option<String>,
     /// Origin id for the matched route.
     pub route_origin_id: Option<String>,
+    /// Origin id for the response-producing source node, when known.
+    pub response_origin_id: Option<String>,
     /// HTTP response status returned to the client.
     pub status: u16,
     /// Captured path parameters.
@@ -1460,6 +1463,7 @@ async fn handle_request(
                 route_method: None,
                 route_path: None,
                 route_origin_id: None,
+                response_origin_id: None,
                 status: response.status().as_u16(),
                 params: HashMap::new(),
                 query,
@@ -1492,6 +1496,7 @@ async fn handle_request(
                     route_method: Some(entry.method),
                     route_path: Some(entry.path),
                     route_origin_id: Some(entry.origin_id),
+                    response_origin_id: None,
                     status: response.status().as_u16(),
                     params,
                     query,
@@ -1550,12 +1555,19 @@ async fn handle_request(
         eprintln!("{w}");
     }
 
-    let response = match outcome.response {
+    let (response, response_origin_id) = match outcome.response {
         Some(resp) => {
+            let response_origin_id = resp.origin_id.clone();
             let extra_headers = response_extra_headers(&entry.method, &entry.path, &resp);
-            response_from_respond(resp, Some(&entry.origin_id), &extra_headers)
+            (
+                response_from_respond(resp, Some(&entry.origin_id), &extra_headers),
+                response_origin_id,
+            )
         }
-        None => default_response(&outcome.value, Some(&entry.origin_id)),
+        None => (
+            default_response(&outcome.value, Some(&entry.origin_id)),
+            None,
+        ),
     };
     record_request_frame(
         trace_state.as_ref(),
@@ -1565,6 +1577,7 @@ async fn handle_request(
             route_method: Some(entry.method),
             route_path: Some(entry.path),
             route_origin_id: Some(entry.origin_id),
+            response_origin_id,
             status: response.status().as_u16(),
             params: frame_params,
             query: frame_query,
@@ -1723,6 +1736,7 @@ fn request_frame_json(frame: &ServerRequestFrame) -> serde_json::Value {
         "route_method": frame.route_method.as_deref(),
         "route_path": frame.route_path.as_deref(),
         "route_origin_id": frame.route_origin_id.as_deref(),
+        "response_origin_id": frame.response_origin_id.as_deref(),
         "params": &frame.params,
         "query": &frame.query,
         "body": &frame.body,
@@ -1741,6 +1755,7 @@ fn response_from_respond(
     origin_id: Option<&str>,
     extra_headers: &[(String, String)],
 ) -> ServerResponse {
+    let response_origin_id = resp.origin_id.clone();
     let status = u16::try_from(resp.status)
         .ok()
         .and_then(|s| StatusCode::from_u16(s).ok())
@@ -1749,7 +1764,8 @@ fn response_from_respond(
     // SPEC §11.9: `@redirect` 가 기록한 Location 이 있으면 body 없이
     // `Location:` 헤더 + 상태로 응답한다. payload/raw_body 는 무시.
     if let Some(loc) = resp.location {
-        let builder = response_builder(status, origin_id).header("location", loc);
+        let builder = response_builder(status, origin_id, response_origin_id.as_deref())
+            .header("location", loc);
         return apply_extra_response_headers(builder, extra_headers)
             .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
@@ -1759,7 +1775,8 @@ fn response_from_respond(
     // body 금지 상태(204/304/1xx)에서도 파일은 있을 수 없는 조합이라 일반
     // 경로보다 먼저 잡는다.
     if let Some(raw) = resp.raw_body {
-        let builder = response_builder(status, origin_id).header("content-type", raw.content_type);
+        let builder = response_builder(status, origin_id, response_origin_id.as_deref())
+            .header("content-type", raw.content_type);
         return apply_extra_response_headers(builder, extra_headers)
             .body(RuntimeBody::full(Bytes::from(raw.bytes)))
             .expect("valid response");
@@ -1769,13 +1786,17 @@ fn response_from_respond(
     // 빈 body 로 보낸다. SPEC 도 `@respond 204 {}` 에서 body 인코더 제거를
     // 기대하므로, payload 값과 무관하게 no-body 경로를 우선한다.
     if status_disallows_body(status) || matches!(resp.payload, Value::Void) {
-        return apply_extra_response_headers(response_builder(status, origin_id), extra_headers)
-            .body(RuntimeBody::full(Bytes::new()))
-            .expect("valid response");
+        return apply_extra_response_headers(
+            response_builder(status, origin_id, response_origin_id.as_deref()),
+            extra_headers,
+        )
+        .body(RuntimeBody::full(Bytes::new()))
+        .expect("valid response");
     }
     let json = value_to_json(&resp.payload);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
-    let builder = response_builder(status, origin_id).header("content-type", "application/json");
+    let builder = response_builder(status, origin_id, response_origin_id.as_deref())
+        .header("content-type", "application/json");
     apply_extra_response_headers(builder, extra_headers)
         .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
@@ -1875,22 +1896,29 @@ fn default_response(value: &Value, origin_id: Option<&str>) -> ServerResponse {
     // Void 는 빈 200. 이렇게 하면 `@route GET /health { "ok" }` 같은 간단한
     // 핸들러가 그대로 동작한다.
     if matches!(value, Value::Void) {
-        return response_builder(StatusCode::OK, origin_id)
+        return response_builder(StatusCode::OK, origin_id, None)
             .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
     let json = value_to_json(value);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
-    response_builder(StatusCode::OK, origin_id)
+    response_builder(StatusCode::OK, origin_id, None)
         .header("content-type", "application/json")
         .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
 }
 
-fn response_builder(status: StatusCode, origin_id: Option<&str>) -> hyper::http::response::Builder {
+fn response_builder(
+    status: StatusCode,
+    origin_id: Option<&str>,
+    response_origin_id: Option<&str>,
+) -> hyper::http::response::Builder {
     let mut builder = Response::builder().status(status);
     if let Some(origin_id) = origin_id {
         builder = builder.header(ORV_ORIGIN_ID_HEADER, origin_id);
+    }
+    if let Some(response_origin_id) = response_origin_id {
+        builder = builder.header(ORV_RESPONSE_ORIGIN_ID_HEADER, response_origin_id);
     }
     builder
 }
@@ -2170,6 +2198,7 @@ mod tests {
             route_method: Some("GET".to_string()),
             route_path: Some("/users/:id".to_string()),
             route_origin_id: Some("ori_route_user".to_string()),
+            response_origin_id: Some("ori_response_user".to_string()),
             status: 200,
             params: HashMap::from([("id".to_string(), "42".to_string())]),
             query: HashMap::from([("tab".to_string(), "orders".to_string())]),
@@ -2187,6 +2216,10 @@ mod tests {
         assert_eq!(trace["frames"][0]["route_method"], "GET");
         assert_eq!(trace["frames"][0]["route_path"], "/users/:id");
         assert_eq!(trace["frames"][0]["route_origin_id"], "ori_route_user");
+        assert_eq!(
+            trace["frames"][0]["response_origin_id"],
+            "ori_response_user"
+        );
         assert_eq!(trace["frames"][0]["params"]["id"], "42");
         assert_eq!(trace["frames"][0]["query"]["tab"], "orders");
         assert_eq!(trace["frames"][0]["body"], "{\"active\":true}");
@@ -2204,6 +2237,7 @@ mod tests {
             route_method: Some("POST".to_string()),
             route_path: Some("/orders".to_string()),
             route_origin_id: Some("ori_route_order".to_string()),
+            response_origin_id: Some("ori_response_order".to_string()),
             status: 201,
             params: HashMap::new(),
             query: HashMap::new(),
@@ -2218,6 +2252,10 @@ mod tests {
         assert_eq!(trace["kind"], "orv.production.trace");
         assert_eq!(trace["frames"][0]["method"], "POST");
         assert_eq!(trace["frames"][0]["status"], 201);
+        assert_eq!(
+            trace["frames"][0]["response_origin_id"],
+            "ori_response_order"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2854,6 +2892,9 @@ mod tests {
             assert_eq!(trace["frames"][0]["method"], "GET");
             assert_eq!(trace["frames"][0]["path"], "/ping");
             assert_eq!(trace["frames"][0]["status"], 200);
+            assert!(trace["frames"][0]["response_origin_id"]
+                .as_str()
+                .is_some_and(|origin| origin.starts_with("ori_")));
             let _ = std::fs::remove_dir_all(&dir);
         })
         .await;
@@ -3052,7 +3093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_response_includes_route_origin_id_header() {
+    async fn route_response_includes_origin_headers() {
         run_on_localset(async {
             let ServerTestCase {
                 listen,
@@ -3070,6 +3111,13 @@ mod tests {
                 .find(|expr| matches!(expr.kind, HirExprKind::Route { .. }))
                 .expect("route");
             let expected_origin = expected_origin_id("route", "GET /ping", route.span);
+            let HirExprKind::Route { handler, .. } = &route.kind else {
+                unreachable!("route expression");
+            };
+            let HirStmt::Expr(respond) = &handler.stmts[0] else {
+                panic!("expected respond statement");
+            };
+            let expected_response_origin = expected_origin_id("domain", "respond", respond.span);
             let (addr, handle, _boot) = spawn_for_test(
                 listen.as_deref(),
                 &routes,
@@ -3080,11 +3128,17 @@ mod tests {
             .await
             .expect("spawn");
 
-            let (status, ct, origin, _headers, body) =
+            let (status, ct, origin, headers, body) =
                 send_request_full(addr, "GET", "/ping", None).await;
             assert_eq!(status, 200);
             assert_eq!(ct.as_deref(), Some("application/json"));
             assert_eq!(origin.as_deref(), Some(expected_origin.as_str()));
+            assert_eq!(
+                headers
+                    .get(ORV_RESPONSE_ORIGIN_ID_HEADER)
+                    .map(String::as_str),
+                Some(expected_response_origin.as_str())
+            );
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["ok"], serde_json::json!(true));
 
@@ -3396,6 +3450,7 @@ mod tests {
     #[test]
     fn member_login_cookie_rejects_unsafe_session_id() {
         let resp = ResponseCtx {
+            origin_id: None,
             status: 201,
             payload: Value::Object(vec![(
                 "session".to_string(),
@@ -4214,6 +4269,8 @@ mod tests {
             let home_html = String::from_utf8(home_body).expect("home html");
             assert!(home_html.contains("<h1>Miol Shop</h1>"));
             assert!(home_html.contains("<form action=\"/products\" method=\"post\">"));
+            assert!(home_html
+                .contains("<input type=\"text\" name=\"badge\" value=\"New arrival\" required>"));
             assert!(home_html.contains("<input type=\"number\" name=\"stock\" required>"));
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
@@ -4241,6 +4298,7 @@ mod tests {
                     serde_json::json!({
                         "sku": "csrf-product",
                         "name": "CSRF Product",
+                        "badge": "CSRF",
                         "price": 1,
                         "stock": 1
                     })
@@ -4389,6 +4447,7 @@ mod tests {
             let product_payload = serde_json::json!({
                 "sku": "kettle",
                 "name": "Kettle",
+                "badge": "Featured",
                 "price": 25000,
                 "stock": 2
             })
@@ -4418,7 +4477,8 @@ mod tests {
                     addr,
                     "POST",
                     "/products",
-                    "sku=mug&name=Mug&price=1200&stock=3&_csrf=orv-reference-csrf".to_string(),
+                    "sku=mug&name=Mug&badge=Counter&price=1200&stock=3&_csrf=orv-reference-csrf"
+                        .to_string(),
                     "application/x-www-form-urlencoded",
                     &[("cookie", csrf_cookie_pair.as_str())],
                 )
@@ -4462,8 +4522,8 @@ mod tests {
             let admin_catalog_html =
                 String::from_utf8(admin_catalog_body).expect("admin catalog html");
             assert!(admin_catalog_html.contains("<h1>Catalog</h1>"));
-            assert!(admin_catalog_html.contains("kettle: Kettle / stock 2"));
-            assert!(admin_catalog_html.contains("mug: Mug / stock 3"));
+            assert!(admin_catalog_html.contains("kettle: Kettle / Featured / stock 2"));
+            assert!(admin_catalog_html.contains("mug: Mug / Counter / stock 3"));
 
             let (form_order_status, _, form_order_body) =
                 send_request_with_content_type_and_headers(

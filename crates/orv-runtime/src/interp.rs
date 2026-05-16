@@ -22,9 +22,9 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use hmac::{Hmac, Mac};
 use orv_hir::{
-    BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt,
-    HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
-    HirTypeRefKind, NameId, UnaryOp,
+    origin_id, BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody,
+    HirFunctionStmt, HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment,
+    HirTypeConstraint, HirTypeRef, HirTypeRefKind, NameId, UnaryOp,
 };
 use rand_core::OsRng;
 use sha2::Sha256;
@@ -146,6 +146,9 @@ impl Default for RequestCtx {
 /// 처럼 빈 객체가 오면 그대로 빈 오브젝트 JSON 이 된다.
 #[derive(Clone, Debug)]
 pub struct ResponseCtx {
+    /// Source-backed origin id for the response-producing expression when it is
+    /// known, for example the `@respond` HIR node.
+    pub origin_id: Option<String>,
     /// HTTP status code (예: `200`, `404`). MVP 범위는 i64 로 받되 런타임
     /// 검증 시 1xx–5xx 만 허용한다.
     pub status: i64,
@@ -1213,6 +1216,7 @@ impl<W: Write> Interp<W> {
                 // 도달하지 않지만 방어적으로 덮어쓰기 방지.
                 if self.response.is_none() {
                     self.response = Some(ResponseCtx {
+                        origin_id: Some(origin_id("domain", "respond", expr.span)),
                         status: status_code,
                         payload: payload_value,
                         raw_body: None,
@@ -3490,6 +3494,7 @@ impl<W: Write> Interp<W> {
         };
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
+                origin_id: None,
                 status,
                 payload: Value::Void,
                 raw_body: None,
@@ -3656,6 +3661,7 @@ impl<W: Write> Interp<W> {
     ) -> Result<Value, RuntimeError> {
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
+                origin_id: None,
                 status,
                 payload: Value::Void,
                 raw_body: Some(RawResponseBody {
@@ -3674,6 +3680,7 @@ impl<W: Write> Interp<W> {
     fn respond_status(&mut self, status: i64) -> Result<Value, RuntimeError> {
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
+                origin_id: None,
                 status,
                 payload: Value::Void,
                 raw_body: None,
@@ -3687,6 +3694,7 @@ impl<W: Write> Interp<W> {
     fn respond_value(&mut self, status: i64, payload: Value) -> Value {
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
+                origin_id: None,
                 status,
                 payload,
                 raw_body: None,

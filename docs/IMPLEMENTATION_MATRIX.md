@@ -15,7 +15,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 이 축이 깨지면 editor, deploy, native optimizer, shop scaffold 모두 신뢰를 잃는다. 따라서 feature 추가보다 먼저 다음 연결을 안정 계약으로 올린다.
 
 - `Span -> AST node -> HIR node -> runtime event -> origin id`
-- `orv graph`, `orv origins`, `x-orv-origin-id`, trace JSON의 origin schema 정합성
+- `orv graph`, `orv origins`, `x-orv-origin-id`, `x-orv-response-origin-id`, trace JSON의 origin schema 정합성
 - route, DB query, HTML node, function call, domain invocation의 동일 reveal 모델
 - first-party editor 없이도 CLI/static graph view만으로 production output에서 source로 돌아가는 경로
 

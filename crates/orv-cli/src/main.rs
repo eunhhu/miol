@@ -6023,19 +6023,26 @@ fn editor_trace_payload_json(
     let mut status_counts = EditorTraceStatusCounts::default();
     for (index, frame) in frames.iter().enumerate() {
         let origin_id = editor_trace_frame_origin_id(frame);
+        let response_origin_id = editor_trace_frame_response_origin_id(frame);
         let navigation = match origin_id {
             Some(origin_id) => editor_reveal_json(dir, origin_id)?,
             None => serde_json::Value::Null,
         };
+        let response_navigation = match response_origin_id {
+            Some(origin_id) => editor_reveal_json(dir, origin_id)?,
+            None => serde_json::Value::Null,
+        };
         let request = editor_trace_request_json(frame);
-        let summary = editor_trace_summary_json(&request, origin_id);
+        let summary = editor_trace_summary_json(&request, origin_id, response_origin_id);
         status_counts.record(request.get("status").and_then(serde_json::Value::as_u64));
         editor_frames.push(serde_json::json!({
             "index": index,
             "origin_id": origin_id,
+            "response_origin_id": response_origin_id,
             "request": request,
             "summary": summary,
             "navigation": navigation,
+            "response_navigation": response_navigation,
         }));
     }
     Ok(serde_json::json!({
@@ -6310,6 +6317,7 @@ fn editor_trace_status_counts_json(counts: &EditorTraceStatusCounts) -> serde_js
 fn editor_trace_summary_json(
     request: &serde_json::Value,
     origin_id: Option<&str>,
+    response_origin_id: Option<&str>,
 ) -> serde_json::Value {
     let method = request
         .get("method")
@@ -6326,6 +6334,7 @@ fn editor_trace_summary_json(
         "status": status,
         "status_class": editor_trace_status_class(status),
         "origin_id": origin_id,
+        "response_origin_id": response_origin_id,
     })
 }
 
@@ -6378,6 +6387,13 @@ fn editor_trace_frame_origin_id(frame: &serde_json::Value) -> Option<&str> {
         .filter(|origin_id| !origin_id.is_empty())
 }
 
+fn editor_trace_frame_response_origin_id(frame: &serde_json::Value) -> Option<&str> {
+    frame
+        .get("response_origin_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|origin_id| !origin_id.is_empty())
+}
+
 fn editor_trace_request_json(frame: &serde_json::Value) -> serde_json::Value {
     let mut request = serde_json::Map::new();
     for key in [
@@ -6387,6 +6403,7 @@ fn editor_trace_request_json(frame: &serde_json::Value) -> serde_json::Value {
         "route_method",
         "route_path",
         "route_origin_id",
+        "response_origin_id",
         "params",
         "query",
         "body",
@@ -9583,10 +9600,18 @@ fn editor_native_host_trace_frames_json(
                         .get("navigation")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
+                    let response_navigation = frame
+                        .get("response_navigation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let origin_id = frame.get("origin_id").and_then(serde_json::Value::as_str);
+                    let response_origin_id = frame
+                        .get("response_origin_id")
+                        .and_then(serde_json::Value::as_str);
                     serde_json::json!({
                         "index": frame.get("index").cloned().unwrap_or(serde_json::Value::Null),
                         "origin_id": frame.get("origin_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "response_origin_id": frame.get("response_origin_id").cloned().unwrap_or(serde_json::Value::Null),
                         "request": frame.get("request").cloned().unwrap_or_else(|| serde_json::json!({})),
                         "summary": frame.get("summary").cloned().unwrap_or_else(|| serde_json::json!({})),
                         "source": navigation
@@ -9597,8 +9622,18 @@ fn editor_native_host_trace_frames_json(
                             .get("production")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null),
+                        "response_source": response_navigation
+                            .get("source")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "response_production": response_navigation
+                            .get("production")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
                         "reveal_command": editor_trace_frame_reveal_command_json(build_dir, origin_id),
+                        "response_reveal_command": editor_trace_frame_reveal_command_json(build_dir, response_origin_id),
                         "navigation": navigation,
+                        "response_navigation": response_navigation,
                     })
                 })
                 .collect()
@@ -14294,6 +14329,9 @@ fn dap_server_request_frame_display(frame: &orv_runtime::server::ServerRequestFr
     )];
     if let (Some(method), Some(path)) = (&frame.route_method, &frame.route_path) {
         parts.push(format!("route {method} {path}"));
+    }
+    if let Some(origin_id) = &frame.response_origin_id {
+        parts.push(format!("response {origin_id}"));
     }
     if !frame.params.is_empty() {
         parts.push(format!("params {}", dap_string_map_display(&frame.params)));
@@ -47969,6 +48007,74 @@ let sig quantity: int = 1
         assert!(trace["frames"][0]["navigation"]["source"]["snippet"]
             .as_str()
             .is_some_and(|snippet| snippet.contains("@route GET /ping")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_trace_links_response_origin_to_source_navigation() {
+        let dir = temp_output_dir("editor-trace-response");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 0
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build(&path, &out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "GET /ping")
+            .expect("route origin");
+        let response = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "domain" && entry.name == "respond")
+            .expect("response origin");
+        let trace_path = dir.join("production-trace.json");
+        write_json(
+            &trace_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "orv.production.trace",
+                "frames": [{
+                    "method": "GET",
+                    "path": "/ping",
+                    "status": 200,
+                    "route_origin_id": route.id,
+                    "response_origin_id": response.id,
+                }],
+            }),
+        )
+        .expect("write trace");
+
+        let trace = editor_trace_json(&out, &trace_path).expect("editor trace");
+
+        assert_eq!(trace["frames"][0]["origin_id"], route.id);
+        assert_eq!(trace["frames"][0]["response_origin_id"], response.id);
+        assert_eq!(
+            trace["frames"][0]["summary"]["response_origin_id"],
+            response.id
+        );
+        assert!(trace["frames"][0]["navigation"]["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@route GET /ping")));
+        assert!(
+            trace["frames"][0]["response_navigation"]["source"]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("@respond 200"))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
