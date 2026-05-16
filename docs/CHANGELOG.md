@@ -5,6 +5,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 ## 2026-05-16
 
 - Added a reference HTTP bridge for PostgreSQL/MySQL `@db.connect` handles: configured `ORV_DB_ADAPTER_POSTGRES_ENDPOINT`, `ORV_DB_ADAPTER_MYSQL_ENDPOINT`, or `ORV_DB_ADAPTER_ENDPOINT` values turn external DB handles from explicit unsupported status into checked `http-json-v1` POST adapter calls, with optional bearer tokens from provider-specific or generic DB adapter auth envs.
+- Made `@design` token lookup work inside HTML render attributes and added editable color/spacing/typography tokens to the shop starter home shell.
 - Surfaced PostgreSQL/MySQL DB bridge request shape, bounded transient retry policy, and provider-specific endpoint/auth env knobs in `deploy/db-adapters.json`, generated Compose/env.example, preflight envs, and the deploy runbook; production deploy env checks now require the provider-specific bridge endpoint before launch while keeping bridge auth tokens optional.
 - Aligned deploy preflight and smoke tests with the runtime DB bridge fallback envs, so generic `ORV_DB_ADAPTER_ENDPOINT` and `ORV_DB_ADAPTER_AUTH_TOKEN` can satisfy shared bridge deployments when provider-specific values are unset.
 - Extended generated deploy smoke tests so external DB bridge builds check `deploy/db-adapters.json` and POST a safe `schema` probe to each configured provider bridge endpoint.

@@ -2396,6 +2396,8 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
+Theme tokens live in the starter `@design` block (`@colors`, `@spacing`, and `@typography`) and are used by the home page shell, so copy and visual theme edits stay in source instead of generated artifacts.\n\
+\n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths. Admin routes are protected by `@Auth required role=\"admin\"`; the starter seeds a reference admin member `admin` / `admin@example.test` for local smoke sessions.\n\
 \n\
 Signup stores an Argon2 `passwordHash` through `hash.password`; login uses `hash.verify` and never persists plaintext passwords.\n\
@@ -30222,6 +30224,14 @@ test "checkout excluded failure" {
         assert!(source.contains(
             r#"let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")"#
         ));
+        assert!(source.contains("@design"));
+        assert!(source.contains("@colors"));
+        assert!(source.contains(r##"primary: "#315c5a""##));
+        assert!(source.contains("@spacing"));
+        assert!(source.contains("@typography"));
+        assert!(source.contains("@design.colors.surface"));
+        assert!(source.contains("@design.spacing.lg"));
+        assert!(source.contains("@design.typography.fontFamily"));
         assert!(source.contains("@route GET / {\n"));
         assert!(source.contains("@serve @html"));
         assert!(source.contains("@a href=\"/catalog\" \"Shop catalog\""));
@@ -30376,6 +30386,11 @@ test "checkout excluded failure" {
         assert!(guide.contains("Back up `data/shop.sqlite` and commerce record logs"));
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
+        assert!(guide.contains("Theme tokens"));
+        assert!(guide.contains("@design"));
+        assert!(guide.contains("@colors"));
+        assert!(guide.contains("@spacing"));
+        assert!(guide.contains("@typography"));
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("@Auth required role=\"admin\""));
         assert!(guide.contains("admin@example.test"));

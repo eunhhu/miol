@@ -11,6 +11,17 @@
   @listen 0
   let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
 
+  @design {
+    @colors {
+      primary: "#315c5a",
+      accent: "#d97706",
+      surface: "#f8fafc",
+      text: "#15201e"
+    }
+    @spacing { sm: "8px", md: "16px", lg: "24px" }
+    @typography { fontFamily: "Inter, system-ui, sans-serif" }
+  }
+
   struct ProductInput {
     _csrf: string?
     sku: string(trim, min=1)
@@ -93,6 +104,7 @@
   @route GET / {
     @serve @html {
       @body {
+        style="background-color: {@design.colors.surface}; color: {@design.colors.text}; padding: {@design.spacing.lg}; font-family: {@design.typography.fontFamily}"
         @h1 "Miol Shop"
         @p "Catalog, member signup, payment capture, and shipment booking are ready."
         @nav {

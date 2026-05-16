@@ -3900,6 +3900,53 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn server_design_tokens_are_visible_to_html_handlers() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r##"@server {
+                    @listen 0
+                    @design {
+                        @colors { surface: "#f8fafc", text: "#15201e" }
+                        @spacing { lg: "24px" }
+                    }
+                    @route GET / {
+                        @serve @html {
+                            @body {
+                                style="background-color: {@design.colors.surface}; color: {@design.colors.text}; padding: {@design.spacing.lg}"
+                                @h1 "Miol Shop"
+                            }
+                        }
+                    }
+                }"##,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, body) = send_request(addr, "GET", "/", None).await;
+            assert_eq!(status, 200);
+            let html = String::from_utf8(body).expect("html utf-8");
+            assert!(html.contains(
+                r##"style="background-color: #f8fafc; color: #15201e; padding: 24px""##
+            ));
+
+            handle.abort();
+        })
+        .await;
+    }
+
     // --- C6 E2E: fixtures/e2e/*.orv 파일을 실제로 lower 하고 서버를 띄워 ---
     // --- 실제 HTTP 요청으로 응답을 검증한다. ---
 

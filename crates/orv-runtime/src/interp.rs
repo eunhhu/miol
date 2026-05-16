@@ -192,16 +192,18 @@ pub struct HandlerOutcome {
     pub warnings: Vec<String>,
 }
 
-/// Runtime schema/type registry captured across interpreter boundaries.
+/// Runtime schema/domain registry captured across interpreter boundaries.
 ///
 /// HTTP server boot evaluates server-level statements once, then each request
 /// runs in a fresh interpreter. The lexical env alone is not enough for
 /// `@body: SignupForm` because struct fields and type aliases live in these
-/// validator maps, so server code carries this registry alongside env values.
+/// validator maps. `@design` tokens are also runtime domain state, so server
+/// code carries this registry alongside env values.
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeTypeRegistry {
     pub type_structs: HashMap<String, Vec<(String, HirTypeRef)>>,
     pub type_aliases: HashMap<String, HirTypeRef>,
+    pub design_tokens: HashMap<String, Value>,
 }
 
 /// Result of a reference-runtime debug run.
@@ -901,12 +903,14 @@ impl<W: Write> Interp<W> {
         RuntimeTypeRegistry {
             type_structs: self.type_structs.clone(),
             type_aliases: self.type_aliases.clone(),
+            design_tokens: self.design_tokens.clone(),
         }
     }
 
     fn apply_type_registry(&mut self, types: RuntimeTypeRegistry) {
         self.type_structs = types.type_structs;
         self.type_aliases = types.type_aliases;
+        self.design_tokens = types.design_tokens;
     }
 
     fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
@@ -1246,6 +1250,9 @@ impl<W: Write> Interp<W> {
             HirExprKind::Domain { name, args, .. } => {
                 // HTML 렌더 모드에서는 임의 이름의 도메인이 태그로 해석된다.
                 if self.html_buffer.is_some() {
+                    if name == "design" && args.is_empty() {
+                        return Ok(self.design_value());
+                    }
                     self.render_tag(name, args)?;
                     return Ok(Value::Void);
                 }
@@ -8707,6 +8714,27 @@ let third: int = 3
         )
         .unwrap();
         assert_eq!(out, "#0057ff\n12px\n");
+    }
+
+    #[test]
+    fn html_attributes_can_use_design_tokens() {
+        let out = run_str(
+            r##"@design {
+  @colors { surface: "#f8fafc", text: "#15201e" }
+  @spacing { lg: "24px" }
+}
+@out @html {
+  @body {
+    style="background-color: {@design.colors.surface}; color: {@design.colors.text}; padding: {@design.spacing.lg}"
+    @h1 "Miol Shop"
+  }
+}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "<html><body style=\"background-color: #f8fafc; color: #15201e; padding: 24px\"><h1>Miol Shop</h1></body></html>\n"
+        );
     }
 
     #[test]
