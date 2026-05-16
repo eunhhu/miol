@@ -2014,6 +2014,22 @@ mod tests {
         HashMap<String, String>,
         Vec<u8>,
     ) {
+        send_request_full_with_headers(addr, method, path, body, &[]).await
+    }
+
+    async fn send_request_full_with_headers(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        headers: &[(&str, &str)],
+    ) -> (
+        u16,
+        Option<String>,
+        Option<String>,
+        HashMap<String, String>,
+        Vec<u8>,
+    ) {
         let stream = TcpStream::connect(addr).await.expect("connect");
         let io = TokioIo::new(stream);
         let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
@@ -2033,6 +2049,9 @@ mod tests {
             .header("host", "localhost");
         if has_body {
             builder = builder.header("content-type", "application/json");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let req = builder.body(Full::new(bytes)).expect("build req");
         let resp = sender.send_request(req).await.expect("send");
@@ -2095,6 +2114,18 @@ mod tests {
         body: String,
         content_type: &str,
     ) -> (u16, Option<String>, Vec<u8>) {
+        send_request_with_content_type_and_headers(addr, method, path, body, content_type, &[])
+            .await
+    }
+
+    async fn send_request_with_content_type_and_headers(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: String,
+        content_type: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<String>, Vec<u8>) {
         let stream = TcpStream::connect(addr).await.expect("connect");
         let io = TokioIo::new(stream);
         let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
@@ -2103,11 +2134,15 @@ mod tests {
         });
 
         let uri: hyper::Uri = path.parse().expect("uri");
-        let req = Request::builder()
+        let mut builder = Request::builder()
             .method(method)
             .uri(uri)
             .header("host", "localhost")
-            .header("content-type", content_type)
+            .header("content-type", content_type);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
             .body(Full::new(Bytes::from(body)))
             .expect("build req");
         let resp = sender.send_request(req).await.expect("send");
@@ -3278,6 +3313,12 @@ mod tests {
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
             assert!(home_html
                 .contains("<input type=\"hidden\" name=\"_csrf\" value=\"orv-reference-csrf\">"));
+            assert_eq!(
+                home_html
+                    .matches("<input type=\"hidden\" name=\"_csrf\" value=\"orv-reference-csrf\">")
+                    .count(),
+                8
+            );
             assert!(home_html.contains("<form action=\"/cart/items\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("<a href=\"/catalog\">Shop catalog</a>"));
@@ -3286,6 +3327,93 @@ mod tests {
             assert!(home_html.contains("POST /payments"));
             assert!(home_html.contains("POST /webhooks/stripe"));
             assert!(home_html.contains("POST /shipments"));
+
+            let csrf_required_routes = [
+                (
+                    "/products",
+                    serde_json::json!({
+                        "sku": "csrf-product",
+                        "name": "CSRF Product",
+                        "price": 1,
+                        "stock": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/members",
+                    serde_json::json!({
+                        "handle": "csrf-member",
+                        "name": "CSRF Member",
+                        "email": "csrf-member@example.test"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/members/login",
+                    serde_json::json!({
+                        "handle": "csrf-member",
+                        "email": "csrf-member@example.test"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/cart/items",
+                    serde_json::json!({
+                        "handle": "csrf-member",
+                        "sku": "csrf-product",
+                        "quantity": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/orders",
+                    serde_json::json!({
+                        "customer": "csrf-member",
+                        "sku": "csrf-product",
+                        "quantity": 1,
+                        "total": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/checkout",
+                    serde_json::json!({
+                        "handle": "csrf-member",
+                        "sku": "csrf-product",
+                        "quantity": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/payments",
+                    serde_json::json!({
+                        "orderId": 1,
+                        "amount": 1,
+                        "method": "card"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "/shipments",
+                    serde_json::json!({
+                        "orderId": 1,
+                        "carrier": "local",
+                        "address": "Seoul"
+                    })
+                    .to_string(),
+                ),
+            ];
+            for (path, body) in csrf_required_routes {
+                let (status, _, response_body) = send_request(addr, "POST", path, Some(body)).await;
+                assert_eq!(status, 403, "{path} should require csrf");
+                let rejection: serde_json::Value =
+                    serde_json::from_slice(&response_body).expect("csrf rejection json");
+                assert_eq!(
+                    rejection["err"],
+                    serde_json::json!("csrf_token_required"),
+                    "{path} should return csrf rejection"
+                );
+            }
 
             let (admin_status, admin_ct, admin_body) =
                 send_request(addr, "GET", "/admin", None).await;
@@ -3317,8 +3445,17 @@ mod tests {
                 "stock": 2
             })
             .to_string();
-            let (create_product_status, _, create_product_body) =
-                send_request(addr, "POST", "/products", Some(product_payload)).await;
+            let (create_product_status, _, create_product_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/products",
+                Some(product_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(create_product_status, 201);
             let created_product: serde_json::Value =
                 serde_json::from_slice(&create_product_body).expect("product json");
@@ -3328,14 +3465,16 @@ mod tests {
                 serde_json::json!("kettle")
             );
 
-            let (form_product_status, _, form_product_body) = send_request_with_content_type(
-                addr,
-                "POST",
-                "/products",
-                "sku=mug&name=Mug&price=1200&stock=3".to_string(),
-                "application/x-www-form-urlencoded",
-            )
-            .await;
+            let (form_product_status, _, form_product_body) =
+                send_request_with_content_type_and_headers(
+                    addr,
+                    "POST",
+                    "/products",
+                    "sku=mug&name=Mug&price=1200&stock=3&_csrf=orv-reference-csrf".to_string(),
+                    "application/x-www-form-urlencoded",
+                    &[("cookie", csrf_cookie_pair.as_str())],
+                )
+                .await;
             assert_eq!(form_product_status, 201);
             let form_product: serde_json::Value =
                 serde_json::from_slice(&form_product_body).expect("form product json");
@@ -3371,14 +3510,17 @@ mod tests {
             assert!(admin_catalog_html.contains("kettle: Kettle / stock 2"));
             assert!(admin_catalog_html.contains("mug: Mug / stock 3"));
 
-            let (form_order_status, _, form_order_body) = send_request_with_content_type(
-                addr,
-                "POST",
-                "/orders",
-                "customer=bea&sku=mug&quantity=2&total=2400".to_string(),
-                "application/x-www-form-urlencoded",
-            )
-            .await;
+            let (form_order_status, _, form_order_body) =
+                send_request_with_content_type_and_headers(
+                    addr,
+                    "POST",
+                    "/orders",
+                    "customer=bea&sku=mug&quantity=2&total=2400&_csrf=orv-reference-csrf"
+                        .to_string(),
+                    "application/x-www-form-urlencoded",
+                    &[("cookie", csrf_cookie_pair.as_str())],
+                )
+                .await;
             assert_eq!(form_order_status, 201);
             let form_order: serde_json::Value =
                 serde_json::from_slice(&form_order_body).expect("form order json");
@@ -3393,8 +3535,17 @@ mod tests {
                 "total": 25000
             })
             .to_string();
-            let (create_order_status, _, create_order_body) =
-                send_request(addr, "POST", "/orders", Some(order_payload)).await;
+            let (create_order_status, _, create_order_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/orders",
+                Some(order_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(create_order_status, 201);
             let created_order: serde_json::Value =
                 serde_json::from_slice(&create_order_body).expect("order json");
@@ -3428,8 +3579,17 @@ mod tests {
                 "total": 50000
             })
             .to_string();
-            let (oversell_status, _, oversell_body) =
-                send_request(addr, "POST", "/orders", Some(oversell_payload)).await;
+            let (oversell_status, _, oversell_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/orders",
+                Some(oversell_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(oversell_status, 409);
             let oversell: serde_json::Value =
                 serde_json::from_slice(&oversell_body).expect("oversell json");
@@ -3442,8 +3602,17 @@ mod tests {
                 "email": "ada@example.test"
             })
             .to_string();
-            let (create_member_status, _, create_member_body) =
-                send_request(addr, "POST", "/members", Some(member_payload)).await;
+            let (create_member_status, _, create_member_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/members",
+                Some(member_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(create_member_status, 201);
             let created_member: serde_json::Value =
                 serde_json::from_slice(&create_member_body).expect("member json");
@@ -3464,8 +3633,17 @@ mod tests {
                 "email": "ada@example.test"
             })
             .to_string();
-            let (login_status, _, _, login_headers, login_body) =
-                send_request_full(addr, "POST", "/members/login", Some(login_payload)).await;
+            let (login_status, _, _, login_headers, login_body) = send_request_full_with_headers(
+                addr,
+                "POST",
+                "/members/login",
+                Some(login_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(login_status, 201);
             let login_cookie = login_headers.get("set-cookie").expect("login set-cookie");
             assert!(login_cookie.contains("orv_session=1"));
@@ -3489,8 +3667,17 @@ mod tests {
                 "quantity": 1
             })
             .to_string();
-            let (cart_item_status, _, cart_item_body) =
-                send_request(addr, "POST", "/cart/items", Some(cart_payload)).await;
+            let (cart_item_status, _, cart_item_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/cart/items",
+                Some(cart_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(cart_item_status, 201);
             let cart_item: serde_json::Value =
                 serde_json::from_slice(&cart_item_body).expect("cart item json");
@@ -3538,8 +3725,17 @@ mod tests {
                 "method": "card"
             })
             .to_string();
-            let (payment_status, _, payment_body) =
-                send_request(addr, "POST", "/payments", Some(payment_payload)).await;
+            let (payment_status, _, payment_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/payments",
+                Some(payment_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(payment_status, 201);
             let payment: serde_json::Value =
                 serde_json::from_slice(&payment_body).expect("payment json");
@@ -3553,8 +3749,17 @@ mod tests {
                 "address": "Seoul"
             })
             .to_string();
-            let (shipment_status, _, shipment_body) =
-                send_request(addr, "POST", "/shipments", Some(shipment_payload)).await;
+            let (shipment_status, _, shipment_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/shipments",
+                Some(shipment_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(shipment_status, 201);
             let shipment: serde_json::Value =
                 serde_json::from_slice(&shipment_body).expect("shipment json");

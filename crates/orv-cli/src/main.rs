@@ -2402,7 +2402,7 @@ Successful `POST /members/login` responses set an `orv_session` cookie with `Htt
 \n\
 The account sessions view requires that login cookie through `@session required` and reads the current session with `@session.id`.\n\
 \n\
-The checkout form includes a reference `_csrf` hidden token. `POST /checkout` uses `@csrf`, which requires that token to match the `orv_csrf` cookie minted by HTML GET responses.\n\
+Browser mutation forms include a reference `_csrf` hidden token. Their POST routes use `@csrf`, which requires that token to match the `orv_csrf` cookie minted by HTML GET responses; the Stripe webhook route stays signature-verified as a provider callback.\n\
 \n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, shipment, webhook, and audit rows in the SQLite file.\n\
 \n\
@@ -28398,6 +28398,8 @@ test "checkout excluded failure" {
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
+        assert!(source.contains("@input type=hidden name=_csrf value=\"orv-reference-csrf\""));
+        assert!(source.matches("@csrf").count() >= 8);
         assert!(source.contains("@route POST /checkout"));
         assert!(source.contains("One-step checkout"));
         assert!(source.contains("@route POST /members"));

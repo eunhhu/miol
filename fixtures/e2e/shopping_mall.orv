@@ -31,6 +31,7 @@
           @h2 "Browser checkout forms"
           @form action="/products" method=post {
             @h3 "Add product"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "SKU"
             @input type=text name=sku required
             @label "Name"
@@ -43,6 +44,7 @@
           }
           @form action="/members" method=post {
             @h3 "Join member"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Handle"
             @input type=text name=handle required
             @label "Name"
@@ -53,6 +55,7 @@
           }
           @form action="/members/login" method=post {
             @h3 "Member login"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Handle"
             @input type=text name=handle required
             @label "Email"
@@ -61,6 +64,7 @@
           }
           @form action="/orders" method=post {
             @h3 "Reserve order"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Customer"
             @input type=text name=customer required
             @label "SKU"
@@ -92,6 +96,7 @@
           }
           @form action="/cart/items" method=post {
             @h3 "Add to cart"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Member handle"
             @input type=text name=handle required
             @label "SKU"
@@ -102,6 +107,7 @@
           }
           @form action="/payments" method=post {
             @h3 "Capture payment"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Order ID"
             @input type=number name=orderId required
             @label "Amount"
@@ -118,6 +124,7 @@
           }
           @form action="/shipments" method=post {
             @h3 "Book shipment"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Order ID"
             @input type=number name=orderId required
             @label "Carrier"
@@ -327,6 +334,7 @@
   }
 
   @route POST /products {
+    @csrf
     let price: int = @body.price as int
     let stock: int = @body.stock as int
     let product = await shopdb.create("Product", {
@@ -356,6 +364,7 @@
   }
 
   @route POST /members {
+    @csrf
     let member = await shopdb.create("Member", @body)
     await shopdb.create("AuditEvent", {
       kind: "member.create",
@@ -373,6 +382,7 @@
   }
 
   @route POST /members/login {
+    @csrf
     let member = await shopdb.find("Member", { handle: @body.handle })
     if member == void {
       @respond 404 { err: "member_not_found", handle: @body.handle }
@@ -396,6 +406,7 @@
   }
 
   @route POST /cart/items {
+    @csrf
     let quantity: int = @body.quantity as int
     let member = await shopdb.find("Member", { handle: @body.handle })
     if member == void {
@@ -426,6 +437,7 @@
   }
 
   @route POST /orders {
+    @csrf
     let quantity: int = @body.quantity as int
     let total: int = @body.total as int
     let product = await shopdb.find("Product", { sku: @body.sku })
@@ -547,6 +559,7 @@
   }
 
   @route POST /payments {
+    @csrf
     let orderId: int = @body.orderId as int
     let amount: int = @body.amount as int
     let order = await shopdb.find("Order", { id: orderId })
@@ -660,6 +673,7 @@
   }
 
   @route POST /shipments {
+    @csrf
     let orderId: int = @body.orderId as int
     let payment = await shopdb.find("Payment", { orderId: orderId })
     if payment == void {
