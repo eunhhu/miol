@@ -21049,6 +21049,11 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must extract cookies for protected shop routes");
     }
+    if deploy_routes_include(artifact, "POST", "/checkout")
+        && (!smoke.contains("orv_smoke_fetch()") || !smoke.contains("orv_smoke_body_contains()"))
+    {
+        anyhow::bail!("deploy smoke test must inspect shop response bodies");
+    }
     verify_deploy_smoke_client_contract(&smoke, client)?;
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
@@ -21076,11 +21081,15 @@ fn verify_deploy_smoke_test_artifact(
         }
     }
     if deploy_routes_include(artifact, "POST", "/checkout") {
-        for path in ["/products", "/members", "/cart/items", "/checkout"] {
+        for path in ["/products", "/members", "/cart/items"] {
             let command = format!(r#"orv_smoke_curl "POST {path}" -X POST "$BASE_URL{path}""#);
             if !smoke.contains(&command) {
                 anyhow::bail!("deploy smoke test must cover POST {path}");
             }
+        }
+        let checkout_command = r#"orv_smoke_fetch "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout""#;
+        if !smoke.contains(checkout_command) {
+            anyhow::bail!("deploy smoke test must cover POST /checkout with captured body");
         }
         if !smoke.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke SKU");
@@ -21100,6 +21109,23 @@ fn verify_deploy_smoke_test_artifact(
                 anyhow::bail!(
                     "deploy smoke test must cover GET /account/sessions with a session cookie"
                 );
+            }
+        }
+        for required in [
+            r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#,
+            r#"orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU""#,
+            r#"orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HANDLE""#,
+            r#"orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'"#,
+            r#"orv_smoke_body_contains "checkout captured payment" "$SMOKE_CHECKOUT_BODY" '"status":"captured"'"#,
+            r#"orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'"#,
+            r#"orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU""#,
+            r#"orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'"#,
+            r#"orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'"#,
+            r#"orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'"#,
+            r#"orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'"#,
+        ] {
+            if !smoke.contains(required) {
+                anyhow::bail!("deploy smoke test must include {required}");
             }
         }
         for route in artifact.routes.iter().filter(|route| {
@@ -27087,6 +27113,26 @@ orv_smoke_curl() {{
   fi
 }}
 
+orv_smoke_fetch() {{
+  label="$1"
+  output_path="$2"
+  shift 2
+  if ! curl -fsS "$@" > "$output_path"; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
+orv_smoke_body_contains() {{
+  label="$1"
+  body_path="$2"
+  pattern="$3"
+  if ! grep -F "$pattern" "$body_path" >/dev/null; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
 orv_smoke_cookie_from_headers() {{
   cookie_name="$1"
   headers_path="$2"
@@ -27151,7 +27197,17 @@ SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
 SMOKE_HEADERS="$(mktemp)"
 SMOKE_MEMBER_HEADERS="$(mktemp)"
 SMOKE_ADMIN_HEADERS="$(mktemp)"
-trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS"' EXIT
+SMOKE_CATALOG_BODY="$(mktemp)"
+SMOKE_CART_BODY="$(mktemp)"
+SMOKE_ACCOUNT_BODY="$(mktemp)"
+SMOKE_CHECKOUT_BODY="$(mktemp)"
+SMOKE_ADMIN_SUMMARY_BODY="$(mktemp)"
+SMOKE_ADMIN_CATALOG_BODY="$(mktemp)"
+SMOKE_ADMIN_ORDERS_BODY="$(mktemp)"
+SMOKE_ADMIN_PAYMENTS_BODY="$(mktemp)"
+SMOKE_ADMIN_SHIPMENTS_BODY="$(mktemp)"
+SMOKE_ADMIN_AUDIT_BODY="$(mktemp)"
+trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
 
 orv_smoke_curl "GET / csrf cookie" -D "$SMOKE_HEADERS" "$BASE_URL/"
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
@@ -27170,8 +27226,17 @@ if [ -z "$MEMBER_SESSION_COOKIE" ]; then
   exit 1
 fi
 orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
+orv_smoke_fetch "GET /account/sessions content" "$SMOKE_ACCOUNT_BODY" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
+orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HANDLE"
 orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
-orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
+orv_smoke_fetch "GET /catalog content" "$SMOKE_CATALOG_BODY" "$BASE_URL/catalog"
+orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_fetch "GET /cart content" "$SMOKE_CART_BODY" "$BASE_URL/cart"
+orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU"
+orv_smoke_fetch "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
+orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'
+orv_smoke_body_contains "checkout captured payment" "$SMOKE_CHECKOUT_BODY" '"status":"captured"'
+orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'
 orv_smoke_curl "POST /members/login admin" -D "$SMOKE_ADMIN_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\",\"password\":\"admin-reference-password\"}"
 ADMIN_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_ADMIN_HEADERS")"
 ADMIN_ROLE_COOKIE="$(orv_smoke_cookie_from_headers orv_session_role "$SMOKE_ADMIN_HEADERS")"
@@ -27179,6 +27244,22 @@ if [ -z "$ADMIN_SESSION_COOKIE" ] || [ -z "$ADMIN_ROLE_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing admin session cookies\n' >&2
   exit 1
 fi
+orv_smoke_fetch "GET /admin/summary content" "$SMOKE_ADMIN_SUMMARY_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary"
+orv_smoke_body_contains "admin summary orders" "$SMOKE_ADMIN_SUMMARY_BODY" '"orders"'
+orv_smoke_body_contains "admin summary payments" "$SMOKE_ADMIN_SUMMARY_BODY" '"payments"'
+orv_smoke_fetch "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
+orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_fetch "GET /admin/orders content" "$SMOKE_ADMIN_ORDERS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/orders"
+orv_smoke_body_contains "admin orders smoke member" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_HANDLE"
+orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'
+orv_smoke_fetch "GET /admin/payments content" "$SMOKE_ADMIN_PAYMENTS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/payments"
+orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'
+orv_smoke_fetch "GET /admin/shipments content" "$SMOKE_ADMIN_SHIPMENTS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/shipments"
+orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'
+orv_smoke_fetch "GET /admin/audit content" "$SMOKE_ADMIN_AUDIT_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/audit"
+orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'
+orv_smoke_body_contains "admin audit payment" "$SMOKE_ADMIN_AUDIT_BODY" 'payment.capture'
+orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipment.book'
 "#,
         );
         for route in server_artifact.routes.iter().filter(|route| {
@@ -28868,6 +28949,8 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
+        assert!(smoke_test.contains("orv_smoke_fetch()"));
+        assert!(smoke_test.contains("orv_smoke_body_contains()"));
         assert!(smoke_test.contains("orv_smoke_cookie_from_headers()"));
         assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
         assert!(smoke_test.contains(r#"READY_PATH="/health""#));
@@ -28897,14 +28980,47 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains(r#"\"password\":\"${SMOKE_PASSWORD}\""#));
         assert!(smoke_test
             .contains(r#"orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items""#));
-        assert!(
-            smoke_test.contains(r#"orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout""#)
-        );
+        assert!(smoke_test.contains(
+            r#"orv_smoke_fetch "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "checkout captured payment" "$SMOKE_CHECKOUT_BODY" '"status":"captured"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'"#
+        ));
         assert!(smoke_test.contains(r#"orv_smoke_curl "POST /members/login admin""#));
         assert!(smoke_test.contains("ADMIN_SESSION_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session \"$SMOKE_ADMIN_HEADERS\")\""));
         assert!(smoke_test.contains("ADMIN_ROLE_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session_role \"$SMOKE_ADMIN_HEADERS\")\""));
         assert!(smoke_test.contains(
             r#"orv_smoke_curl "GET /admin/summary" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HANDLE""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'"#
         ));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");

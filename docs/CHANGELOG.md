@@ -2,6 +2,10 @@
 
 Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual and dated.
 
+## 2026-05-16
+
+- Strengthened generated production shop smoke tests so checkout/admin validation captures response bodies and checks checkout status, payment capture, shipment tracking, customer catalog/cart/session read models, and admin catalog/order/payment/shipment/audit read models.
+
 ## 2026-05-06
 
 - Added shop scaffold coverage for persisted catalog, cart, member sessions, checkout, admin read models, payment records, shipment records, and webhook records.
