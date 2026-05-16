@@ -2394,6 +2394,12 @@ orv deploy-env-check dist\n\
 orv run-build dist\n\
 ```\n\
 \n\
+`orv run-build dist` keeps the local reference server in the foreground. Leave it running while you open the browser, or run the generated smoke test from a second terminal:\n\
+\n\
+```sh\n\
+sh dist/deploy/smoke-test.sh\n\
+```\n\
+\n\
 Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
 Theme tokens live in the starter `@design` block (`@colors`, `@spacing`, and `@typography`) and are used by the home page shell, so copy and visual theme edits stay in source instead of generated artifacts.\n\
@@ -30988,6 +30994,8 @@ test "checkout excluded failure" {
         assert!(guide.contains("orv build . --prod --out dist"));
         assert!(guide.contains("orv verify-build dist"));
         assert!(guide.contains("orv deploy-env-check dist"));
+        assert!(guide.contains("keeps the local reference server in the foreground"));
+        assert!(guide.contains("sh dist/deploy/smoke-test.sh"));
         assert!(guide.contains("deploy/README.md"));
         assert!(guide.contains("deploy/compose.yaml"));
         assert!(guide.contains("deploy/env.example"));

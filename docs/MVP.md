@@ -74,6 +74,8 @@ orv run-build dist
 sh dist/deploy/smoke-test.sh
 ```
 
+`orv run-build dist`는 reference server를 foreground에서 유지한다. 이 명령을 실행한 터미널은 그대로 두고, generated smoke test는 두 번째 터미널에서 실행한다.
+
 초기 acceptance는 mock/local payment와 mock/local shipping을 사용한다. Stripe와 실제 carrier provider는 이 경로가 안정화된 뒤 production adapter milestone에서 다룬다.
 
 ## Explicit Non-Goals For MVP

@@ -41,6 +41,8 @@ orv run-build dist
 sh dist/deploy/smoke-test.sh
 ```
 
+`orv run-build dist` keeps the reference server in the foreground. Keep that command running and execute the generated smoke test from a second terminal, or use the generated Docker Compose runbook for a detached server.
+
 This gate proves the implementation path first. Human 5-hour runs then measure authoring UX, not whether the scaffold can boot.
 
 ## Success Criteria
