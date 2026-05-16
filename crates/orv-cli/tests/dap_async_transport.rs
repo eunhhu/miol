@@ -287,10 +287,21 @@ fn dap_attach_runtime_in_process_reports_request_frames() {
         }),
     );
     assert_eq!(continued["success"], true, "{continued}");
-    wait_for_http_response(
+    let response = wait_for_http_response(
         port,
         "/users/42?debug=true",
         &["\"id\":\"42\"", "\"debug\":\"true\""],
+    );
+    let response_origin_id = response
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-orv-response-origin-id")
+                .then(|| value.trim().to_string())
+        })
+        .expect("response origin header");
+    let expected_request_summary = format!(
+        "GET /users/42 -> 200 route GET /users/:id response {response_origin_id} params id=42 query debug=true"
     );
 
     let request_count = dap_response(
@@ -315,10 +326,7 @@ fn dap_attach_runtime_in_process_reports_request_frames() {
         }),
     );
     assert_eq!(last_request["success"], true, "{last_request}");
-    assert_eq!(
-        last_request["body"]["result"],
-        "GET /users/42 -> 200 route GET /users/:id params id=42 query debug=true"
-    );
+    assert_eq!(last_request["body"]["result"], expected_request_summary);
 
     let request_frames = dap_response(
         &mut dap,
@@ -332,7 +340,7 @@ fn dap_attach_runtime_in_process_reports_request_frames() {
     assert_eq!(request_frames["success"], true, "{request_frames}");
     assert_eq!(
         request_frames["body"]["result"],
-        "#1 GET /users/42 -> 200 route GET /users/:id params id=42 query debug=true"
+        format!("#1 {expected_request_summary}")
     );
 
     let terminated = dap_response(

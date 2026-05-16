@@ -6520,6 +6520,7 @@ fn editor_debug_json(path: &Path) -> anyhow::Result<serde_json::Value> {
         "session_runner": editor_debug_session_runner_json(path),
         "result_artifact": editor_debug_result_artifact_json(),
         "configurations": editor_debug_configurations_json(path),
+        "source_inventory": editor_debug_source_inventory_json(&loaded.files),
         "controls": editor_debug_controls_json(),
         "breakpoint_sources": editor_debug_breakpoint_sources_json(&loaded.files),
         "function_breakpoints": editor_debug_function_breakpoints_json(&loaded),
@@ -6537,6 +6538,8 @@ fn editor_debug_session_json(
     exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<serde_json::Value> {
+    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sources = editor_dap_sources(&loaded.files);
     let controls = if controls.is_empty() {
         vec![EditorDebugControl::Next]
     } else {
@@ -6570,6 +6573,10 @@ fn editor_debug_session_json(
             "live": true,
         },
     }));
+    let loaded_sources_seq = next_seq;
+    next_seq += 1;
+    requests.push(editor_debug_loaded_sources_request_json(loaded_sources_seq));
+    let source_requests = editor_debug_push_source_requests(&mut requests, &mut next_seq, &sources);
     let breakpoint_requests =
         editor_debug_push_breakpoint_requests(&mut requests, &mut next_seq, breakpoints);
     let (data_breakpoint_info_requests, data_breakpoint_set_request) =
@@ -6638,6 +6645,11 @@ fn editor_debug_session_json(
     let control_summaries = editor_debug_control_summaries(&frames, control_requests);
     let watch_expression_summaries =
         editor_debug_watch_expression_summaries(&frames, watch_expression_requests);
+    let loaded_sources = dap_response_for_request_seq(&frames, loaded_sources_seq)
+        .and_then(|response| response.get("body").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let source_snapshot_summaries =
+        editor_debug_source_snapshot_summaries(&frames, source_requests);
     let stack = dap_response_for_request_seq(&frames, stack_seq)
         .and_then(|response| response.get("body").cloned())
         .unwrap_or_else(|| serde_json::json!({}));
@@ -6669,6 +6681,8 @@ fn editor_debug_session_json(
         "function_breakpoints": function_breakpoint_summaries,
         "data_breakpoints": data_breakpoint_summaries,
         "exception_filters": exception_filter_summaries,
+        "loaded_sources": loaded_sources,
+        "source_snapshots": source_snapshot_summaries,
         "control": first_control,
         "controls": control_summaries,
         "watch_expressions": watch_expression_summaries,
@@ -6769,6 +6783,15 @@ fn editor_debug_runner_result_panels_json(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let loaded_sources = debug
+        .get("loaded_sources")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let source_snapshots = debug
+        .get("source_snapshots")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let session_summary = editor_debug_session_summary_json(
         debug,
         &selected_frame,
@@ -6810,12 +6833,16 @@ fn editor_debug_runner_result_panels_json(
             "data_breakpoint_count": data_breakpoints.len(),
             "exception_filter_count": exception_filters.len(),
             "watch_expression_count": watch_expressions.len(),
+            "loaded_source_count": json_array_count(loaded_sources.get("sources")),
+            "source_snapshot_count": source_snapshots.len(),
             "controls": controls,
             "breakpoints": breakpoints,
             "function_breakpoints": function_breakpoints,
             "data_breakpoints": data_breakpoints,
             "exception_filters": exception_filters,
             "watch_expressions": watch_expressions,
+            "loaded_sources": loaded_sources,
+            "source_snapshots": source_snapshots,
             "event_count": events.len(),
             "stopped_event_count": stopped_events.len(),
             "output_event_count": output_events.len(),
@@ -6931,6 +6958,16 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
             {
                 "name": "watch_expressions",
                 "path": "panels.debug.watch_expressions",
+                "kind": "array",
+            },
+            {
+                "name": "loaded_sources",
+                "path": "panels.debug.loaded_sources",
+                "kind": "object",
+            },
+            {
+                "name": "source_snapshots",
+                "path": "panels.debug.source_snapshots",
                 "kind": "array",
             },
             {
@@ -7060,6 +7097,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let source_snapshots = value
+        .pointer("/panels/debug/source_snapshots")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let control_count = value
         .pointer("/panels/debug/control_count")
         .and_then(serde_json::Value::as_u64)
@@ -7078,6 +7120,14 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .unwrap_or(0);
     let exception_filter_count = value
         .pointer("/panels/debug/exception_filter_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let loaded_source_count = value
+        .pointer("/panels/debug/loaded_source_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let source_snapshot_count = value
+        .pointer("/panels/debug/source_snapshot_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let mut html = String::new();
@@ -7109,6 +7159,14 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     write!(
         &mut html,
         "<section class=\"panel\"><h2>Exception Filters</h2><div class=\"metric\">{exception_filter_count}</div><p class=\"muted\">configured exception filters</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Loaded Sources</h2><div class=\"metric\">{loaded_source_count}</div><p class=\"muted\">DAP loadedSources entries</p></section>"
+    )?;
+    write!(
+        &mut html,
+        "<section class=\"panel\"><h2>Source Snapshots</h2><div class=\"metric\">{source_snapshot_count}</div><p class=\"muted\">DAP source responses</p></section>"
     )?;
     html.push_str("<section class=\"panel wide\"><h2>Session Summary</h2><pre>");
     html.push_str(&html_escape_text(&editor_debug_session_summary_text(
@@ -7212,6 +7270,15 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
             &mut html,
             "<li>{}</li>",
             html_escape_text(&editor_debug_watch_expression_summary(&expression))
+        )?;
+    }
+    html.push_str("</ul></section>\n");
+    html.push_str("<section class=\"panel wide\"><h2>Source Snapshots</h2><ul class=\"list\">");
+    for snapshot in source_snapshots {
+        write!(
+            &mut html,
+            "<li>{}</li>",
+            html_escape_text(&editor_debug_source_snapshot_summary(&snapshot))
         )?;
     }
     html.push_str("</ul></section>\n");
@@ -7697,6 +7764,41 @@ fn editor_debug_watch_expression_summary(expression: &serde_json::Value) -> Stri
     .join(" ")
 }
 
+fn editor_debug_source_snapshot_summary(snapshot: &serde_json::Value) -> String {
+    let name = snapshot
+        .pointer("/source/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("source");
+    let path = snapshot
+        .pointer("/source/path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let checksum = snapshot
+        .pointer("/checksum/value")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let length = json_u64_field(snapshot, "content_length");
+    let lines = json_u64_field(snapshot, "line_count");
+    let success = snapshot
+        .pointer("/response/success")
+        .and_then(serde_json::Value::as_bool)
+        .map_or_else(String::new, |success| {
+            format!("success {}", if success { "true" } else { "false" })
+        });
+    [
+        name.to_string(),
+        path.to_string(),
+        format!("bytes {length}"),
+        format!("lines {lines}"),
+        checksum.to_string(),
+        success,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 fn editor_debug_variable_summary(variable: &serde_json::Value) -> String {
     let name = variable
         .get("name")
@@ -7733,6 +7835,22 @@ fn editor_debug_runner_artifact_root(state_path: &Path) -> PathBuf {
         return parent.parent().unwrap_or(parent).to_path_buf();
     }
     parent.to_path_buf()
+}
+
+fn editor_debug_push_source_requests(
+    requests: &mut Vec<serde_json::Value>,
+    next_seq: &mut u64,
+    sources: &[DapSourceInfo],
+) -> Vec<(u64, DapSourceInfo, serde_json::Value)> {
+    let mut source_requests = Vec::new();
+    for source in sources {
+        let seq = *next_seq;
+        *next_seq += 1;
+        let request = editor_debug_source_request_json(seq, source);
+        requests.push(request.clone());
+        source_requests.push((seq, source.clone(), request));
+    }
+    source_requests
 }
 
 fn editor_debug_push_breakpoint_requests(
@@ -7888,6 +8006,34 @@ fn editor_debug_breakpoint_summaries(
         .collect()
 }
 
+fn editor_debug_source_snapshot_summaries(
+    frames: &[serde_json::Value],
+    source_requests: Vec<(u64, DapSourceInfo, serde_json::Value)>,
+) -> Vec<serde_json::Value> {
+    source_requests
+        .into_iter()
+        .map(|(seq, source, request)| {
+            let response =
+                dap_response_for_request_seq(frames, seq).unwrap_or(serde_json::Value::Null);
+            let content = response
+                .pointer("/body/content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            serde_json::json!({
+                "source": dap_source_json(&source),
+                "request": request,
+                "response": response,
+                "content_length": content.len(),
+                "line_count": content.lines().count(),
+                "checksum": {
+                    "algorithm": "SHA256",
+                    "value": source.checksum,
+                },
+            })
+        })
+        .collect()
+}
+
 fn editor_debug_function_breakpoint_summaries(
     frames: &[serde_json::Value],
     function_breakpoint_requests: Vec<(u64, Vec<String>, serde_json::Value)>,
@@ -7994,6 +8140,7 @@ fn editor_debug_adapter_json() -> serde_json::Value {
 fn editor_debug_capabilities_json() -> serde_json::Value {
     serde_json::json!({
         "supportsConfigurationDoneRequest": true,
+        "supportsLoadedSourcesRequest": true,
         "supportsBreakpointLocationsRequest": true,
         "supportsConditionalBreakpoints": true,
         "supportsHitConditionalBreakpoints": true,
@@ -8341,6 +8488,56 @@ fn editor_debug_controls_json() -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn editor_debug_source_inventory_json(files: &[SourceFile]) -> serde_json::Value {
+    let sources = editor_dap_sources(files);
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.debug.source_inventory",
+        "protocol": "dap",
+        "source_count": sources.len(),
+        "loaded_sources_request": editor_debug_loaded_sources_request_json(0),
+        "sources": sources
+            .iter()
+            .map(editor_debug_source_inventory_entry_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn editor_debug_source_inventory_entry_json(source: &DapSourceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "source": dap_source_json(source),
+        "source_reference": source.reference,
+        "path": source.path.display().to_string(),
+        "uri": source.uri,
+        "checksum": {
+            "algorithm": "SHA256",
+            "value": source.checksum,
+        },
+        "request": editor_debug_source_request_json(0, source),
+    })
+}
+
+fn editor_debug_loaded_sources_request_json(seq: u64) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "request",
+        "command": "loadedSources",
+        "arguments": {},
+    })
+}
+
+fn editor_debug_source_request_json(seq: u64, source: &DapSourceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "type": "request",
+        "command": "source",
+        "arguments": {
+            "sourceReference": source.reference,
+            "source": dap_source_json(source),
+        },
+    })
+}
+
 fn editor_debug_breakpoint_sources_json(files: &[SourceFile]) -> Vec<serde_json::Value> {
     files
         .iter()
@@ -8550,6 +8747,16 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         .cloned()
         .unwrap_or_default();
     let configuration_count = configurations.len();
+    let source_inventory = debug.get("source_inventory").cloned().unwrap_or_else(|| {
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "orv.editor.debug.source_inventory",
+            "protocol": "dap",
+            "source_count": 0,
+            "sources": [],
+        })
+    });
+    let source_count = json_array_count(source_inventory.get("sources"));
     let breakpoint_count = debug
         .get("breakpoint_sources")
         .and_then(serde_json::Value::as_array)
@@ -8645,6 +8852,8 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "runner_command": runner.get("command").cloned().unwrap_or_else(|| editor_debug_control_runner_command(EditorDebugControl::Next)),
             "configurations": configurations,
             "configuration_count": configuration_count,
+            "source_inventory": source_inventory,
+            "source_count": source_count,
             "control_commands": control_commands,
             "breakpoint_commands": breakpoint_commands,
             "function_breakpoint_commands": function_breakpoint_commands,
@@ -8718,6 +8927,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "project_graph": true,
             "runtime_inspection": true,
             "dap_controls": controls > 0,
+            "dap_sources": source_count > 0,
             "production_adapters": production_adapters,
             "production_preflight": production_preflight,
             "production_route_policies": production_route_policies,
@@ -9225,6 +9435,11 @@ fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
                 "name": "configurations",
                 "path": "debug.configurations",
                 "kind": "array",
+            },
+            {
+                "name": "source_inventory",
+                "path": "debug.source_inventory",
+                "kind": "object",
             },
             {
                 "name": "control_commands",
@@ -50104,6 +50319,10 @@ define Auth() -> { @out "auth" }
             serde_json::json!(true)
         );
         assert_eq!(
+            state["debug"]["capabilities"]["supportsLoadedSourcesRequest"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
             state["debug"]["capabilities"]["supportsStepInTargetsRequest"],
             serde_json::json!(true)
         );
@@ -50207,6 +50426,28 @@ define Auth() -> { @out "auth" }
             state["debug"]["result_artifact"]["panel_contract"]["root"],
             "panels.debug"
         );
+        assert_eq!(
+            state["debug"]["source_inventory"]["kind"],
+            "orv.editor.debug.source_inventory"
+        );
+        assert_eq!(state["debug"]["source_inventory"]["source_count"], 1);
+        assert_eq!(
+            state["debug"]["source_inventory"]["loaded_sources_request"]["command"],
+            "loadedSources"
+        );
+        assert!(state["debug"]["source_inventory"]["sources"]
+            .as_array()
+            .expect("source inventory")
+            .iter()
+            .any(|source| {
+                source["source"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("app.orv"))
+                    && source["source"]["sourceReference"] == 1
+                    && source["request"]["command"] == "source"
+                    && source["request"]["arguments"]["sourceReference"] == 1
+                    && source["checksum"]["algorithm"] == "SHA256"
+            }));
         assert!(
             state["debug"]["result_artifact"]["panel_contract"]["sections"]
                 .as_array()
@@ -50223,6 +50464,80 @@ define Auth() -> { @out "auth" }
         assert_editor_debug_breakpoint_sources(&state);
         assert_editor_debug_controls(&state);
         assert_editor_debug_html(&html);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_debug_source_inventory_tracks_imports() {
+        let dir = temp_output_dir("editor-export-debug-sources");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("create models dir");
+        let path = dir.join("app.orv");
+        let imported = models.join("user.orv");
+        let imported_source = "pub struct User { id: int }\n";
+        std::fs::write(
+            &path,
+            "import models.user.User\nlet user: User = { id: 1 }\n@out \"ok\"\n",
+        )
+        .expect("write source");
+        std::fs::write(&imported, imported_source).expect("write imported source");
+        let out = dir.join("editor");
+
+        cmd_editor_export(&path, &out).expect("editor export");
+        let state = read_json_value(&out.join("state.json")).expect("editor state");
+        let native_host =
+            read_json_value(&out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH)).expect("native host");
+        let run = editor_debug_runner_session_json(
+            &out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug source inventory");
+
+        assert_eq!(state["debug"]["source_inventory"]["source_count"], 2);
+        assert_eq!(
+            native_host["debug"]["source_inventory"],
+            state["debug"]["source_inventory"]
+        );
+        assert!(state["debug"]["source_inventory"]["sources"]
+            .as_array()
+            .expect("source inventory")
+            .iter()
+            .any(|source| {
+                source["source"]["name"] == "user.orv"
+                    && source["checksum"]["value"]
+                        == serde_json::json!(sha256_hex(imported_source.as_bytes()))
+                    && source["request"]["command"] == "source"
+            }));
+        assert!(run["debug"]["loaded_sources"]["sources"]
+            .as_array()
+            .expect("loaded sources")
+            .iter()
+            .any(|source| {
+                source["name"] == "user.orv"
+                    && source["checksums"][0]["checksum"]
+                        == serde_json::json!(sha256_hex(imported_source.as_bytes()))
+            }));
+        assert!(run["debug"]["source_snapshots"]
+            .as_array()
+            .expect("source snapshots")
+            .iter()
+            .any(|snapshot| {
+                snapshot["source"]["name"] == "user.orv"
+                    && snapshot["response"]["success"] == true
+                    && snapshot["response"]["body"]["content"] == imported_source
+            }));
+        assert_eq!(run["panels"]["debug"]["loaded_source_count"], 2);
+        assert_eq!(run["panels"]["debug"]["source_snapshot_count"], 2);
+        assert!(run["panels"]["debug"]["source_snapshots"]
+            .as_array()
+            .expect("panel source snapshots")
+            .iter()
+            .any(|snapshot| snapshot["source"]["name"] == "user.orv"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -50271,6 +50586,12 @@ define Auth() -> { @out "auth" }
             native_host["debug"]["capabilities"],
             state["debug"]["capabilities"]
         );
+        assert_eq!(
+            native_host["debug"]["source_inventory"],
+            state["debug"]["source_inventory"]
+        );
+        assert_eq!(native_host["debug"]["source_count"], 1);
+        assert_eq!(native_host["capabilities"]["dap_sources"], true);
         assert_eq!(
             native_host["debug"]["runner_command"],
             state["debug"]["session_runner"]["command"]
@@ -50329,6 +50650,9 @@ define Auth() -> { @out "auth" }
             .iter()
             .any(|section| section["name"] == "configurations"
                 && section["path"] == "debug.configurations"));
+        assert!(debug_sections.iter().any(|section| {
+            section["name"] == "source_inventory" && section["path"] == "debug.source_inventory"
+        }));
         assert!(debug_sections.iter().any(|section| {
             section["name"] == "control_commands" && section["path"] == "debug.control_commands"
         }));
@@ -50406,6 +50730,14 @@ define Auth() -> { @out "auth" }
                 .iter()
                 .any(|section| section["name"] == "watch_expressions"
                     && section["path"] == "panels.debug.watch_expressions")
+        );
+        assert!(
+            native_host["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("native host result panel sections")
+                .iter()
+                .any(|section| section["name"] == "source_snapshots"
+                    && section["path"] == "panels.debug.source_snapshots")
         );
         assert_eq!(native_host["debug"]["configuration_count"], 3);
         let configurations = native_host["debug"]["configurations"]
@@ -50763,7 +51095,7 @@ define Auth() -> { @out "auth" }
         assert!(controls
             .iter()
             .all(|control| control["response"]["success"] == true));
-        assert_eq!(debug["transport"]["request_count"], 8);
+        assert_eq!(debug["transport"]["request_count"], 10);
         assert_eq!(debug["stack"]["stackFrames"][0]["line"], 3);
         assert!(debug["locals"]
             .as_array()
@@ -50872,7 +51204,7 @@ define Auth() -> { @out "auth" }
         )
         .expect("editor debug session");
 
-        assert_eq!(debug["transport"]["request_count"], 8);
+        assert_eq!(debug["transport"]["request_count"], 10);
         assert_eq!(
             debug["breakpoints"][0]["source"]["path"],
             path.display().to_string()
@@ -51045,7 +51377,7 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["kind"], "orv.editor.debug.runner.result");
         assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
         assert_eq!(run["debug"]["transport"]["framing"], "content-length");
-        assert_eq!(run["debug"]["transport"]["request_count"], 8);
+        assert_eq!(run["debug"]["transport"]["request_count"], 10);
         assert_eq!(run["debug"]["stack"]["stackFrames"][0]["line"], 3);
         assert!(run["debug"]["locals"]
             .as_array()
