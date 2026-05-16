@@ -21941,6 +21941,12 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must check curl availability");
     }
+    if !smoke.contains(r#"ORV_BIN="${ORV_BIN:-orv}""#)
+        || !smoke.contains("orv_smoke_reveal_contains()")
+        || !smoke.contains("orv deploy smoke test requires orv")
+    {
+        anyhow::bail!("deploy smoke test must verify source reveal with the ORV CLI");
+    }
     if !smoke.contains("ORV_SMOKE_BUILD_DIR=") || !smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#) {
         anyhow::bail!("deploy smoke test must run from its build directory");
     }
@@ -22060,6 +22066,11 @@ fn verify_deploy_smoke_test_artifact(
         if !smoke.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke SKU");
         }
+        if (!persistence.db_paths.is_empty() || !persistence.db_env.is_empty())
+            && !smoke.contains(r#"ORV_SMOKE_DB_CONNECT_ORIGIN="ori_"#)
+        {
+            anyhow::bail!("deploy smoke test must declare a DB connect source origin");
+        }
         if !smoke.contains(r#"SMOKE_SKU_SECOND="orv-smoke-sku-${SMOKE_ID}-2""#)
             || !smoke.contains(r#"SMOKE_SKU_THIRD="orv-smoke-sku-${SMOKE_ID}-3""#)
         {
@@ -22090,6 +22101,8 @@ fn verify_deploy_smoke_test_artifact(
             r#"orv_smoke_body_contains "home copy" "$SMOKE_HOME_BODY" 'Catalog, member signup, payment capture, and shipment booking are ready.'"#,
             r#"orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-color: #f8fafc'"#,
             r#"orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'"#,
+            r#"orv_smoke_reveal_contains "reveal GET / source" "$ORV_SMOKE_ORIGIN_GET_ROOT" '@route GET /'"#,
+            r#"orv_smoke_reveal_contains "reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#,
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#,
             r#"orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND""#,
             r#"orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD""#,
@@ -22108,6 +22121,17 @@ fn verify_deploy_smoke_test_artifact(
         ] {
             if !smoke.contains(required) {
                 anyhow::bail!("deploy smoke test must include {required}");
+            }
+        }
+        if !persistence.db_paths.is_empty() || !persistence.db_env.is_empty() {
+            for required in [
+                r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
+                r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
+                r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#,
+            ] {
+                if !smoke.contains(required) {
+                    anyhow::bail!("deploy smoke test must include {required}");
+                }
             }
         }
         for route in artifact.routes.iter().filter(|route| {
@@ -25424,6 +25448,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             out,
             &entry,
             &manifest,
+            &origin_map,
             server_artifact.as_ref(),
             ProdBuildTargets {
                 static_page: static_page_path.as_deref(),
@@ -28788,6 +28813,7 @@ fn write_prod_deploy_artifacts(
     out: &Path,
     entry: &Path,
     manifest: &orv_compiler::BuildManifest,
+    origin_map: &orv_compiler::OriginMap,
     server_artifact: Option<&orv_compiler::ServerRuntimeArtifact>,
     targets: ProdBuildTargets<'_>,
 ) -> anyhow::Result<()> {
@@ -28825,7 +28851,14 @@ fn write_prod_deploy_artifacts(
             targets.server_artifact,
             &persistence,
         )?;
-        write_prod_smoke_test_artifact(out, smoke_test, server_artifact, &persistence, &client)?;
+        write_prod_smoke_test_artifact(
+            out,
+            smoke_test,
+            server_artifact,
+            origin_map,
+            &persistence,
+            &client,
+        )?;
         write_prod_preflight_artifact(
             out,
             preflight,
@@ -29137,6 +29170,7 @@ fn write_prod_smoke_test_artifact(
     out: &Path,
     path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    origin_map: &orv_compiler::OriginMap,
     persistence: &DeployPersistence,
     client: &serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -29147,11 +29181,35 @@ ORV_SMOKE_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 ORV_SMOKE_BUILD_DIR=$(CDPATH= cd "$ORV_SMOKE_SCRIPT_DIR/.." && pwd)
 cd "$ORV_SMOKE_BUILD_DIR"
 BASE_URL="${{ORV_BASE_URL:-{}}}"
+ORV_BIN="${{ORV_BIN:-orv}}"
 
 if ! command -v curl >/dev/null 2>&1; then
   printf 'orv deploy smoke test requires curl\n' >&2
   exit 127
 fi
+
+if ! command -v "$ORV_BIN" >/dev/null 2>&1; then
+  printf 'orv deploy smoke test requires orv; set ORV_BIN to the local binary path\n' >&2
+  exit 127
+fi
+
+orv_smoke_reveal_contains() {{
+  label="$1"
+  origin_id="$2"
+  pattern="$3"
+  output_path="$(mktemp)"
+  if ! "$ORV_BIN" reveal . "$origin_id" > "$output_path"; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s reveal command\n' "$label" >&2
+    exit 1
+  fi
+  if ! grep -F "$pattern" "$output_path" >/dev/null; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s reveal missing %s\n' "$label" "$pattern" >&2
+    exit 1
+  fi
+  rm -f "$output_path"
+}}
 
 orv_smoke_curl() {{
   label="$1"
@@ -29445,6 +29503,12 @@ done
         let admin_payments_origin = deploy_smoke_origin_var_ref("GET", "/admin/payments");
         let admin_shipments_origin = deploy_smoke_origin_var_ref("GET", "/admin/shipments");
         let admin_audit_origin = deploy_smoke_origin_var_ref("GET", "/admin/audit");
+        let db_connect_origin = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "@db.connect")
+            .map(|entry| entry.id.clone())
+            .unwrap_or_default();
         let shop_smoke = r#"
 SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
@@ -29456,6 +29520,7 @@ SMOKE_BADGE_THIRD="orv-smoke-badge-${SMOKE_ID}-3"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
 SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
+ORV_SMOKE_DB_CONNECT_ORIGIN="__DB_CONNECT_ORIGIN__"
 SMOKE_HEADERS="$(mktemp)"
 SMOKE_MEMBER_HEADERS="$(mktemp)"
 SMOKE_ADMIN_HEADERS="$(mktemp)"
@@ -29477,6 +29542,13 @@ orv_smoke_body_contains "home title" "$SMOKE_HOME_BODY" 'Miol Shop'
 orv_smoke_body_contains "home copy" "$SMOKE_HOME_BODY" 'Catalog, member signup, payment capture, and shipment booking are ready.'
 orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-color: #f8fafc'
 orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'
+orv_smoke_reveal_contains "reveal GET / source" "__ROOT_ORIGIN__" '@route GET /'
+orv_smoke_reveal_contains "reveal GET / production" "__ROOT_ORIGIN__" '"path": "/"'
+if [ -n "$ORV_SMOKE_DB_CONNECT_ORIGIN" ]; then
+  orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
+  orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
+  orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'
+fi
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
 if [ -z "$CSRF_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing orv_csrf cookie\n' >&2
@@ -29541,6 +29613,7 @@ orv_smoke_body_contains "admin audit payment" "$SMOKE_ADMIN_AUDIT_BODY" 'payment
 orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipment.book'
 "#
         .replace("__ROOT_ORIGIN__", &root_origin)
+        .replace("__DB_CONNECT_ORIGIN__", &db_connect_origin)
         .replace("__PRODUCTS_ORIGIN__", &products_origin)
         .replace("__MEMBERS_ORIGIN__", &members_origin)
         .replace("__LOGIN_ORIGIN__", &login_origin)
@@ -31445,8 +31518,11 @@ test "checkout excluded failure" {
                 && env["provider"] == "stripe"
                 && env["required"] == false));
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
+        assert!(smoke_test.contains(r#"ORV_BIN="${ORV_BIN:-orv}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
+        assert!(smoke_test.contains("orv deploy smoke test requires orv"));
+        assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
@@ -31479,6 +31555,22 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET / source" "$ORV_SMOKE_ORIGIN_GET_ROOT" '@route GET /'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#
+        ));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_DB_CONNECT_ORIGIN="ori_"#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#
         ));
         assert!(smoke_test.contains(
             "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\""
