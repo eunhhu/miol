@@ -21526,9 +21526,23 @@ fn verify_deploy_smoke_test_artifact(
     }
     if !artifact.routes.is_empty()
         && (!smoke.contains("orv_smoke_origin_header()")
-            || !smoke.contains("orv_smoke_curl_origin()"))
+            || !smoke.contains("orv_smoke_curl_origin()")
+            || !smoke.contains("expected_origin")
+            || !smoke.contains("wrong x-orv-origin-id"))
     {
-        anyhow::bail!("deploy smoke test must verify route origin headers");
+        anyhow::bail!("deploy smoke test must verify exact route origin headers");
+    }
+    for route in &artifact.routes {
+        let assignment = format!(
+            r#"{}="{}""#,
+            deploy_smoke_origin_var_name(&route.method, &route.path),
+            route.origin_id
+        );
+        if !smoke.contains(&assignment) {
+            let method = &route.method;
+            let path = &route.path;
+            anyhow::bail!("deploy smoke test must declare expected origin for {method} {path}");
+        }
     }
     if deploy_routes_include(artifact, "POST", "/checkout")
         && !smoke.contains("orv_smoke_cookie_from_headers()")
@@ -21556,9 +21570,10 @@ fn verify_deploy_smoke_test_artifact(
             && !route.path.starts_with("/admin")
             && route.path != "/account/sessions"
     }) {
+        let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
         let command = format!(
-            r#"orv_smoke_curl_origin "GET {}" "$BASE_URL{}""#,
-            route.path, route.path
+            r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
+            route.path, origin_ref, route.path
         );
         if !smoke.contains(&command) {
             let method = &route.method;
@@ -21568,14 +21583,19 @@ fn verify_deploy_smoke_test_artifact(
     }
     if deploy_routes_include(artifact, "POST", "/checkout") {
         for path in ["/products", "/members", "/cart/items"] {
-            let command =
-                format!(r#"orv_smoke_curl_origin "POST {path}" -X POST "$BASE_URL{path}""#);
+            let origin_ref = deploy_smoke_origin_var_ref("POST", path);
+            let command = format!(
+                r#"orv_smoke_curl_origin "POST {path}" "{origin_ref}" -X POST "$BASE_URL{path}""#
+            );
             if !smoke.contains(&command) {
                 anyhow::bail!("deploy smoke test must cover POST {path}");
             }
         }
-        let checkout_command = r#"orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout""#;
-        if !smoke.contains(checkout_command) {
+        let checkout_origin_ref = deploy_smoke_origin_var_ref("POST", "/checkout");
+        let checkout_command = format!(
+            r#"orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" "{checkout_origin_ref}" -X POST "$BASE_URL/checkout""#
+        );
+        if !smoke.contains(&checkout_command) {
             anyhow::bail!("deploy smoke test must cover POST /checkout with captured body");
         }
         if !smoke.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#) {
@@ -21591,8 +21611,11 @@ fn verify_deploy_smoke_test_artifact(
             anyhow::bail!("deploy smoke test must send reference CSRF cookie/token");
         }
         if deploy_routes_include(artifact, "GET", "/account/sessions") {
-            let command = r#"orv_smoke_curl_origin "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#;
-            if !smoke.contains(command) {
+            let origin_ref = deploy_smoke_origin_var_ref("GET", "/account/sessions");
+            let command = format!(
+                r#"orv_smoke_curl_origin "GET /account/sessions" "{origin_ref}" -H "cookie: ${{MEMBER_SESSION_COOKIE}}" "$BASE_URL/account/sessions""#
+            );
+            if !smoke.contains(&command) {
                 anyhow::bail!(
                     "deploy smoke test must cover GET /account/sessions with a session cookie"
                 );
@@ -21618,9 +21641,10 @@ fn verify_deploy_smoke_test_artifact(
         for route in artifact.routes.iter().filter(|route| {
             route.method == "GET" && !route.path.contains(':') && route.path.starts_with("/admin")
         }) {
+            let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
             let command = format!(
-                r#"orv_smoke_curl_origin "GET {}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
-                route.path, route.path
+                r#"orv_smoke_curl_origin "GET {}" "{}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
+                route.path, origin_ref, route.path
             );
             if !smoke.contains(&command) {
                 let path = &route.path;
@@ -26841,6 +26865,34 @@ fn deploy_routes_include(
         .any(|route| route.method == method && route.path == path)
 }
 
+fn deploy_smoke_origin_var_name(method: &str, path: &str) -> String {
+    let mut suffix = String::new();
+    let mut wrote = false;
+    for ch in path.trim_matches('/').chars() {
+        if ch.is_ascii_alphanumeric() {
+            suffix.push(ch.to_ascii_uppercase());
+            wrote = true;
+        } else if wrote && !suffix.ends_with('_') {
+            suffix.push('_');
+        }
+    }
+    while suffix.ends_with('_') {
+        suffix.pop();
+    }
+    if !wrote {
+        suffix.push_str("ROOT");
+    }
+    format!(
+        "ORV_SMOKE_ORIGIN_{}_{}",
+        method.to_ascii_uppercase(),
+        suffix
+    )
+}
+
+fn deploy_smoke_origin_var_ref(method: &str, path: &str) -> String {
+    format!("${}", deploy_smoke_origin_var_name(method, path))
+}
+
 fn deploy_smoke_ready_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> Option<&str> {
     artifact
         .routes
@@ -27646,42 +27698,53 @@ orv_smoke_curl() {{
 orv_smoke_origin_header() {{
   label="$1"
   headers_path="$2"
-  if ! tr -d '\r' < "$headers_path" | awk '
+  expected_origin="$3"
+  actual_origin="$(tr -d '\r' < "$headers_path" | awk '
     {{
       lower = tolower($0)
-      if (index(lower, "x-orv-origin-id:") == 1 && index($0, "ori_") > 0) {{
-        found = 1
+      if (index(lower, "x-orv-origin-id:") == 1) {{
+        value = substr($0, index($0, ":") + 1)
+        sub(/^[[:space:]]*/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+        print value
+        exit
       }}
     }}
-    END {{ exit found ? 0 : 1 }}
-  '; then
+  ')"
+  if [ -z "$actual_origin" ]; then
     printf 'orv deploy smoke test failed: %s missing x-orv-origin-id\n' "$label" >&2
+    exit 1
+  fi
+  if [ "$actual_origin" != "$expected_origin" ]; then
+    printf 'orv deploy smoke test failed: %s wrong x-orv-origin-id expected %s got %s\n' "$label" "$expected_origin" "$actual_origin" >&2
     exit 1
   fi
 }}
 
 orv_smoke_curl_origin() {{
   label="$1"
-  shift
+  expected_origin="$2"
+  shift 2
   orv_smoke_tmp_headers="$(mktemp)"
   if ! curl -fsS -D "$orv_smoke_tmp_headers" "$@" >/dev/null; then
     rm -f "$orv_smoke_tmp_headers"
     printf 'orv deploy smoke test failed: %s\n' "$label" >&2
     exit 1
   fi
-  orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers"
+  orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers" "$expected_origin"
   rm -f "$orv_smoke_tmp_headers"
 }}
 
 orv_smoke_curl_capture_origin() {{
   label="$1"
   headers_path="$2"
-  shift 2
+  expected_origin="$3"
+  shift 3
   if ! curl -fsS -D "$headers_path" "$@" >/dev/null; then
     printf 'orv deploy smoke test failed: %s\n' "$label" >&2
     exit 1
   fi
-  orv_smoke_origin_header "$label" "$headers_path"
+  orv_smoke_origin_header "$label" "$headers_path" "$expected_origin"
 }}
 
 orv_smoke_fetch() {{
@@ -27697,14 +27760,15 @@ orv_smoke_fetch() {{
 orv_smoke_fetch_origin() {{
   label="$1"
   output_path="$2"
-  shift 2
+  expected_origin="$3"
+  shift 3
   orv_smoke_tmp_headers="$(mktemp)"
   if ! curl -fsS -D "$orv_smoke_tmp_headers" "$@" > "$output_path"; then
     rm -f "$orv_smoke_tmp_headers"
     printf 'orv deploy smoke test failed: %s\n' "$label" >&2
     exit 1
   fi
-  orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers"
+  orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers" "$expected_origin"
   rm -f "$orv_smoke_tmp_headers"
 }}
 
@@ -27712,12 +27776,13 @@ orv_smoke_fetch_capture_origin() {{
   label="$1"
   output_path="$2"
   headers_path="$3"
-  shift 3
+  expected_origin="$4"
+  shift 4
   if ! curl -fsS -D "$headers_path" "$@" > "$output_path"; then
     printf 'orv deploy smoke test failed: %s\n' "$label" >&2
     exit 1
   fi
-  orv_smoke_origin_header "$label" "$headers_path"
+  orv_smoke_origin_header "$label" "$headers_path" "$expected_origin"
 }}
 
 orv_smoke_body_contains() {{
@@ -27753,6 +27818,17 @@ orv_smoke_cookie_from_headers() {{
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
+    for route in &server_artifact.routes {
+        let _ = writeln!(
+            script,
+            r#"{}="{}""#,
+            deploy_smoke_origin_var_name(&route.method, &route.path),
+            route.origin_id
+        );
+    }
+    if !server_artifact.routes.is_empty() {
+        script.push('\n');
+    }
     script.push_str(&deploy_smoke_client_contract_section(client));
     if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
         let _ = writeln!(
@@ -27777,15 +27853,30 @@ done
             && !route.path.starts_with("/admin")
             && route.path != "/account/sessions"
     }) {
+        let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
         let _ = writeln!(
             script,
-            r#"orv_smoke_curl_origin "GET {}" "$BASE_URL{}""#,
-            route.path, route.path
+            r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
+            route.path, origin_ref, route.path
         );
     }
     if deploy_routes_include(server_artifact, "POST", "/checkout") {
-        script.push_str(
-            r#"
+        let root_origin = deploy_smoke_origin_var_ref("GET", "/");
+        let products_origin = deploy_smoke_origin_var_ref("POST", "/products");
+        let members_origin = deploy_smoke_origin_var_ref("POST", "/members");
+        let login_origin = deploy_smoke_origin_var_ref("POST", "/members/login");
+        let account_origin = deploy_smoke_origin_var_ref("GET", "/account/sessions");
+        let cart_items_origin = deploy_smoke_origin_var_ref("POST", "/cart/items");
+        let catalog_origin = deploy_smoke_origin_var_ref("GET", "/catalog");
+        let cart_origin = deploy_smoke_origin_var_ref("GET", "/cart");
+        let checkout_origin = deploy_smoke_origin_var_ref("POST", "/checkout");
+        let admin_summary_origin = deploy_smoke_origin_var_ref("GET", "/admin/summary");
+        let admin_catalog_origin = deploy_smoke_origin_var_ref("GET", "/admin/catalog");
+        let admin_orders_origin = deploy_smoke_origin_var_ref("GET", "/admin/orders");
+        let admin_payments_origin = deploy_smoke_origin_var_ref("GET", "/admin/payments");
+        let admin_shipments_origin = deploy_smoke_origin_var_ref("GET", "/admin/shipments");
+        let admin_audit_origin = deploy_smoke_origin_var_ref("GET", "/admin/audit");
+        let shop_smoke = r#"
 SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
@@ -27806,7 +27897,7 @@ SMOKE_ADMIN_SHIPMENTS_BODY="$(mktemp)"
 SMOKE_ADMIN_AUDIT_BODY="$(mktemp)"
 trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
 
-orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "$BASE_URL/"
+orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "__ROOT_ORIGIN__" "$BASE_URL/"
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
 if [ -z "$CSRF_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing orv_csrf cookie\n' >&2
@@ -27814,58 +27905,74 @@ if [ -z "$CSRF_COOKIE" ]; then
 fi
 CSRF_TOKEN="${CSRF_COOKIE#orv_csrf=}"
 
-orv_smoke_curl_origin "POST /products" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
-orv_smoke_curl_origin "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
-orv_smoke_curl_capture_origin "POST /members/login smoke" "$SMOKE_MEMBER_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
+orv_smoke_curl_origin "POST /products" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
+orv_smoke_curl_origin "POST /members" "__MEMBERS_ORIGIN__" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
+orv_smoke_curl_capture_origin "POST /members/login smoke" "$SMOKE_MEMBER_HEADERS" "__LOGIN_ORIGIN__" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 MEMBER_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_MEMBER_HEADERS")"
 if [ -z "$MEMBER_SESSION_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing member session cookie\n' >&2
   exit 1
 fi
-orv_smoke_curl_origin "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
-orv_smoke_fetch_origin "GET /account/sessions content" "$SMOKE_ACCOUNT_BODY" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
+orv_smoke_curl_origin "GET /account/sessions" "__ACCOUNT_ORIGIN__" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
+orv_smoke_fetch_origin "GET /account/sessions content" "$SMOKE_ACCOUNT_BODY" "__ACCOUNT_ORIGIN__" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
 orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HANDLE"
-orv_smoke_curl_origin "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
-orv_smoke_fetch_origin "GET /catalog content" "$SMOKE_CATALOG_BODY" "$BASE_URL/catalog"
+orv_smoke_curl_origin "POST /cart/items" "__CART_ITEMS_ORIGIN__" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
+orv_smoke_fetch_origin "GET /catalog content" "$SMOKE_CATALOG_BODY" "__CATALOG_ORIGIN__" "$BASE_URL/catalog"
 orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU"
-orv_smoke_fetch_origin "GET /cart content" "$SMOKE_CART_BODY" "$BASE_URL/cart"
+orv_smoke_fetch_origin "GET /cart content" "$SMOKE_CART_BODY" "__CART_ORIGIN__" "$BASE_URL/cart"
 orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU"
-orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
+orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" "__CHECKOUT_ORIGIN__" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
 orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'
 orv_smoke_body_contains "checkout captured payment" "$SMOKE_CHECKOUT_BODY" '"status":"captured"'
 orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'
-orv_smoke_curl_capture_origin "POST /members/login admin" "$SMOKE_ADMIN_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\",\"password\":\"admin-reference-password\"}"
+orv_smoke_curl_capture_origin "POST /members/login admin" "$SMOKE_ADMIN_HEADERS" "__LOGIN_ORIGIN__" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\",\"password\":\"admin-reference-password\"}"
 ADMIN_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_ADMIN_HEADERS")"
 ADMIN_ROLE_COOKIE="$(orv_smoke_cookie_from_headers orv_session_role "$SMOKE_ADMIN_HEADERS")"
 if [ -z "$ADMIN_SESSION_COOKIE" ] || [ -z "$ADMIN_ROLE_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing admin session cookies\n' >&2
   exit 1
 fi
-orv_smoke_fetch_origin "GET /admin/summary content" "$SMOKE_ADMIN_SUMMARY_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary"
+orv_smoke_fetch_origin "GET /admin/summary content" "$SMOKE_ADMIN_SUMMARY_BODY" "__ADMIN_SUMMARY_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary"
 orv_smoke_body_contains "admin summary orders" "$SMOKE_ADMIN_SUMMARY_BODY" '"orders"'
 orv_smoke_body_contains "admin summary payments" "$SMOKE_ADMIN_SUMMARY_BODY" '"payments"'
-orv_smoke_fetch_origin "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
+orv_smoke_fetch_origin "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" "__ADMIN_CATALOG_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
 orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU"
-orv_smoke_fetch_origin "GET /admin/orders content" "$SMOKE_ADMIN_ORDERS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/orders"
+orv_smoke_fetch_origin "GET /admin/orders content" "$SMOKE_ADMIN_ORDERS_BODY" "__ADMIN_ORDERS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/orders"
 orv_smoke_body_contains "admin orders smoke member" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_HANDLE"
 orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'
-orv_smoke_fetch_origin "GET /admin/payments content" "$SMOKE_ADMIN_PAYMENTS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/payments"
+orv_smoke_fetch_origin "GET /admin/payments content" "$SMOKE_ADMIN_PAYMENTS_BODY" "__ADMIN_PAYMENTS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/payments"
 orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'
-orv_smoke_fetch_origin "GET /admin/shipments content" "$SMOKE_ADMIN_SHIPMENTS_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/shipments"
+orv_smoke_fetch_origin "GET /admin/shipments content" "$SMOKE_ADMIN_SHIPMENTS_BODY" "__ADMIN_SHIPMENTS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/shipments"
 orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'
-orv_smoke_fetch_origin "GET /admin/audit content" "$SMOKE_ADMIN_AUDIT_BODY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/audit"
+orv_smoke_fetch_origin "GET /admin/audit content" "$SMOKE_ADMIN_AUDIT_BODY" "__ADMIN_AUDIT_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/audit"
 orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'
 orv_smoke_body_contains "admin audit payment" "$SMOKE_ADMIN_AUDIT_BODY" 'payment.capture'
 orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipment.book'
-"#,
-        );
+"#
+        .replace("__ROOT_ORIGIN__", &root_origin)
+        .replace("__PRODUCTS_ORIGIN__", &products_origin)
+        .replace("__MEMBERS_ORIGIN__", &members_origin)
+        .replace("__LOGIN_ORIGIN__", &login_origin)
+        .replace("__ACCOUNT_ORIGIN__", &account_origin)
+        .replace("__CART_ITEMS_ORIGIN__", &cart_items_origin)
+        .replace("__CATALOG_ORIGIN__", &catalog_origin)
+        .replace("__CART_ORIGIN__", &cart_origin)
+        .replace("__CHECKOUT_ORIGIN__", &checkout_origin)
+        .replace("__ADMIN_SUMMARY_ORIGIN__", &admin_summary_origin)
+        .replace("__ADMIN_CATALOG_ORIGIN__", &admin_catalog_origin)
+        .replace("__ADMIN_ORDERS_ORIGIN__", &admin_orders_origin)
+        .replace("__ADMIN_PAYMENTS_ORIGIN__", &admin_payments_origin)
+        .replace("__ADMIN_SHIPMENTS_ORIGIN__", &admin_shipments_origin)
+        .replace("__ADMIN_AUDIT_ORIGIN__", &admin_audit_origin);
+        script.push_str(&shop_smoke);
         for route in server_artifact.routes.iter().filter(|route| {
             route.method == "GET" && !route.path.contains(':') && route.path.starts_with("/admin")
         }) {
+            let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
             let _ = writeln!(
                 script,
-                r#"orv_smoke_curl_origin "GET {}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
-                route.path, route.path
+                r#"orv_smoke_curl_origin "GET {}" "{}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
+                route.path, origin_ref, route.path
             );
         }
     }
@@ -29556,32 +29663,37 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains(r#"READY_PATH="/health""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
-        assert!(smoke_test.contains(r#"orv_smoke_curl_origin "GET /health" "$BASE_URL/health""#));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_ORIGIN_GET_HEALTH="ori_"#));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "$BASE_URL/""#
+            r#"orv_smoke_curl_origin "GET /health" "$ORV_SMOKE_ORIGIN_GET_HEALTH" "$BASE_URL/health""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "$ORV_SMOKE_ORIGIN_GET_ROOT" "$BASE_URL/""#
         ));
         assert!(smoke_test.contains(
             "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\""
         ));
         assert!(smoke_test.contains(r#"-H "x-csrf-token: ${CSRF_TOKEN}""#));
         assert!(smoke_test
-            .contains(r#"orv_smoke_curl_origin "POST /products" -X POST "$BASE_URL/products""#));
+            .contains(r#"orv_smoke_curl_origin "POST /products" "$ORV_SMOKE_ORIGIN_POST_PRODUCTS" -X POST "$BASE_URL/products""#));
         assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
         assert!(smoke_test
-            .contains(r#"orv_smoke_curl_origin "POST /members" -X POST "$BASE_URL/members""#));
-        assert!(smoke_test.contains(r#"orv_smoke_curl_capture_origin "POST /members/login smoke""#));
+            .contains(r#"orv_smoke_curl_origin "POST /members" "$ORV_SMOKE_ORIGIN_POST_MEMBERS" -X POST "$BASE_URL/members""#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_capture_origin "POST /members/login smoke" "$SMOKE_MEMBER_HEADERS" "$ORV_SMOKE_ORIGIN_POST_MEMBERS_LOGIN""#
+        ));
         assert!(smoke_test.contains("MEMBER_SESSION_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session \"$SMOKE_MEMBER_HEADERS\")\""));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_origin "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#
+            r#"orv_smoke_curl_origin "GET /account/sessions" "$ORV_SMOKE_ORIGIN_GET_ACCOUNT_SESSIONS" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#
         ));
         assert!(smoke_test.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#));
         assert!(smoke_test.contains(r#"SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}""#));
         assert!(smoke_test.contains(r#"\"password\":\"${SMOKE_PASSWORD}\""#));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_origin "POST /cart/items" -X POST "$BASE_URL/cart/items""#
+            r#"orv_smoke_curl_origin "POST /cart/items" "$ORV_SMOKE_ORIGIN_POST_CART_ITEMS" -X POST "$BASE_URL/cart/items""#
         ));
         assert!(smoke_test.contains(
-            r#"orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" -X POST "$BASE_URL/checkout""#
+            r#"orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" "$ORV_SMOKE_ORIGIN_POST_CHECKOUT" -X POST "$BASE_URL/checkout""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'"#
@@ -29592,11 +29704,13 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'"#
         ));
-        assert!(smoke_test.contains(r#"orv_smoke_curl_capture_origin "POST /members/login admin""#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_capture_origin "POST /members/login admin" "$SMOKE_ADMIN_HEADERS" "$ORV_SMOKE_ORIGIN_POST_MEMBERS_LOGIN""#
+        ));
         assert!(smoke_test.contains("ADMIN_SESSION_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session \"$SMOKE_ADMIN_HEADERS\")\""));
         assert!(smoke_test.contains("ADMIN_ROLE_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session_role \"$SMOKE_ADMIN_HEADERS\")\""));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_origin "GET /admin/summary" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary""#
+            r#"orv_smoke_curl_origin "GET /admin/summary" "$ORV_SMOKE_ORIGIN_GET_ADMIN_SUMMARY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#
@@ -41199,7 +41313,10 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(r#"READY_PATH="/ping""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
-        assert!(smoke_test.contains(r#"orv_smoke_curl_origin "GET /ping" "$BASE_URL/ping""#));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_ORIGIN_GET_PING="ori_"#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_origin "GET /ping" "$ORV_SMOKE_ORIGIN_GET_PING" "$BASE_URL/ping""#
+        ));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
@@ -42135,6 +42252,34 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy server smoke_test must be deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_smoke_origin_assignment_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-origin-source");
+        let out = temp_output_dir("deploy-smoke-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact = read_server_artifact(&out.join("server").join("app.orv-runtime.json"))
+            .expect("server artifact");
+        let route = artifact
+            .routes
+            .iter()
+            .find(|route| route.method == "GET" && route.path == "/ping")
+            .expect("GET /ping route");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        let expected = format!(r#"ORV_SMOKE_ORIGIN_GET_PING="{}""#, route.origin_id);
+        let smoke = smoke.replace(&expected, r#"ORV_SMOKE_ORIGIN_GET_PING="ori_wrong""#);
+        write_text(&smoke_path, &smoke).expect("write corrupt smoke test");
+
+        let err = cmd_verify_build(&out).expect_err("smoke origin mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test must declare expected origin for GET /ping"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
