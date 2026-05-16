@@ -23079,21 +23079,60 @@ fn verify_deploy_smoke_client_contract(
     if !smoke.contains("orv_smoke_file()") || !smoke.contains("orv_smoke_grep()") {
         anyhow::bail!("deploy smoke test must include client file contract helpers");
     }
-    for key in ["manifest", "page", "loader", "wasm"] {
+    for key in ["manifest", "reactive_plan", "page", "loader", "wasm"] {
         let path = json_str(client, key, "deploy client")?;
         let command = format!(r#"orv_smoke_file "{path}""#);
         if !smoke.contains(&command) {
             anyhow::bail!("deploy smoke test must check client {key} {path}");
         }
     }
+    let reactive_plan = json_str(client, "reactive_plan", "deploy client")?;
     let page = json_str(client, "page", "deploy client")?;
     let loader = json_str(client, "loader", "deploy client")?;
     let manifest = json_str(client, "manifest", "deploy client")?;
     for required in [
         format!(r#"orv_smoke_grep "client page marker" "{page}" 'data-orv-client="wasm"'"#),
         format!(r#"orv_smoke_grep "client loader reference" "{page}" 'app.js'"#),
+        format!(
+            r#"orv_smoke_grep "client manifest reactive plan path" "{manifest}" '"reactive_plan": "{reactive_plan}"'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client manifest reactive plan hash" "{manifest}" '"reactive_plan_hash"'"#
+        ),
+        format!(r#"orv_smoke_grep "client manifest loader hash" "{manifest}" '"loader_hash"'"#),
+        format!(r#"orv_smoke_grep "client manifest wasm hash" "{manifest}" '"wasm_hash"'"#),
+        format!(
+            r#"orv_smoke_grep "client manifest source bundle" "{manifest}" '"source_bundle": "source-bundle.json"'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client manifest runtime" "{manifest}" '"runtime": "client_wasm"'"#
+        ),
         format!(r#"orv_smoke_grep "client manifest capabilities" "{manifest}" '"capabilities"'"#),
+        format!(
+            r#"orv_smoke_grep "client manifest capability surfaces" "{manifest}" '"surfaces"'"#
+        ),
+        format!(r#"orv_smoke_grep "client manifest event actions" "{manifest}" '"event_actions"'"#),
+        format!(
+            r#"orv_smoke_grep "client reactive plan kind" "{reactive_plan}" '"kind": "orv.client.reactive_plan"'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client reactive plan source bundle" "{reactive_plan}" '"source_bundle": "source-bundle.json"'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client reactive plan blocked_by" "{reactive_plan}" '"blocked_by"'"#
+        ),
         format!(r#"orv_smoke_grep "client loader bootstrap" "{loader}" 'ORV_CLIENT_BOOTSTRAP'"#),
+        format!(
+            r#"orv_smoke_grep "client loader embedded reactive plan" "{loader}" 'embeddedReactivePlan'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client loader embedded reactive plan hash" "{loader}" 'embeddedReactivePlanHash'"#
+        ),
+        format!(
+            r#"orv_smoke_grep "client loader source bundle hash" "{loader}" 'sourceBundleHash'"#
+        ),
+        format!(r#"orv_smoke_grep "client loader wasm reference" "{loader}" 'app.wasm'"#),
+        format!(r#"orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'"#),
     ] {
         if !smoke.contains(&required) {
             anyhow::bail!("deploy smoke test must include {required}");
@@ -23847,7 +23886,7 @@ fn verify_deploy_runbook_client_section(
     let Some(client) = client.filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    for key in ["manifest", "page", "loader", "wasm"] {
+    for key in ["manifest", "reactive_plan", "page", "loader", "wasm"] {
         let path = json_str(client, key, "deploy client")?;
         if !runbook.contains(path) {
             anyhow::bail!("deploy runbook must document client {key} {path}");
@@ -24026,6 +24065,23 @@ fn verify_deploy_client_target(
     }
     let manifest_value = read_json_value(&manifest_target)?;
     verify_client_manifest_value(dir, &manifest_value)?;
+    let reactive_plan = json_str(client, "reactive_plan", "deploy client")?;
+    if manifest_value
+        .get("reactive_plan")
+        .and_then(serde_json::Value::as_str)
+        != Some(reactive_plan)
+    {
+        anyhow::bail!("deploy client reactive_plan does not match client manifest");
+    }
+    let reactive_plan_target = dir.join(reactive_plan);
+    if !reactive_plan_target.is_file() {
+        anyhow::bail!(
+            "missing deploy client reactive plan: {}",
+            reactive_plan_target.display()
+        );
+    }
+    let reactive_plan_value = read_json_value(&reactive_plan_target)?;
+    verify_client_reactive_plan_value(dir, &reactive_plan_value)?;
     if client.get("capabilities") != manifest_value.get("capabilities") {
         anyhow::bail!("deploy client capabilities do not match client manifest");
     }
@@ -26656,6 +26712,7 @@ fn cmd_build_with_profile(path: &Path, out: &Path, profile: BuildProfile) -> any
             ProdBuildTargets {
                 static_page: static_page_path.as_deref(),
                 client_manifest: client_manifest_path.as_deref(),
+                client_reactive_plan: client_reactive_plan_path.as_deref(),
                 client_page: client_page_path.as_deref(),
                 client_js: client_js_path.as_deref(),
                 client_wasm: client_wasm_path.as_deref(),
@@ -30028,6 +30085,7 @@ fn html_attr_escape(value: &str) -> String {
 struct ProdBuildTargets<'a> {
     static_page: Option<&'a str>,
     client_manifest: Option<&'a str>,
+    client_reactive_plan: Option<&'a str>,
     client_page: Option<&'a str>,
     client_js: Option<&'a str>,
     client_wasm: Option<&'a str>,
@@ -30190,8 +30248,15 @@ fn prod_deploy_client_json(
         .client_manifest
         .ok_or_else(|| anyhow::anyhow!("missing client_manifest bundle target"))?;
     let client_manifest_value = read_json_value(&out.join(client_manifest))?;
+    let reactive_plan = targets
+        .client_reactive_plan
+        .ok_or_else(|| anyhow::anyhow!("missing client_reactive_plan bundle target"))?;
+    if json_str(&client_manifest_value, "reactive_plan", "client manifest")? != reactive_plan {
+        anyhow::bail!("client manifest reactive_plan does not match bundle target");
+    }
     Ok(serde_json::json!({
         "manifest": client_manifest,
+        "reactive_plan": reactive_plan,
         "page": targets.client_page.ok_or_else(|| anyhow::anyhow!("missing client_page bundle target"))?,
         "loader": targets.client_js.ok_or_else(|| anyhow::anyhow!("missing client_js bundle target"))?,
         "wasm": targets.client_wasm.ok_or_else(|| anyhow::anyhow!("missing client_wasm bundle target"))?,
@@ -31204,18 +31269,36 @@ fn deploy_smoke_client_contract_section(client: &serde_json::Value) -> String {
         return String::new();
     }
     let manifest = json_str_or_empty(client, "manifest");
+    let reactive_plan = json_str_or_empty(client, "reactive_plan");
     let page = json_str_or_empty(client, "page");
     let loader = json_str_or_empty(client, "loader");
     let wasm = json_str_or_empty(client, "wasm");
     format!(
         r#"orv_smoke_file "{manifest}"
+orv_smoke_file "{reactive_plan}"
 orv_smoke_file "{page}"
 orv_smoke_file "{loader}"
 orv_smoke_file "{wasm}"
 orv_smoke_grep "client page marker" "{page}" 'data-orv-client="wasm"'
 orv_smoke_grep "client loader reference" "{page}" 'app.js'
+orv_smoke_grep "client manifest reactive plan path" "{manifest}" '"reactive_plan": "{reactive_plan}"'
+orv_smoke_grep "client manifest reactive plan hash" "{manifest}" '"reactive_plan_hash"'
+orv_smoke_grep "client manifest loader hash" "{manifest}" '"loader_hash"'
+orv_smoke_grep "client manifest wasm hash" "{manifest}" '"wasm_hash"'
+orv_smoke_grep "client manifest source bundle" "{manifest}" '"source_bundle": "source-bundle.json"'
+orv_smoke_grep "client manifest runtime" "{manifest}" '"runtime": "client_wasm"'
 orv_smoke_grep "client manifest capabilities" "{manifest}" '"capabilities"'
+orv_smoke_grep "client manifest capability surfaces" "{manifest}" '"surfaces"'
+orv_smoke_grep "client manifest event actions" "{manifest}" '"event_actions"'
+orv_smoke_grep "client reactive plan kind" "{reactive_plan}" '"kind": "orv.client.reactive_plan"'
+orv_smoke_grep "client reactive plan source bundle" "{reactive_plan}" '"source_bundle": "source-bundle.json"'
+orv_smoke_grep "client reactive plan blocked_by" "{reactive_plan}" '"blocked_by"'
 orv_smoke_grep "client loader bootstrap" "{loader}" 'ORV_CLIENT_BOOTSTRAP'
+orv_smoke_grep "client loader embedded reactive plan" "{loader}" 'embeddedReactivePlan'
+orv_smoke_grep "client loader embedded reactive plan hash" "{loader}" 'embeddedReactivePlanHash'
+orv_smoke_grep "client loader source bundle hash" "{loader}" 'sourceBundleHash'
+orv_smoke_grep "client loader wasm reference" "{loader}" 'app.wasm'
+orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'
 
 "#
     )
@@ -31370,6 +31453,7 @@ fn deploy_runbook_client_section(client: &serde_json::Value) -> String {
         return String::new();
     }
     let manifest = json_str_or_empty(client, "manifest");
+    let reactive_plan = json_str_or_empty(client, "reactive_plan");
     let page = json_str_or_empty(client, "page");
     let loader = json_str_or_empty(client, "loader");
     let wasm = json_str_or_empty(client, "wasm");
@@ -31405,6 +31489,7 @@ fn deploy_runbook_client_section(client: &serde_json::Value) -> String {
         r#"## Client Bundle
 
 - Client manifest: {manifest}
+- Client reactive plan: {reactive_plan}
 - Client page: {page}
 - Client loader: {loader}
 - Client WASM: {wasm}
@@ -45265,6 +45350,7 @@ let sig count: int = 0
 
         assert!(runbook.contains("## Client Bundle"));
         assert!(runbook.contains("- Client manifest: client/manifest.json"));
+        assert!(runbook.contains("- Client reactive plan: client/reactive-plan.json"));
         assert!(runbook.contains("- Client page: pages/index.html"));
         assert!(runbook.contains("- Client loader: client/app.js"));
         assert!(runbook.contains("- Client WASM: client/app.wasm"));
@@ -45318,6 +45404,7 @@ let sig count: int = 0
         assert!(smoke.contains("orv_smoke_file()"));
         assert!(smoke.contains("orv_smoke_grep()"));
         assert!(smoke.contains(r#"orv_smoke_file "client/manifest.json""#));
+        assert!(smoke.contains(r#"orv_smoke_file "client/reactive-plan.json""#));
         assert!(smoke.contains(r#"orv_smoke_file "pages/index.html""#));
         assert!(smoke.contains(r#"orv_smoke_file "client/app.js""#));
         assert!(smoke.contains(r#"orv_smoke_file "client/app.wasm""#));
@@ -45325,10 +45412,58 @@ let sig count: int = 0
             r#"orv_smoke_grep "client page marker" "pages/index.html" 'data-orv-client="wasm"'"#
         ));
         assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest reactive plan path" "client/manifest.json" '"reactive_plan": "client/reactive-plan.json"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest reactive plan hash" "client/manifest.json" '"reactive_plan_hash"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest loader hash" "client/manifest.json" '"loader_hash"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest wasm hash" "client/manifest.json" '"wasm_hash"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest source bundle" "client/manifest.json" '"source_bundle": "source-bundle.json"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest runtime" "client/manifest.json" '"runtime": "client_wasm"'"#
+        ));
+        assert!(smoke.contains(
             r#"orv_smoke_grep "client manifest capabilities" "client/manifest.json" '"capabilities"'"#
         ));
         assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest capability surfaces" "client/manifest.json" '"surfaces"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client manifest event actions" "client/manifest.json" '"event_actions"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client reactive plan kind" "client/reactive-plan.json" '"kind": "orv.client.reactive_plan"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client reactive plan source bundle" "client/reactive-plan.json" '"source_bundle": "source-bundle.json"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client reactive plan blocked_by" "client/reactive-plan.json" '"blocked_by"'"#
+        ));
+        assert!(smoke.contains(
             r#"orv_smoke_grep "client loader bootstrap" "client/app.js" 'ORV_CLIENT_BOOTSTRAP'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader embedded reactive plan" "client/app.js" 'embeddedReactivePlan'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader embedded reactive plan hash" "client/app.js" 'embeddedReactivePlanHash'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader source bundle hash" "client/app.js" 'sourceBundleHash'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader wasm reference" "client/app.js" 'app.wasm'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_grep "client loader signal setter" "client/app.js" '__ORV_SET_SIGNAL__'"#
         ));
         cmd_verify_build(&out).expect("verify client smoke test");
 
@@ -48612,6 +48747,10 @@ models = { path = "../../shared/models", version = "2.0.0" }
         let deploy =
             read_json_value(&build_out.join("deploy").join("manifest.json")).expect("deploy");
         assert_eq!(deploy["client"]["manifest"], "client/manifest.json");
+        assert_eq!(
+            deploy["client"]["reactive_plan"],
+            "client/reactive-plan.json"
+        );
         assert_eq!(deploy["client"]["page"], "pages/index.html");
         assert_eq!(deploy["client"]["loader"], "client/app.js");
         assert_eq!(deploy["client"]["wasm"], "client/app.wasm");
@@ -48661,6 +48800,33 @@ models = { path = "../../shared/models", version = "2.0.0" }
         assert!(
             err.to_string()
                 .contains("deploy client capabilities do not match client manifest"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_client_reactive_plan_drift() {
+        let out = temp_output_dir("verify-build-deploy-client-reactive-plan");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(
+            &entry,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+        let deploy_path = build_out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_path).expect("deploy manifest");
+        deploy["client"]["reactive_plan"] = serde_json::json!("client/other-plan.json");
+        write_json(&deploy_path, &deploy).expect("write drifted deploy manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid deploy client reactive plan");
+        assert!(
+            err.to_string()
+                .contains("deploy client reactive_plan does not match client manifest"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&out);
