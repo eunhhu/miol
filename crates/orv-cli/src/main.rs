@@ -18871,7 +18871,10 @@ fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::Value> {
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(300.0);
     let task_report = benchmark_report_tasks(&evidence, max_elapsed_minutes)?;
-    let data_report = benchmark_report_data(&evidence)?;
+    let smoke_output_rel = evidence
+        .pointer("/artifacts/smoke_output")
+        .and_then(serde_json::Value::as_str);
+    let data_report = benchmark_report_data(&evidence, Some(dir), smoke_output_rel)?;
     let status = benchmark_report_status_summary(&task_report, &data_report, max_elapsed_minutes);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -19041,7 +19044,11 @@ fn benchmark_report_tasks(
     }))
 }
 
-fn benchmark_report_data(evidence: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+fn benchmark_report_data(
+    evidence: &serde_json::Value,
+    build_dir: Option<&Path>,
+    smoke_output_rel: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
     let data = evidence
         .get("data")
         .and_then(serde_json::Value::as_object)
@@ -19067,10 +19074,11 @@ fn benchmark_report_data(evidence: &serde_json::Value) -> anyhow::Result<serde_j
     {
         missing.push("first_error_to_fix_minutes".to_string());
     }
-    if data
-        .get("smoke_test_output")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
+    let (smoke_test_output, smoke_test_output_source) =
+        benchmark_smoke_test_output_value(data, build_dir, smoke_output_rel);
+    if smoke_test_output
+        .as_str()
+        .is_none_or(|value| value.trim().is_empty())
     {
         missing.push("smoke_test_output".to_string());
     }
@@ -19080,9 +19088,41 @@ fn benchmark_report_data(evidence: &serde_json::Value) -> anyhow::Result<serde_j
         "compiler_runtime_errors": data.get("compiler_runtime_errors").cloned().unwrap_or(serde_json::Value::Null),
         "first_error_to_fix_minutes": data.get("first_error_to_fix_minutes").cloned().unwrap_or(serde_json::Value::Null),
         "manual_config_edits": data.get("manual_config_edits").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "smoke_test_output": data.get("smoke_test_output").cloned().unwrap_or(serde_json::Value::Null),
+        "smoke_test_output": smoke_test_output,
+        "smoke_test_output_source": smoke_test_output_source,
         "participant_notes": data.get("participant_notes").cloned().unwrap_or(serde_json::Value::Null),
     }))
+}
+
+fn benchmark_smoke_test_output_value(
+    data: &serde_json::Map<String, serde_json::Value>,
+    build_dir: Option<&Path>,
+    smoke_output_rel: Option<&str>,
+) -> (serde_json::Value, serde_json::Value) {
+    let evidence_value = data
+        .get("smoke_test_output")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if evidence_value
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return (evidence_value, serde_json::json!("evidence"));
+    }
+    let Some(build_dir) = build_dir else {
+        return (evidence_value, serde_json::Value::Null);
+    };
+    let Some(smoke_output_rel) = smoke_output_rel else {
+        return (evidence_value, serde_json::Value::Null);
+    };
+    let smoke_output_path = build_dir.join(smoke_output_rel);
+    match std::fs::read_to_string(&smoke_output_path) {
+        Ok(output) if !output.trim().is_empty() => (
+            serde_json::json!(output),
+            serde_json::json!(smoke_output_rel),
+        ),
+        _ => (evidence_value, serde_json::Value::Null),
+    }
 }
 
 fn benchmark_report_status_is_missing(status: &str) -> bool {
@@ -22144,6 +22184,10 @@ fn verify_deploy_server_target(
     if smoke_test != DEPLOY_SMOKE_TEST_PATH {
         anyhow::bail!("deploy server smoke_test must be {DEPLOY_SMOKE_TEST_PATH}");
     }
+    let smoke_output = json_str(server, "smoke_output", "deploy server")?;
+    if smoke_output != DEPLOY_SMOKE_OUTPUT_PATH {
+        anyhow::bail!("deploy server smoke_output must be {DEPLOY_SMOKE_OUTPUT_PATH}");
+    }
     let preflight = json_str(server, "preflight", "deploy server")?;
     if preflight != DEPLOY_PREFLIGHT_PATH {
         anyhow::bail!("deploy server preflight must be {DEPLOY_PREFLIGHT_PATH}");
@@ -22250,6 +22294,7 @@ fn verify_deploy_server_target(
         db_adapters,
         commerce_adapters,
         smoke_test,
+        smoke_output,
         preflight,
         benchmark_evidence,
         runbook,
@@ -22634,6 +22679,11 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke.contains("command -v curl") || !smoke.contains("orv deploy smoke test requires curl")
     {
         anyhow::bail!("deploy smoke test must check curl availability");
+    }
+    if !smoke.contains(r#"ORV_SMOKE_OUTPUT="${ORV_SMOKE_OUTPUT:-deploy/smoke-output.txt}""#)
+        || !smoke.contains(r#"> "$ORV_SMOKE_OUTPUT""#)
+    {
+        anyhow::bail!("deploy smoke test must write deploy smoke output artifact");
     }
     if !smoke.contains(r#"ORV_BIN="${ORV_BIN:-orv}""#)
         || !smoke.contains("orv_smoke_reveal_contains()")
@@ -23137,6 +23187,7 @@ fn verify_deploy_preflight_artifact(
         ("db_adapters", artifacts.db_adapters),
         ("commerce_adapters", artifacts.commerce_adapters),
         ("smoke_test", artifacts.smoke_test),
+        ("smoke_output", artifacts.smoke_output),
         ("preflight", artifacts.preflight),
         ("benchmark_evidence", artifacts.benchmark_evidence),
         ("runbook", artifacts.runbook),
@@ -23583,6 +23634,7 @@ struct DeployRunbookArtifacts<'a> {
     db_adapters: &'a str,
     commerce_adapters: &'a str,
     smoke_test: &'a str,
+    smoke_output: &'a str,
     preflight: &'a str,
     benchmark_evidence: &'a str,
     runbook: &'a str,
@@ -23626,6 +23678,10 @@ fn verify_deploy_runbook_artifact(
     if !runbook.contains(artifacts.smoke_test) {
         let smoke_test_path = artifacts.smoke_test;
         anyhow::bail!("deploy runbook must reference {smoke_test_path}");
+    }
+    if !runbook.contains(artifacts.smoke_output) {
+        let smoke_output_path = artifacts.smoke_output;
+        anyhow::bail!("deploy runbook must reference {smoke_output_path}");
     }
     if !runbook.contains(artifacts.preflight) {
         let preflight_path = artifacts.preflight;
@@ -24781,7 +24837,10 @@ fn reveal_benchmark_evidence_summary(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(300.0);
     let task_report = benchmark_report_tasks(&evidence, max_elapsed_minutes)?;
-    let data_report = benchmark_report_data(&evidence)?;
+    let smoke_output_rel = preflight
+        .pointer("/artifacts/smoke_output")
+        .and_then(serde_json::Value::as_str);
+    let data_report = benchmark_report_data(&evidence, Some(dir), smoke_output_rel)?;
     let report_status =
         benchmark_report_status_summary(&task_report, &data_report, max_elapsed_minutes);
     Ok(serde_json::json!({
@@ -29472,6 +29531,7 @@ const CLIENT_WASM_PATH: &str = "client/app.wasm";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const DEPLOY_SMOKE_TEST_PATH: &str = "deploy/smoke-test.sh";
+const DEPLOY_SMOKE_OUTPUT_PATH: &str = "deploy/smoke-output.txt";
 const DEPLOY_PREFLIGHT_PATH: &str = "deploy/preflight.json";
 const DEPLOY_BENCHMARK_EVIDENCE_PATH: &str = "deploy/benchmark-evidence.json";
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
@@ -29979,6 +30039,7 @@ fn write_prod_deploy_artifacts(
         let db_adapters = "deploy/db-adapters.json";
         let commerce_adapters = "deploy/commerce-adapters.json";
         let smoke_test = DEPLOY_SMOKE_TEST_PATH;
+        let smoke_output = DEPLOY_SMOKE_OUTPUT_PATH;
         let preflight = DEPLOY_PREFLIGHT_PATH;
         let benchmark_evidence = DEPLOY_BENCHMARK_EVIDENCE_PATH;
         let runbook = "deploy/README.md";
@@ -30018,6 +30079,7 @@ fn write_prod_deploy_artifacts(
             db_adapters,
             commerce_adapters,
             smoke_test,
+            smoke_output,
             preflight,
             benchmark_evidence,
             runbook,
@@ -30064,6 +30126,7 @@ fn write_prod_deploy_artifacts(
             "db_adapters": db_adapters,
             "commerce_adapters": commerce_adapters,
             "smoke_test": smoke_test,
+            "smoke_output": smoke_output,
             "preflight": preflight,
             "benchmark_evidence": benchmark_evidence,
             "runbook": runbook,
@@ -30333,6 +30396,7 @@ fn deploy_preflight_artifacts_value(artifacts: &DeployRunbookArtifacts<'_>) -> s
         "db_adapters": artifacts.db_adapters,
         "commerce_adapters": artifacts.commerce_adapters,
         "smoke_test": artifacts.smoke_test,
+        "smoke_output": artifacts.smoke_output,
         "preflight": artifacts.preflight,
         "benchmark_evidence": artifacts.benchmark_evidence,
         "runbook": artifacts.runbook,
@@ -30475,6 +30539,7 @@ ORV_SMOKE_BUILD_DIR=$(CDPATH= cd "$ORV_SMOKE_SCRIPT_DIR/.." && pwd)
 cd "$ORV_SMOKE_BUILD_DIR"
 BASE_URL="${{ORV_BASE_URL:-{}}}"
 ORV_BIN="${{ORV_BIN:-orv}}"
+ORV_SMOKE_OUTPUT="${{ORV_SMOKE_OUTPUT:-{}}}"
 
 if ! command -v curl >/dev/null 2>&1; then
   printf 'orv deploy smoke test requires curl\n' >&2
@@ -30804,7 +30869,8 @@ orv_smoke_cookie_from_headers() {{
 }}
 
 "#,
-        deploy_smoke_base_url(server_artifact.listen.as_ref())
+        deploy_smoke_base_url(server_artifact.listen.as_ref()),
+        DEPLOY_SMOKE_OUTPUT_PATH
     );
     for route in &server_artifact.routes {
         let _ = writeln!(
@@ -31088,7 +31154,9 @@ orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipme
         }
     }
     script.push_str("orv_smoke_trace_stream\n");
-    script.push_str("printf 'orv deploy smoke test passed\\n'\n");
+    script.push_str(
+        "printf 'orv deploy smoke test passed\\n' > \"$ORV_SMOKE_OUTPUT\"\nprintf 'orv deploy smoke test passed\\n'\n",
+    );
     let target = out.join(path);
     write_text(&target, &script)?;
     set_executable_if_supported(&target)
@@ -31168,6 +31236,7 @@ fn write_prod_deploy_runbook(
     let db_adapters_path = artifacts.db_adapters;
     let commerce_adapters_path = artifacts.commerce_adapters;
     let smoke_test_path = artifacts.smoke_test;
+    let smoke_output_path = artifacts.smoke_output;
     let preflight_path = artifacts.preflight;
     let benchmark_evidence_path = artifacts.benchmark_evidence;
     let routes_artifact = artifacts.routes;
@@ -31198,6 +31267,7 @@ fn write_prod_deploy_runbook(
 - DB adapters: {db_adapters_path}
 - Commerce adapters: {commerce_adapters_path}
 - Smoke test: {smoke_test_path}
+- Smoke output: {smoke_output_path}
 - Preflight: {preflight_path}
 - Benchmark evidence: {benchmark_evidence_path}
 - Routes: {routes_artifact}
@@ -31243,6 +31313,7 @@ orv benchmark-report .
 ## Benchmark Evidence
 
 Record human-run timing and observation data in `{benchmark_evidence_path}` after the preflight and smoke commands pass. The file keeps the 5-hour shop benchmark tasks, data-to-record fields, and preflight hash together so benchmark reports stay tied to the checked build contract.
+The generated smoke test writes `{smoke_output_path}` on success, and `orv benchmark-report .` uses it when the evidence `smoke_test_output` field is still empty.
 
 ```sh
 orv benchmark-report . --require-pass
@@ -32830,6 +32901,10 @@ test "checkout excluded failure" {
             serde_json::json!("deploy/smoke-test.sh")
         );
         assert_eq!(
+            deploy["server"]["smoke_output"],
+            serde_json::json!("deploy/smoke-output.txt")
+        );
+        assert_eq!(
             deploy["server"]["preflight"],
             serde_json::json!("deploy/preflight.json")
         );
@@ -33017,6 +33092,10 @@ test "checkout excluded failure" {
         assert_eq!(
             preflight["artifacts"]["benchmark_evidence"],
             serde_json::json!("deploy/benchmark-evidence.json")
+        );
+        assert_eq!(
+            preflight["artifacts"]["smoke_output"],
+            serde_json::json!("deploy/smoke-output.txt")
         );
         assert!(preflight["benchmark"]["success_criteria"]
             .as_array()
@@ -33288,6 +33367,7 @@ test "checkout excluded failure" {
         assert!(runbook.contains("deploy/env.example"));
         assert!(runbook.contains("deploy/commerce-adapters.json"));
         assert!(runbook.contains("deploy/smoke-test.sh"));
+        assert!(runbook.contains("deploy/smoke-output.txt"));
         assert!(runbook.contains("deploy/preflight.json"));
         assert!(runbook.contains("deploy/benchmark-evidence.json"));
         assert!(runbook.contains("## Benchmark Evidence"));
@@ -44870,6 +44950,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["env_example"], "deploy/env.example");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(deploy["server"]["smoke_test"], "deploy/smoke-test.sh");
+        assert_eq!(deploy["server"]["smoke_output"], "deploy/smoke-output.txt");
         assert_eq!(deploy["server"]["preflight"], "deploy/preflight.json");
         assert_eq!(
             deploy["server"]["benchmark_evidence"],
@@ -44946,6 +45027,7 @@ entry = "src/main.orv"
         assert!(runbook.contains("ORV_BUILD_DIR is an explicit override"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
+        assert!(runbook.contains("deploy/smoke-output.txt"));
         assert!(runbook.contains("deploy/preflight.json"));
         assert!(runbook.contains("deploy/benchmark-evidence.json"));
         assert!(runbook.contains("## Benchmark Evidence"));
@@ -44965,6 +45047,9 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
+        assert!(smoke_test
+            .contains(r#"ORV_SMOKE_OUTPUT="${ORV_SMOKE_OUTPUT:-deploy/smoke-output.txt}""#));
+        assert!(smoke_test.contains(r#"> "$ORV_SMOKE_OUTPUT""#));
         assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_editor_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_lsp_reveal_contains()"));
@@ -45003,6 +45088,10 @@ entry = "src/main.orv"
         assert_eq!(preflight["kind"], "orv.deploy.preflight");
         assert_eq!(preflight["artifact"], "server/app.orv-runtime.json");
         assert_eq!(preflight["artifacts"]["smoke_test"], "deploy/smoke-test.sh");
+        assert_eq!(
+            preflight["artifacts"]["smoke_output"],
+            "deploy/smoke-output.txt"
+        );
         assert_eq!(preflight["artifacts"]["preflight"], "deploy/preflight.json");
         assert_eq!(
             preflight["artifacts"]["benchmark_evidence"],
@@ -46329,6 +46418,31 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_deploy_smoke_output_contract_missing() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-output-source");
+        let out = temp_output_dir("deploy-smoke-output-missing");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        write_text(
+            &smoke_path,
+            &smoke.replace(r#"> "$ORV_SMOKE_OUTPUT""#, r#"> /dev/null"#),
+        )
+        .expect("write corrupt smoke test");
+
+        let err = cmd_verify_build(&out).expect_err("smoke output contract mismatch");
+
+        assert!(
+            err.to_string()
+                .contains("deploy smoke test must write deploy smoke output artifact"),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
     fn verify_build_rejects_deploy_smoke_origin_assignment_mismatch() {
         let (src_dir, path) = prod_server_source("deploy-smoke-origin-source");
         let out = temp_output_dir("deploy-smoke-origin-mismatch");
@@ -47072,6 +47186,55 @@ let sig count: int = 0
             0
         );
         cmd_benchmark_report(&out, true).expect("require pass accepts recorded evidence");
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn benchmark_report_uses_generated_smoke_output_artifact() {
+        let (src_dir, path) = prod_server_source("benchmark-report-smoke-output-source");
+        let out = temp_output_dir("benchmark-report-smoke-output");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+        let smoke_output_path = out.join("deploy").join("smoke-output.txt");
+        let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+        evidence["recording_status"] = serde_json::json!("recorded");
+        for entry in evidence["task_entries"]
+            .as_array_mut()
+            .expect("task entries")
+        {
+            entry["elapsed_minutes"] = serde_json::json!(10.0);
+            entry["status"] = serde_json::json!("passed");
+        }
+        evidence["data"]["docs_help_lookups"] = serde_json::json!(1);
+        evidence["data"]["compiler_runtime_errors"] = serde_json::json!(0);
+        evidence["data"]["manual_config_edits"] = serde_json::json!([]);
+        evidence["data"]["participant_notes"] = serde_json::json!("smoke output from artifact");
+        write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
+        std::fs::write(&smoke_output_path, "orv deploy smoke test passed\n")
+            .expect("write smoke output");
+
+        let report = benchmark_report_value(&out).expect("benchmark report");
+
+        assert_eq!(report["status"], "passed");
+        assert_eq!(
+            report["data"]["smoke_test_output"],
+            "orv deploy smoke test passed\n"
+        );
+        assert_eq!(
+            report["data"]["smoke_test_output_source"],
+            "deploy/smoke-output.txt"
+        );
+        assert_eq!(
+            report["data"]["missing_data"]
+                .as_array()
+                .expect("missing data")
+                .len(),
+            0
+        );
+        cmd_benchmark_report(&out, true)
+            .expect("require pass accepts generated smoke output artifact");
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -49980,6 +50143,7 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["commands"]["benchmark_report_require_pass"]
                     == "orv benchmark-report . --require-pass"
                 && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
+                && target["artifacts"]["smoke_output"] == "deploy/smoke-output.txt"
                 && target["artifacts"]["benchmark_evidence"] == "deploy/benchmark-evidence.json"
                 && target["benchmark"]["kind"] == "orv.benchmark.shop_5h"
                 && target["benchmark"]["max_elapsed_minutes"] == 300
@@ -53578,6 +53742,10 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             state["production"]["preflight"][0]["artifacts"]["benchmark_evidence"],
             "deploy/benchmark-evidence.json"
+        );
+        assert_eq!(
+            state["production"]["preflight"][0]["artifacts"]["smoke_output"],
+            "deploy/smoke-output.txt"
         );
         assert_eq!(
             state["production"]["preflight"][0]["benchmark_evidence"]["recording_status"],
