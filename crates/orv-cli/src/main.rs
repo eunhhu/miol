@@ -22086,6 +22086,10 @@ fn verify_deploy_smoke_test_artifact(
             }
         }
         for required in [
+            r#"orv_smoke_body_contains "home title" "$SMOKE_HOME_BODY" 'Miol Shop'"#,
+            r#"orv_smoke_body_contains "home copy" "$SMOKE_HOME_BODY" 'Catalog, member signup, payment capture, and shipment booking are ready.'"#,
+            r#"orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-color: #f8fafc'"#,
+            r#"orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'"#,
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#,
             r#"orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND""#,
             r#"orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD""#,
@@ -29455,6 +29459,7 @@ SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
 SMOKE_HEADERS="$(mktemp)"
 SMOKE_MEMBER_HEADERS="$(mktemp)"
 SMOKE_ADMIN_HEADERS="$(mktemp)"
+SMOKE_HOME_BODY="$(mktemp)"
 SMOKE_CATALOG_BODY="$(mktemp)"
 SMOKE_CART_BODY="$(mktemp)"
 SMOKE_ACCOUNT_BODY="$(mktemp)"
@@ -29465,9 +29470,13 @@ SMOKE_ADMIN_ORDERS_BODY="$(mktemp)"
 SMOKE_ADMIN_PAYMENTS_BODY="$(mktemp)"
 SMOKE_ADMIN_SHIPMENTS_BODY="$(mktemp)"
 SMOKE_ADMIN_AUDIT_BODY="$(mktemp)"
-trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
+trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_HOME_BODY" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
 
-orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "__ROOT_ORIGIN__" "$BASE_URL/"
+orv_smoke_fetch_capture_origin "GET / home" "$SMOKE_HOME_BODY" "$SMOKE_HEADERS" "__ROOT_ORIGIN__" "$BASE_URL/"
+orv_smoke_body_contains "home title" "$SMOKE_HOME_BODY" 'Miol Shop'
+orv_smoke_body_contains "home copy" "$SMOKE_HOME_BODY" 'Catalog, member signup, payment capture, and shipment booking are ready.'
+orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-color: #f8fafc'
+orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
 if [ -z "$CSRF_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing orv_csrf cookie\n' >&2
@@ -31445,6 +31454,7 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("orv_smoke_curl_origin_response()"));
         assert!(smoke_test.contains("orv_smoke_fetch()"));
         assert!(smoke_test.contains("orv_smoke_fetch_origin()"));
+        assert!(smoke_test.contains("orv_smoke_fetch_capture_origin()"));
         assert!(smoke_test.contains("orv_smoke_body_contains()"));
         assert!(smoke_test.contains("orv_smoke_cookie_from_headers()"));
         assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
@@ -31457,7 +31467,18 @@ test "checkout excluded failure" {
             r#"orv_smoke_curl_origin_response "GET /health" "$ORV_SMOKE_ORIGIN_GET_HEALTH" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH" "$BASE_URL/health""#
         ));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "$ORV_SMOKE_ORIGIN_GET_ROOT" "$BASE_URL/""#
+            r#"orv_smoke_fetch_capture_origin "GET / home" "$SMOKE_HOME_BODY" "$SMOKE_HEADERS" "$ORV_SMOKE_ORIGIN_GET_ROOT" "$BASE_URL/""#
+        ));
+        assert!(smoke_test
+            .contains(r#"orv_smoke_body_contains "home title" "$SMOKE_HOME_BODY" 'Miol Shop'"#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "home copy" "$SMOKE_HOME_BODY" 'Catalog, member signup, payment capture, and shipment booking are ready.'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-color: #f8fafc'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'"#
         ));
         assert!(smoke_test.contains(
             "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\""
