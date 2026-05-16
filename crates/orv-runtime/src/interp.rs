@@ -4651,8 +4651,7 @@ fn external_db_adapter_bridge_value(
     if let Some(token) = external_db_adapter_auth_token(provider) {
         headers.push(("authorization", format!("Bearer {token}")));
     }
-    let response =
-        http_post_json_with_headers_for("external db adapter", endpoint, &request, &headers)?;
+    let response = external_db_adapter_http_post_json(endpoint, &request, &headers)?;
     let value = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
         RuntimeError::native(format!(
             "external db adapter response was not JSON: {source}"
@@ -4780,6 +4779,24 @@ fn http_post_json_with_headers_for(
         )));
     }
     Ok(response_body)
+}
+
+fn external_db_adapter_http_post_json(
+    url: &str,
+    body: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<String, RuntimeError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match http_post_json_with_headers_for("external db adapter", url, body, extra_headers) {
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < 2 && provider_http_error_is_retryable(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| RuntimeError::native("external db adapter request failed")))
 }
 
 fn provider_http_post_json(
@@ -10386,6 +10403,56 @@ let created = external.create("User", { name: "Ada" })
         assert_eq!(body_json["method"], "create");
         assert_eq!(body_json["args"][0], "User");
         assert_eq!(body_json["args"][1]["name"], "Ada");
+    }
+
+    #[test]
+    fn db_connect_external_adapter_bridge_retries_transient_errors() {
+        let _env_guard = super::test_env::guard();
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind db retry test server");
+        let address = listener.local_addr().expect("db retry test server address");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept db retry request");
+                let request = read_test_http_request(&mut stream);
+                server_requests.lock().unwrap().push(request);
+                if attempt == 0 {
+                    write_test_http_response(
+                        &mut stream,
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 15\r\nconnection: close\r\n\r\ntransient fault",
+                    );
+                } else {
+                    write_test_http_json_response(
+                        &mut stream,
+                        r#"{"status":"found_after_retry","row":{"id":7}}"#,
+                    );
+                }
+            }
+        });
+        super::test_env::set(
+            "ORV_DB_ADAPTER_MYSQL_ENDPOINT",
+            &format!("http://{address}/db"),
+        );
+        super::test_env::set("ORV_DB_ADAPTER_ENDPOINT", "");
+        let out = run_str(
+            r#"let external = @db.connect "mysql://localhost/shop"
+let found = external.find("User", { id: 7 })
+@out found.status
+@out found.row.id"#,
+        )
+        .expect("external adapter bridge retry");
+        super::test_env::clear("ORV_DB_ADAPTER_MYSQL_ENDPOINT");
+        super::test_env::clear("ORV_DB_ADAPTER_ENDPOINT");
+        server.join().expect("db retry test server finished");
+
+        assert_eq!(out, "found_after_retry\n7\n");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("POST /db ")));
     }
 
     #[test]

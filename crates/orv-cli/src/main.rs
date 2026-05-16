@@ -26552,6 +26552,10 @@ fn deploy_db_adapter_bridge_value(envs: &[DeployProviderEnv]) -> serde_json::Val
             "method": "db method",
             "args": "runtime value array",
         },
+        "retry": {
+            "attempts": 3,
+            "on": ["5xx", "connect_error", "read_error", "timeout"],
+        },
         "env": deploy_provider_env_value(envs),
     })
 }
@@ -42708,6 +42712,10 @@ let sig count: int = 0
                             "method": "db method",
                             "args": "runtime value array"
                         },
+                        "retry": {
+                            "attempts": 3,
+                            "on": ["5xx", "connect_error", "read_error", "timeout"]
+                        },
                         "env": [
                             {
                                 "env": "ORV_DB_ADAPTER_MYSQL_ENDPOINT",
@@ -42758,6 +42766,10 @@ let sig count: int = 0
                             "url": "adapter url",
                             "method": "db method",
                             "args": "runtime value array"
+                        },
+                        "retry": {
+                            "attempts": 3,
+                            "on": ["5xx", "connect_error", "read_error", "timeout"]
                         },
                         "env": [
                             {
