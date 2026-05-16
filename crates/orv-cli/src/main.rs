@@ -22821,12 +22821,13 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
         "source": reveal_source(entry, &file_paths, &server_artifacts, source_bundle.as_ref()),
         "project_graph": reveal_project_graph_node(&graph, origin_id),
         "production": {
-            "routes": reveal_routes(origin_id, &server_artifacts),
-            "native_server": reveal_native_server_targets(dir, origin_id)?,
+            "routes": reveal_routes(origin_id, &origin_map, &server_artifacts),
+            "native_server": reveal_native_server_targets(dir, origin_id, &origin_map)?,
             "preflight": reveal_preflight_targets(dir)?,
+            "static": reveal_static_targets(dir, origin_id, &origin_map)?,
             "db_adapters": reveal_db_adapter_targets(dir)?,
             "commerce_adapters": reveal_commerce_adapter_targets(dir)?,
-            "client": reveal_client_targets(dir, entry)?,
+            "client": reveal_client_targets(dir, origin_id, entry, &origin_map)?,
         },
     }))
 }
@@ -22972,20 +22973,21 @@ fn reveal_project_graph_node(graph: &serde_json::Value, origin_id: &str) -> serd
 
 fn reveal_routes(
     origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
     server_artifacts: &[(String, orv_compiler::ServerRuntimeArtifact)],
 ) -> Vec<serde_json::Value> {
     let mut routes = Vec::new();
     for (artifact_path, artifact) in server_artifacts {
-        for route in artifact
-            .routes
-            .iter()
-            .filter(|route| route.origin_id == origin_id)
-        {
+        for route in artifact.routes.iter().filter(|route| {
+            route.origin_id == origin_id || origin_contains(origin_map, &route.origin_id, origin_id)
+        }) {
             routes.push(serde_json::json!({
                 "artifact": artifact_path,
                 "method": route.method,
                 "path": route.path,
                 "origin_id": route.origin_id,
+                "match": if route.origin_id == origin_id { "direct" } else { "contains" },
+                "matched_origin_id": origin_id,
                 "policies": route.policies,
             }));
         }
@@ -22996,6 +22998,7 @@ fn reveal_routes(
 fn reveal_native_server_targets(
     dir: &Path,
     origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
     let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
@@ -23021,6 +23024,12 @@ fn reveal_native_server_targets(
                     .filter(|route| {
                         route.get("origin_id").and_then(serde_json::Value::as_str)
                             == Some(origin_id)
+                            || route
+                                .get("origin_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|route_origin_id| {
+                                    origin_contains(origin_map, route_origin_id, origin_id)
+                                })
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -23069,6 +23078,46 @@ fn reveal_native_server_targets(
         }));
     }
     Ok(targets)
+}
+
+fn origin_contains(
+    origin_map: &orv_compiler::OriginMap,
+    ancestor_id: &str,
+    descendant_id: &str,
+) -> bool {
+    if ancestor_id == descendant_id {
+        return true;
+    }
+    let mut stack = vec![ancestor_id];
+    let mut seen = HashSet::<&str>::new();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        for edge in origin_map
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "contains" && edge.from == current)
+        {
+            if edge.to == descendant_id {
+                return true;
+            }
+            stack.push(edge.to.as_str());
+        }
+    }
+    false
+}
+
+fn origin_is_html_projection_origin(origin_map: &orv_compiler::OriginMap, origin_id: &str) -> bool {
+    origin_map.entries.iter().any(|entry| {
+        entry.id == origin_id
+            && entry.kind == "domain"
+            && matches!(entry.name.as_str(), "html" | "out")
+    }) || origin_map.entries.iter().any(|entry| {
+        entry.kind == "domain"
+            && entry.name == "html"
+            && origin_contains(origin_map, &entry.id, origin_id)
+    })
 }
 
 fn reveal_native_server_routes_source(
@@ -23347,11 +23396,49 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
     })])
 }
 
+fn reveal_static_targets(
+    dir: &Path,
+    origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    if !origin_is_html_projection_origin(origin_map, origin_id) {
+        return Ok(Vec::new());
+    }
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for bundle in bundles.iter().filter(|bundle| {
+        bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+    }) {
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target_path = dir.join(path);
+        let exists = target_path.is_file();
+        let verified = exists && verify_static_page_target(bundle, &target_path).is_ok();
+        targets.push(serde_json::json!({
+            "kind": "static_page",
+            "path": path,
+            "exists": exists,
+            "verified": verified,
+            "runtime_features": bundle
+                .get("runtime_features")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        }));
+    }
+    Ok(targets)
+}
+
 fn reveal_client_targets(
     dir: &Path,
+    origin_id: &str,
     entry: &orv_compiler::OriginEntry,
+    origin_map: &orv_compiler::OriginMap,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    if !matches!(entry.kind.as_str(), "signal" | "await") {
+    if !matches!(entry.kind.as_str(), "signal" | "await")
+        && !origin_is_html_projection_origin(origin_map, origin_id)
+    {
         return Ok(Vec::new());
     }
     reveal_client_bundle_targets(dir)
@@ -46783,6 +46870,107 @@ models = { path = "../../shared/models", version = "2.0.0" }
             "unexpected error: {message}"
         );
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reveal_origin_links_static_html_to_page_output() {
+        let out = temp_output_dir("reveal-static-html");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build(&entry, &build_out).expect("build artifacts");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(build_out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let html = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "domain" && entry.name == "html")
+            .expect("html origin");
+
+        let reveal = reveal_origin_json(&build_out, &html.id).expect("reveal html origin");
+
+        assert_eq!(reveal["origin"]["kind"], "domain");
+        assert_eq!(reveal["origin"]["name"], "html");
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@html")));
+        let static_targets = reveal["production"]["static"]
+            .as_array()
+            .expect("static targets");
+        assert!(static_targets.iter().any(|target| {
+            target["kind"] == "static_page"
+                && target["path"] == "pages/index.html"
+                && target["exists"] == true
+                && target["verified"] == true
+                && target["runtime_features"]
+                    .as_array()
+                    .expect("runtime features")
+                    .is_empty()
+        }));
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn reveal_origin_links_route_html_to_containing_route_output() {
+        let dir = temp_output_dir("reveal-route-html-source");
+        std::fs::create_dir_all(&dir).expect("create route html source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route GET / {
+    @serve @html {
+      @body { @h1 "Home" }
+    }
+  }
+}
+"#,
+        )
+        .expect("write route html source");
+        let out = temp_output_dir("reveal-route-html");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let html = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "domain" && entry.name == "html")
+            .expect("html origin");
+
+        let reveal = reveal_origin_json(&out, &html.id).expect("reveal html origin");
+
+        assert!(reveal["source"]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("@html")));
+        let routes = reveal["production"]["routes"]
+            .as_array()
+            .expect("production routes");
+        assert!(routes.iter().any(|route| {
+            route["method"] == "GET"
+                && route["path"] == "/"
+                && route["match"] == "contains"
+                && route["matched_origin_id"] == html.id
+        }));
+        let native_server = reveal["production"]["native_server"]
+            .as_array()
+            .expect("native server targets");
+        assert!(native_server.iter().any(|target| {
+            target["routes"]
+                .as_array()
+                .expect("native routes")
+                .iter()
+                .any(|route| route["method"] == "GET" && route["path"] == "/")
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
