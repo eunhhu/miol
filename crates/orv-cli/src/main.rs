@@ -22060,6 +22060,11 @@ fn verify_deploy_smoke_test_artifact(
         if !smoke.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke SKU");
         }
+        if !smoke.contains(r#"SMOKE_SKU_SECOND="orv-smoke-sku-${SMOKE_ID}-2""#)
+            || !smoke.contains(r#"SMOKE_SKU_THIRD="orv-smoke-sku-${SMOKE_ID}-3""#)
+        {
+            anyhow::bail!("deploy smoke test must create three unique smoke SKUs");
+        }
         if !smoke.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke member handle");
         }
@@ -22082,12 +22087,16 @@ fn verify_deploy_smoke_test_artifact(
         }
         for required in [
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#,
+            r#"orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND""#,
+            r#"orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD""#,
             r#"orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU""#,
             r#"orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HANDLE""#,
             r#"orv_smoke_body_contains "checkout shipped order" "$SMOKE_CHECKOUT_BODY" '"status":"shipped"'"#,
             r#"orv_smoke_body_contains "checkout captured payment" "$SMOKE_CHECKOUT_BODY" '"status":"captured"'"#,
             r#"orv_smoke_body_contains "checkout shipment tracking" "$SMOKE_CHECKOUT_BODY" 'TRK-LOCAL'"#,
             r#"orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU""#,
+            r#"orv_smoke_body_contains "admin catalog second smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_SECOND""#,
+            r#"orv_smoke_body_contains "admin catalog third smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_THIRD""#,
             r#"orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'"#,
             r#"orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'"#,
             r#"orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'"#,
@@ -29435,7 +29444,11 @@ done
         let shop_smoke = r#"
 SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
+SMOKE_SKU_SECOND="orv-smoke-sku-${SMOKE_ID}-2"
+SMOKE_SKU_THIRD="orv-smoke-sku-${SMOKE_ID}-3"
 SMOKE_BADGE="orv-smoke-badge-${SMOKE_ID}"
+SMOKE_BADGE_SECOND="orv-smoke-badge-${SMOKE_ID}-2"
+SMOKE_BADGE_THIRD="orv-smoke-badge-${SMOKE_ID}-3"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
 SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
@@ -29463,6 +29476,8 @@ fi
 CSRF_TOKEN="${CSRF_COOKIE#orv_csrf=}"
 
 orv_smoke_curl_origin "POST /products" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"badge\":\"${SMOKE_BADGE}\",\"price\":1000,\"stock\":5}"
+orv_smoke_curl_origin "POST /products second" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU_SECOND}\",\"name\":\"ORV Smoke Product 2\",\"badge\":\"${SMOKE_BADGE_SECOND}\",\"price\":1200,\"stock\":4}"
+orv_smoke_curl_origin "POST /products third" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU_THIRD}\",\"name\":\"ORV Smoke Product 3\",\"badge\":\"${SMOKE_BADGE_THIRD}\",\"price\":1300,\"stock\":3}"
 orv_smoke_curl_origin "POST /members" "__MEMBERS_ORIGIN__" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 orv_smoke_curl_capture_origin "POST /members/login smoke" "$SMOKE_MEMBER_HEADERS" "__LOGIN_ORIGIN__" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 MEMBER_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_MEMBER_HEADERS")"
@@ -29476,7 +29491,11 @@ orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HA
 orv_smoke_curl_origin "POST /cart/items" "__CART_ITEMS_ORIGIN__" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
 orv_smoke_fetch_origin "GET /catalog content" "$SMOKE_CATALOG_BODY" "__CATALOG_ORIGIN__" "$BASE_URL/catalog"
 orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND"
+orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD"
 orv_smoke_body_contains "catalog smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE"
+orv_smoke_body_contains "catalog second smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE_SECOND"
+orv_smoke_body_contains "catalog third smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE_THIRD"
 orv_smoke_fetch_origin "GET /cart content" "$SMOKE_CART_BODY" "__CART_ORIGIN__" "$BASE_URL/cart"
 orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU"
 orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" "__CHECKOUT_ORIGIN__" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
@@ -29495,7 +29514,11 @@ orv_smoke_body_contains "admin summary orders" "$SMOKE_ADMIN_SUMMARY_BODY" '"ord
 orv_smoke_body_contains "admin summary payments" "$SMOKE_ADMIN_SUMMARY_BODY" '"payments"'
 orv_smoke_fetch_origin "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" "__ADMIN_CATALOG_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
 orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_body_contains "admin catalog second smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_SECOND"
+orv_smoke_body_contains "admin catalog third smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_THIRD"
 orv_smoke_body_contains "admin catalog smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE"
+orv_smoke_body_contains "admin catalog second smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE_SECOND"
+orv_smoke_body_contains "admin catalog third smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE_THIRD"
 orv_smoke_fetch_origin "GET /admin/orders content" "$SMOKE_ADMIN_ORDERS_BODY" "__ADMIN_ORDERS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/orders"
 orv_smoke_body_contains "admin orders smoke member" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_HANDLE"
 orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'
@@ -31443,7 +31466,17 @@ test "checkout excluded failure" {
         assert!(smoke_test
             .contains(r#"orv_smoke_curl_origin "POST /products" "$ORV_SMOKE_ORIGIN_POST_PRODUCTS" -X POST "$BASE_URL/products""#));
         assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"SMOKE_SKU_SECOND="orv-smoke-sku-${SMOKE_ID}-2""#));
+        assert!(smoke_test.contains(r#"SMOKE_SKU_THIRD="orv-smoke-sku-${SMOKE_ID}-3""#));
         assert!(smoke_test.contains(r#"SMOKE_BADGE="orv-smoke-badge-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"SMOKE_BADGE_SECOND="orv-smoke-badge-${SMOKE_ID}-2""#));
+        assert!(smoke_test.contains(r#"SMOKE_BADGE_THIRD="orv-smoke-badge-${SMOKE_ID}-3""#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_origin "POST /products second" "$ORV_SMOKE_ORIGIN_POST_PRODUCTS""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl_origin "POST /products third" "$ORV_SMOKE_ORIGIN_POST_PRODUCTS""#
+        ));
         assert!(smoke_test
             .contains(r#"orv_smoke_curl_origin "POST /members" "$ORV_SMOKE_ORIGIN_POST_MEMBERS" -X POST "$BASE_URL/members""#));
         assert!(smoke_test.contains(
@@ -31483,7 +31516,19 @@ test "checkout excluded failure" {
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD""#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "catalog smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog second smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE_SECOND""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog third smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE_THIRD""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU""#
@@ -31495,7 +31540,19 @@ test "checkout excluded failure" {
             r#"orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU""#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog second smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_SECOND""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog third smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_THIRD""#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin catalog smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog second smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE_SECOND""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog third smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE_THIRD""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'"#
