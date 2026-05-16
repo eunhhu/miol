@@ -18153,6 +18153,7 @@ fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let origin_map = read_origin_map(dir)?;
     verify_origin_map_contract(&origin_map)?;
     let source_bundle = read_source_bundle_artifact(&dir.join("source-bundle.json"))?;
+    verify_project_graph_contract(dir, &origin_map, &source_bundle)?;
     verify_bundle_targets(dir, &plan, &origin_map, &source_bundle)?;
     verify_manifest_artifacts(dir, &manifest)?;
     verify_deploy_manifest_if_present(dir, &origin_map, &source_bundle)?;
@@ -18206,6 +18207,223 @@ fn verify_origin_map_contract(origin_map: &orv_compiler::OriginMap) -> anyhow::R
         }
     }
     Ok(())
+}
+
+fn verify_project_graph_contract(
+    dir: &Path,
+    origin_map: &orv_compiler::OriginMap,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<()> {
+    let graph = read_json_value(&dir.join("project-graph.json"))?;
+    if graph
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("project-graph.json schema_version must be 1");
+    }
+    let nodes = graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json nodes must be an array"))?;
+    let edges = graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json edges must be an array"))?;
+    verify_project_graph_stats(&graph, nodes, edges, origin_map)?;
+    let semantic_origin_map = graph
+        .pointer("/semantic/origin_map")
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json semantic.origin_map is missing"))?;
+    if semantic_origin_map != &serde_json::to_value(origin_map)? {
+        anyhow::bail!("project-graph.json semantic origin_map does not match origin-map.json");
+    }
+    let semantic_origin_edges = graph
+        .pointer("/semantic/origin_edges")
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json semantic.origin_edges is missing"))?;
+    if semantic_origin_edges != &serde_json::Value::Array(origin_edges(origin_map)) {
+        anyhow::bail!("project-graph.json semantic origin_edges do not match origin-map.json");
+    }
+    let node_ids = verify_project_graph_nodes(nodes, source_bundle)?;
+    verify_project_graph_edges(edges, &node_ids)?;
+    verify_project_graph_origin_links(&graph, nodes, origin_map, &node_ids)?;
+    Ok(())
+}
+
+fn verify_project_graph_stats(
+    graph: &serde_json::Value,
+    nodes: &[serde_json::Value],
+    edges: &[serde_json::Value],
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<()> {
+    let stats = graph
+        .get("stats")
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json stats is missing"))?;
+    verify_project_graph_stat(stats, "node_count", nodes.len())?;
+    verify_project_graph_stat(stats, "edge_count", edges.len())?;
+    verify_project_graph_stat(stats, "semantic_origin_count", origin_map.entries.len())?;
+    verify_project_graph_stat(stats, "semantic_edge_count", origin_map.edges.len())?;
+    let call_edges = origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == "calls")
+        .count();
+    verify_project_graph_stat(stats, "semantic_call_edge_count", call_edges)?;
+    Ok(())
+}
+
+fn verify_project_graph_stat(
+    stats: &serde_json::Value,
+    key: &str,
+    expected: usize,
+) -> anyhow::Result<()> {
+    let actual = stats
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("project-graph.json stats.{key} must be an integer"))?;
+    if actual != expected as u64 {
+        anyhow::bail!("project-graph.json stats.{key} does not match graph content");
+    }
+    Ok(())
+}
+
+fn verify_project_graph_nodes(
+    nodes: &[serde_json::Value],
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<HashSet<u64>> {
+    let mut node_ids = HashSet::new();
+    let mut file_paths = HashSet::new();
+    for node in nodes {
+        let id = node
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("project-graph.json node id must be an integer"))?;
+        if !node_ids.insert(id) {
+            anyhow::bail!("project-graph.json contains duplicate node id {id}");
+        }
+        let kind = json_str(node, "kind", "project graph node")?;
+        let name = json_str(node, "name", "project graph node")?;
+        if kind == "file" {
+            file_paths.insert(normalized_artifact_path(name));
+        }
+    }
+    for file in &source_bundle.files {
+        let path = normalized_artifact_path(&file.path);
+        if !file_paths.contains(&path) {
+            anyhow::bail!("project-graph.json is missing source-bundle file node {path}");
+        }
+    }
+    if file_paths.len() != source_bundle.files.len() {
+        anyhow::bail!("project-graph.json file nodes do not match source-bundle files");
+    }
+    Ok(node_ids)
+}
+
+fn verify_project_graph_edges(
+    edges: &[serde_json::Value],
+    node_ids: &HashSet<u64>,
+) -> anyhow::Result<()> {
+    for edge in edges {
+        let from = edge
+            .get("from")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("project-graph.json edge from must be an integer"))?;
+        let to = edge
+            .get("to")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("project-graph.json edge to must be an integer"))?;
+        if !node_ids.contains(&from) {
+            anyhow::bail!("project-graph.json edge from {from} does not reference a node");
+        }
+        if !node_ids.contains(&to) {
+            anyhow::bail!("project-graph.json edge to {to} does not reference a node");
+        }
+        let _ = json_str(edge, "kind", "project graph edge")?;
+    }
+    Ok(())
+}
+
+fn verify_project_graph_origin_links(
+    graph: &serde_json::Value,
+    nodes: &[serde_json::Value],
+    origin_map: &orv_compiler::OriginMap,
+    node_ids: &HashSet<u64>,
+) -> anyhow::Result<()> {
+    let origin_links = graph
+        .pointer("/semantic/origin_links")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("project-graph.json semantic.origin_links must be an array")
+        })?;
+    let expected = expected_project_graph_origin_links(nodes, origin_map)?;
+    if origin_links != &expected {
+        anyhow::bail!(
+            "project-graph.json semantic origin_links do not match graph nodes and origin-map.json"
+        );
+    }
+    let origin_ids = origin_map
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    for link in origin_links {
+        let origin_id = json_str(link, "origin_id", "project graph origin link")?;
+        if !origin_ids.contains(origin_id) {
+            anyhow::bail!(
+                "project-graph.json origin link `{origin_id}` does not reference origin-map.json"
+            );
+        }
+        let node_id = link
+            .get("node_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("project-graph.json origin link node_id must be an integer")
+            })?;
+        if !node_ids.contains(&node_id) {
+            anyhow::bail!(
+                "project-graph.json origin link node_id {node_id} does not reference a node"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expected_project_graph_origin_links(
+    nodes: &[serde_json::Value],
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut links = Vec::new();
+    for entry in &origin_map.entries {
+        if let Some(node) = nodes
+            .iter()
+            .find(|node| project_graph_node_matches_origin(node, entry))
+        {
+            let node_id = node
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("project-graph.json node id must be an integer"))?;
+            links.push(serde_json::json!({
+                "kind": "source_node",
+                "origin_id": entry.id,
+                "node_id": node_id,
+            }));
+        }
+    }
+    Ok(links)
+}
+
+fn project_graph_node_matches_origin(
+    node: &serde_json::Value,
+    entry: &orv_compiler::OriginEntry,
+) -> bool {
+    node.get("file").and_then(serde_json::Value::as_u64) == Some(u64::from(entry.span.file))
+        && node
+            .pointer("/span/start")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(entry.span.start))
+        && node
+            .pointer("/span/end")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(entry.span.end))
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -42104,6 +42322,66 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("does not match build source-bundle artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_project_graph_semantic_origin_drift() {
+        let (src_dir, path) = prod_server_source("project-graph-origin-source");
+        let out = temp_output_dir("project-graph-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let graph_path = out.join("project-graph.json");
+        let mut graph = read_json_value(&graph_path).expect("project graph");
+        graph["semantic"]["origin_map"]["entries"][0]["id"] = serde_json::json!("ori_wrong");
+        write_json(&graph_path, &graph).expect("write corrupt project graph");
+
+        let err = cmd_verify_build(&out).expect_err("project graph origin drift");
+
+        assert!(err
+            .to_string()
+            .contains("project-graph.json semantic origin_map does not match origin-map.json"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_project_graph_source_file_drift() {
+        let (src_dir, path) = prod_server_source("project-graph-file-source");
+        let out = temp_output_dir("project-graph-file-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let graph_path = out.join("project-graph.json");
+        let mut graph = read_json_value(&graph_path).expect("project graph");
+        graph["nodes"][0]["name"] = serde_json::json!("/tmp/wrong.orv");
+        write_json(&graph_path, &graph).expect("write corrupt project graph");
+
+        let err = cmd_verify_build(&out).expect_err("project graph source file drift");
+
+        assert!(err
+            .to_string()
+            .contains("project-graph.json is missing source-bundle file node"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_project_graph_origin_link_drift() {
+        let (src_dir, path) = prod_server_source("project-graph-link-source");
+        let out = temp_output_dir("project-graph-link-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let graph_path = out.join("project-graph.json");
+        let mut graph = read_json_value(&graph_path).expect("project graph");
+        graph["semantic"]["origin_links"] = serde_json::json!([]);
+        write_json(&graph_path, &graph).expect("write corrupt project graph");
+
+        let err = cmd_verify_build(&out).expect_err("project graph origin link drift");
+
+        assert!(err.to_string().contains(
+            "project-graph.json semantic origin_links do not match graph nodes and origin-map.json"
+        ));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
