@@ -13,6 +13,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Made DAP `setInstructionBreakpoints` verify `orv:frame:N` pseudo-instruction references after launch and stop `continue` on matching runtime frames.
 - Exposed CSRF, session cookie, auth role, and default route rate-limit requirements as shared `runtime_features` across build, server, deploy, and native plan artifacts.
 - Added generated `deploy/preflight.json` so verify-build, deploy-env-check, run-build, smoke-test, runtime features, security features, persistence, env requirements, and linked deploy artifacts share one checked preflight contract.
+- Exposed the checked deploy preflight contract through reveal/editor/LSP production payloads and the native editor production panel.
 
 ## 2026-05-06
 
