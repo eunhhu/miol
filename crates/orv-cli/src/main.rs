@@ -21856,6 +21856,18 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must verify exact route origin headers");
     }
+    let has_single_response_origin = artifact
+        .routes
+        .iter()
+        .any(|route| deploy_smoke_unique_response_origin(route).is_some());
+    if has_single_response_origin
+        && (!smoke.contains("orv_smoke_response_origin_header()")
+            || !smoke.contains("orv_smoke_curl_origin_response()")
+            || !smoke.contains("expected_response_origin")
+            || !smoke.contains("wrong x-orv-response-origin-id"))
+    {
+        anyhow::bail!("deploy smoke test must verify exact response origin headers");
+    }
     for route in &artifact.routes {
         let assignment = format!(
             r#"{}="{}""#,
@@ -21866,6 +21878,20 @@ fn verify_deploy_smoke_test_artifact(
             let method = &route.method;
             let path = &route.path;
             anyhow::bail!("deploy smoke test must declare expected origin for {method} {path}");
+        }
+        if let Some(response_origin_id) = deploy_smoke_unique_response_origin(route) {
+            let assignment = format!(
+                r#"{}="{}""#,
+                deploy_smoke_response_origin_var_name(&route.method, &route.path),
+                response_origin_id
+            );
+            if !smoke.contains(&assignment) {
+                let method = &route.method;
+                let path = &route.path;
+                anyhow::bail!(
+                    "deploy smoke test must declare expected response origin for {method} {path}"
+                );
+            }
         }
     }
     if deploy_routes_include(artifact, "POST", "/checkout")
@@ -21896,10 +21922,19 @@ fn verify_deploy_smoke_test_artifact(
             && route.path != "/account/sessions"
     }) {
         let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
-        let command = format!(
-            r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
-            route.path, origin_ref, route.path
-        );
+        let command = if deploy_smoke_unique_response_origin(route).is_some() {
+            let response_origin_ref =
+                deploy_smoke_response_origin_var_ref(&route.method, &route.path);
+            format!(
+                r#"orv_smoke_curl_origin_response "GET {}" "{}" "{}" "$BASE_URL{}""#,
+                route.path, origin_ref, response_origin_ref, route.path
+            )
+        } else {
+            format!(
+                r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
+                route.path, origin_ref, route.path
+            )
+        };
         if !smoke.contains(&command) {
             let method = &route.method;
             let path = &route.path;
@@ -27752,6 +27787,25 @@ fn deploy_smoke_origin_var_ref(method: &str, path: &str) -> String {
     format!("${}", deploy_smoke_origin_var_name(method, path))
 }
 
+fn deploy_smoke_response_origin_var_name(method: &str, path: &str) -> String {
+    deploy_smoke_origin_var_name(method, path).replacen(
+        "ORV_SMOKE_ORIGIN_",
+        "ORV_SMOKE_RESPONSE_ORIGIN_",
+        1,
+    )
+}
+
+fn deploy_smoke_response_origin_var_ref(method: &str, path: &str) -> String {
+    format!("${}", deploy_smoke_response_origin_var_name(method, path))
+}
+
+fn deploy_smoke_unique_response_origin(route: &orv_compiler::ServerRouteArtifact) -> Option<&str> {
+    match route.response_origin_ids.as_slice() {
+        [origin_id] => Some(origin_id.as_str()),
+        _ => None,
+    }
+}
+
 fn deploy_smoke_ready_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> Option<&str> {
     artifact
         .routes
@@ -28675,6 +28729,32 @@ orv_smoke_origin_header() {{
   fi
 }}
 
+orv_smoke_response_origin_header() {{
+  label="$1"
+  headers_path="$2"
+  expected_response_origin="$3"
+  actual_response_origin="$(tr -d '\r' < "$headers_path" | awk '
+    {{
+      lower = tolower($0)
+      if (index(lower, "x-orv-response-origin-id:") == 1) {{
+        value = substr($0, index($0, ":") + 1)
+        sub(/^[[:space:]]*/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+        print value
+        exit
+      }}
+    }}
+  ')"
+  if [ -z "$actual_response_origin" ]; then
+    printf 'orv deploy smoke test failed: %s missing x-orv-response-origin-id\n' "$label" >&2
+    exit 1
+  fi
+  if [ "$actual_response_origin" != "$expected_response_origin" ]; then
+    printf 'orv deploy smoke test failed: %s wrong x-orv-response-origin-id expected %s got %s\n' "$label" "$expected_response_origin" "$actual_response_origin" >&2
+    exit 1
+  fi
+}}
+
 orv_smoke_curl_origin() {{
   label="$1"
   expected_origin="$2"
@@ -28686,6 +28766,22 @@ orv_smoke_curl_origin() {{
     exit 1
   fi
   orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers" "$expected_origin"
+  rm -f "$orv_smoke_tmp_headers"
+}}
+
+orv_smoke_curl_origin_response() {{
+  label="$1"
+  expected_origin="$2"
+  expected_response_origin="$3"
+  shift 3
+  orv_smoke_tmp_headers="$(mktemp)"
+  if ! curl -fsS -D "$orv_smoke_tmp_headers" "$@" >/dev/null; then
+    rm -f "$orv_smoke_tmp_headers"
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+  orv_smoke_origin_header "$label" "$orv_smoke_tmp_headers" "$expected_origin"
+  orv_smoke_response_origin_header "$label" "$orv_smoke_tmp_headers" "$expected_response_origin"
   rm -f "$orv_smoke_tmp_headers"
 }}
 
@@ -28820,6 +28916,14 @@ orv_smoke_cookie_from_headers() {{
             deploy_smoke_origin_var_name(&route.method, &route.path),
             route.origin_id
         );
+        if let Some(response_origin_id) = deploy_smoke_unique_response_origin(route) {
+            let _ = writeln!(
+                script,
+                r#"{}="{}""#,
+                deploy_smoke_response_origin_var_name(&route.method, &route.path),
+                response_origin_id
+            );
+        }
     }
     if !server_artifact.routes.is_empty() {
         script.push('\n');
@@ -28850,11 +28954,21 @@ done
             && route.path != "/account/sessions"
     }) {
         let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
-            route.path, origin_ref, route.path
-        );
+        if deploy_smoke_unique_response_origin(route).is_some() {
+            let response_origin_ref =
+                deploy_smoke_response_origin_var_ref(&route.method, &route.path);
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_curl_origin_response "GET {}" "{}" "{}" "$BASE_URL{}""#,
+                route.path, origin_ref, response_origin_ref, route.path
+            );
+        } else {
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_curl_origin "GET {}" "{}" "$BASE_URL{}""#,
+                route.path, origin_ref, route.path
+            );
+        }
     }
     if deploy_routes_include(server_artifact, "POST", "/checkout") {
         let root_origin = deploy_smoke_origin_var_ref("GET", "/");
@@ -30809,7 +30923,9 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
+        assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_curl_origin()"));
+        assert!(smoke_test.contains("orv_smoke_curl_origin_response()"));
         assert!(smoke_test.contains("orv_smoke_fetch()"));
         assert!(smoke_test.contains("orv_smoke_fetch_origin()"));
         assert!(smoke_test.contains("orv_smoke_body_contains()"));
@@ -30819,8 +30935,9 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
         assert!(smoke_test.contains(r#"ORV_SMOKE_ORIGIN_GET_HEALTH="ori_"#));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH="ori_"#));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_origin "GET /health" "$ORV_SMOKE_ORIGIN_GET_HEALTH" "$BASE_URL/health""#
+            r#"orv_smoke_curl_origin_response "GET /health" "$ORV_SMOKE_ORIGIN_GET_HEALTH" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH" "$BASE_URL/health""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_curl_capture_origin "GET / csrf cookie" "$SMOKE_HEADERS" "$ORV_SMOKE_ORIGIN_GET_ROOT" "$BASE_URL/""#
@@ -42562,14 +42679,17 @@ entry = "src/main.orv"
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
+        assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_curl_origin()"));
+        assert!(smoke_test.contains("orv_smoke_curl_origin_response()"));
         assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
         assert!(smoke_test.contains(r#"READY_PATH="/ping""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
         assert!(smoke_test.contains(r#"ORV_SMOKE_ORIGIN_GET_PING="ori_"#));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_RESPONSE_ORIGIN_GET_PING="ori_"#));
         assert!(smoke_test.contains(
-            r#"orv_smoke_curl_origin "GET /ping" "$ORV_SMOKE_ORIGIN_GET_PING" "$BASE_URL/ping""#
+            r#"orv_smoke_curl_origin_response "GET /ping" "$ORV_SMOKE_ORIGIN_GET_PING" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" "$BASE_URL/ping""#
         ));
         let preflight = read_json_value(&deploy_preflight_path).expect("deploy preflight");
         assert_eq!(preflight["schema_version"], 1);
@@ -43748,6 +43868,41 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy smoke test must declare expected origin for GET /ping"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_smoke_response_origin_assignment_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-response-origin-source");
+        let out = temp_output_dir("deploy-smoke-response-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact = read_server_artifact(&out.join("server").join("app.orv-runtime.json"))
+            .expect("server artifact");
+        let route = artifact
+            .routes
+            .iter()
+            .find(|route| route.method == "GET" && route.path == "/ping")
+            .expect("GET /ping route");
+        let response_origin = route
+            .response_origin_ids
+            .first()
+            .expect("GET /ping response origin");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        let expected = format!(r#"ORV_SMOKE_RESPONSE_ORIGIN_GET_PING="{response_origin}""#);
+        let smoke = smoke.replace(
+            &expected,
+            r#"ORV_SMOKE_RESPONSE_ORIGIN_GET_PING="ori_wrong""#,
+        );
+        write_text(&smoke_path, &smoke).expect("write corrupt smoke test");
+
+        let err = cmd_verify_build(&out).expect_err("smoke response origin mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test must declare expected response origin for GET /ping"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
