@@ -22826,7 +22826,7 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
             "preflight": reveal_preflight_targets(dir)?,
             "static": reveal_static_targets(dir, origin_id, &origin_map)?,
             "db_adapters": reveal_db_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
-            "commerce_adapters": reveal_commerce_adapter_targets(dir)?,
+            "commerce_adapters": reveal_commerce_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
             "client": reveal_client_targets(dir, origin_id, entry, &origin_map)?,
         },
     }))
@@ -23258,6 +23258,22 @@ fn reveal_native_runtime_image_plan(
 }
 
 fn reveal_commerce_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    reveal_commerce_adapter_targets_impl(dir, None, None)
+}
+
+fn reveal_commerce_adapter_targets_for_origin(
+    dir: &Path,
+    origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    reveal_commerce_adapter_targets_impl(dir, Some(origin_id), Some(origin_map))
+}
+
+fn reveal_commerce_adapter_targets_impl(
+    dir: &Path,
+    origin_id: Option<&str>,
+    origin_map: Option<&orv_compiler::OriginMap>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let deploy_manifest_path = dir.join("deploy").join("manifest.json");
     if !deploy_manifest_path.is_file() {
         return Ok(Vec::new());
@@ -23279,18 +23295,29 @@ fn reveal_commerce_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json:
         })]);
     }
     let artifact = read_json_value(&target_path)?;
+    let adapters = artifact
+        .get("adapters")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let matched_adapters = origin_id
+        .zip(origin_map)
+        .map(|(origin_id, origin_map)| {
+            reveal_adapter_origin_matches(&adapters, origin_id, origin_map)
+        })
+        .unwrap_or_default();
     Ok(vec![serde_json::json!({
         "kind": "commerce_adapters",
         "path": path,
         "exists": true,
+        "selected_origin_id": origin_id,
+        "matched": !matched_adapters.is_empty(),
+        "matched_adapter_count": matched_adapters.len(),
         "artifact": artifact
             .get("artifact")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "adapters": artifact
-            .get("adapters")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([])),
+        "adapters": adapters,
+        "matched_adapters": matched_adapters,
     })])
 }
 
@@ -23369,14 +23396,18 @@ fn reveal_adapter_origin_matches(
     adapters
         .iter()
         .filter_map(|adapter| {
-            let source_origin_id = adapter
-                .get("source_origin_id")
-                .and_then(serde_json::Value::as_str)?;
-            let match_kind = if source_origin_id == origin_id {
+            let source_origin_ids = adapter_source_origin_ids(adapter);
+            let match_kind = if source_origin_ids.iter().any(|source| source == origin_id) {
                 "direct"
-            } else if origin_contains(origin_map, source_origin_id, origin_id) {
+            } else if source_origin_ids
+                .iter()
+                .any(|source| origin_contains(origin_map, source, origin_id))
+            {
                 "source_contains_selected"
-            } else if origin_contains(origin_map, origin_id, source_origin_id) {
+            } else if source_origin_ids
+                .iter()
+                .any(|source| origin_contains(origin_map, origin_id, source))
+            {
                 "selected_contains_source"
             } else {
                 return None;
@@ -23392,6 +23423,27 @@ fn reveal_adapter_origin_matches(
             Some(value)
         })
         .collect()
+}
+
+fn adapter_source_origin_ids(adapter: &serde_json::Value) -> Vec<String> {
+    let mut ids = adapter
+        .get("source_origin_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(id) = adapter
+        .get("source_origin_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        ids.push(id.to_string());
+    }
+    normalize_source_origin_ids(&mut ids);
+    ids
 }
 
 fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -26574,7 +26626,7 @@ struct DeployDbAdapter {
     endpoint: Option<String>,
     adapter_status: String,
     bridge_env: Vec<DeployProviderEnv>,
-    source_origin_id: Option<String>,
+    source_origin_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -26587,6 +26639,7 @@ struct DeployCommerceAdapter {
     endpoint: Option<String>,
     record_path: Option<String>,
     provider_env: Vec<DeployProviderEnv>,
+    source_origin_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -26629,16 +26682,14 @@ impl DeployPersistenceAccumulator {
         self.db_endpoints.dedup();
         self.db_env.sort();
         self.db_env.dedup();
-        self.db_adapters.sort();
-        self.db_adapters.dedup();
+        self.db_adapters = merge_deploy_db_adapters(self.db_adapters);
         self.record_paths.sort();
         self.record_paths.dedup();
         self.commerce_endpoints.sort();
         self.commerce_endpoints.dedup();
         self.commerce_env.sort();
         self.commerce_env.dedup();
-        self.commerce_adapters.sort();
-        self.commerce_adapters.dedup();
+        self.commerce_adapters = merge_deploy_commerce_adapters(self.commerce_adapters);
         let mut persistent_paths = self.wal_paths.clone();
         persistent_paths.extend(self.db_paths.clone());
         persistent_paths.extend(self.record_paths.clone());
@@ -26657,6 +26708,70 @@ impl DeployPersistenceAccumulator {
             commerce_adapters: self.commerce_adapters,
         }
     }
+}
+
+fn merge_deploy_db_adapters(adapters: Vec<DeployDbAdapter>) -> Vec<DeployDbAdapter> {
+    let mut merged = Vec::<DeployDbAdapter>::new();
+    for mut adapter in adapters {
+        normalize_source_origin_ids(&mut adapter.source_origin_ids);
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| same_db_adapter_contract(existing, &adapter))
+        {
+            existing.source_origin_ids.extend(adapter.source_origin_ids);
+            normalize_source_origin_ids(&mut existing.source_origin_ids);
+        } else {
+            merged.push(adapter);
+        }
+    }
+    merged.sort();
+    merged
+}
+
+fn same_db_adapter_contract(a: &DeployDbAdapter, b: &DeployDbAdapter) -> bool {
+    a.mode == b.mode
+        && a.provider == b.provider
+        && a.env == b.env
+        && a.default == b.default
+        && a.endpoint == b.endpoint
+        && a.adapter_status == b.adapter_status
+        && a.bridge_env == b.bridge_env
+}
+
+fn merge_deploy_commerce_adapters(
+    adapters: Vec<DeployCommerceAdapter>,
+) -> Vec<DeployCommerceAdapter> {
+    let mut merged = Vec::<DeployCommerceAdapter>::new();
+    for mut adapter in adapters {
+        normalize_source_origin_ids(&mut adapter.source_origin_ids);
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| same_commerce_adapter_contract(existing, &adapter))
+        {
+            existing.source_origin_ids.extend(adapter.source_origin_ids);
+            normalize_source_origin_ids(&mut existing.source_origin_ids);
+        } else {
+            merged.push(adapter);
+        }
+    }
+    merged.sort();
+    merged
+}
+
+fn same_commerce_adapter_contract(a: &DeployCommerceAdapter, b: &DeployCommerceAdapter) -> bool {
+    a.kind == b.kind
+        && a.mode == b.mode
+        && a.provider == b.provider
+        && a.env == b.env
+        && a.default == b.default
+        && a.endpoint == b.endpoint
+        && a.record_path == b.record_path
+        && a.provider_env == b.provider_env
+}
+
+fn normalize_source_origin_ids(source_origin_ids: &mut Vec<String>) {
+    source_origin_ids.sort();
+    source_origin_ids.dedup();
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26834,7 +26949,8 @@ fn deploy_db_adapter_value(adapters: &[DeployDbAdapter]) -> Vec<serde_json::Valu
                 "default": adapter.default.as_deref(),
                 "endpoint": adapter.endpoint.as_deref(),
                 "adapter_status": adapter.adapter_status,
-                "source_origin_id": adapter.source_origin_id.as_deref(),
+                "source_origin_id": adapter.source_origin_ids.first().map(String::as_str),
+                "source_origin_ids": adapter.source_origin_ids.clone(),
                 "runtime": {
                     "status": adapter.adapter_status,
                     "query_methods": ["create", "find", "update", "delete", "transaction"],
@@ -26901,6 +27017,8 @@ fn deploy_commerce_adapter_value(adapters: &[DeployCommerceAdapter]) -> Vec<serd
                 "default": adapter.default.as_deref(),
                 "endpoint": adapter.endpoint.as_deref(),
                 "record_path": adapter.record_path.as_deref(),
+                "source_origin_id": adapter.source_origin_ids.first().map(String::as_str),
+                "source_origin_ids": adapter.source_origin_ids.clone(),
                 "request": deploy_commerce_adapter_request_value(&adapter.kind),
             });
             if let Some(provider) = &adapter.provider {
@@ -27170,7 +27288,12 @@ fn collect_expr_persistence_paths(expr: &orv_hir::HirExpr, out: &mut DeployPersi
                 } else {
                     "shipping"
                 };
-                collect_commerce_adapter_persistence_arg(kind, arg, out);
+                collect_commerce_adapter_persistence_arg(
+                    kind,
+                    arg,
+                    hir_source_origin_id("call", &call_name, expr.span),
+                    out,
+                );
             }
         }
     }
@@ -27392,7 +27515,7 @@ fn collect_db_adapter_persistence_arg(
                 endpoint: None,
                 adapter_status: "env_required".to_string(),
                 bridge_env: Vec::new(),
-                source_origin_id: source_origin_id.clone(),
+                source_origin_ids: source_origin_id.clone().into_iter().collect(),
             });
         }
         out.db_env.push(env);
@@ -27422,7 +27545,7 @@ fn collect_db_adapter_url(
             endpoint: Some(url.to_string()),
             adapter_status: "unsupported_runtime".to_string(),
             bridge_env: db_adapter_bridge_env(provider),
-            source_origin_id,
+            source_origin_ids: source_origin_id.into_iter().collect(),
         });
     }
 }
@@ -27484,10 +27607,11 @@ fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
 fn collect_commerce_adapter_persistence_arg(
     kind: &str,
     arg: &orv_hir::HirExpr,
+    source_origin_id: Option<String>,
     out: &mut DeployPersistenceAccumulator,
 ) {
     if let Some(url) = hir_static_string(arg) {
-        collect_commerce_adapter_url(kind, &url, None, None, out);
+        collect_commerce_adapter_url(kind, &url, None, None, source_origin_id.clone(), out);
     }
     if let Some(env) = hir_env_configured_string(arg) {
         if let Some(default) = &env.default {
@@ -27496,6 +27620,7 @@ fn collect_commerce_adapter_persistence_arg(
                 default,
                 Some(env.env.clone()),
                 Some(default.clone()),
+                source_origin_id.clone(),
                 out,
             );
         } else {
@@ -27508,6 +27633,7 @@ fn collect_commerce_adapter_persistence_arg(
                 endpoint: None,
                 record_path: None,
                 provider_env: Vec::new(),
+                source_origin_ids: source_origin_id.clone().into_iter().collect(),
             });
         }
         out.commerce_env.push(env);
@@ -27519,6 +27645,7 @@ fn collect_commerce_adapter_url(
     url: &str,
     env: Option<String>,
     default: Option<String>,
+    source_origin_id: Option<String>,
     out: &mut DeployPersistenceAccumulator,
 ) {
     let mut mode = "local".to_string();
@@ -27553,6 +27680,7 @@ fn collect_commerce_adapter_url(
         endpoint,
         record_path,
         provider_env,
+        source_origin_ids: source_origin_id.into_iter().collect(),
     });
 }
 
@@ -30036,6 +30164,21 @@ mod tests {
         path
     }
 
+    fn adapter_values_without_source_origin_ids(value: &serde_json::Value) -> serde_json::Value {
+        let mut value = value.clone();
+        for adapter in value.as_array_mut().expect("adapter array") {
+            adapter
+                .as_object_mut()
+                .expect("adapter object")
+                .remove("source_origin_id");
+            adapter
+                .as_object_mut()
+                .expect("adapter object")
+                .remove("source_origin_ids");
+        }
+        value
+    }
+
     fn workspace_build_fixture(name: &str) -> PathBuf {
         let root = temp_output_dir(name);
         std::fs::create_dir_all(root.join("apps/web/src")).expect("create web src");
@@ -30957,7 +31100,7 @@ test "checkout excluded failure" {
             ])
         );
         assert_eq!(
-            commerce_adapters["adapters"],
+            adapter_values_without_source_origin_ids(&commerce_adapters["adapters"]),
             serde_json::json!([
                 {
                     "kind": "payment",
@@ -31025,6 +31168,13 @@ test "checkout excluded failure" {
                 }
             ])
         );
+        assert!(commerce_adapters["adapters"]
+            .as_array()
+            .expect("commerce adapters")
+            .iter()
+            .all(|adapter| adapter["source_origin_id"]
+                .as_str()
+                .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
         assert_eq!(
             container["persistence"]["volumes"][0]["host"],
             serde_json::json!("data")
@@ -43208,18 +43358,8 @@ let sig count: int = 0
         assert!(adapters.iter().all(|adapter| adapter["source_origin_id"]
             .as_str()
             .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
-        let mut adapters_without_source = db_adapters["adapters"].clone();
-        for adapter in adapters_without_source
-            .as_array_mut()
-            .expect("db adapters without source")
-        {
-            adapter
-                .as_object_mut()
-                .expect("db adapter object")
-                .remove("source_origin_id");
-        }
         assert_eq!(
-            adapters_without_source,
+            adapter_values_without_source_origin_ids(&db_adapters["adapters"]),
             serde_json::json!([
                 {
                     "kind": "db",
@@ -43588,7 +43728,7 @@ let sig count: int = 0
         assert_eq!(commerce_adapters["schema_version"], 1);
         assert_eq!(commerce_adapters["artifact"], "server/app.orv-runtime.json");
         assert_eq!(
-            commerce_adapters["adapters"],
+            adapter_values_without_source_origin_ids(&commerce_adapters["adapters"]),
             serde_json::json!([
                 {
                     "kind": "payment",
@@ -43626,6 +43766,13 @@ let sig count: int = 0
                 }
             ])
         );
+        assert!(commerce_adapters["adapters"]
+            .as_array()
+            .expect("commerce adapters")
+            .iter()
+            .all(|adapter| adapter["source_origin_id"]
+                .as_str()
+                .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
         assert!(runbook.contains(
             "- Commerce adapter env: PAYMENT_ADAPTER_URL default http://payments.internal/capture"
         ));
@@ -43697,7 +43844,7 @@ let sig count: int = 0
         assert!(compose.contains(r#"CARRIER_API_ENDPOINT: "${CARRIER_API_ENDPOINT}""#));
         assert!(compose.contains(r#"CARRIER_WEBHOOK_SECRET: "${CARRIER_WEBHOOK_SECRET}""#));
         assert_eq!(
-            commerce_adapters["adapters"],
+            adapter_values_without_source_origin_ids(&commerce_adapters["adapters"]),
             serde_json::json!([
                 {
                     "kind": "payment",
@@ -43776,6 +43923,13 @@ let sig count: int = 0
                 }
             ])
         );
+        assert!(commerce_adapters["adapters"]
+            .as_array()
+            .expect("commerce adapters")
+            .iter()
+            .all(|adapter| adapter["source_origin_id"]
+                .as_str()
+                .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
         assert!(env_example.contains("STRIPE_API_ENDPOINT="));
         assert!(env_example.contains("STRIPE_SECRET_KEY="));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
@@ -47254,7 +47408,80 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["adapters"][0]["env"] == "PAYMENT_ADAPTER_URL"
                 && target["adapters"][0]["endpoint"] == "http://payments.internal/capture"
                 && target["adapters"][0]["request"]["kind"] == "payment.capture"
+                && target["adapters"][0]["source_origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))
         }));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn reveal_origin_links_commerce_connects_to_deploy_adapter_contract() {
+        let dir = temp_output_dir("reveal-commerce-connect-origin-source");
+        std::fs::create_dir_all(&dir).expect("create commerce connect reveal source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  let shipping = @shipping.connect(@env.SHIPPING_ADAPTER_URL ?? "http://shipping.internal/book")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    let booked = shipping.book({ orderId: "o_1", carrier: "post", address: "Seoul" })
+    @respond 200 { payment: captured.status, shipment: booked.status }
+  }
+}
+"#,
+        )
+        .expect("write commerce connect reveal source");
+        let out = temp_output_dir("reveal-commerce-connect-origin");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        for (origin_name, kind, endpoint) in [
+            (
+                "@payment.connect",
+                "payment",
+                "http://payments.internal/capture",
+            ),
+            (
+                "@shipping.connect",
+                "shipping",
+                "http://shipping.internal/book",
+            ),
+        ] {
+            let origin = origin_map
+                .entries
+                .iter()
+                .find(|entry| entry.kind == "call" && entry.name == origin_name)
+                .expect("commerce connect origin");
+            let reveal = reveal_origin_json(&out, &origin.id).expect("reveal commerce origin");
+            let target = reveal["production"]["commerce_adapters"]
+                .as_array()
+                .expect("commerce adapters")
+                .iter()
+                .find(|target| target["path"] == "deploy/commerce-adapters.json")
+                .expect("commerce adapter target")
+                .clone();
+            let matched = target["matched_adapters"]
+                .as_array()
+                .expect("matched commerce adapters");
+
+            assert_eq!(target["matched"], true);
+            assert_eq!(target["selected_origin_id"], origin.id);
+            assert_eq!(target["matched_adapter_count"], 1);
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched[0]["source_origin_id"], origin.id);
+            assert_eq!(matched[0]["matched_origin_id"], origin.id);
+            assert_eq!(matched[0]["match"], "direct");
+            assert_eq!(matched[0]["kind"], kind);
+            assert_eq!(matched[0]["endpoint"], endpoint);
+        }
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
