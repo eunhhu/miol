@@ -37,6 +37,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub(crate) const ORV_CSRF_COOKIE_NAME: &str = "orv_csrf";
 pub(crate) const ORV_REFERENCE_CSRF_TOKEN: &str = "orv-reference-csrf";
+pub(crate) const ORV_SESSION_COOKIE_NAME: &str = "orv_session";
+pub(crate) const ORV_SESSION_ROLE_COOKIE_NAME: &str = "orv_session_role";
 
 /// B4 `@env` 테스트 override.
 ///
@@ -1155,6 +1157,10 @@ impl<W: Write> Interp<W> {
                 }
                 if name == "csrf" && self.request.is_some() {
                     return self.eval_csrf_domain(args);
+                }
+                if name == "Auth" && self.request.is_some() && is_declarative_auth_invocation(args)
+                {
+                    return self.eval_auth_domain(args);
                 }
                 // 요청 컨텍스트가 있다면 request-state 도메인을 해석한다.
                 if self.request.is_some() {
@@ -3567,7 +3573,7 @@ impl<W: Write> Interp<W> {
             [] => Ok(self.session_value()),
             [arg] if is_required_arg(arg) => {
                 if let Some(id) = self.session_id_from_cookie() {
-                    Ok(session_object(Some(id)))
+                    Ok(session_object(Some(id), self.session_role_from_cookie()))
                 } else {
                     Ok(self.respond_value(
                         401,
@@ -3585,12 +3591,20 @@ impl<W: Write> Interp<W> {
     }
 
     fn session_value(&self) -> Value {
-        session_object(self.session_id_from_cookie())
+        session_object(
+            self.session_id_from_cookie(),
+            self.session_role_from_cookie(),
+        )
     }
 
     fn session_id_from_cookie(&self) -> Option<String> {
         let ctx = self.request.as_ref()?;
-        cookie_value_from_headers(&ctx.headers, "orv_session")
+        cookie_value_from_headers(&ctx.headers, ORV_SESSION_COOKIE_NAME)
+    }
+
+    fn session_role_from_cookie(&self) -> Option<String> {
+        let ctx = self.request.as_ref()?;
+        cookie_value_from_headers(&ctx.headers, ORV_SESSION_ROLE_COOKIE_NAME)
     }
 
     fn eval_csrf_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
@@ -3617,6 +3631,101 @@ impl<W: Write> Interp<W> {
                 )]),
             ))
         }
+    }
+
+    fn eval_auth_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        let policy = self.eval_auth_policy(args)?;
+        let session_id = self.session_id_from_cookie();
+        let session_role = self.session_role_from_cookie();
+        let requires_session = policy.required || policy.role.is_some();
+
+        if requires_session && session_id.is_none() {
+            return Ok(self.respond_value(
+                401,
+                Value::Object(vec![(
+                    "err".to_string(),
+                    Value::Str("auth_required".to_string()),
+                )]),
+            ));
+        }
+
+        if let Some(required_role) = &policy.role {
+            if session_role.as_deref() != Some(required_role.as_str()) {
+                return Ok(self.respond_value(
+                    403,
+                    Value::Object(vec![
+                        ("err".to_string(), Value::Str("role_required".to_string())),
+                        (
+                            "requiredRole".to_string(),
+                            Value::Str(required_role.clone()),
+                        ),
+                        (
+                            "role".to_string(),
+                            session_role.clone().map(Value::Str).unwrap_or(Value::Void),
+                        ),
+                    ]),
+                ));
+            }
+        }
+
+        Ok(Value::Object(vec![
+            ("status".to_string(), Value::Str("authorized".to_string())),
+            (
+                "session".to_string(),
+                session_object(session_id, session_role.clone()),
+            ),
+            (
+                "role".to_string(),
+                session_role.map(Value::Str).unwrap_or(Value::Void),
+            ),
+            (
+                "requiredRole".to_string(),
+                policy.role.map(Value::Str).unwrap_or(Value::Void),
+            ),
+        ]))
+    }
+
+    fn eval_auth_policy(&mut self, args: &[HirExpr]) -> Result<AuthPolicy, RuntimeError> {
+        let mut policy = AuthPolicy::default();
+        for arg in args {
+            match &arg.kind {
+                HirExprKind::Ident(ident) if ident.name == "required" => {
+                    policy.required = true;
+                }
+                HirExprKind::Assign { target, value } if target.name == "required" => {
+                    match self.eval(value)? {
+                        Value::Bool(required) => policy.required = required,
+                        other => {
+                            return Err(RuntimeError::native(format!(
+                                "`@Auth required` expects bool, got {other}"
+                            )));
+                        }
+                    }
+                }
+                HirExprKind::Assign { target, value } if target.name == "role" => {
+                    match self.eval(value)? {
+                        Value::Str(role) if !role.is_empty() => policy.role = Some(role),
+                        other => {
+                            return Err(RuntimeError::native(format!(
+                                "`@Auth role` expects non-empty string, got {other}"
+                            )));
+                        }
+                    }
+                }
+                HirExprKind::Assign { target, .. } => {
+                    return Err(RuntimeError::native(format!(
+                        "`@Auth` got unknown policy `{}`",
+                        target.name
+                    )));
+                }
+                _ => {
+                    return Err(RuntimeError::native(
+                        "`@Auth` expects `required` and optional `role=\"...\"`",
+                    ));
+                }
+            }
+        }
+        Ok(policy)
     }
 
     /// HTML 모드에서 `@tag ...` 도메인 호출 하나를 현재 버퍼에 렌더한다.
@@ -3778,14 +3887,32 @@ fn response_headers_object(resp: &ResponseCtx) -> Value {
     Value::Object(headers)
 }
 
+#[derive(Default)]
+struct AuthPolicy {
+    required: bool,
+    role: Option<String>,
+}
+
 fn is_required_arg(expr: &HirExpr) -> bool {
     matches!(&expr.kind, HirExprKind::Ident(ident) if ident.name == "required")
 }
 
-fn session_object(id: Option<String>) -> Value {
+fn is_declarative_auth_invocation(args: &[HirExpr]) -> bool {
+    args.iter().any(|arg| match &arg.kind {
+        HirExprKind::Ident(ident) => ident.name == "required",
+        HirExprKind::Assign { target, .. } => matches!(target.name.as_str(), "required" | "role"),
+        _ => false,
+    })
+}
+
+fn session_object(id: Option<String>, role: Option<String>) -> Value {
     let present = id.is_some();
     Value::Object(vec![
         ("id".to_string(), id.map(Value::Str).unwrap_or(Value::Void)),
+        (
+            "role".to_string(),
+            role.map(Value::Str).unwrap_or(Value::Void),
+        ),
         ("present".to_string(), Value::Bool(present)),
     ])
 }
@@ -8234,6 +8361,73 @@ let third: int = 3
         assert!(fields.iter().any(|(name, value)| {
             name == "err" && matches!(value, Value::Str(err) if err == "session_required")
         }));
+    }
+
+    #[test]
+    fn auth_required_role_allows_matching_session_role_cookie() {
+        let ctx = RequestCtx {
+            headers: [(
+                "cookie".into(),
+                "orv_session=admin_1; orv_session_role=admin".into(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"@Auth required role="admin"
+@out @session.role"#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "admin\n");
+    }
+
+    #[test]
+    fn auth_required_records_unauthorized_response() {
+        let (outcome, out) = eval_handler_outcome_src(
+            r#"@Auth required role="admin"
+@out "after""#,
+            RequestCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(out, "");
+        let response = outcome.response.expect("auth response");
+        assert_eq!(response.status, 401);
+        let Value::Object(fields) = response.payload else {
+            panic!("expected object payload");
+        };
+        assert!(fields.iter().any(|(name, value)| name == "err"
+            && matches!(value, Value::Str(err) if err == "auth_required")));
+    }
+
+    #[test]
+    fn auth_required_role_records_forbidden_response() {
+        let ctx = RequestCtx {
+            headers: [(
+                "cookie".into(),
+                "orv_session=member_1; orv_session_role=member".into(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let (outcome, out) = eval_handler_outcome_src(
+            r#"@Auth required role="admin"
+@out "after""#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "");
+        let response = outcome.response.expect("auth response");
+        assert_eq!(response.status, 403);
+        let Value::Object(fields) = response.payload else {
+            panic!("expected object payload");
+        };
+        assert!(fields.iter().any(|(name, value)| name == "err"
+            && matches!(value, Value::Str(err) if err == "role_required")));
+        assert!(fields.iter().any(|(name, value)| name == "requiredRole"
+            && matches!(value, Value::Str(role) if role == "admin")));
     }
 
     #[test]

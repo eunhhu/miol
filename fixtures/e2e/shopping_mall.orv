@@ -10,6 +10,15 @@
 @server {
   @listen 0
   let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
+  let adminMember = await shopdb.find("Member", { handle: "admin" })
+  if adminMember == void {
+    await shopdb.create("Member", {
+      handle: "admin",
+      name: "Admin",
+      email: "admin@example.test",
+      role: "admin"
+    })
+  }
 
   @route GET /health {
     @respond 200 { ok: true, service: "shopping" }
@@ -150,6 +159,7 @@
   }
 
   @route GET /admin {
+    @Auth required role="admin"
     @serve @html {
       @body {
         @h1 "Miol Shop Admin"
@@ -187,6 +197,7 @@
   }
 
   @route GET /admin/summary {
+    @Auth required role="admin"
     let products = await shopdb.count("Product", {})
     let members = await shopdb.count("Member", {})
     let orders = await shopdb.count("Order", {})
@@ -206,6 +217,7 @@
   }
 
   @route GET /admin/catalog {
+    @Auth required role="admin"
     let products = await shopdb.findAll("Product", {})
     @serve @html {
       @body {
@@ -264,6 +276,7 @@
   }
 
   @route GET /admin/orders {
+    @Auth required role="admin"
     let orders = await shopdb.findAll("Order", {})
     @serve @html {
       @body {
@@ -278,6 +291,7 @@
   }
 
   @route GET /admin/payments {
+    @Auth required role="admin"
     let payments = await shopdb.findAll("Payment", {})
     @serve @html {
       @body {
@@ -292,6 +306,7 @@
   }
 
   @route GET /admin/shipments {
+    @Auth required role="admin"
     let shipments = await shopdb.findAll("Shipment", {})
     @serve @html {
       @body {
@@ -306,6 +321,7 @@
   }
 
   @route GET /admin/webhooks {
+    @Auth required role="admin"
     let webhooks = await shopdb.findAll("WebhookEvent", {})
     @serve @html {
       @body {
@@ -320,6 +336,7 @@
   }
 
   @route GET /admin/audit {
+    @Auth required role="admin"
     let auditEvents = await shopdb.findAll("AuditEvent", {})
     @serve @html {
       @body {
@@ -365,7 +382,12 @@
 
   @route POST /members {
     @csrf
-    let member = await shopdb.create("Member", @body)
+    let member = await shopdb.create("Member", {
+      handle: @body.handle,
+      name: @body.name,
+      email: @body.email,
+      role: "member"
+    })
     await shopdb.create("AuditEvent", {
       kind: "member.create",
       entity: "Member",
@@ -393,7 +415,8 @@
     let session = await shopdb.create("Session", {
       memberId: member.id,
       handle: member.handle,
-      status: "active"
+      status: "active",
+      role: member.role ?? "member"
     })
     await shopdb.create("AuditEvent", {
       kind: "session.login",

@@ -46,6 +46,7 @@ use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
     eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env_with_db, RequestCtx,
     ResponseCtx, RuntimeError, Value, ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN,
+    ORV_SESSION_COOKIE_NAME, ORV_SESSION_ROLE_COOKIE_NAME,
 };
 
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
@@ -1254,6 +1255,9 @@ fn response_extra_headers(method: &str, path: &str, resp: &ResponseCtx) -> Vec<(
     if let Some(cookie) = login_session_cookie(method, path, resp) {
         headers.push(("set-cookie".to_string(), cookie));
     }
+    if let Some(cookie) = login_session_role_cookie(method, path, resp) {
+        headers.push(("set-cookie".to_string(), cookie));
+    }
     if let Some(cookie) = csrf_cookie(method, resp) {
         headers.push(("set-cookie".to_string(), cookie));
     }
@@ -1268,7 +1272,19 @@ fn login_session_cookie(method: &str, path: &str, resp: &ResponseCtx) -> Option<
     let session_id = object_field_value(session, "id")?;
     let cookie_value = cookie_scalar_value(session_id)?;
     Some(format!(
-        "orv_session={cookie_value}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure"
+        "{ORV_SESSION_COOKIE_NAME}={cookie_value}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure"
+    ))
+}
+
+fn login_session_role_cookie(method: &str, path: &str, resp: &ResponseCtx) -> Option<String> {
+    if method != "POST" || path != "/members/login" || !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let session = object_field_value(&resp.payload, "session")?;
+    let role = object_field_value(session, "role")?;
+    let cookie_value = cookie_scalar_value(role)?;
+    Some(format!(
+        "{ORV_SESSION_ROLE_COOKIE_NAME}={cookie_value}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure"
     ))
 }
 
@@ -2067,18 +2083,30 @@ mod tests {
             .get(TEST_ORIGIN_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(std::string::ToString::to_string);
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-            })
-            .collect();
+        let mut headers = HashMap::<String, String>::new();
+        for (name, value) in resp.headers() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            headers
+                .entry(name.as_str().to_string())
+                .and_modify(|existing| {
+                    existing.push('\n');
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
+        }
         let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
         (status, ct, origin, headers, bytes)
+    }
+
+    fn cookie_header_from_set_cookie(value: &str) -> String {
+        value
+            .lines()
+            .filter_map(|cookie| cookie.split(';').next())
+            .filter(|cookie| !cookie.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     async fn open_trace_event_stream(
@@ -2660,7 +2688,7 @@ mod tests {
                     @listen 0
                     @route POST /members/login {
                         @respond 201 {
-                          session: { id: 42, handle: "ada", status: "active" }
+                          session: { id: 42, handle: "ada", status: "active", role: "admin" }
                         }
                     }
                 }"#,
@@ -2680,6 +2708,7 @@ mod tests {
             assert_eq!(status, 201);
             let cookie = headers.get("set-cookie").expect("set-cookie header");
             assert!(cookie.contains("orv_session=42"));
+            assert!(cookie.contains("orv_session_role=admin"));
             assert!(cookie.contains("Path=/"));
             assert!(cookie.contains("Max-Age=86400"));
             assert!(cookie.contains("HttpOnly"));
@@ -2754,6 +2783,72 @@ mod tests {
             assert_eq!(status, 200);
             let ok: serde_json::Value = serde_json::from_slice(&body).expect("session json");
             assert_eq!(ok["sessionId"], serde_json::json!("abc_123"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auth_role_route_checks_reference_session_role_cookie() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route GET /admin {
+                        @Auth required role="admin"
+                        @respond 200 { ok: true, role: @session.role }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (missing_status, _, missing_body) = send_request(addr, "GET", "/admin", None).await;
+            assert_eq!(missing_status, 401);
+            let missing: serde_json::Value =
+                serde_json::from_slice(&missing_body).expect("missing auth json");
+            assert_eq!(missing["err"], serde_json::json!("auth_required"));
+
+            let (member_status, _, member_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin",
+                None,
+                &[("cookie", "orv_session=abc_123; orv_session_role=member")],
+            )
+            .await;
+            assert_eq!(member_status, 403);
+            let member: serde_json::Value =
+                serde_json::from_slice(&member_body).expect("member auth json");
+            assert_eq!(member["err"], serde_json::json!("role_required"));
+            assert_eq!(member["requiredRole"], serde_json::json!("admin"));
+            assert_eq!(member["role"], serde_json::json!("member"));
+
+            let (status, _, body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin",
+                None,
+                &[("cookie", "orv_session=admin_1; orv_session_role=admin")],
+            )
+            .await;
+            assert_eq!(status, 200);
+            let ok: serde_json::Value = serde_json::from_slice(&body).expect("auth json");
+            assert_eq!(ok["ok"], serde_json::json!(true));
+            assert_eq!(ok["role"], serde_json::json!("admin"));
 
             handle.abort();
         })
@@ -3415,8 +3510,48 @@ mod tests {
                 );
             }
 
-            let (admin_status, admin_ct, admin_body) =
+            let (missing_admin_status, _, missing_admin_body) =
                 send_request(addr, "GET", "/admin", None).await;
+            assert_eq!(missing_admin_status, 401);
+            let missing_admin: serde_json::Value =
+                serde_json::from_slice(&missing_admin_body).expect("missing admin auth json");
+            assert_eq!(missing_admin["err"], serde_json::json!("auth_required"));
+
+            let admin_login_payload = serde_json::json!({
+                "handle": "admin",
+                "email": "admin@example.test"
+            })
+            .to_string();
+            let (admin_login_status, _, _, admin_login_headers, admin_login_body) =
+                send_request_full_with_headers(
+                    addr,
+                    "POST",
+                    "/members/login",
+                    Some(admin_login_payload),
+                    &[
+                        ("cookie", csrf_cookie_pair.as_str()),
+                        ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                    ],
+                )
+                .await;
+            assert_eq!(admin_login_status, 201);
+            let admin_login: serde_json::Value =
+                serde_json::from_slice(&admin_login_body).expect("admin login json");
+            assert_eq!(admin_login["session"]["role"], serde_json::json!("admin"));
+            let admin_cookie = admin_login_headers
+                .get("set-cookie")
+                .expect("admin login set-cookie");
+            assert!(admin_cookie.contains("orv_session_role=admin"));
+            let admin_cookie_header = cookie_header_from_set_cookie(admin_cookie);
+
+            let (admin_status, admin_ct, admin_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_status, 200);
             assert_eq!(admin_ct.as_deref(), Some("text/html; charset=utf-8"));
             let admin_html = String::from_utf8(admin_body).expect("admin html");
@@ -3498,7 +3633,14 @@ mod tests {
             assert!(catalog_html.contains("stock 3"));
 
             let (admin_catalog_status, admin_catalog_ct, admin_catalog_body) =
-                send_request(addr, "GET", "/admin/catalog", None).await;
+                send_request_with_headers(
+                    addr,
+                    "GET",
+                    "/admin/catalog",
+                    None,
+                    &[("cookie", admin_cookie_header.as_str())],
+                )
+                .await;
             assert_eq!(admin_catalog_status, 200);
             assert_eq!(
                 admin_catalog_ct.as_deref(),
@@ -3646,20 +3788,32 @@ mod tests {
             .await;
             assert_eq!(login_status, 201);
             let login_cookie = login_headers.get("set-cookie").expect("login set-cookie");
-            assert!(login_cookie.contains("orv_session=1"));
+            assert!(login_cookie.contains("orv_session=2"));
+            assert!(login_cookie.contains("orv_session_role=member"));
             assert!(login_cookie.contains("Path=/"));
             assert!(login_cookie.contains("Max-Age=86400"));
             assert!(login_cookie.contains("HttpOnly"));
             assert!(login_cookie.contains("SameSite=Lax"));
             assert!(login_cookie.contains("Secure"));
-            let login_cookie_pair = login_cookie
-                .split(';')
-                .next()
-                .expect("login cookie pair")
-                .to_string();
+            let login_cookie_header = cookie_header_from_set_cookie(login_cookie);
             let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
             assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
             assert_eq!(login["session"]["status"], serde_json::json!("active"));
+            assert_eq!(login["session"]["role"], serde_json::json!("member"));
+
+            let (member_admin_status, _, member_admin_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin",
+                None,
+                &[("cookie", login_cookie_header.as_str())],
+            )
+            .await;
+            assert_eq!(member_admin_status, 403);
+            let member_admin: serde_json::Value =
+                serde_json::from_slice(&member_admin_body).expect("member admin auth json");
+            assert_eq!(member_admin["err"], serde_json::json!("role_required"));
+            assert_eq!(member_admin["requiredRole"], serde_json::json!("admin"));
 
             let cart_payload = serde_json::json!({
                 "handle": "ada",
@@ -3709,7 +3863,7 @@ mod tests {
                 "GET",
                 "/account/sessions",
                 None,
-                &[("cookie", login_cookie_pair.as_str())],
+                &[("cookie", login_cookie_header.as_str())],
             )
             .await;
             assert_eq!(sessions_status, 200);
@@ -3894,15 +4048,27 @@ mod tests {
                 serde_json::json!("provider_reconciled")
             );
 
-            let (admin_orders_status, _, admin_orders_body) =
-                send_request(addr, "GET", "/admin/orders", None).await;
+            let (admin_orders_status, _, admin_orders_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/orders",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_orders_status, 200);
             let admin_orders_html = String::from_utf8(admin_orders_body).expect("orders html utf8");
             assert!(admin_orders_html.contains("ada"));
             assert!(admin_orders_html.contains("provider_reconciled"));
 
-            let (admin_payments_status, _, admin_payments_body) =
-                send_request(addr, "GET", "/admin/payments", None).await;
+            let (admin_payments_status, _, admin_payments_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/payments",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_payments_status, 200);
             let admin_payments_html =
                 String::from_utf8(admin_payments_body).expect("payments html utf8");
@@ -3910,15 +4076,27 @@ mod tests {
             assert!(admin_payments_html.contains("provider_paid"));
             assert!(admin_payments_html.contains("file"));
 
-            let (admin_shipments_status, _, admin_shipments_body) =
-                send_request(addr, "GET", "/admin/shipments", None).await;
+            let (admin_shipments_status, _, admin_shipments_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/shipments",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_shipments_status, 200);
             let admin_shipments_html =
                 String::from_utf8(admin_shipments_body).expect("shipments html utf8");
             assert!(admin_shipments_html.contains("TRK-LOCAL"));
 
-            let (admin_webhooks_status, _, admin_webhooks_body) =
-                send_request(addr, "GET", "/admin/webhooks", None).await;
+            let (admin_webhooks_status, _, admin_webhooks_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/webhooks",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_webhooks_status, 200);
             let admin_webhooks_html =
                 String::from_utf8(admin_webhooks_body).expect("webhooks html utf8");
@@ -3926,8 +4104,14 @@ mod tests {
             assert!(admin_webhooks_html.contains("evt_checkout_paid"));
             assert!(admin_webhooks_html.contains("verified"));
 
-            let (admin_audit_status, _, admin_audit_body) =
-                send_request(addr, "GET", "/admin/audit", None).await;
+            let (admin_audit_status, _, admin_audit_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/audit",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(admin_audit_status, 200);
             let admin_audit_html = String::from_utf8(admin_audit_body).expect("audit html utf8");
             assert!(admin_audit_html.contains("checkout.complete"));
@@ -3935,28 +4119,40 @@ mod tests {
             assert!(admin_audit_html.contains("shipment.book"));
             assert!(admin_audit_html.contains("webhook.received"));
 
-            let (summary_status, _, summary_body) =
-                send_request(addr, "GET", "/admin/summary", None).await;
+            let (summary_status, _, summary_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/admin/summary",
+                None,
+                &[("cookie", admin_cookie_header.as_str())],
+            )
+            .await;
             assert_eq!(summary_status, 200);
             let summary: serde_json::Value =
                 serde_json::from_slice(&summary_body).expect("admin summary json");
             assert_eq!(summary["products"], serde_json::json!(2));
-            assert_eq!(summary["members"], serde_json::json!(1));
+            assert_eq!(summary["members"], serde_json::json!(2));
             assert_eq!(summary["orders"], serde_json::json!(3));
             assert_eq!(summary["payments"], serde_json::json!(2));
             assert_eq!(summary["shipments"], serde_json::json!(2));
             assert_eq!(summary["webhookEvents"], serde_json::json!(2));
-            assert_eq!(summary["auditEvents"], serde_json::json!(15));
+            assert_eq!(summary["auditEvents"], serde_json::json!(16));
 
             handle.abort();
 
             let restored = crate::db::InMemoryDb::load_sqlite(&sqlite_path)
                 .expect("reload shopping fixture sqlite");
             let snapshot = restored.snapshot_json();
-            assert_eq!(
-                snapshot["tables"]["Member"]["rows"][0]["handle"],
-                serde_json::json!("ada")
-            );
+            let member_rows = snapshot["tables"]["Member"]["rows"]
+                .as_array()
+                .expect("member rows");
+            assert_eq!(member_rows.len(), 2);
+            assert!(member_rows
+                .iter()
+                .any(|member| member["handle"] == "admin" && member["role"] == "admin"));
+            assert!(member_rows
+                .iter()
+                .any(|member| member["handle"] == "ada" && member["role"] == "member"));
             assert_eq!(
                 snapshot["tables"]["Order"]["rows"].as_array().map(Vec::len),
                 Some(3)
@@ -3991,12 +4187,17 @@ mod tests {
                 snapshot["tables"]["AuditEvent"]["rows"]
                     .as_array()
                     .map(Vec::len),
-                Some(15)
+                Some(16)
             );
-            assert_eq!(
-                snapshot["tables"]["AuditEvent"]["rows"][0]["kind"],
-                serde_json::json!("product.create")
-            );
+            let audit_rows = snapshot["tables"]["AuditEvent"]["rows"]
+                .as_array()
+                .expect("audit rows");
+            assert!(audit_rows
+                .iter()
+                .any(|event| event["kind"] == "product.create"));
+            assert!(audit_rows
+                .iter()
+                .any(|event| event["kind"] == "session.login" && event["actor"] == "admin"));
             let payment_records =
                 std::fs::read_to_string(&payment_path).expect("payment record log");
             let shipping_records =

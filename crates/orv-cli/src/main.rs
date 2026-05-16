@@ -2396,9 +2396,9 @@ orv run-build dist\n\
 \n\
 Browser home: http://localhost:8080/ provides product, member signup/login, order, one-step checkout, payment, and shipment forms.\n\
 \n\
-Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths.\n\
+Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths. Admin routes are protected by `@Auth required role=\"admin\"`; the starter seeds a reference admin member `admin` / `admin@example.test` for local smoke sessions.\n\
 \n\
-Successful `POST /members/login` responses set an `orv_session` cookie with `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, and one-day `Max-Age` defaults.\n\
+Successful `POST /members/login` responses set an `orv_session` cookie with `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, and one-day `Max-Age` defaults. When the session has a role, the reference runtime also sets an `orv_session_role` cookie for declarative `@Auth` role checks.\n\
 \n\
 The account sessions view requires that login cookie through `@session required` and reads the current session with `@session.id`.\n\
 \n\
@@ -21042,6 +21042,11 @@ fn verify_deploy_smoke_test_artifact(
     if !smoke.contains("orv_smoke_curl()") || !smoke.contains("orv deploy smoke test failed: %s") {
         anyhow::bail!("deploy smoke test must label failed curl steps");
     }
+    if deploy_routes_include(artifact, "POST", "/checkout")
+        && !smoke.contains("orv_smoke_cookie_from_headers()")
+    {
+        anyhow::bail!("deploy smoke test must extract cookies for protected shop routes");
+    }
     verify_deploy_smoke_client_contract(&smoke, client)?;
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
@@ -21052,11 +21057,12 @@ fn verify_deploy_smoke_test_artifact(
             anyhow::bail!("deploy smoke test must wait for server readiness");
         }
     }
-    for route in artifact
-        .routes
-        .iter()
-        .filter(|route| route.method == "GET" && !route.path.contains(':'))
-    {
+    for route in artifact.routes.iter().filter(|route| {
+        route.method == "GET"
+            && !route.path.contains(':')
+            && !route.path.starts_with("/admin")
+            && route.path != "/account/sessions"
+    }) {
         let command = format!(
             r#"orv_smoke_curl "GET {}" "$BASE_URL{}""#,
             route.path, route.path
@@ -21079,6 +21085,32 @@ fn verify_deploy_smoke_test_artifact(
         }
         if !smoke.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#) {
             anyhow::bail!("deploy smoke test must use unique smoke member handle");
+        }
+        if !smoke.contains(
+            "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\"",
+        ) || !smoke.contains(r#"-H "x-csrf-token: ${CSRF_TOKEN}""#)
+        {
+            anyhow::bail!("deploy smoke test must send reference CSRF cookie/token");
+        }
+        if deploy_routes_include(artifact, "GET", "/account/sessions") {
+            let command = r#"orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#;
+            if !smoke.contains(command) {
+                anyhow::bail!(
+                    "deploy smoke test must cover GET /account/sessions with a session cookie"
+                );
+            }
+        }
+        for route in artifact.routes.iter().filter(|route| {
+            route.method == "GET" && !route.path.contains(':') && route.path.starts_with("/admin")
+        }) {
+            let command = format!(
+                r#"orv_smoke_curl "GET {}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
+                route.path, route.path
+            );
+            if !smoke.contains(&command) {
+                let path = &route.path;
+                anyhow::bail!("deploy smoke test must cover GET {path} with an admin role cookie");
+            }
         }
     }
     Ok(())
@@ -27053,6 +27085,26 @@ orv_smoke_curl() {{
   fi
 }}
 
+orv_smoke_cookie_from_headers() {{
+  cookie_name="$1"
+  headers_path="$2"
+  tr -d '\r' < "$headers_path" | awk -v cookie_name="$cookie_name" '
+    {{
+      lower = tolower($0)
+      if (index(lower, "set-cookie:") == 1) {{
+        line = substr($0, length("set-cookie:") + 1)
+        sub(/^[[:space:]]*/, "", line)
+        split(line, parts, ";")
+        split(parts[1], kv, "=")
+        if (kv[1] == cookie_name) {{
+          print parts[1]
+          exit
+        }}
+      }}
+    }}
+  '
+}}
+
 "#,
         deploy_smoke_base_url(server_artifact.listen.as_ref())
     );
@@ -27074,11 +27126,12 @@ done
 "#
         );
     }
-    for route in server_artifact
-        .routes
-        .iter()
-        .filter(|route| route.method == "GET" && !route.path.contains(':'))
-    {
+    for route in server_artifact.routes.iter().filter(|route| {
+        route.method == "GET"
+            && !route.path.contains(':')
+            && !route.path.starts_with("/admin")
+            && route.path != "/account/sessions"
+    }) {
         let _ = writeln!(
             script,
             r#"orv_smoke_curl "GET {}" "$BASE_URL{}""#,
@@ -27092,14 +27145,48 @@ SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
+SMOKE_HEADERS="$(mktemp)"
+SMOKE_MEMBER_HEADERS="$(mktemp)"
+SMOKE_ADMIN_HEADERS="$(mktemp)"
+trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS"' EXIT
 
-orv_smoke_curl "POST /products" -X POST "$BASE_URL/products" -H 'content-type: application/json' --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
-orv_smoke_curl "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}"
-orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
-orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
-orv_smoke_curl "GET /admin/summary" "$BASE_URL/admin/summary"
+orv_smoke_curl "GET / csrf cookie" -D "$SMOKE_HEADERS" "$BASE_URL/"
+CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
+if [ -z "$CSRF_COOKIE" ]; then
+  printf 'orv deploy smoke test failed: missing orv_csrf cookie\n' >&2
+  exit 1
+fi
+CSRF_TOKEN="${CSRF_COOKIE#orv_csrf=}"
+
+orv_smoke_curl "POST /products" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
+orv_smoke_curl "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}"
+orv_smoke_curl "POST /members/login smoke" -D "$SMOKE_MEMBER_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\"}"
+MEMBER_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_MEMBER_HEADERS")"
+if [ -z "$MEMBER_SESSION_COOKIE" ]; then
+  printf 'orv deploy smoke test failed: missing member session cookie\n' >&2
+  exit 1
+fi
+orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
+orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
+orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
+orv_smoke_curl "POST /members/login admin" -D "$SMOKE_ADMIN_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\"}"
+ADMIN_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_ADMIN_HEADERS")"
+ADMIN_ROLE_COOKIE="$(orv_smoke_cookie_from_headers orv_session_role "$SMOKE_ADMIN_HEADERS")"
+if [ -z "$ADMIN_SESSION_COOKIE" ] || [ -z "$ADMIN_ROLE_COOKIE" ]; then
+  printf 'orv deploy smoke test failed: missing admin session cookies\n' >&2
+  exit 1
+fi
 "#,
         );
+        for route in server_artifact.routes.iter().filter(|route| {
+            route.method == "GET" && !route.path.contains(':') && route.path.starts_with("/admin")
+        }) {
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_curl "GET {}" -H "cookie: ${{ADMIN_SESSION_COOKIE}}; ${{ADMIN_ROLE_COOKIE}}" "$BASE_URL{}""#,
+                route.path, route.path
+            );
+        }
     }
     script.push_str("printf 'orv deploy smoke test passed\\n'\n");
     let target = out.join(path);
@@ -28372,6 +28459,10 @@ test "checkout excluded failure" {
         assert!(source.contains("Account Sessions"));
         assert!(source.contains("@a href=\"/admin\" \"Admin dashboard\""));
         assert!(source.contains("@route GET /admin"));
+        assert!(source.contains("@Auth required role=\"admin\""));
+        assert!(source.matches("@Auth required role=\"admin\"").count() >= 8);
+        assert!(source.contains(r#"handle: "admin""#));
+        assert!(source.contains(r#"email: "admin@example.test""#));
         assert!(source.contains("Operations dashboard"));
         assert!(source.contains("@a href=\"/admin/summary\" \"Operations summary\""));
         assert!(source.contains("@route GET /admin/summary"));
@@ -28403,9 +28494,11 @@ test "checkout excluded failure" {
         assert!(source.contains("@route POST /checkout"));
         assert!(source.contains("One-step checkout"));
         assert!(source.contains("@route POST /members"));
+        assert!(source.contains(r#"role: "member""#));
         assert!(source.contains("@form action=\"/members/login\" method=post"));
         assert!(source.contains("@route POST /members/login"));
         assert!(source.contains(r#"shopdb.create("Session""#));
+        assert!(source.contains(r#"role: member.role ?? "member""#));
         assert!(source.contains("@route POST /payments"));
         assert!(source.contains("@route POST /webhooks/stripe"));
         assert!(source.contains(r#"@header["stripe-signature"]"#));
@@ -28492,7 +28585,10 @@ test "checkout excluded failure" {
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
+        assert!(guide.contains("@Auth required role=\"admin\""));
+        assert!(guide.contains("admin@example.test"));
         assert!(guide.contains("orv_session"));
+        assert!(guide.contains("orv_session_role"));
         assert!(guide.contains("HttpOnly"));
         assert!(guide.contains("SameSite=Lax"));
         assert!(guide.contains("Secure"));
@@ -28750,11 +28846,18 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
+        assert!(smoke_test.contains("orv_smoke_cookie_from_headers()"));
         assert!(smoke_test.contains("orv deploy smoke test failed: %s"));
         assert!(smoke_test.contains(r#"READY_PATH="/health""#));
         assert!(smoke_test.contains("for attempt in 1 2 3 4 5"));
         assert!(smoke_test.contains("sleep 1"));
         assert!(smoke_test.contains(r#"orv_smoke_curl "GET /health" "$BASE_URL/health""#));
+        assert!(smoke_test
+            .contains(r#"orv_smoke_curl "GET / csrf cookie" -D "$SMOKE_HEADERS" "$BASE_URL/""#));
+        assert!(smoke_test.contains(
+            "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\""
+        ));
+        assert!(smoke_test.contains(r#"-H "x-csrf-token: ${CSRF_TOKEN}""#));
         assert!(
             smoke_test.contains(r#"orv_smoke_curl "POST /products" -X POST "$BASE_URL/products""#)
         );
@@ -28762,15 +28865,23 @@ test "checkout excluded failure" {
         assert!(
             smoke_test.contains(r#"orv_smoke_curl "POST /members" -X POST "$BASE_URL/members""#)
         );
+        assert!(smoke_test.contains(r#"orv_smoke_curl "POST /members/login smoke""#));
+        assert!(smoke_test.contains("MEMBER_SESSION_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session \"$SMOKE_MEMBER_HEADERS\")\""));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#
+        ));
         assert!(smoke_test.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#));
         assert!(smoke_test
             .contains(r#"orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items""#));
         assert!(
             smoke_test.contains(r#"orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout""#)
         );
-        assert!(
-            smoke_test.contains(r#"orv_smoke_curl "GET /admin/summary" "$BASE_URL/admin/summary""#)
-        );
+        assert!(smoke_test.contains(r#"orv_smoke_curl "POST /members/login admin""#));
+        assert!(smoke_test.contains("ADMIN_SESSION_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session \"$SMOKE_ADMIN_HEADERS\")\""));
+        assert!(smoke_test.contains("ADMIN_ROLE_COOKIE=\"$(orv_smoke_cookie_from_headers orv_session_role \"$SMOKE_ADMIN_HEADERS\")\""));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_curl "GET /admin/summary" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary""#
+        ));
         let runbook =
             std::fs::read_to_string(out.join("deploy").join("README.md")).expect("deploy runbook");
         assert!(runbook.contains("deploy/env.example"));

@@ -5355,6 +5355,42 @@ struct Registration {
         assert!(args.is_empty());
     }
 
+    #[test]
+    fn auth_domain_parses_required_role_policy() {
+        let r = parse_str(
+            r#"
+            @route GET /admin/orders {
+              @Auth required role="admin"
+              @respond 200 { ok: true }
+            }
+            "#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let args = route_args(&r.program.items[0]);
+        let ExprKind::Block(body) = &args[2].kind else {
+            panic!("route body must be block");
+        };
+        assert_eq!(body.stmts.len(), 2);
+        let Stmt::Expr(auth) = &body.stmts[0] else {
+            panic!("expected auth expr");
+        };
+        let ExprKind::Domain { name, args } = &auth.kind else {
+            panic!("expected auth domain");
+        };
+        assert_eq!(name.name, "Auth");
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[0].kind,
+            ExprKind::Assign { target, value }
+                if target.name == "required" && matches!(value.kind, ExprKind::True)
+        ));
+        assert!(matches!(
+            &args[1].kind,
+            ExprKind::Assign { target, value }
+                if target.name == "role" && matches!(value.kind, ExprKind::String(_))
+        ));
+    }
+
     // ── 문자열 보간 ──
 
     fn segments_of(expr: &Expr) -> &[StringSegment] {
