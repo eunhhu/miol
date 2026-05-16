@@ -352,7 +352,7 @@ impl Resolver {
                     self.resolve_expr(elem);
                 }
             }
-            ExprKind::Domain { args, .. } => {
+            ExprKind::Domain { name, args } => {
                 // SPEC §9.3: domain 인자에서 `key=value` 는 property 이다.
                 // property 의 `key` 는 호출 시 도메인 signature 에 매칭될
                 // 이름일 뿐 현재 스코프의 바인딩이 아니므로 resolve 대상이
@@ -361,6 +361,9 @@ impl Resolver {
                 for arg in args {
                     if let ExprKind::Assign { value, .. } = &arg.kind {
                         self.resolve_expr(value);
+                    } else if is_domain_flag_arg(&name.name, arg) {
+                        // Declarative policy flags such as `@rateLimit exempt`
+                        // are syntax-level markers, not variable references.
                     } else {
                         self.resolve_expr(arg);
                     }
@@ -592,6 +595,13 @@ fn is_builtin_name(name: &str) -> bool {
     )
 }
 
+fn is_domain_flag_arg(domain: &str, arg: &Expr) -> bool {
+    matches!(
+        (domain, &arg.kind),
+        ("rateLimit", ExprKind::Ident(ident)) if ident.name == "exempt"
+    )
+}
+
 fn undefined_diagnostic(ident: &Ident) -> Diagnostic {
     Diagnostic::error(format!("undefined variable `{}`", ident.name))
         .with_code("resolve/undefined")
@@ -658,6 +668,12 @@ mod tests {
         assert!(result.diagnostics[0]
             .message
             .contains("undefined variable `ghost`"));
+    }
+
+    #[test]
+    fn rate_limit_exempt_flag_is_not_variable_reference() {
+        let result = resolve_ok("@rateLimit exempt");
+        assert!(result.decls.is_empty());
     }
 
     #[test]

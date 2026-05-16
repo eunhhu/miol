@@ -26,7 +26,7 @@ Beginner-facing code should prefer declarative security domains:
 @route POST /checkout {
   @session required
   @csrf
-  @rateLimit key=@session.userId limit=10 window=1m
+  @rateLimit key=@session.userId limit=10 window="1m"
   @CheckoutPolicy
   @body: CheckoutForm
 

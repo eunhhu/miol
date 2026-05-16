@@ -1287,6 +1287,9 @@ impl<W: Write> Interp<W> {
                 if name == "csrf" && self.request.is_some() {
                     return self.eval_csrf_domain(args);
                 }
+                if name == "rateLimit" && self.request.is_some() {
+                    return self.eval_rate_limit_domain(args);
+                }
                 if name == "Auth" && self.request.is_some() && is_declarative_auth_invocation(args)
                 {
                     return self.eval_auth_domain(args);
@@ -3856,6 +3859,80 @@ impl<W: Write> Interp<W> {
         }
     }
 
+    fn eval_rate_limit_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        let mut key = None;
+        let mut limit = None;
+        let mut window_seconds = None;
+        let mut exempt = false;
+        for arg in args {
+            match &arg.kind {
+                HirExprKind::Ident(ident) if ident.name == "exempt" => exempt = true,
+                HirExprKind::Assign { target, value } if target.name == "exempt" => {
+                    match self.eval(value)? {
+                        Value::Bool(value) => exempt = value,
+                        other => {
+                            return Err(RuntimeError::native(format!(
+                                "`@rateLimit exempt` expects bool, got {other}"
+                            )));
+                        }
+                    }
+                }
+                HirExprKind::Assign { target, value }
+                    if matches!(target.name.as_str(), "limit" | "max") =>
+                {
+                    match self.eval(value)? {
+                        Value::Int(value) if value > 0 => limit = Some(value),
+                        other => {
+                            return Err(RuntimeError::native(format!(
+                                "`@rateLimit limit` expects positive integer, got {other}"
+                            )));
+                        }
+                    }
+                }
+                HirExprKind::Assign { target, value } if target.name == "window" => {
+                    window_seconds = Some(eval_rate_limit_window_seconds(self.eval(value)?)?);
+                }
+                HirExprKind::Assign { target, value } if target.name == "key" => {
+                    key =
+                        Some(rate_limit_key_label(value).unwrap_or_else(|| "dynamic".to_string()));
+                }
+                HirExprKind::Assign { target, .. } => {
+                    return Err(RuntimeError::native(format!(
+                        "`@rateLimit` got unknown policy `{}`",
+                        target.name
+                    )));
+                }
+                _ => {
+                    return Err(RuntimeError::native(
+                        "`@rateLimit` expects `limit=<n> window=<seconds|duration>`, optional `key=...`, or `exempt`",
+                    ));
+                }
+            }
+        }
+        if exempt {
+            return Ok(Value::Object(vec![
+                ("status".to_string(), Value::Str("exempt".to_string())),
+                ("exempt".to_string(), Value::Bool(true)),
+                (
+                    "key".to_string(),
+                    key.map(Value::Str).unwrap_or(Value::Void),
+                ),
+            ]));
+        }
+        let limit = limit.ok_or_else(|| RuntimeError::native("`@rateLimit` missing `limit`"))?;
+        let window_seconds =
+            window_seconds.ok_or_else(|| RuntimeError::native("`@rateLimit` missing `window`"))?;
+        Ok(Value::Object(vec![
+            ("status".to_string(), Value::Str("configured".to_string())),
+            ("limit".to_string(), Value::Int(limit)),
+            ("windowSeconds".to_string(), Value::Int(window_seconds)),
+            (
+                "key".to_string(),
+                key.map(Value::Str).unwrap_or(Value::Void),
+            ),
+        ]))
+    }
+
     fn eval_auth_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
         let policy = self.eval_auth_policy(args)?;
         let session_id = self.session_id_from_cookie();
@@ -4116,6 +4193,62 @@ fn response_headers_object(resp: &ResponseCtx) -> Value {
         ));
     }
     Value::Object(headers)
+}
+
+fn eval_rate_limit_window_seconds(value: Value) -> Result<i64, RuntimeError> {
+    match value {
+        Value::Int(value) if value > 0 => Ok(value),
+        Value::Str(value) => parse_duration_seconds_literal(&value)
+            .map(i64::from)
+            .ok_or_else(|| {
+                RuntimeError::native(
+                    "`@rateLimit window` expects positive seconds or a duration string",
+                )
+            }),
+        other => Err(RuntimeError::native(format!(
+            "`@rateLimit window` expects positive seconds or a duration string, got {other}"
+        ))),
+    }
+}
+
+fn parse_duration_seconds_literal(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let digit_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let (amount, unit) = trimmed.split_at(digit_len);
+    let amount = amount.replace('_', "").parse::<u32>().ok()?;
+    if amount == 0 {
+        return None;
+    }
+    let multiplier = match unit.trim() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        _ => return None,
+    };
+    amount.checked_mul(multiplier)
+}
+
+fn rate_limit_key_label(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::String(_) => string_literal_from_expr(expr),
+        HirExprKind::Ident(ident) => Some(ident.name.clone()),
+        HirExprKind::Domain { name, args, .. } if args.is_empty() => Some(format!("@{name}")),
+        HirExprKind::Field { target, field, .. } => {
+            rate_limit_key_label(target).map(|target| format!("{target}.{field}"))
+        }
+        HirExprKind::OptionalField { target, field, .. } => {
+            rate_limit_key_label(target).map(|target| format!("{target}?.{field}"))
+        }
+        HirExprKind::Paren(expr) => rate_limit_key_label(expr),
+        _ => None,
+    }
 }
 
 #[derive(Default)]

@@ -347,6 +347,12 @@ pub struct ServerRoutePolicyArtifact {
     /// Required role for auth role policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Static rate-limit key expression summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Whether this policy explicitly disables a built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt: Option<bool>,
     /// Request limit for built-in route rate limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -2592,6 +2598,8 @@ pub struct OrvNativeRoutePolicy {
     pub origin_id: Option<&'static str>,
     pub required: Option<bool>,
     pub role: Option<&'static str>,
+    pub key: Option<&'static str>,
+    pub exempt: Option<bool>,
     pub limit: Option<u32>,
     pub window_seconds: Option<u32>,
 }
@@ -7885,11 +7893,13 @@ fn rust_option_u32_literal(value: Option<u32>) -> String {
 
 fn native_route_policy_literal(policy: &ServerRoutePolicyArtifact) -> String {
     format!(
-        "OrvNativeRoutePolicy {{ kind: {}, origin_id: {}, required: {}, role: {}, limit: {}, window_seconds: {} }}",
+        "OrvNativeRoutePolicy {{ kind: {}, origin_id: {}, required: {}, role: {}, key: {}, exempt: {}, limit: {}, window_seconds: {} }}",
         rust_string_literal(&policy.kind),
         rust_option_string_literal(policy.origin_id.as_deref()),
         rust_option_bool_literal(policy.required),
         rust_option_string_literal(policy.role.as_deref()),
+        rust_option_string_literal(policy.key.as_deref()),
+        rust_option_bool_literal(policy.exempt),
         rust_option_u32_literal(policy.limit),
         rust_option_u32_literal(policy.window_seconds),
     )
@@ -11884,8 +11894,35 @@ fn verify_route_policy_artifact(
                     route.method, route.path, policy.kind
                 ));
             }
+            if policy.key.is_some()
+                || policy.exempt.is_some()
+                || policy.limit.is_some()
+                || policy.window_seconds.is_some()
+            {
+                errors.push(format!(
+                    "route {} {} {} policy must not set rate-limit fields",
+                    route.method, route.path, policy.kind
+                ));
+            }
         }
         "rate_limit" => {
+            if (policy.key.is_some() || policy.exempt.is_some())
+                && policy.origin_id.as_deref().is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "route {} {} explicit rate_limit policy has empty origin id",
+                    route.method, route.path
+                ));
+            }
+            if policy.exempt == Some(true) {
+                if policy.limit.is_some() || policy.window_seconds.is_some() {
+                    errors.push(format!(
+                        "route {} {} rate_limit exempt policy must not set limit/window_seconds",
+                        route.method, route.path
+                    ));
+                }
+                return;
+            }
             if policy.limit.unwrap_or_default() == 0 {
                 errors.push(format!(
                     "route {} {} rate_limit policy must have a positive limit",
@@ -11895,6 +11932,12 @@ fn verify_route_policy_artifact(
             if policy.window_seconds.unwrap_or_default() == 0 {
                 errors.push(format!(
                     "route {} {} rate_limit policy must have a positive window_seconds",
+                    route.method, route.path
+                ));
+            }
+            if policy.required.is_some() || policy.role.is_some() {
+                errors.push(format!(
+                    "route {} {} rate_limit policy must not set auth fields",
                     route.method, route.path
                 ));
             }
@@ -12035,13 +12078,19 @@ fn collect_expr_policy_artifacts(
         } => {
             let name = format!("{method} {path}");
             let route_origin = origin_id("route", &name, expr.span);
-            let defaults = default_route_policy_artifacts(method, path);
-            if !defaults.is_empty() {
-                out.entry(route_origin.clone())
-                    .or_default()
-                    .extend(defaults);
-            }
             collect_block_policy_artifacts(handler, Some(&route_origin), out);
+            if !out
+                .get(&route_origin)
+                .is_some_and(|policies| policies.iter().any(|policy| policy.kind == "rate_limit"))
+            {
+                let defaults = default_route_policy_artifacts(method, path);
+                if !defaults.is_empty() {
+                    let policies = out.entry(route_origin).or_default();
+                    for policy in defaults.into_iter().rev() {
+                        policies.insert(0, policy);
+                    }
+                }
+            }
         }
         HirExprKind::Domain { name, args, .. } => {
             if let Some(route_origin_id) = route_origin_id {
@@ -12226,6 +12275,8 @@ fn route_policy_artifact_from_domain(
             origin_id,
             required: Some(true),
             role: None,
+            key: None,
+            exempt: None,
             limit: None,
             window_seconds: None,
         }),
@@ -12234,6 +12285,8 @@ fn route_policy_artifact_from_domain(
             origin_id,
             required: Some(true),
             role: None,
+            key: None,
+            exempt: None,
             limit: None,
             window_seconds: None,
         }),
@@ -12245,6 +12298,8 @@ fn route_policy_artifact_from_domain(
                     origin_id,
                     required: Some(true),
                     role,
+                    key: None,
+                    exempt: None,
                     limit: None,
                     window_seconds: None,
                 })
@@ -12252,8 +12307,63 @@ fn route_policy_artifact_from_domain(
                 None
             }
         }
+        "rateLimit" => rate_limit_policy_artifact(origin_id, args),
         _ => None,
     }
+}
+
+fn rate_limit_policy_artifact(
+    origin_id: Option<String>,
+    args: &[HirExpr],
+) -> Option<ServerRoutePolicyArtifact> {
+    let mut key = None;
+    let mut exempt = false;
+    let mut limit = None;
+    let mut window_seconds = None;
+    for arg in args {
+        match &arg.kind {
+            HirExprKind::Ident(ident) if ident.name == "exempt" => {
+                exempt = true;
+            }
+            HirExprKind::Assign { target, value } if target.name == "exempt" => {
+                exempt = static_bool(value).unwrap_or(false);
+            }
+            HirExprKind::Assign { target, value }
+                if matches!(target.name.as_str(), "limit" | "max") =>
+            {
+                limit = static_positive_u32(value);
+            }
+            HirExprKind::Assign { target, value } if target.name == "window" => {
+                window_seconds = static_duration_seconds(value);
+            }
+            HirExprKind::Assign { target, value } if target.name == "key" => {
+                key = static_rate_limit_key(value);
+            }
+            _ => {}
+        }
+    }
+    if exempt {
+        return Some(ServerRoutePolicyArtifact {
+            kind: "rate_limit".to_string(),
+            origin_id,
+            required: None,
+            role: None,
+            key,
+            exempt: Some(true),
+            limit: None,
+            window_seconds: None,
+        });
+    }
+    Some(ServerRoutePolicyArtifact {
+        kind: "rate_limit".to_string(),
+        origin_id,
+        required: None,
+        role: None,
+        key,
+        exempt: None,
+        limit,
+        window_seconds,
+    })
 }
 
 fn default_route_policy_artifacts(method: &str, path: &str) -> Vec<ServerRoutePolicyArtifact> {
@@ -12265,9 +12375,61 @@ fn default_route_policy_artifacts(method: &str, path: &str) -> Vec<ServerRoutePo
         origin_id: None,
         required: None,
         role: None,
+        key: None,
+        exempt: None,
         limit: Some(limit),
         window_seconds: Some(window_seconds),
     }]
+}
+
+fn static_positive_u32(expr: &HirExpr) -> Option<u32> {
+    static_integer(expr).and_then(|value| u32::try_from(value).ok().filter(|value| *value > 0))
+}
+
+fn static_duration_seconds(expr: &HirExpr) -> Option<u32> {
+    static_positive_u32(expr).or_else(|| {
+        static_string_literal(expr).and_then(|value| parse_duration_seconds_literal(&value))
+    })
+}
+
+fn parse_duration_seconds_literal(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let digit_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let (amount, unit) = trimmed.split_at(digit_len);
+    let amount = amount.replace('_', "").parse::<u32>().ok()?;
+    if amount == 0 {
+        return None;
+    }
+    let multiplier = match unit.trim() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        _ => return None,
+    };
+    amount.checked_mul(multiplier)
+}
+
+fn static_rate_limit_key(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::String(_) => static_string_literal(expr),
+        HirExprKind::Ident(ident) => Some(ident.name.clone()),
+        HirExprKind::Domain { name, args, .. } if args.is_empty() => Some(format!("@{name}")),
+        HirExprKind::Field { target, field, .. } => {
+            static_rate_limit_key(target).map(|target| format!("{target}.{field}"))
+        }
+        HirExprKind::OptionalField { target, field, .. } => {
+            static_rate_limit_key(target).map(|target| format!("{target}?.{field}"))
+        }
+        HirExprKind::Paren(expr) => static_rate_limit_key(expr),
+        _ => None,
+    }
 }
 
 fn default_route_rate_limit(method: &str, path: &str) -> Option<(u32, u32)> {
@@ -12657,6 +12819,9 @@ fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usi
             }
             ("domain", "Auth") => {
                 features.insert("auth_roles");
+            }
+            ("domain", "rateLimit") => {
+                features.insert("rate_limit");
             }
             _ => {}
         }
@@ -13822,6 +13987,76 @@ function greet(name: string): string -> "hi {name}""#,
         }));
 
         verify_server_runtime_artifact(&artifact).expect("policy artifact verifies");
+    }
+
+    #[test]
+    fn server_runtime_artifact_records_explicit_rate_limit_policy() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /limited {
+    @rateLimit key=@body.memberId limit=2 window="1m"
+    @respond 201 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let route = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/limited")
+            .expect("limited route");
+
+        assert!(artifact
+            .runtime_features
+            .contains(&"rate_limit".to_string()));
+        assert_eq!(route.policies.len(), 1);
+        let policy = &route.policies[0];
+        assert_eq!(policy.kind, "rate_limit");
+        assert!(policy
+            .origin_id
+            .as_deref()
+            .is_some_and(|origin_id| origin_id.starts_with("ori_")));
+        assert_eq!(policy.key.as_deref(), Some("@body.memberId"));
+        assert_eq!(policy.limit, Some(2));
+        assert_eq!(policy.window_seconds, Some(60));
+        assert_eq!(policy.exempt, None);
+        verify_server_runtime_artifact(&artifact).expect("rate-limit policy verifies");
+    }
+
+    #[test]
+    fn server_runtime_artifact_records_rate_limit_exemption_without_default() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /checkout {
+    @rateLimit exempt
+    @respond 201 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let route = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/checkout")
+            .expect("checkout route");
+
+        assert_eq!(route.policies.len(), 1);
+        let policy = &route.policies[0];
+        assert_eq!(policy.kind, "rate_limit");
+        assert!(policy
+            .origin_id
+            .as_deref()
+            .is_some_and(|origin_id| origin_id.starts_with("ori_")));
+        assert_eq!(policy.exempt, Some(true));
+        assert_eq!(policy.limit, None);
+        assert_eq!(policy.window_seconds, None);
+        verify_server_runtime_artifact(&artifact).expect("exempt policy verifies");
     }
 
     #[test]
@@ -19957,6 +20192,31 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(source.contains("required: Some(true)"));
         assert!(source.contains("kind: \"rate_limit\""));
         assert!(source.contains("limit: Some(10)"));
+        assert!(source.contains("window_seconds: Some(60)"));
+    }
+
+    #[test]
+    fn native_server_routes_source_declares_explicit_rate_limit_policy_fields() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /limited {
+    @rateLimit key=@body.memberId limit=2 window="1m"
+    @respond 201 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+
+        assert!(source.contains("pub struct OrvNativeRoutePolicy"));
+        assert!(source.contains("kind: \"rate_limit\""));
+        assert!(source.contains("origin_id: Some(\"ori_"));
+        assert!(source.contains("key: Some(\"@body.memberId\")"));
+        assert!(source.contains("exempt: None"));
+        assert!(source.contains("limit: Some(2)"));
         assert!(source.contains("window_seconds: Some(60)"));
     }
 

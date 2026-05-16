@@ -38,7 +38,10 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use orv_hir::{origin_id, HirExpr, HirExprKind, HirProgram, HirStmt, NameId};
+use orv_hir::{
+    origin_id, HirBlock, HirExpr, HirExprKind, HirProgram, HirStmt, HirStringSegment, NameId,
+    UnaryOp,
+};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -76,6 +79,7 @@ struct RouteEntry {
     path: String,
     handler: HirExpr,
     origin_id: String,
+    rate_limit: Option<RateLimitPolicy>,
 }
 
 /// Route table shared only inside a tokio current-thread server loop.
@@ -280,10 +284,16 @@ impl RateLimitState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RateLimitPolicy {
     limit: usize,
     window: Duration,
+    key: Option<String>,
+}
+
+enum RouteRateLimitPolicy {
+    Apply(RateLimitPolicy),
+    Exempt,
 }
 
 fn default_rate_limit_policy(method: &str, path: &str) -> Option<RateLimitPolicy> {
@@ -291,13 +301,452 @@ fn default_rate_limit_policy(method: &str, path: &str) -> Option<RateLimitPolicy
         ("POST", "/members/login" | "/checkout") => Some(RateLimitPolicy {
             limit: 10,
             window: RATE_LIMIT_WINDOW,
+            key: None,
         }),
         ("POST", "/webhooks/stripe") => Some(RateLimitPolicy {
             limit: 60,
             window: RATE_LIMIT_WINDOW,
+            key: None,
         }),
         _ => None,
     }
+}
+
+fn route_rate_limit_policy(
+    method: &str,
+    path: &str,
+    handler: &HirBlock,
+) -> Result<Option<RateLimitPolicy>, RuntimeError> {
+    match find_route_rate_limit_policy(handler)? {
+        Some(RouteRateLimitPolicy::Apply(policy)) => Ok(Some(policy)),
+        Some(RouteRateLimitPolicy::Exempt) => Ok(None),
+        None => Ok(default_rate_limit_policy(method, path)),
+    }
+}
+
+fn find_route_rate_limit_policy(
+    block: &HirBlock,
+) -> Result<Option<RouteRateLimitPolicy>, RuntimeError> {
+    for stmt in &block.stmts {
+        if let Some(policy) = find_stmt_rate_limit_policy(stmt)? {
+            return Ok(Some(policy));
+        }
+    }
+    Ok(None)
+}
+
+fn find_stmt_rate_limit_policy(
+    stmt: &HirStmt,
+) -> Result<Option<RouteRateLimitPolicy>, RuntimeError> {
+    match stmt {
+        HirStmt::Let(stmt) => find_expr_rate_limit_policy(&stmt.init),
+        HirStmt::Const(stmt) => find_expr_rate_limit_policy(&stmt.init),
+        HirStmt::Function(stmt) => match &stmt.body {
+            orv_hir::HirFunctionBody::Block(block) => find_route_rate_limit_policy(block),
+            orv_hir::HirFunctionBody::Expr(expr) => find_expr_rate_limit_policy(expr),
+        },
+        HirStmt::Return(stmt) => stmt
+            .value
+            .as_ref()
+            .map_or(Ok(None), find_expr_rate_limit_policy),
+        HirStmt::Expr(expr) => find_expr_rate_limit_policy(expr),
+        HirStmt::Struct(_) | HirStmt::Enum(_) | HirStmt::TypeAlias(_) | HirStmt::Import(_) => {
+            Ok(None)
+        }
+    }
+}
+
+fn find_expr_rate_limit_policy(
+    expr: &HirExpr,
+) -> Result<Option<RouteRateLimitPolicy>, RuntimeError> {
+    match &expr.kind {
+        HirExprKind::Domain { name, args, .. } if name == "rateLimit" => {
+            parse_rate_limit_policy(args).map(Some)
+        }
+        HirExprKind::Domain { args, .. } => {
+            for arg in args {
+                if let Some(policy) = find_expr_rate_limit_policy(arg)? {
+                    return Ok(Some(policy));
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::Block(block) | HirExprKind::Html(block) => find_route_rate_limit_policy(block),
+        HirExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => find_expr_rate_limit_policy(cond)?.map_or_else(
+            || {
+                find_route_rate_limit_policy(then)?.map_or_else(
+                    || {
+                        else_branch
+                            .as_ref()
+                            .map_or(Ok(None), |expr| find_expr_rate_limit_policy(expr))
+                    },
+                    |policy| Ok(Some(policy)),
+                )
+            },
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::When { scrutinee, arms } => {
+            if let Some(policy) = find_expr_rate_limit_policy(scrutinee)? {
+                return Ok(Some(policy));
+            }
+            for arm in arms {
+                if let Some(policy) = find_expr_rate_limit_policy(&arm.body)? {
+                    return Ok(Some(policy));
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::For { iter, body, .. } => find_expr_rate_limit_policy(iter)?.map_or_else(
+            || find_route_rate_limit_policy(body),
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::While { cond, body } => find_expr_rate_limit_policy(cond)?.map_or_else(
+            || find_route_rate_limit_policy(body),
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::Try { try_block, catch } => find_route_rate_limit_policy(try_block)?
+            .map_or_else(
+                || {
+                    catch
+                        .as_ref()
+                        .map_or(Ok(None), |catch| find_route_rate_limit_policy(&catch.body))
+                },
+                |policy| Ok(Some(policy)),
+            ),
+        HirExprKind::Paren(expr)
+        | HirExprKind::Out(expr)
+        | HirExprKind::Throw(expr)
+        | HirExprKind::Await(expr)
+        | HirExprKind::Cast { expr, .. } => find_expr_rate_limit_policy(expr),
+        HirExprKind::Unary { expr, .. } => find_expr_rate_limit_policy(expr),
+        HirExprKind::Binary { lhs, rhs, .. } => find_expr_rate_limit_policy(lhs)?.map_or_else(
+            || find_expr_rate_limit_policy(rhs),
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::Assign { value, .. } | HirExprKind::AssignField { value, .. } => {
+            find_expr_rate_limit_policy(value)
+        }
+        HirExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => find_expr_rate_limit_policy(object)?.map_or_else(
+            || {
+                find_expr_rate_limit_policy(index)?.map_or_else(
+                    || find_expr_rate_limit_policy(value),
+                    |policy| Ok(Some(policy)),
+                )
+            },
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::Call { callee, args } => find_expr_rate_limit_policy(callee)?.map_or_else(
+            || {
+                for arg in args {
+                    if let Some(policy) = find_expr_rate_limit_policy(arg)? {
+                        return Ok(Some(policy));
+                    }
+                }
+                Ok(None)
+            },
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
+            for item in items {
+                if let Some(policy) = find_expr_rate_limit_policy(item)? {
+                    return Ok(Some(policy));
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                if let Some(policy) = find_expr_rate_limit_policy(&field.value)? {
+                    return Ok(Some(policy));
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::Index { target, index } => find_expr_rate_limit_policy(target)?.map_or_else(
+            || find_expr_rate_limit_policy(index),
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::Slice { target, start, end } => {
+            if let Some(policy) = find_expr_rate_limit_policy(target)? {
+                return Ok(Some(policy));
+            }
+            if let Some(start) = start {
+                if let Some(policy) = find_expr_rate_limit_policy(start)? {
+                    return Ok(Some(policy));
+                }
+            }
+            end.as_ref()
+                .map_or(Ok(None), |end| find_expr_rate_limit_policy(end))
+        }
+        HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
+            find_expr_rate_limit_policy(target)
+        }
+        HirExprKind::Lambda { body, .. } => match body.as_ref() {
+            orv_hir::HirFunctionBody::Block(block) => find_route_rate_limit_policy(block),
+            orv_hir::HirFunctionBody::Expr(expr) => find_expr_rate_limit_policy(expr),
+        },
+        HirExprKind::Range { start, end, .. } => find_expr_rate_limit_policy(start)?.map_or_else(
+            || find_expr_rate_limit_policy(end),
+            |policy| Ok(Some(policy)),
+        ),
+        HirExprKind::String(segments) => {
+            for segment in segments {
+                if let HirStringSegment::Interp(expr) = segment {
+                    if let Some(policy) = find_expr_rate_limit_policy(expr)? {
+                        return Ok(Some(policy));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::Server { routes, .. } => {
+            for route in routes {
+                if let Some(policy) = find_expr_rate_limit_policy(route)? {
+                    return Ok(Some(policy));
+                }
+            }
+            Ok(None)
+        }
+        HirExprKind::Route { handler, .. } => find_route_rate_limit_policy(handler),
+        HirExprKind::Integer(_)
+        | HirExprKind::Float(_)
+        | HirExprKind::Regex { .. }
+        | HirExprKind::True
+        | HirExprKind::False
+        | HirExprKind::Void
+        | HirExprKind::TypeName(_)
+        | HirExprKind::Ident(_)
+        | HirExprKind::Respond { .. }
+        | HirExprKind::Break
+        | HirExprKind::Continue => Ok(None),
+    }
+}
+
+fn parse_rate_limit_policy(args: &[HirExpr]) -> Result<RouteRateLimitPolicy, RuntimeError> {
+    let mut key = None;
+    let mut limit = None;
+    let mut window = None;
+    let mut exempt = false;
+    for arg in args {
+        match &arg.kind {
+            HirExprKind::Ident(ident) if ident.name == "exempt" => exempt = true,
+            HirExprKind::Assign { target, value } if target.name == "exempt" => {
+                exempt = static_bool(value).ok_or_else(|| {
+                    RuntimeError::native("`@rateLimit exempt` expects a static bool")
+                })?;
+            }
+            HirExprKind::Assign { target, value }
+                if matches!(target.name.as_str(), "limit" | "max") =>
+            {
+                limit = Some(static_positive_usize(value).ok_or_else(|| {
+                    RuntimeError::native("`@rateLimit limit` expects a positive static integer")
+                })?);
+            }
+            HirExprKind::Assign { target, value } if target.name == "window" => {
+                window = Some(static_rate_limit_window(value).ok_or_else(|| {
+                    RuntimeError::native(
+                        "`@rateLimit window` expects positive seconds or a duration string",
+                    )
+                })?);
+            }
+            HirExprKind::Assign { target, value } if target.name == "key" => {
+                key = Some(static_rate_limit_key(value).ok_or_else(|| {
+                    RuntimeError::native("`@rateLimit key` expects a static request key expression")
+                })?);
+            }
+            _ => {
+                return Err(RuntimeError::native(
+                    "`@rateLimit` expects `limit=<n> window=<seconds|duration>`, optional `key=...`, or `exempt`",
+                ));
+            }
+        }
+    }
+    if exempt {
+        return Ok(RouteRateLimitPolicy::Exempt);
+    }
+    Ok(RouteRateLimitPolicy::Apply(RateLimitPolicy {
+        limit: limit.ok_or_else(|| RuntimeError::native("`@rateLimit` missing `limit`"))?,
+        window: window.ok_or_else(|| RuntimeError::native("`@rateLimit` missing `window`"))?,
+        key,
+    }))
+}
+
+fn static_positive_usize(expr: &HirExpr) -> Option<usize> {
+    static_integer(expr).and_then(|value| usize::try_from(value).ok().filter(|value| *value > 0))
+}
+
+fn static_integer(expr: &HirExpr) -> Option<i64> {
+    match &expr.kind {
+        HirExprKind::Integer(value) => value.replace('_', "").parse::<i64>().ok(),
+        HirExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => static_integer(expr).map(|value| -value),
+        HirExprKind::Paren(expr) => static_integer(expr),
+        _ => None,
+    }
+}
+
+fn static_bool(expr: &HirExpr) -> Option<bool> {
+    match &expr.kind {
+        HirExprKind::True => Some(true),
+        HirExprKind::False => Some(false),
+        HirExprKind::Paren(expr) => static_bool(expr),
+        _ => None,
+    }
+}
+
+fn static_string(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::String(segments) => {
+            let mut out = String::new();
+            for segment in segments {
+                match segment {
+                    HirStringSegment::Str(value) => out.push_str(value),
+                    HirStringSegment::Interp(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        HirExprKind::Paren(expr) => static_string(expr),
+        _ => None,
+    }
+}
+
+fn static_rate_limit_window(expr: &HirExpr) -> Option<Duration> {
+    static_positive_usize(expr)
+        .map(|seconds| Duration::from_secs(seconds as u64))
+        .or_else(|| static_string(expr).and_then(|value| parse_duration_literal(&value)))
+}
+
+fn parse_duration_literal(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let digit_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let (amount, unit) = trimmed.split_at(digit_len);
+    let amount = amount.replace('_', "").parse::<u64>().ok()?;
+    if amount == 0 {
+        return None;
+    }
+    let multiplier = match unit.trim() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        _ => return None,
+    };
+    amount.checked_mul(multiplier).map(Duration::from_secs)
+}
+
+fn static_rate_limit_key(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::String(_) => static_string(expr),
+        HirExprKind::Ident(ident) => Some(ident.name.clone()),
+        HirExprKind::Domain { name, args, .. } if args.is_empty() => Some(format!("@{name}")),
+        HirExprKind::Field { target, field, .. } => {
+            static_rate_limit_key(target).map(|target| format!("{target}.{field}"))
+        }
+        HirExprKind::OptionalField { target, field, .. } => {
+            static_rate_limit_key(target).map(|target| format!("{target}?.{field}"))
+        }
+        HirExprKind::Paren(expr) => static_rate_limit_key(expr),
+        _ => None,
+    }
+}
+
+fn rate_limit_bucket_key(
+    method: &str,
+    path: &str,
+    policy_key: Option<&str>,
+    client_ip: &str,
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    body: &Value,
+) -> String {
+    let discriminator = policy_key
+        .and_then(|key| rate_limit_key_value(key, headers, query, body))
+        .unwrap_or_else(|| format!("ip:{client_ip}"));
+    format!("{method}:{path}:{discriminator}")
+}
+
+fn rate_limit_key_value(
+    key: &str,
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    body: &Value,
+) -> Option<String> {
+    match key {
+        "@session.id" | "@session.userId" => {
+            cookie_value_from_headers(headers, ORV_SESSION_COOKIE_NAME)
+                .map(|value| format!("session:{value}"))
+        }
+        "@session.role" => cookie_value_from_headers(headers, ORV_SESSION_ROLE_COOKIE_NAME)
+            .map(|value| format!("session-role:{value}")),
+        _ => key
+            .strip_prefix("@body.")
+            .and_then(|field| value_object_field_string(body, field))
+            .map(|value| format!("body:{value}"))
+            .or_else(|| {
+                key.strip_prefix("@query.")
+                    .and_then(|field| query.get(field).filter(|value| !value.is_empty()).cloned())
+                    .map(|value| format!("query:{value}"))
+            })
+            .or_else(|| {
+                key.strip_prefix("@header.")
+                    .and_then(|field| header_value_case_insensitive(headers, field))
+                    .map(|value| format!("header:{value}"))
+            })
+            .or_else(|| (!key.is_empty()).then(|| format!("static:{key}"))),
+    }
+}
+
+fn cookie_value_from_headers(
+    headers: &HashMap<String, String>,
+    cookie_name: &str,
+) -> Option<String> {
+    let cookie_header = header_value_case_insensitive(headers, "cookie")?;
+    cookie_header.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        let value = value.trim();
+        (name.trim() == cookie_name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn header_value_case_insensitive(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    headers.iter().find_map(|(header, value)| {
+        (header.eq_ignore_ascii_case(name) && !value.is_empty()).then(|| value.clone())
+    })
+}
+
+fn value_object_field_string(value: &Value, name: &str) -> Option<String> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    fields.iter().find_map(|(field, value)| {
+        if field != name {
+            return None;
+        }
+        match value {
+            Value::Str(value) if !value.is_empty() => Some(value.clone()),
+            Value::Int(value) => Some(value.to_string()),
+            Value::Float(value) if value.is_finite() => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        }
+    })
 }
 
 /// Captured metadata for one HTTP request handled by an attached runtime.
@@ -830,6 +1279,7 @@ fn collect_routes(routes: &[HirExpr]) -> Result<Vec<RouteEntry>, RuntimeError> {
             path: path.clone(),
             handler: handler_expr,
             origin_id: origin_id("route", &format!("{method} {path}"), expr.span),
+            rate_limit: route_rate_limit_policy(method, path, handler)?,
         });
     }
     Ok(out)
@@ -1019,9 +1469,17 @@ async fn handle_request(
         return response;
     };
 
-    if let Some(policy) = default_rate_limit_policy(&entry.method, &entry.path) {
-        let key = format!("{}:{}:{client_ip}", entry.method, entry.path);
-        if !rate_limits.check(&key, policy.limit, policy.window) {
+    if let Some(policy) = &entry.rate_limit {
+        let bucket = rate_limit_bucket_key(
+            &entry.method,
+            &entry.path,
+            policy.key.as_deref(),
+            &client_ip,
+            &headers,
+            &query,
+            &body_value,
+        );
+        if !rate_limits.check(&bucket, policy.limit, policy.window) {
             let response = plain_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too Many Requests: route rate limit exceeded".into(),
@@ -2742,6 +3200,148 @@ mod tests {
             assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
             let body = String::from_utf8(body).expect("rate-limit body utf8");
             assert!(body.contains("rate limit exceeded"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_route_rate_limit_overrides_default_policy() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /checkout {
+                        @rateLimit limit=2 window=60
+                        @respond 200 { ok: true }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            for _ in 0..2 {
+                let (status, _, _) =
+                    send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+                assert_eq!(status, 200);
+            }
+            let (status, _, body) =
+                send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+            assert_eq!(status, 429);
+            assert!(String::from_utf8(body)
+                .expect("rate-limit body utf8")
+                .contains("rate limit exceeded"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn checkout_route_rate_limit_can_be_exempted() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /checkout {
+                        @rateLimit exempt
+                        @respond 200 { ok: true }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            for _ in 0..12 {
+                let (status, _, _) =
+                    send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+                assert_eq!(status, 200);
+            }
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_route_rate_limit_can_use_body_key() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /limited {
+                        @rateLimit key=@body.memberId limit=1 window=60
+                        @respond 200 { ok: true }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, _) = send_request(
+                addr,
+                "POST",
+                "/limited",
+                Some(r#"{"memberId":"alice"}"#.into()),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let (status, _, _) = send_request(
+                addr,
+                "POST",
+                "/limited",
+                Some(r#"{"memberId":"bob"}"#.into()),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let (status, _, body) = send_request(
+                addr,
+                "POST",
+                "/limited",
+                Some(r#"{"memberId":"alice"}"#.into()),
+            )
+            .await;
+            assert_eq!(status, 429);
+            assert!(String::from_utf8(body)
+                .expect("rate-limit body utf8")
+                .contains("rate limit exceeded"));
 
             handle.abort();
         })

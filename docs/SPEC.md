@@ -2094,14 +2094,14 @@ App Authoring Surface에서는 직접 bearer token을 자르는 대신 안전한
 @route GET /admin/orders {
   @Auth required role="admin"
   @session
-  @rateLimit key=@session.userId limit=60 window=1m
+  @rateLimit key=@session.userId limit=60 window="1m"
   @respond 200 await @db.find Order
 }
 
 @route POST /checkout {
   @session required
   @csrf
-  @rateLimit key=@session.userId limit=10 window=1m
+  @rateLimit key=@session.userId limit=10 window="1m"
   @body: CheckoutForm
   @respond 200 await checkout(@body)
 }
