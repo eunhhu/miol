@@ -73,7 +73,7 @@ pub struct LowerResult {
 
 struct Lowerer<'a> {
     resolved: &'a ResolveResult,
-    /// NameId → 이 바인딩의 타입. let/const/param 선언 시점에 채운다.
+    /// `NameId` → 이 바인딩의 타입. let/const/param 선언 시점에 채운다.
     /// 참조 사이트에서 `Ident` 타입 추론에 사용.
     name_types: RefCell<HashMap<NameId, hir::Type>>,
     /// 타입 별칭 스코프. 가장 안쪽 스코프가 뒤에 온다.
@@ -86,7 +86,7 @@ struct Lowerer<'a> {
     diagnostics: RefCell<Vec<Diagnostic>>,
 }
 
-impl<'a> Lowerer<'a> {
+impl Lowerer<'_> {
     fn function_type_parts(&self, f: &ast::FunctionStmt) -> (Vec<hir::Type>, hir::Type) {
         let param_tys = f
             .params
@@ -204,6 +204,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    #[allow(clippy::self_only_used_in_recursion)]
     fn ty_ref(&self, t: &ast::TypeRef) -> hir::HirTypeRef {
         hir::HirTypeRef {
             span: t.span,
@@ -245,22 +246,19 @@ impl<'a> Lowerer<'a> {
         let constraints = lower_type_ref_constraints(t);
         let kind = match &t.kind {
             ast::TypeRefKind::Named(id) => {
-                if alias_stack.iter().any(|seen| seen == &id.name) {
-                    hir::HirTypeRefKind::Named(id.name.clone())
-                } else if let Some(alias) = self.lookup_type_alias(&id.name) {
-                    if alias.params.is_empty() {
-                        alias_stack.push(id.name.clone());
-                        let mut expanded = self.expanded_ty_ref_inner(&alias.ty, alias_stack);
-                        alias_stack.pop();
-                        expanded.constraints.extend(constraints);
-                        expanded.span = t.span;
-                        return expanded;
-                    } else {
-                        hir::HirTypeRefKind::Named(id.name.clone())
+                if !alias_stack.iter().any(|seen| seen == &id.name) {
+                    if let Some(alias) = self.lookup_type_alias(&id.name) {
+                        if alias.params.is_empty() {
+                            alias_stack.push(id.name.clone());
+                            let mut expanded = self.expanded_ty_ref_inner(&alias.ty, alias_stack);
+                            alias_stack.pop();
+                            expanded.constraints.extend(constraints);
+                            expanded.span = t.span;
+                            return expanded;
+                        }
                     }
-                } else {
-                    hir::HirTypeRefKind::Named(id.name.clone())
                 }
+                hir::HirTypeRefKind::Named(id.name.clone())
             }
             ast::TypeRefKind::Nullable(inner) => hir::HirTypeRefKind::Nullable(Box::new(
                 self.expanded_ty_ref_inner(inner, alias_stack),
@@ -380,6 +378,7 @@ impl<'a> Lowerer<'a> {
 
     /// 표현식 모양에서 타입을 단방향 추론한다. MVP 수준 — 리터럴/이항연산/
     /// array literal/식별자 참조만 정확히, 나머지는 `Unknown` 으로 폴백.
+    #[allow(clippy::too_many_lines)]
     fn infer_type(&self, expr: &ast::Expr) -> hir::Type {
         match &expr.kind {
             ast::ExprKind::Integer(_) => hir::Type::Int,
@@ -415,12 +414,18 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.infer_type(lhs);
                 let r = self.infer_type(rhs);
-                use ast::BinaryOp::*;
                 match op {
                     // 비교/논리 연산은 Bool.
-                    Eq | Ne | Lt | Gt | Le | Ge | And | Or => hir::Type::Bool,
+                    ast::BinaryOp::Eq
+                    | ast::BinaryOp::Ne
+                    | ast::BinaryOp::Lt
+                    | ast::BinaryOp::Gt
+                    | ast::BinaryOp::Le
+                    | ast::BinaryOp::Ge
+                    | ast::BinaryOp::And
+                    | ast::BinaryOp::Or => hir::Type::Bool,
                     // 수치 연산: 두 피연산자 같은 수치 타입이면 유지, 아니면 Unknown.
-                    Add => {
+                    ast::BinaryOp::Add => {
                         if matches!(l, hir::Type::String) && matches!(r, hir::Type::String) {
                             hir::Type::String
                         } else if matches!(l, hir::Type::Int) && matches!(r, hir::Type::Int) {
@@ -431,7 +436,11 @@ impl<'a> Lowerer<'a> {
                             hir::Type::Unknown
                         }
                     }
-                    Sub | Mul | Div | Rem | Pow => {
+                    ast::BinaryOp::Sub
+                    | ast::BinaryOp::Mul
+                    | ast::BinaryOp::Div
+                    | ast::BinaryOp::Rem
+                    | ast::BinaryOp::Pow => {
                         if matches!(l, hir::Type::Int) && matches!(r, hir::Type::Int) {
                             hir::Type::Int
                         } else if matches!(l, hir::Type::Float) && matches!(r, hir::Type::Float) {
@@ -441,9 +450,13 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                     // 비트/시프트 → 수치.
-                    BitAnd | BitOr | BitXor | Shl | Shr => l,
+                    ast::BinaryOp::BitAnd
+                    | ast::BinaryOp::BitOr
+                    | ast::BinaryOp::BitXor
+                    | ast::BinaryOp::Shl
+                    | ast::BinaryOp::Shr => l,
                     // `??` — LHS 가 nullable 이면 벗겨진 타입, 아니면 LHS.
-                    Coalesce => match l {
+                    ast::BinaryOp::Coalesce => match l {
                         hir::Type::Nullable(inner) => *inner,
                         other => other,
                     },
@@ -452,17 +465,17 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Array(items) => {
                 let mut iter = items.iter().map(|e| self.infer_type(e));
                 let first = iter.next();
-                match first {
-                    None => hir::Type::Array(Box::new(hir::Type::Unknown)),
-                    Some(t0) => {
+                first.map_or_else(
+                    || hir::Type::Array(Box::new(hir::Type::Unknown)),
+                    |t0| {
                         let uniform = iter.all(|t| t == t0 || matches!(t, hir::Type::Unknown));
                         if uniform {
                             hir::Type::Array(Box::new(t0))
                         } else {
                             hir::Type::Array(Box::new(hir::Type::Unknown))
                         }
-                    }
-                }
+                    },
+                )
             }
             ast::ExprKind::Tuple(elems) => {
                 hir::Type::Tuple(elems.iter().map(|e| self.infer_type(e)).collect())
@@ -489,16 +502,7 @@ impl<'a> Lowerer<'a> {
                         ast::ExprKind::Ident(i) => i.name.clone(),
                         _ => "<anonymous>".to_string(),
                     };
-                    if args.len() != params.len() {
-                        self.diagnostics.borrow_mut().push(
-                            Diagnostic::error(format!(
-                                "`{fname}` expects {} argument(s), got {}",
-                                params.len(),
-                                args.len()
-                            ))
-                            .with_primary(callee.span, ""),
-                        );
-                    } else {
+                    if args.len() == params.len() {
                         for (i, (arg, ptype)) in args.iter().zip(params.iter()).enumerate() {
                             let aty = self.infer_type(arg);
                             if !self.is_assignable(ptype, &aty) {
@@ -521,6 +525,15 @@ impl<'a> Lowerer<'a> {
                                     .push(Diagnostic::error(msg).with_primary(arg.span, ""));
                             }
                         }
+                    } else {
+                        self.diagnostics.borrow_mut().push(
+                            Diagnostic::error(format!(
+                                "`{fname}` expects {} argument(s), got {}",
+                                params.len(),
+                                args.len()
+                            ))
+                            .with_primary(callee.span, ""),
+                        );
                     }
                     return *ret;
                 }
@@ -571,6 +584,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn collect_return_types_from_expr(
         &self,
         expr: &ast::Expr,
@@ -643,12 +657,7 @@ impl<'a> Lowerer<'a> {
                 self.collect_return_types_from_expr(start, out);
                 self.collect_return_types_from_expr(end, out);
             }
-            ast::ExprKind::Object(fields) => {
-                for field in fields {
-                    self.collect_return_types_from_expr(&field.value, out);
-                }
-            }
-            ast::ExprKind::TypedObject { fields, .. } => {
+            ast::ExprKind::Object(fields) | ast::ExprKind::TypedObject { fields, .. } => {
                 for field in fields {
                     self.collect_return_types_from_expr(&field.value, out);
                 }
@@ -669,14 +678,14 @@ impl<'a> Lowerer<'a> {
             ast::ExprKind::Field { target, .. } | ast::ExprKind::OptionalField { target, .. } => {
                 self.collect_return_types_from_expr(target, out);
             }
-            ast::ExprKind::Lambda { .. } => {}
             ast::ExprKind::Try { try_block, catch } => {
                 self.collect_return_types_from_block(try_block, out);
                 if let Some(catch) = catch {
                     self.collect_return_types_from_block(&catch.body, out);
                 }
             }
-            ast::ExprKind::Integer(_)
+            ast::ExprKind::Lambda { .. }
+            | ast::ExprKind::Integer(_)
             | ast::ExprKind::Float(_)
             | ast::ExprKind::String(_)
             | ast::ExprKind::Regex { .. }
@@ -843,7 +852,7 @@ impl<'a> Lowerer<'a> {
                     ))
                 }
             }
-            hir::Type::Pattern(raw) => self.pattern_conformance_error(raw, value, what),
+            hir::Type::Pattern(raw) => pattern_conformance_error(raw, value, what),
             hir::Type::Constrained { base, constraints } => self
                 .literal_conformance_error(base, value, what)
                 .or_else(|| constraint_conformance_error(constraints, value, what)),
@@ -872,41 +881,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn pattern_conformance_error(
-        &self,
-        raw: &str,
-        value: &ast::Expr,
-        what: &str,
-    ) -> Option<String> {
-        match raw {
-            "true" => {
-                if matches!(value.kind, ast::ExprKind::False) {
-                    Some(format!("pattern mismatch: {what} must be literal `true`"))
-                } else {
-                    None
-                }
-            }
-            "false" => {
-                if matches!(value.kind, ast::ExprKind::True) {
-                    Some(format!("pattern mismatch: {what} must be literal `false`"))
-                } else {
-                    None
-                }
-            }
-            _ => {
-                let s = plain_string_literal(value)?;
-                if pattern_matches(raw, s) {
-                    None
-                } else {
-                    Some(format!(
-                        "pattern mismatch: {what} value `{s}` does not match `{}`",
-                        display_pattern(raw)
-                    ))
-                }
-            }
-        }
-    }
-
     fn param(&self, p: &ast::Param) -> hir::HirParam {
         hir::HirParam {
             name: self.ident(&p.name),
@@ -922,14 +896,14 @@ impl<'a> Lowerer<'a> {
                 // 추론 타입과 비교. 없으면 init 타입을 그대로 등록 (let 추론).
                 let init_ty = self.infer_type(&l.init);
                 let name_id = self.name_id(&l.name);
-                let decl_ty = match &l.ty {
-                    Some(ty_ref) => {
+                let decl_ty = l.ty.as_ref().map_or_else(
+                    || init_ty,
+                    |ty_ref| {
                         let target = self.ty_ref_to_type(ty_ref);
                         self.check_assign_expr(&target, &l.init, &format!("`{}`", l.name.name));
                         target
-                    }
-                    None => init_ty.clone(),
-                };
+                    },
+                );
                 self.name_types.borrow_mut().insert(name_id, decl_ty);
                 hir::HirStmt::Let(Box::new(hir::HirLetStmt {
                     kind: match l.kind {
@@ -946,14 +920,14 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::Const(c) => {
                 let init_ty = self.infer_type(&c.init);
                 let name_id = self.name_id(&c.name);
-                let decl_ty = match &c.ty {
-                    Some(ty_ref) => {
+                let decl_ty = c.ty.as_ref().map_or_else(
+                    || init_ty,
+                    |ty_ref| {
                         let target = self.ty_ref_to_type(ty_ref);
                         self.check_assign_expr(&target, &c.init, &format!("`{}`", c.name.name));
                         target
-                    }
-                    None => init_ty.clone(),
-                };
+                    },
+                );
                 self.name_types.borrow_mut().insert(name_id, decl_ty);
                 hir::HirStmt::Const(Box::new(hir::HirConstStmt {
                     name: self.ident(&c.name),
@@ -1118,6 +1092,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn expr_kind(&self, e: &ast::Expr) -> hir::HirExprKind {
         match &e.kind {
             ast::ExprKind::Integer(s) => hir::HirExprKind::Integer(s.clone()),
@@ -1320,14 +1295,14 @@ impl<'a> Lowerer<'a> {
             // 인자가 없으면 빈 줄 출력 동작을 유지하기 위해 `void` 리터럴을
             // 채워 넣는다. 다중 인자는 기존 인터프리터 동작(첫 인자만)과
             // 일치시키기 위해 첫 인자만 취한다.
-            let arg = match args.first() {
-                Some(first) => self.expr(first),
-                None => hir::HirExpr {
+            let arg = args.first().map_or_else(
+                || hir::HirExpr {
                     kind: hir::HirExprKind::Void,
                     ty: hir::Type::Unknown,
                     span: origin.span,
                 },
-            };
+                |first| self.expr(first),
+            );
             return hir::HirExprKind::Out(Box::new(arg));
         }
         if name.name == "html" {
@@ -1423,14 +1398,14 @@ impl<'a> Lowerer<'a> {
                         // `@listen N` — 첫 인자를 port 표현식으로 사용한다.
                         // 인자가 없거나 여러 개여도 첫 인자만 취하고 나머지
                         // 는 무시 (MVP).
-                        let port_expr = match d_args.first() {
-                            Some(e) => self.expr(e),
-                            None => hir::HirExpr {
+                        let port_expr = d_args.first().map_or_else(
+                            || hir::HirExpr {
                                 kind: hir::HirExprKind::Void,
                                 ty: hir::Type::Unknown,
                                 span: expr.span,
                             },
-                        };
+                            |e| self.expr(e),
+                        );
                         // 중복 @listen 은 마지막이 우세. 진단은 C5b 의 서버
                         // 기동 시 에러로 엮어 올리는 쪽이 자연스러우므로
                         // 여기서는 조용히 덮어쓴다.
@@ -1482,10 +1457,10 @@ impl<'a> Lowerer<'a> {
     /// - group (`method == ""`): body block 내부의 `@route` 들을 재귀 lower,
     ///   자신의 path 를 prefix 에 이어 붙여 전달. group body 의 비-route
     ///   stmt 는 현재 silent 로 drop — A2-min 은 미들웨어 등을 지원 범위
-    ///   밖으로 둔다. C_middleware 마일스톤에서 진단 경로 합류.
+    ///   밖으로 둔다. `C_middleware` 마일스톤에서 진단 경로 합류.
     ///
     /// 형식이 이상한 입력(인자 수/타입 불일치)은 빈 벡터. 호출자가 이를
-    /// "변환 실패" 로 간주해 body_stmts 로 밀어 넣는다.
+    /// "변환 실패" 로 간주해 `body_stmts` 로 밀어 넣는다.
     fn flatten_route_args(
         &self,
         args: &[ast::Expr],
@@ -1552,10 +1527,7 @@ impl<'a> Lowerer<'a> {
         } else {
             let mut stmts = inherited_stmts.to_vec();
             stmts.extend(block.stmts.clone());
-            let start = inherited_stmts
-                .first()
-                .map(ast::Stmt::span)
-                .unwrap_or(block.span);
+            let start = inherited_stmts.first().map_or(block.span, ast::Stmt::span);
             ast::Block {
                 stmts,
                 span: start.join(block.span),
@@ -1620,22 +1592,22 @@ impl<'a> Lowerer<'a> {
     /// payload 가 빠진 경우(`@respond 204` 등) 여기서 `Void` 를 채워 넣어
     /// 런타임이 항상 같은 모양을 보도록 한다.
     fn lower_respond(&self, origin: &ast::Expr, args: &[ast::Expr]) -> hir::HirExprKind {
-        let status = match args.first() {
-            Some(e) => self.expr(e),
-            None => hir::HirExpr {
+        let status = args.first().map_or_else(
+            || hir::HirExpr {
                 kind: hir::HirExprKind::Void,
                 ty: hir::Type::Unknown,
                 span: origin.span,
             },
-        };
-        let payload = match args.get(1) {
-            Some(e) => self.expr(e),
-            None => hir::HirExpr {
+            |e| self.expr(e),
+        );
+        let payload = args.get(1).map_or_else(
+            || hir::HirExpr {
                 kind: hir::HirExprKind::Void,
                 ty: hir::Type::Unknown,
                 span: origin.span,
             },
-        };
+            |e| self.expr(e),
+        );
         hir::HirExprKind::Respond {
             status: Box::new(status),
             payload: Box::new(payload),
@@ -1679,6 +1651,36 @@ impl<'a> Lowerer<'a> {
             ast::Pattern::Guard(e) => hir::HirPattern::Guard(self.expr(e)),
             ast::Pattern::Not(e) => hir::HirPattern::Not(self.expr(e)),
             ast::Pattern::Contains(e) => hir::HirPattern::Contains(self.expr(e)),
+        }
+    }
+}
+
+fn pattern_conformance_error(raw: &str, value: &ast::Expr, what: &str) -> Option<String> {
+    match raw {
+        "true" => {
+            if matches!(value.kind, ast::ExprKind::False) {
+                Some(format!("pattern mismatch: {what} must be literal `true`"))
+            } else {
+                None
+            }
+        }
+        "false" => {
+            if matches!(value.kind, ast::ExprKind::True) {
+                Some(format!("pattern mismatch: {what} must be literal `false`"))
+            } else {
+                None
+            }
+        }
+        _ => {
+            let s = plain_string_literal(value)?;
+            if pattern_matches(raw, s) {
+                None
+            } else {
+                Some(format!(
+                    "pattern mismatch: {what} value `{s}` does not match `{}`",
+                    display_pattern(raw)
+                ))
+            }
         }
     }
 }
@@ -1741,7 +1743,7 @@ fn ast_domain_is(expr: &ast::Expr, expected: &str) -> bool {
     }
 }
 
-fn unary_op(op: ast::UnaryOp) -> hir::UnaryOp {
+const fn unary_op(op: ast::UnaryOp) -> hir::UnaryOp {
     match op {
         ast::UnaryOp::Not => hir::UnaryOp::Not,
         ast::UnaryOp::Neg => hir::UnaryOp::Neg,
@@ -1749,7 +1751,7 @@ fn unary_op(op: ast::UnaryOp) -> hir::UnaryOp {
     }
 }
 
-fn binary_op(op: ast::BinaryOp) -> hir::BinaryOp {
+const fn binary_op(op: ast::BinaryOp) -> hir::BinaryOp {
     use ast::BinaryOp as A;
     use hir::BinaryOp as H;
     match op {
@@ -1917,7 +1919,7 @@ fn comparison_bound(op: ast::BinaryOp, n: i64) -> Option<hir::HirTypeConstraint>
     }
 }
 
-fn invert_comparison(op: ast::BinaryOp) -> Option<ast::BinaryOp> {
+const fn invert_comparison(op: ast::BinaryOp) -> Option<ast::BinaryOp> {
     match op {
         ast::BinaryOp::Eq => Some(ast::BinaryOp::Eq),
         ast::BinaryOp::Ge => Some(ast::BinaryOp::Le),
@@ -2250,7 +2252,6 @@ fn placeholder_matches(name: &str, value: &str) -> bool {
         return value.len() == n && value.chars().all(|c| c.is_ascii_digit());
     }
     match name {
-        "string" => !value.is_empty(),
         "int" => value.parse::<i64>().is_ok(),
         "uint" => value.parse::<u64>().is_ok(),
         "float" => value.parse::<f64>().is_ok(),
