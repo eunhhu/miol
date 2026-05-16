@@ -26,6 +26,7 @@
     _csrf: string?
     sku: string(trim, min=1)
     name: string(trim, min=1)
+    badge: string(trim, min=1)
     price: int(min=0)
     stock: int(min=0)
   }
@@ -116,6 +117,7 @@
         @section {
           class="shop-actions"
           @h2 "Browser checkout forms"
+          @p "Product field example: badge is persisted and shown in catalog and admin views."
           @form action="/products" method=post {
             @h3 "Add product"
             @input type=hidden name=_csrf value="orv-reference-csrf"
@@ -123,6 +125,8 @@
             @input type=text name=sku required
             @label "Name"
             @input type=text name=name required
+            @label "Badge"
+            @input type=text name=badge value="New arrival" required
             @label "Price"
             @input type=number name=price required
             @label "Stock"
@@ -306,7 +310,7 @@
         @h1 "Catalog"
         @ul {
           for product in products {
-            @li "{product.sku}: {product.name} / stock {product.stock}"
+            @li "{product.sku}: {product.name} / {product.badge} / stock {product.stock}"
           }
         }
       }
@@ -320,7 +324,7 @@
         @h1 "Shop Catalog"
         @ul {
           for product in products {
-            @li "{product.name} ({product.sku}) / price {product.price} / stock {product.stock}"
+            @li "{product.name} ({product.sku}) / {product.badge} / price {product.price} / stock {product.stock}"
           }
         }
       }
@@ -440,6 +444,7 @@
     let product = await shopdb.create("Product", {
       sku: @body.sku,
       name: @body.name,
+      badge: @body.badge,
       price: price,
       stock: stock
     })

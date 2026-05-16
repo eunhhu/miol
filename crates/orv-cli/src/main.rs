@@ -2398,6 +2398,8 @@ Browser home: http://localhost:8080/ provides product, member signup/login, orde
 \n\
 Theme tokens live in the starter `@design` block (`@colors`, `@spacing`, and `@typography`) and are used by the home page shell, so copy and visual theme edits stay in source instead of generated artifacts.\n\
 \n\
+Product field edits follow the starter `ProductInput.badge` path: form input, `POST /products` persistence, customer `/catalog`, admin `/admin/catalog`, and generated smoke checks all carry the field end to end.\n\
+\n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths. Admin routes are protected by `@Auth required role=\"admin\"`; the starter seeds a reference admin member `admin` / `admin@example.test` for local smoke sessions.\n\
 \n\
 Signup stores an Argon2 `passwordHash` through `hash.password`; login uses `hash.verify` and never persists plaintext passwords.\n\
@@ -28835,6 +28837,7 @@ done
         let shop_smoke = r#"
 SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
+SMOKE_BADGE="orv-smoke-badge-${SMOKE_ID}"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
 SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
@@ -28861,7 +28864,7 @@ if [ -z "$CSRF_COOKIE" ]; then
 fi
 CSRF_TOKEN="${CSRF_COOKIE#orv_csrf=}"
 
-orv_smoke_curl_origin "POST /products" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
+orv_smoke_curl_origin "POST /products" "__PRODUCTS_ORIGIN__" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"badge\":\"${SMOKE_BADGE}\",\"price\":1000,\"stock\":5}"
 orv_smoke_curl_origin "POST /members" "__MEMBERS_ORIGIN__" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 orv_smoke_curl_capture_origin "POST /members/login smoke" "$SMOKE_MEMBER_HEADERS" "__LOGIN_ORIGIN__" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 MEMBER_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_MEMBER_HEADERS")"
@@ -28875,6 +28878,7 @@ orv_smoke_body_contains "account smoke session" "$SMOKE_ACCOUNT_BODY" "$SMOKE_HA
 orv_smoke_curl_origin "POST /cart/items" "__CART_ITEMS_ORIGIN__" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
 orv_smoke_fetch_origin "GET /catalog content" "$SMOKE_CATALOG_BODY" "__CATALOG_ORIGIN__" "$BASE_URL/catalog"
 orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_body_contains "catalog smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE"
 orv_smoke_fetch_origin "GET /cart content" "$SMOKE_CART_BODY" "__CART_ORIGIN__" "$BASE_URL/cart"
 orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU"
 orv_smoke_fetch_origin "POST /checkout" "$SMOKE_CHECKOUT_BODY" "__CHECKOUT_ORIGIN__" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
@@ -28893,6 +28897,7 @@ orv_smoke_body_contains "admin summary orders" "$SMOKE_ADMIN_SUMMARY_BODY" '"ord
 orv_smoke_body_contains "admin summary payments" "$SMOKE_ADMIN_SUMMARY_BODY" '"payments"'
 orv_smoke_fetch_origin "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" "__ADMIN_CATALOG_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
 orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU"
+orv_smoke_body_contains "admin catalog smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE"
 orv_smoke_fetch_origin "GET /admin/orders content" "$SMOKE_ADMIN_ORDERS_BODY" "__ADMIN_ORDERS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/orders"
 orv_smoke_body_contains "admin orders smoke member" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_HANDLE"
 orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'
@@ -30274,6 +30279,10 @@ test "checkout excluded failure" {
         assert!(source.contains(r#"shopdb.findAll("WebhookEvent", {})"#));
         assert!(source.contains(r#"shopdb.findAll("AuditEvent", {})"#));
         assert!(source.contains("@form action=\"/products\" method=post"));
+        assert!(source.contains("badge: string(trim, min=1)"));
+        assert!(source.contains("@input type=text name=badge value=\"New arrival\" required"));
+        assert!(source.contains("badge: @body.badge"));
+        assert!(source.contains("{product.badge}"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
         assert!(source.contains("@input type=password name=password required"));
@@ -30391,6 +30400,9 @@ test "checkout excluded failure" {
         assert!(guide.contains("@colors"));
         assert!(guide.contains("@spacing"));
         assert!(guide.contains("@typography"));
+        assert!(guide.contains("Product field edits"));
+        assert!(guide.contains("ProductInput.badge"));
+        assert!(guide.contains("/admin/catalog"));
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("@Auth required role=\"admin\""));
         assert!(guide.contains("admin@example.test"));
@@ -30782,6 +30794,7 @@ test "checkout excluded failure" {
         assert!(smoke_test
             .contains(r#"orv_smoke_curl_origin "POST /products" "$ORV_SMOKE_ORIGIN_POST_PRODUCTS" -X POST "$BASE_URL/products""#));
         assert!(smoke_test.contains(r#"SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"SMOKE_BADGE="orv-smoke-badge-${SMOKE_ID}""#));
         assert!(smoke_test
             .contains(r#"orv_smoke_curl_origin "POST /members" "$ORV_SMOKE_ORIGIN_POST_MEMBERS" -X POST "$BASE_URL/members""#));
         assert!(smoke_test.contains(
@@ -30821,6 +30834,9 @@ test "checkout excluded failure" {
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "catalog smoke product field" "$SMOKE_CATALOG_BODY" "$SMOKE_BADGE""#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "cart smoke item" "$SMOKE_CART_BODY" "$SMOKE_SKU""#
         ));
         assert!(smoke_test.contains(
@@ -30828,6 +30844,9 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin catalog smoke product field" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_BADGE""#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin orders shipped" "$SMOKE_ADMIN_ORDERS_BODY" 'shipped'"#
