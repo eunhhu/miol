@@ -73,7 +73,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 | SQLite row JSON adapter | implemented | reference | M1/M2 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | SQLite file with ORV metadata + row JSON |
 | PostgreSQL/MySQL adapters | planned | non-binding | M4+ | `orv-runtime` | - | - | Current handles expose unsupported/fail query methods |
 | Auth/member session scaffold | reference stub | reference | M2 | `orv-cli`, `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv init`, `orv run` | Member/session rows exist; declarative `@session`/`@Auth` hardening still needed |
-| CSRF/rate-limit/security defaults | partial | non-binding | M2 | `orv-runtime`, `orv-cli` | shopping fixture security assertions | `orv check`, `orv run` | Shop scaffold now persists AuditEvent rows for key operations; declarative CSRF/rate-limit/session hardening still planned |
+| CSRF/rate-limit/security defaults | partial | reference | M2 | `orv-runtime`, `orv-cli` | shopping fixture security assertions, rate-limit runtime test | `orv check`, `orv run` | Shop scaffold persists AuditEvent rows and reference server rate-limits login/checkout/webhook hotspots; declarative CSRF/session hardening still planned |
 | Payment/shipping local adapters | implemented | reference | M2 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | Local/file capture and booking records |
 | Payment/shipping HTTP adapters | reference stub | reference | M2/M4+ | `orv-runtime` | commerce adapter tests | `orv run` | Checked JSON POST contract |
 | Stripe webhook verification | reference stub | reference | M2/M4+ | `orv-runtime`, `orv-cli` | shop scaffold tests | `orv run`, `orv deploy-env-check` | HMAC/idempotency reference path |

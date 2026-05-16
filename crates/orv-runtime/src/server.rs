@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -58,6 +59,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const ORV_ORIGIN_ID_HEADER: &str = "x-orv-origin-id";
 const ORV_RUNTIME_REQUEST_TRACE_PATH_ENV: &str = "ORV_RUNTIME_REQUEST_TRACE_PATH";
 const ORV_TRACE_EVENTS_PATH: &str = "/__orv/trace/events";
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 /// `@server` 가 수집한 단일 라우트 — handler HIR 의 스냅샷.
 ///
@@ -228,6 +230,48 @@ impl TraceState {
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RateLimitState {
+    buckets: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+impl RateLimitState {
+    fn check(&self, key: &str, limit: usize, window: Duration) -> bool {
+        let now = Instant::now();
+        let cutoff = now - window;
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return true;
+        };
+        let bucket = buckets.entry(key.to_string()).or_default();
+        bucket.retain(|instant| *instant >= cutoff);
+        if bucket.len() >= limit {
+            return false;
+        }
+        bucket.push(now);
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitPolicy {
+    limit: usize,
+    window: Duration,
+}
+
+fn default_rate_limit_policy(method: &str, path: &str) -> Option<RateLimitPolicy> {
+    match (method, path) {
+        ("POST", "/members/login" | "/checkout") => Some(RateLimitPolicy {
+            limit: 10,
+            window: RATE_LIMIT_WINDOW,
+        }),
+        ("POST", "/webhooks/stripe") => Some(RateLimitPolicy {
+            limit: 60,
+            window: RATE_LIMIT_WINDOW,
+        }),
+        _ => None,
     }
 }
 
@@ -748,6 +792,7 @@ where
     // `&mut` 참조로 폴링한다. 이렇게 해야 매 반복에서 future 를 소비하지 않고
     // 재진입이 가능하다.
     tokio::pin!(shutdown);
+    let rate_limits = RateLimitState::default();
     loop {
         let (stream, peer) = tokio::select! {
             biased;
@@ -766,16 +811,27 @@ where
         let captured_env = captured_env.clone();
         let db = db.clone();
         let trace_state = trace_state.clone();
+        let rate_limits = rate_limits.clone();
         let client_ip = peer.ip().to_string();
         let service = service_fn(move |req| {
             let routes = routes.clone();
             let captured_env = captured_env.clone();
             let db = db.clone();
             let trace_state = trace_state.clone();
+            let rate_limits = rate_limits.clone();
             let client_ip = client_ip.clone();
             async move {
                 Ok::<_, Infallible>(
-                    handle_request(req, routes, captured_env, db, client_ip, trace_state).await,
+                    handle_request(
+                        req,
+                        routes,
+                        captured_env,
+                        db,
+                        client_ip,
+                        trace_state,
+                        rate_limits,
+                    )
+                    .await,
                 )
             }
         });
@@ -835,6 +891,7 @@ async fn handle_request(
     db: DbHandle,
     client_ip: String,
     trace_state: Option<TraceState>,
+    rate_limits: RateLimitState,
 ) -> ServerResponse {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
@@ -891,6 +948,31 @@ async fn handle_request(
         );
         return response;
     };
+
+    if let Some(policy) = default_rate_limit_policy(&entry.method, &entry.path) {
+        let key = format!("{}:{}:{client_ip}", entry.method, entry.path);
+        if !rate_limits.check(&key, policy.limit, policy.window) {
+            let response = plain_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too Many Requests: route rate limit exceeded".into(),
+            );
+            record_request_frame(
+                trace_state.as_ref(),
+                ServerRequestFrame {
+                    method,
+                    path,
+                    route_method: Some(entry.method),
+                    route_path: Some(entry.path),
+                    route_origin_id: Some(entry.origin_id),
+                    status: response.status().as_u16(),
+                    params,
+                    query,
+                    body: request_body_display(&body_value),
+                },
+            );
+            return response;
+        }
+    }
 
     let frame_method = method.clone();
     let frame_path = path.clone();
@@ -2390,6 +2472,47 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["received"]["name"], serde_json::json!("alice"));
             assert_eq!(json["received"]["age"], serde_json::json!(30));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn checkout_route_has_reference_rate_limit() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /checkout { @respond 200 { ok: true } }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            for _ in 0..10 {
+                let (status, _, _) =
+                    send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+                assert_eq!(status, 200);
+            }
+            let (status, content_type, body) =
+                send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+            assert_eq!(status, 429);
+            assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+            let body = String::from_utf8(body).expect("rate-limit body utf8");
+            assert!(body.contains("rate limit exceeded"));
 
             handle.abort();
         })
