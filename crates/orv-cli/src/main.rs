@@ -8764,7 +8764,7 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
         "db_adapters": reveal_db_adapter_targets(build)?,
         "commerce_adapters": reveal_commerce_adapter_targets(build)?,
     });
-    let summary = editor_native_host_production_summary_json(&production);
+    let summary = production_summary_json(&production);
     production
         .as_object_mut()
         .expect("editor production state is object")
@@ -9205,10 +9205,7 @@ fn editor_native_host_production_json(production: &serde_json::Value) -> serde_j
     let Some(mut object) = production.as_object().cloned() else {
         return serde_json::Value::Null;
     };
-    object.insert(
-        "summary".to_string(),
-        editor_native_host_production_summary_json(production),
-    );
+    object.insert("summary".to_string(), production_summary_json(production));
     object.insert(
         "panel_contract".to_string(),
         editor_native_host_production_panel_contract_json(),
@@ -9284,7 +9281,7 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
     })
 }
 
-fn editor_native_host_production_summary_json(production: &serde_json::Value) -> serde_json::Value {
+fn production_summary_json(production: &serde_json::Value) -> serde_json::Value {
     let db_adapters = production
         .get("db_adapters")
         .and_then(serde_json::Value::as_array)
@@ -23149,13 +23146,16 @@ fn verify_deploy_smoke_test_artifact(
                 r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
                 r#"orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
+                r#"orv_smoke_reveal_contains "reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#,
                 r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#,
                 r#"orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
                 r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#,
                 r#"orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_lsp_reveal_contains "lsp reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
                 r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#,
+                r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -24322,20 +24322,27 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
     let file_paths = graph_file_paths(&graph);
     let server_artifacts = read_server_artifacts(dir)?;
     let source_bundle = read_source_bundle_if_present(dir)?;
+    let mut production = serde_json::json!({
+        "graph_contract": editor_production_graph_contract_targets(dir)?,
+        "routes": reveal_routes(origin_id, &origin_map, &server_artifacts),
+        "native_server": reveal_native_server_targets(dir, origin_id, &origin_map)?,
+        "preflight": reveal_preflight_targets(dir)?,
+        "static": reveal_static_targets(dir, origin_id, &origin_map)?,
+        "db_adapters": reveal_db_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
+        "commerce_adapters": reveal_commerce_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
+        "client": reveal_client_targets(dir, origin_id, entry, &origin_map)?,
+    });
+    let summary = production_summary_json(&production);
+    production
+        .as_object_mut()
+        .expect("reveal production payload is object")
+        .insert("summary".to_string(), summary);
     Ok(serde_json::json!({
         "schema_version": 1,
         "origin": entry,
         "source": reveal_source(entry, &file_paths, &server_artifacts, source_bundle.as_ref()),
         "project_graph": reveal_project_graph_node(&graph, origin_id),
-        "production": {
-            "routes": reveal_routes(origin_id, &origin_map, &server_artifacts),
-            "native_server": reveal_native_server_targets(dir, origin_id, &origin_map)?,
-            "preflight": reveal_preflight_targets(dir)?,
-            "static": reveal_static_targets(dir, origin_id, &origin_map)?,
-            "db_adapters": reveal_db_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
-            "commerce_adapters": reveal_commerce_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
-            "client": reveal_client_targets(dir, origin_id, entry, &origin_map)?,
-        },
+        "production": production,
     }))
 }
 
@@ -31332,13 +31339,16 @@ if [ -n "$ORV_SMOKE_DB_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
   orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
+  orv_smoke_reveal_contains "reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'
   orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'
   orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
   orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
+  orv_smoke_editor_reveal_contains "editor reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'
   orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_lsp_reveal_contains "lsp reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
   orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'
+  orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'
 fi
 if [ -n "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'
@@ -33590,16 +33600,25 @@ test "checkout excluded failure" {
             r#"orv_smoke_reveal_contains "reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_editor_reveal_contains "editor reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal DB origin" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"smoke_test_summary"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal DB smoke summary count" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight_smoke_summary_missing_count"'"#
         ));
         assert!(smoke_test.contains(r#"ORV_SMOKE_PAYMENT_CONNECT_ORIGIN="ori_"#));
         assert!(smoke_test.contains(r#"ORV_SMOKE_SHIPPING_CONNECT_ORIGIN="ori_"#));
@@ -51753,6 +51772,28 @@ let sig quantity: int = 1
             .expect("matched db adapters");
 
         assert_eq!(reveal["origin"]["id"], db_connect.id);
+        assert_eq!(
+            reveal["production"]["graph_contract"]
+                .as_array()
+                .expect("graph contract")
+                .len(),
+            3
+        );
+        assert_eq!(reveal["production"]["summary"]["graph_contract_count"], 3);
+        assert_eq!(reveal["production"]["summary"]["preflight_target_count"], 1);
+        assert_eq!(
+            reveal["production"]["summary"]["preflight_smoke_summary_present_count"],
+            0
+        );
+        assert_eq!(
+            reveal["production"]["summary"]["preflight_smoke_summary_missing_count"],
+            1
+        );
+        assert_eq!(
+            reveal["production"]["summary"]["preflight_smoke_summary_missing_marker_count"],
+            0
+        );
+        assert_eq!(reveal["production"]["summary"]["db_target_count"], 1);
         assert_eq!(target["matched"], true);
         assert_eq!(target["selected_origin_id"], db_connect.id);
         assert_eq!(target["matched_adapter_count"], 1);
@@ -51855,6 +51896,12 @@ let sig quantity: int = 1
             .expect("matched commerce adapters");
 
         assert_eq!(reveal["origin"]["id"], payment_connect.id);
+        assert_eq!(reveal["production"]["summary"]["graph_contract_count"], 3);
+        assert_eq!(
+            reveal["production"]["summary"]["preflight_smoke_summary_missing_count"],
+            1
+        );
+        assert_eq!(reveal["production"]["summary"]["commerce_target_count"], 1);
         assert_eq!(reveal["focus"]["origin_id"], payment_connect.id);
         assert_eq!(reveal["focus"]["panel"], "source");
         assert_eq!(target["matched"], true);

@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Added graph-contract and production summary counters to `orv reveal`, `orv editor reveal`, and `orv lsp reveal` production payloads, and made generated deploy smoke checks assert the smoke-evidence summary counter is present across all three reveal surfaces.
 - Added state/native-host/editor Production panel counters for preflight smoke evidence summaries, including present, missing, and missing-marker gap counts.
 - Added reference-runtime `x-orv-response-origin-id` headers and request trace `response_origin_id` fields for executed `@respond` nodes, and wired editor/native-host trace payloads to expose separate response reveal navigation alongside route navigation.
 - Extended generated deploy smoke tests to verify exact `x-orv-response-origin-id` headers for covered routes with one unambiguous response origin, and made verify-build reject response-origin smoke drift.
