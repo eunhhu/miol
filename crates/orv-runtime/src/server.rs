@@ -57,7 +57,7 @@ use crate::interp::{
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
 ///
 /// hyper 자체는 body 크기 상한이 없어, 악의적 거대 POST 한 번에 메모리를 전부
-/// 할당해 버리는 DoS 벡터가 된다. `http_body_util::Limited` 로 래핑해 수집
+/// 할당해 버리는 `DoS` 벡터가 된다. `http_body_util::Limited` 로 래핑해 수집
 /// 단계에서 방지한다. 1MB 는 작은 JSON 페이로드/폼 입력을 통과시키면서
 /// 멀티파트 파일 업로드는 막는 선. 파일 업로드는 SPEC §11 의 별도 경로로
 /// 다룬다.
@@ -115,6 +115,7 @@ struct CapturedRuntimeState {
 }
 
 impl CapturedRuntimeState {
+    #[allow(clippy::missing_const_for_fn)]
     fn new(env: HashMap<NameId, Value>, types: RuntimeTypeRegistry) -> Self {
         Self { env, types }
     }
@@ -249,14 +250,15 @@ impl TraceState {
     }
 
     fn record(&self, frame: ServerRequestFrame) {
-        let index = if let Ok(mut frames) = self.frames.lock() {
-            let index = frames.len();
-            frames.push(frame.clone());
-            index
-        } else {
-            0
+        let event = match self.frames.lock() {
+            Ok(mut frames) => {
+                let index = frames.len();
+                let event = Bytes::from(request_trace_frame_event_body(index, &frame));
+                frames.push(frame);
+                event
+            }
+            Err(_) => Bytes::from(request_trace_frame_event_body(0, &frame)),
         };
-        let event = Bytes::from(request_trace_frame_event_body(index, &frame));
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
         }
@@ -271,7 +273,7 @@ struct RateLimitState {
 impl RateLimitState {
     fn check(&self, key: &str, limit: usize, window: Duration) -> bool {
         let now = Instant::now();
-        let cutoff = now - window;
+        let cutoff = now.checked_sub(window).unwrap_or(now);
         let Ok(mut buckets) = self.buckets.lock() else {
             return true;
         };
@@ -357,6 +359,7 @@ fn find_stmt_rate_limit_policy(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn find_expr_rate_limit_policy(
     expr: &HirExpr,
 ) -> Result<Option<RouteRateLimitPolicy>, RuntimeError> {
@@ -422,8 +425,8 @@ fn find_expr_rate_limit_policy(
         | HirExprKind::Out(expr)
         | HirExprKind::Throw(expr)
         | HirExprKind::Await(expr)
-        | HirExprKind::Cast { expr, .. } => find_expr_rate_limit_policy(expr),
-        HirExprKind::Unary { expr, .. } => find_expr_rate_limit_policy(expr),
+        | HirExprKind::Cast { expr, .. }
+        | HirExprKind::Unary { expr, .. } => find_expr_rate_limit_policy(expr),
         HirExprKind::Binary { lhs, rhs, .. } => find_expr_rate_limit_policy(lhs)?.map_or_else(
             || find_expr_rate_limit_policy(rhs),
             |policy| Ok(Some(policy)),
@@ -778,8 +781,8 @@ pub struct ServerRequestFrame {
 /// 포트 번호와 라우트 테이블을 들고 hyper 서버를 기동한다.
 ///
 /// # Errors
-/// - `listen` 이 Int 가 아니거나 포트 범위를 벗어나면 RuntimeError.
-/// - 바인딩 실패도 RuntimeError.
+/// - `listen` 이 Int 가 아니거나 포트 범위를 벗어나면 `RuntimeError`.
+/// - 바인딩 실패도 `RuntimeError`.
 /// - accept/serve 루프의 I/O 에러는 로그로 흘려보내고 다음 연결로 넘어간다
 ///   (한 커넥션 실패로 서버 전체가 죽지 않도록).
 pub(crate) fn run_server_with_options(
@@ -1253,7 +1256,16 @@ fn resolve_listen_port(
             "@listen port out of range {range}: {n}"
         )));
     }
-    Ok(n as u16)
+    u16::try_from(n).map_err(|_| {
+        RuntimeError::native(format!(
+            "@listen port out of range {}: {n}",
+            if allow_ephemeral_port {
+                "0..=65535"
+            } else {
+                "1..=65535"
+            }
+        ))
+    })
 }
 
 fn collect_routes(routes: &[HirExpr]) -> Result<Vec<RouteEntry>, RuntimeError> {
@@ -1288,6 +1300,7 @@ fn collect_routes(routes: &[HirExpr]) -> Result<Vec<RouteEntry>, RuntimeError> {
     Ok(out)
 }
 
+#[allow(clippy::future_not_send)]
 async fn serve_loop<S>(
     listener: TcpListener,
     routes: LocalRoutes,
@@ -1406,6 +1419,7 @@ fn runtime_request_trace_path_from_env() -> Option<std::path::PathBuf> {
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::future_not_send)]
 async fn handle_request(
     req: Request<Incoming>,
     routes: LocalRoutes,
@@ -1972,15 +1986,12 @@ fn percent_decode_form(raw: &str) -> String {
             b'%' if i + 2 < bytes.len() => {
                 let hi = hex_value(bytes[i + 1]);
                 let lo = hex_value(bytes[i + 2]);
-                match (hi, lo) {
-                    (Some(h), Some(l)) => {
-                        out.push((h << 4) | l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
                 }
             }
             b => {
@@ -1992,7 +2003,7 @@ fn percent_decode_form(raw: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
 }
 
-fn hex_value(b: u8) -> Option<u8> {
+const fn hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -2031,38 +2042,42 @@ pub(crate) fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, S
     if pattern == "*" {
         return Some(HashMap::new());
     }
-    let pat_parts: Vec<&str> = pattern.split('/').collect();
-    let path_parts: Vec<&str> = path.split('/').collect();
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let actual_segments: Vec<&str> = path.split('/').collect();
 
     // A2b: named wildcard suffix `:NAME*` — 패턴 마지막 세그먼트가 이 형태면
     // 앞쪽은 정확 매치, 그 이후의 모든 세그먼트는 `/` 로 join 해 `NAME` 에
     // 캡처. rest 는 최소 1개 세그먼트를 요구 (0 segments 는 일반 prefix 매치와
     // 모호해지므로 거부).
-    if let Some(last) = pat_parts.last() {
+    if let Some(last) = pattern_segments.last() {
         if let Some(name) = last.strip_prefix(':').and_then(|n| n.strip_suffix('*')) {
             // 앞쪽 세그먼트 수가 path 의 세그먼트 수보다 작아야 rest 가
             // 최소 1개 존재한다. `:rest*` 는 필수 캡처이므로 같거나 적으면 실패.
-            let prefix_len = pat_parts.len() - 1;
-            if path_parts.len() <= prefix_len {
+            let prefix_len = pattern_segments.len() - 1;
+            if actual_segments.len() <= prefix_len {
                 return None;
             }
             let mut params = HashMap::new();
-            for (pp, ap) in pat_parts.iter().take(prefix_len).zip(path_parts.iter()) {
+            for (pp, ap) in pattern_segments
+                .iter()
+                .take(prefix_len)
+                .zip(actual_segments.iter())
+            {
                 if !match_route_segment(pp, ap, &mut params) {
                     return None;
                 }
             }
-            let rest = path_parts[prefix_len..].join("/");
+            let rest = actual_segments[prefix_len..].join("/");
             params.insert(name.to_string(), rest);
             return Some(params);
         }
     }
 
-    if pat_parts.len() != path_parts.len() {
+    if pattern_segments.len() != actual_segments.len() {
         return None;
     }
     let mut params = HashMap::new();
-    for (pp, ap) in pat_parts.iter().zip(path_parts.iter()) {
+    for (pp, ap) in pattern_segments.iter().zip(actual_segments.iter()) {
         if !match_route_segment(pp, ap, &mut params) {
             return None;
         }
@@ -2105,7 +2120,7 @@ const fn route_param_name_char(ch: char) -> bool {
 /// - Void → `null` (SPEC §11.4 가 Void payload 를 "빈 body" 로 규정하지만
 ///   직렬화 경로에 들어올 일이 없도록 상위에서 분기. 안전망으로 null.).
 /// - Array → JSON array (재귀).
-/// - Object → JSON object (필드 순서 보존은 serde_json::Map 이 기본 BTreeMap
+/// - Object → JSON object (필드 순서 보존은 `serde_json::Map` 이 기본 `BTreeMap`
 ///   이 아니라 `preserve_order` feature 가 꺼져 있으면 알파벳 순이 될 수
 ///   있다. 테스트가 순서에 의존하지 않도록 값만 비교).
 /// - Function/Lambda/BoundMethod → 문자열로 표시 (SPEC 은 직렬화 불가를
@@ -2114,9 +2129,7 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Int(n) => J::from(*n),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(J::Number)
-            .unwrap_or(J::Null),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
         Value::Bool(b) => J::Bool(*b),
         Value::Str(s) => J::String(s.clone()),
         Value::Regex { pattern, flags } => J::String(format!("r\"{pattern}\"{flags}")),
@@ -2153,17 +2166,18 @@ fn json_to_value(j: serde_json::Value) -> Value {
     match j {
         J::Null => Value::Void,
         J::Bool(b) => Value::Bool(b),
-        J::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else if n.is_f64() {
-                // 명시적으로 소수점이 있는 표기면 float 로 받는다.
-                n.as_f64().map(Value::Float).unwrap_or(Value::Void)
-            } else {
-                // i64 를 넘는 정수(u64 상단)는 원문을 보존.
-                Value::Str(n.to_string())
-            }
-        }
+        J::Number(n) => n.as_i64().map_or_else(
+            || {
+                if n.is_f64() {
+                    // 명시적으로 소수점이 있는 표기면 float 로 받는다.
+                    n.as_f64().map_or(Value::Void, Value::Float)
+                } else {
+                    // i64 를 넘는 정수(u64 상단)는 원문을 보존.
+                    Value::Str(n.to_string())
+                }
+            },
+            Value::Int,
+        ),
         J::String(s) => Value::Str(s),
         J::Array(items) => Value::Array(items.into_iter().map(json_to_value).collect()),
         J::Object(map) => Value::Object(

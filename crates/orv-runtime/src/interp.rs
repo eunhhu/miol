@@ -42,6 +42,7 @@ pub(crate) const ORV_CSRF_COOKIE_NAME: &str = "orv_csrf";
 pub(crate) const ORV_REFERENCE_CSRF_TOKEN: &str = "orv-reference-csrf";
 pub(crate) const ORV_SESSION_COOKIE_NAME: &str = "orv_session";
 pub(crate) const ORV_SESSION_ROLE_COOKIE_NAME: &str = "orv_session_role";
+const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
 
 fn resolve_runtime_path(path: &str, working_dir: Option<&Path>) -> PathBuf {
     let path = Path::new(path);
@@ -405,22 +406,22 @@ pub enum Value {
     /// 이름은 값 타입 기반 dispatch 이므로 `NameId` 가 아닌 문자열을 유지.
     BoundMethod {
         /// 수신자 값.
-        receiver: Box<Value>,
+        receiver: Box<Self>,
         /// 메서드 이름.
         method: String,
     },
     /// 배열.
-    Array(Vec<Value>),
+    Array(Vec<Self>),
     /// 튜플 — 고정 길이, heterogeneous.
-    Tuple(Vec<Value>),
+    Tuple(Vec<Self>),
     /// 오브젝트 — 필드 이름 순서 유지. 필드명은 구조체 멤버이므로 문자열.
-    Object(Vec<(String, Value)>),
-    /// C_db: in-memory DB handle. `@db` 평가 결과이며 `.create` 같은 field
+    Object(Vec<(String, Self)>),
+    /// `C_db`: in-memory DB handle. `@db` 평가 결과이며 `.create` 같은 field
     /// 접근으로 bound method 를 얻어 호출한다.
     Db(DbHandle),
     /// SPEC §4.9: 원시 타입 namespace 핸들. `int` / `string` / `float` / `bool`
     /// 같은 이름이 값 맥락에서 평가되면 이 variant. field access `.from` 이
-    /// BoundMethod 를 만들어 호출하면 타입별 파싱/포맷을 수행한다.
+    /// `BoundMethod` 를 만들어 호출하면 타입별 파싱/포맷을 수행한다.
     TypeName(String),
     /// 내장 전역 함수 핸들 — `max`, `min`, `sin`, `now`, `sleep` 등.
     /// 값 자체는 이름만 담고 실제 dispatch 는 [`Interpreter::call_builtin`]
@@ -781,7 +782,7 @@ struct Interp<W: Write> {
     /// 격리하지 않는다 — handler 안에서 부른 함수가 `@respond` 를 호출한
     /// 경우도 상위 handler 가 즉시 종료돼야 하기 때문.
     response: Option<ResponseCtx>,
-    /// C_middleware: `@next {k: v}` 로 middleware 가 쌓아 올린 문맥 값.
+    /// `C_middleware`: `@next {k: v}` 로 middleware 가 쌓아 올린 문맥 값.
     /// Route handler 안에서 `@context.k` 로 조회된다. `None` 이면 handler
     /// 바깥(예: REPL) — `@context` 참조 시 빈 Object 를 돌려준다.
     ///
@@ -789,7 +790,7 @@ struct Interp<W: Write> {
     /// 뒤에 붙인 값이 우세해야 한다. [`push_context`] 가 기존 키를 제거하고
     /// 새로 push 하므로 `Value::Object` 와 같은 "마지막 value 가 우세" 의미.
     context: Vec<(String, Value)>,
-    /// C_middleware: `@after { body }` 로 등록된 post-handler block 큐.
+    /// `C_middleware`: `@after { body }` 로 등록된 post-handler block 큐.
     /// Route handler 본문이 끝난 뒤 (with `@respond` or not) 이 큐가 순서대로
     /// 평가된다. `@after` 는 `@respond` 를 바꾸지 못한다 (이미 기록됨).
     /// Handler 경계 밖에서는 register 되지 않고 즉시 body 평가된다.
@@ -802,7 +803,7 @@ struct Interp<W: Write> {
     /// 호출 스택 깊이에 따른 저장/복원은 `call_function*` 가 담당 — Rust
     /// 스택을 타고 함수 호출 경계마다 save/restore.
     content_slot: Option<HirBlock>,
-    /// C_db: 프로세스 내 in-memory DB. handler 호출 간 공유되어 이전 요청이
+    /// `C_db`: 프로세스 내 in-memory DB. handler 호출 간 공유되어 이전 요청이
     /// 쓴 데이터를 다음 요청이 읽을 수 있다. 서버 재시작 시 소실.
     db: DbHandle,
     /// SPEC §4 runtime validator: struct 이름 -> 필드 타입.
@@ -988,7 +989,7 @@ impl<W: Write> Interp<W> {
             }
             HirStmt::Function(f) => {
                 let rc = Rc::new((**f).clone());
-                self.env.insert(f.name.id, Value::Function(rc.clone()));
+                self.env.insert(f.name.id, Value::Function(rc));
                 self.debug_register_ident(&f.name);
                 // SPEC §9.6: nested define 은 외부에서 `@Parent.Child` dotted
                 // 경로로 접근 가능해야 한다. parent body 를 재귀 탐색해 nested
@@ -1060,6 +1061,7 @@ impl<W: Write> Interp<W> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn eval(&mut self, expr: &HirExpr) -> Result<Value, RuntimeError> {
         match &expr.kind {
             HirExprKind::Integer(s) => {
@@ -1072,7 +1074,7 @@ impl<W: Write> Interp<W> {
                     return Ok(Value::Int(n));
                 }
                 if let Ok(u) = cleaned.parse::<u64>() {
-                    return Ok(Value::Int(u as i64));
+                    return Ok(Value::Int(i64::from_ne_bytes(u.to_ne_bytes())));
                 }
                 Err(RuntimeError::native(format!(
                     "invalid integer literal `{s}`"
@@ -1342,7 +1344,6 @@ impl<W: Write> Interp<W> {
                     if let Some(prompt) = args.first() {
                         let s = self.eval(prompt)?;
                         print!("{}", value_to_display(&s));
-                        use std::io::Write;
                         let _ = std::io::stdout().flush();
                     }
                     let mut line = String::new();
@@ -1368,7 +1369,7 @@ impl<W: Write> Interp<W> {
                     return self.eval_job_domain(args);
                 }
                 if name == "cron" {
-                    return self.eval_cron_domain(args);
+                    return Ok(self.eval_cron_domain(args));
                 }
                 if name == "unsafe" {
                     return self.eval_unsafe_domain(args);
@@ -1380,10 +1381,10 @@ impl<W: Write> Interp<W> {
                     return self.eval_offline_domain(args);
                 }
                 if name == "ffi" {
-                    return self.eval_ffi_domain(args);
+                    return Ok(Self::eval_ffi_domain(args));
                 }
                 if name == "cache" {
-                    return self.eval_cache_domain(args);
+                    return Ok(Self::eval_cache_domain(args));
                 }
                 if name == "design" {
                     return self.eval_design_domain(args);
@@ -1783,8 +1784,7 @@ impl<W: Write> Interp<W> {
                     (Value::Object(fields), Value::Str(key)) => Ok(fields
                         .into_iter()
                         .find(|(field, _)| field == &key)
-                        .map(|(_, value)| value)
-                        .unwrap_or(Value::Void)),
+                        .map_or(Value::Void, |(_, value)| value)),
                     (Value::Array(items), Value::Int(idx)) => {
                         let n = i64::try_from(items.len()).unwrap_or(i64::MAX);
                         let actual = if idx < 0 { idx + n } else { idx };
@@ -1793,7 +1793,12 @@ impl<W: Write> Interp<W> {
                                 "index {idx} out of bounds for length {n}"
                             )));
                         }
-                        Ok(items[actual as usize].clone())
+                        let actual = usize::try_from(actual).map_err(|_| {
+                            RuntimeError::native(format!(
+                                "index {idx} out of bounds for length {n}"
+                            ))
+                        })?;
+                        Ok(items[actual].clone())
                     }
                     (Value::Str(s), Value::Int(idx)) => {
                         let chars: Vec<char> = s.chars().collect();
@@ -1804,7 +1809,12 @@ impl<W: Write> Interp<W> {
                                 "index {idx} out of bounds for length {n}"
                             )));
                         }
-                        Ok(Value::Str(chars[actual as usize].to_string()))
+                        let actual = usize::try_from(actual).map_err(|_| {
+                            RuntimeError::native(format!(
+                                "index {idx} out of bounds for length {n}"
+                            ))
+                        })?;
+                        Ok(Value::Str(chars[actual].to_string()))
                     }
                     (Value::Object(_), other) => Err(RuntimeError::native(format!(
                         "object index must be a string, got {other}"
@@ -1934,7 +1944,7 @@ impl<W: Write> Interp<W> {
                 if let Value::BoundMethod { receiver, method } = &callee_value {
                     if method == "transaction" {
                         if let Value::Db(db) = receiver.as_ref() {
-                            return self.eval_db_transaction(db.clone(), args);
+                            return self.eval_db_transaction(db, args);
                         }
                     }
                     if method == "render" {
@@ -1964,7 +1974,7 @@ impl<W: Write> Interp<W> {
 
     fn eval_db_transaction(
         &mut self,
-        db: DbHandle,
+        db: &DbHandle,
         args: &[HirExpr],
     ) -> Result<Value, RuntimeError> {
         let snapshot = db.borrow().clone();
@@ -2071,9 +2081,9 @@ impl<W: Write> Interp<W> {
         &self,
         type_name: &str,
         method: &str,
-        args: Vec<Value>,
+        args: &[Value],
     ) -> Result<Value, RuntimeError> {
-        let [input] = args.as_slice() else {
+        let [input] = args else {
             return Err(RuntimeError::native(format!(
                 "`{type_name}.{method}` expects one argument"
             )));
@@ -2215,6 +2225,7 @@ impl<W: Write> Interp<W> {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn apply_validation_constraints(
         &self,
         value: Value,
@@ -2245,6 +2256,7 @@ impl<W: Write> Interp<W> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn call_method(
         &mut self,
         receiver: Value,
@@ -2332,13 +2344,11 @@ impl<W: Write> Interp<W> {
             },
             (Value::Str(s), "replace") => {
                 let mut it = args.into_iter();
-                let from = match it.next() {
-                    Some(Value::Str(v)) => v,
-                    _ => return Err(RuntimeError::native("replace expects (from, to) strings")),
+                let Some(Value::Str(from)) = it.next() else {
+                    return Err(RuntimeError::native("replace expects (from, to) strings"));
                 };
-                let to = match it.next() {
-                    Some(Value::Str(v)) => v,
-                    _ => return Err(RuntimeError::native("replace expects (from, to) strings")),
+                let Some(Value::Str(to)) = it.next() else {
+                    return Err(RuntimeError::native("replace expects (from, to) strings"));
                 };
                 Ok(Value::Str(s.replace(&from, &to)))
             }
@@ -2368,7 +2378,7 @@ impl<W: Write> Interp<W> {
                 convert_from(&type_name, arg)
             }
             (Value::TypeName(type_name), "parse" | "safeParse" | "errors" | "is" | "validate") => {
-                self.call_type_validation_method(&type_name, method, args)
+                self.call_type_validation_method(&type_name, method, &args)
             }
             // ── SPEC 부록 @fs.read / @fs.write ──
             //
@@ -2410,7 +2420,7 @@ impl<W: Write> Interp<W> {
                 };
                 let resolved_path = self.runtime_path(&path);
                 std::fs::write(&resolved_path, &content)
-                    .map(|_| Value::Void)
+                    .map(|()| Value::Void)
                     .map_err(|e| RuntimeError::native(format!("`@fs.write` failed: {e}")))
             }
             // ── SPEC 부록 @process.run ──
@@ -2485,7 +2495,7 @@ impl<W: Write> Interp<W> {
                 m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
                 | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save"
                 | "load" | "wal" | "checkpoint" | "savepoint" | "rollback"),
-            ) => call_db_method(&db, m, args, self.runtime_options.working_dir.as_deref()),
+            ) => call_db_method(&db, m, &args, self.runtime_options.working_dir.as_deref()),
             (recv, m) => Err(RuntimeError::native(format!("no method `{m}` on {recv}"))),
         }
     }
@@ -2501,7 +2511,7 @@ impl<W: Write> Interp<W> {
             .map(value_to_display)
             .unwrap_or_default();
         match (kind, method) {
-            ("cache", "put") | ("offline.store", "put") => {
+            ("cache" | "offline.store", "put") => {
                 let key = string_arg(args, 0, "`put` expects (key, value)")?;
                 let value = args
                     .get(1)
@@ -2514,7 +2524,7 @@ impl<W: Write> Interp<W> {
                     ("key".to_string(), Value::Str(key)),
                 ]))
             }
-            ("cache", "get") | ("offline.store", "get") => {
+            ("cache" | "offline.store", "get") => {
                 let key = string_arg(args, 0, "`get` expects key")?;
                 let value = self
                     .state_bucket(kind, &name)
@@ -2525,7 +2535,7 @@ impl<W: Write> Interp<W> {
                     ("value".to_string(), value),
                 ]))
             }
-            ("cache", "delete") | ("offline.store", "delete") => {
+            ("cache" | "offline.store", "delete") => {
                 let key = string_arg(args, 0, "`delete` expects key")?;
                 let removed = self.state_bucket_mut(kind, &name).remove(&key).is_some();
                 Ok(Value::Object(vec![
@@ -2587,15 +2597,13 @@ impl<W: Write> Interp<W> {
             _ if ns.starts_with("job.") && method == "enqueue" => {
                 let name = ns.strip_prefix("job.").unwrap_or(ns).to_string();
                 let payload = args.first().cloned().unwrap_or(Value::Void);
-                let (status, result, error) =
-                    if let Some(handler) = self.job_handlers.get(&name).cloned() {
-                        match self.run_job_handler_with_retries(&handler, args) {
-                            Ok(result) => ("completed", result, None),
-                            Err(err) => ("failed", Value::Void, Some(err.message)),
-                        }
-                    } else {
-                        ("queued", Value::Void, None)
-                    };
+                let (status, result, error) = self.job_handlers.get(&name).cloned().map_or(
+                    ("queued", Value::Void, None),
+                    |handler| match self.run_job_handler_with_retries(&handler, args) {
+                        Ok(result) => ("completed", result, None),
+                        Err(err) => ("failed", Value::Void, Some(err.message)),
+                    },
+                );
                 let mut fields = vec![
                     ("name".to_string(), Value::Str(name)),
                     ("status".to_string(), Value::Str(status.to_string())),
@@ -2636,7 +2644,7 @@ impl<W: Write> Interp<W> {
                 job_name.clone(),
                 JobHandler {
                     params,
-                    body: body.clone(),
+                    body,
                     retries,
                 },
             );
@@ -2648,9 +2656,9 @@ impl<W: Write> Interp<W> {
         Ok(Value::TypeName(format!("job.{job_name}")))
     }
 
-    fn eval_cron_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+    fn eval_cron_domain(&mut self, args: &[HirExpr]) -> Value {
         if args.is_empty() {
-            return Ok(Value::TypeName("cron".to_string()));
+            return Value::TypeName("cron".to_string());
         }
         let schedule = args
             .iter()
@@ -2665,13 +2673,13 @@ impl<W: Write> Interp<W> {
                 body,
             });
         }
-        Ok(self.db.borrow_mut().create(
+        self.db.borrow_mut().create(
             "Cron",
             vec![
                 ("schedule".to_string(), Value::Str(schedule)),
                 ("status".to_string(), Value::Str("registered".to_string())),
             ],
-        ))
+        )
     }
 
     fn run_due_crons(&mut self) -> Result<Value, RuntimeError> {
@@ -2766,32 +2774,32 @@ impl<W: Write> Interp<W> {
         )]))
     }
 
-    fn eval_ffi_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+    fn eval_ffi_domain(args: &[HirExpr]) -> Value {
         if args.is_empty() {
-            return Ok(Value::TypeName("ffi".to_string()));
+            return Value::TypeName("ffi".to_string());
         }
         let abi = args
             .iter()
             .find_map(string_literal_from_expr)
             .unwrap_or_else(|| "native".to_string());
-        Ok(Value::Object(vec![
+        Value::Object(vec![
             ("kind".to_string(), Value::Str("ffi".to_string())),
             ("abi".to_string(), Value::Str(abi)),
-        ]))
+        ])
     }
 
-    fn eval_cache_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+    fn eval_cache_domain(args: &[HirExpr]) -> Value {
         if args.is_empty() {
-            return Ok(Value::TypeName("cache".to_string()));
+            return Value::TypeName("cache".to_string());
         }
         let name = args
             .iter()
             .find_map(string_literal_from_expr)
             .unwrap_or_else(|| "cache".to_string());
-        Ok(Value::Object(vec![
+        Value::Object(vec![
             ("kind".to_string(), Value::Str("cache".to_string())),
             ("name".to_string(), Value::Str(name)),
-        ]))
+        ])
     }
 
     fn eval_design_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
@@ -2986,8 +2994,7 @@ impl<W: Write> Interp<W> {
             chunks
                 .iter()
                 .map(|(_, value)| value_to_display(value))
-                .collect::<Vec<_>>()
-                .join(""),
+                .collect::<String>(),
         );
         let size = chunks
             .iter()
@@ -3375,7 +3382,7 @@ impl<W: Write> Interp<W> {
         result
     }
 
-    /// C_middleware: `@before { body }` 를 평가한다.
+    /// `C_middleware`: `@before { body }` 를 평가한다.
     ///
     /// define 본문 안에 등장하면 middleware 로서의 역할을 하며, body block 을
     /// 즉시 평가한다. body 안의 `@next {k: v}` 는 context 에 값을 쌓고,
@@ -3398,7 +3405,7 @@ impl<W: Write> Interp<W> {
         }
     }
 
-    /// C_middleware: `@after { body }` 등록.
+    /// `C_middleware`: `@after { body }` 등록.
     ///
     /// body 는 handler 본문이 완전히 끝난 뒤 flush 되므로, 이 지점에서는 평가
     /// 하지 않고 block 을 복제해 `after_queue` 에 push 한다. handler 경계 밖
@@ -3420,7 +3427,7 @@ impl<W: Write> Interp<W> {
         }
     }
 
-    /// C_middleware: `@next {k: v}` 로 context 에 값 머지.
+    /// `C_middleware`: `@next {k: v}` 로 context 에 값 머지.
     ///
     /// 인자 없는 `@next` 는 pass-through — middleware 체인에서 "변경 없이 다음
     /// 단계로" 신호. 인자가 object literal 이 아니면 에러.
@@ -3503,6 +3510,7 @@ impl<W: Write> Interp<W> {
     /// - `rest` 에 `..` 세그먼트 포함 → 403 (문법적 traversal)
     /// - canonicalize 결과가 root 밖 → 403 (심볼릭/상대경로 traversal)
     /// - 심볼릭 링크 → 403 (더 관대한 정책은 후속 논의)
+    #[allow(clippy::too_many_lines)]
     fn eval_serve(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
         if args.len() != 1 {
             return Err(RuntimeError::native(format!(
@@ -3624,7 +3632,6 @@ impl<W: Write> Interp<W> {
             // 디렉토리 인덱스 서빙은 범위 밖 — 404.
             return self.respond_status(404);
         }
-        const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
         if final_meta.len() > MAX_SERVE_BYTES {
             return Err(RuntimeError::native(format!(
                 "`@serve` file exceeds {MAX_SERVE_BYTES} bytes: {}",
@@ -3637,6 +3644,7 @@ impl<W: Write> Interp<W> {
         self.respond_raw(200, bytes, mime)
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn respond_raw(
         &mut self,
         status: i64,
@@ -3661,6 +3669,7 @@ impl<W: Write> Interp<W> {
 
     /// 단순 상태 코드만 가진 빈 body 응답을 기록하고 early-return 한다.
     /// `@serve` 가 404/403 같이 body 없는 실패 응답을 반환할 때 사용한다.
+    #[allow(clippy::unnecessary_wraps)]
     fn respond_status(&mut self, status: i64) -> Result<Value, RuntimeError> {
         if self.response.is_none() {
             self.response = Some(ResponseCtx {
@@ -3779,10 +3788,10 @@ impl<W: Write> Interp<W> {
                 ("rawBody".into(), Value::Str(ctx.raw_body.clone())),
             ]),
             "response" => {
-                let (status, headers) = match &self.response {
-                    Some(resp) => (resp.status, response_headers_object(resp)),
-                    None => (200, Value::Object(Vec::new())),
-                };
+                let (status, headers) = self.response.as_ref().map_or_else(
+                    || (200, Value::Object(Vec::new())),
+                    |resp| (resp.status, response_headers_object(resp)),
+                );
                 Value::Object(vec![
                     ("status".into(), Value::Int(status)),
                     ("headers".into(), headers),
@@ -3924,10 +3933,7 @@ impl<W: Write> Interp<W> {
             return Ok(Value::Object(vec![
                 ("status".to_string(), Value::Str("exempt".to_string())),
                 ("exempt".to_string(), Value::Bool(true)),
-                (
-                    "key".to_string(),
-                    key.map(Value::Str).unwrap_or(Value::Void),
-                ),
+                ("key".to_string(), key.map_or(Value::Void, Value::Str)),
             ]));
         }
         let limit = limit.ok_or_else(|| RuntimeError::native("`@rateLimit` missing `limit`"))?;
@@ -3937,10 +3943,7 @@ impl<W: Write> Interp<W> {
             ("status".to_string(), Value::Str("configured".to_string())),
             ("limit".to_string(), Value::Int(limit)),
             ("windowSeconds".to_string(), Value::Int(window_seconds)),
-            (
-                "key".to_string(),
-                key.map(Value::Str).unwrap_or(Value::Void),
-            ),
+            ("key".to_string(), key.map_or(Value::Void, Value::Str)),
         ]))
     }
 
@@ -3972,7 +3975,7 @@ impl<W: Write> Interp<W> {
                         ),
                         (
                             "role".to_string(),
-                            session_role.clone().map(Value::Str).unwrap_or(Value::Void),
+                            session_role.map_or(Value::Void, Value::Str),
                         ),
                     ]),
                 ));
@@ -3987,11 +3990,11 @@ impl<W: Write> Interp<W> {
             ),
             (
                 "role".to_string(),
-                session_role.map(Value::Str).unwrap_or(Value::Void),
+                session_role.map_or(Value::Void, Value::Str),
             ),
             (
                 "requiredRole".to_string(),
-                policy.role.map(Value::Str).unwrap_or(Value::Void),
+                policy.role.map_or(Value::Void, Value::Str),
             ),
         ]))
     }
@@ -4298,11 +4301,8 @@ fn is_declarative_auth_invocation(args: &[HirExpr]) -> bool {
 fn session_object(id: Option<String>, role: Option<String>) -> Value {
     let present = id.is_some();
     Value::Object(vec![
-        ("id".to_string(), id.map(Value::Str).unwrap_or(Value::Void)),
-        (
-            "role".to_string(),
-            role.map(Value::Str).unwrap_or(Value::Void),
-        ),
+        ("id".to_string(), id.map_or(Value::Void, Value::Str)),
+        ("role".to_string(), role.map_or(Value::Void, Value::Str)),
         ("present".to_string(), Value::Bool(present)),
     ])
 }
@@ -4569,9 +4569,8 @@ fn call_commerce_adapter_method(
     args: &[Value],
     working_dir: Option<&Path>,
 ) -> Result<Value, RuntimeError> {
-    let provider = object_field(fields, "provider")
-        .map(value_to_display)
-        .unwrap_or_else(|| "test".to_string());
+    let provider =
+        object_field(fields, "provider").map_or_else(|| "test".to_string(), value_to_display);
     let result = match (object_kind(fields).unwrap_or_default(), method) {
         ("payment.adapter", "capture") if provider == "http" => {
             payment_capture_value(&provider, args)?;
@@ -4746,11 +4745,10 @@ fn http_post_json_with_headers_for(
         request.push_str(value);
         request.push_str("\r\n");
     }
-    request.push_str(&format!(
-        "content-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    ));
+    request.push_str("content-length: ");
+    request.push_str(&body.len().to_string());
+    request.push_str("\r\nconnection: close\r\n\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).map_err(|source| {
         RuntimeError::native(format!("{context} failed to write request: {source}"))
     })?;
@@ -4838,11 +4836,10 @@ fn parse_http_adapter_url(context: &str, url: &str) -> Result<HttpAdapterUrl, Ru
             "{context} only supports http:// URLs in the reference runtime: {url}"
         )));
     };
-    let (authority, path) = rest
-        .split_once('/')
-        .map_or((rest, "/".to_string()), |(authority, path)| {
-            (authority, format!("/{path}"))
-        });
+    let (authority, path) = rest.split_once('/').map_or_else(
+        || (rest, "/".to_string()),
+        |(authority, path)| (authority, format!("/{path}")),
+    );
     if authority.is_empty() {
         return Err(RuntimeError::native(format!("{context} URL missing host")));
     }
@@ -5025,7 +5022,7 @@ fn stripe_provider_capture_value(args: &[Value]) -> Result<Value, RuntimeError> 
     let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
         RuntimeError::native(format!("stripe provider response was not JSON: {source}"))
     })?;
-    merge_provider_response(base, remote)
+    Ok(merge_provider_response(base, remote))
 }
 
 fn stripe_webhook_verification_value(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -5211,15 +5208,15 @@ fn carrier_provider_booking_value(args: &[Value]) -> Result<Value, RuntimeError>
     let remote = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
         RuntimeError::native(format!("carrier provider response was not JSON: {source}"))
     })?;
-    merge_provider_response(base, remote)
+    Ok(merge_provider_response(base, remote))
 }
 
-fn merge_provider_response(base: Value, remote: serde_json::Value) -> Result<Value, RuntimeError> {
+fn merge_provider_response(base: Value, remote: serde_json::Value) -> Value {
     let Value::Object(mut fields) = base else {
-        return Ok(runtime_value_from_json(remote));
+        return runtime_value_from_json(remote);
     };
     let serde_json::Value::Object(remote_fields) = remote else {
-        return Ok(Value::Object(fields));
+        return Value::Object(fields);
     };
     for (key, value) in remote_fields {
         if let Some((_, existing)) = fields.iter_mut().find(|(field, _)| field == &key) {
@@ -5228,7 +5225,7 @@ fn merge_provider_response(base: Value, remote: serde_json::Value) -> Result<Val
             fields.push((key, runtime_value_from_json(value)));
         }
     }
-    Ok(Value::Object(fields))
+    Value::Object(fields)
 }
 
 fn payment_provider_credential_fields(provider: &str) -> Vec<(String, Value)> {
@@ -5726,10 +5723,11 @@ fn is_reference_namespace_method(ns: &str, method: &str) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Value, RuntimeError> {
     match (&t, field) {
-        (Value::Array(items), "length") => Ok(Value::Int(items.len() as i64)),
-        (Value::Str(s), "length") => Ok(Value::Int(s.chars().count() as i64)),
+        (Value::Array(items), "length") => Ok(Value::Int(usize_to_i64(items.len()))),
+        (Value::Str(s), "length") => Ok(Value::Int(usize_to_i64(s.chars().count()))),
         (Value::Array(_), "map" | "filter" | "reduce" | "push" | "concat" | "join") => {
             Ok(Value::BoundMethod {
                 receiver: Box::new(t),
@@ -5951,7 +5949,7 @@ fn mime_for_path(path: &std::path::Path) -> String {
 ///
 /// 기존 domain-call 선형 탐색(`f.name.name == requested_name`)이 dotted 이름을
 /// 그대로 매칭하도록, `HirIdent::name` 만 바꾼 새 `HirFunctionStmt` 를 만들어
-/// 새 `NameId` 없이 등록한다 (NameId 충돌 방지 위해 기존 id 와 다른 충분히 큰
+/// 새 `NameId` 없이 등록한다 (`NameId` 충돌 방지 위해 기존 id 와 다른 충분히 큰
 /// 값을 쓰거나, id 는 그대로 두고 이름만 바꾼다 — 런타임 lookup 은 이름으로
 /// 하므로 id 충돌은 실제로는 영향 없음).
 fn register_nested_defines(
@@ -5974,7 +5972,7 @@ fn register_nested_defines(
             // dotted-name 항목은 새 NameId 슬롯(u32::MAX - serial) 을 쓴다.
             // 간단히 현재 env 크기를 뒤집어 유일 키 생성.
             let mut cloned = (**child).clone();
-            cloned.name.name = dotted.clone();
+            cloned.name.name.clone_from(&dotted);
             let slot = NameId(u32::MAX - u32::try_from(env.len()).unwrap_or(0));
             env.insert(slot, Value::Function(Rc::new(cloned)));
             // 재귀 — `Parent.Child.Inner` 도 등록.
@@ -6044,7 +6042,7 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
                 .ok_or_else(|| RuntimeError::native("Type expects 1 argument"))?;
             Ok(Value::Str(type_of(&v).to_string()))
         }
-        "max" | "min" => numeric_fold(name, args),
+        "max" | "min" => numeric_fold(name, &args),
         "abs" => {
             let v = args
                 .into_iter()
@@ -6115,7 +6113,7 @@ fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
     }
 }
 
-fn type_of(v: &Value) -> &'static str {
+const fn type_of(v: &Value) -> &'static str {
     match v {
         Value::Int(_) => "int",
         Value::Float(_) => "float",
@@ -6134,16 +6132,34 @@ fn type_of(v: &Value) -> &'static str {
     }
 }
 
-fn value_to_f64(v: &Value) -> Option<f64> {
+const fn value_to_f64(v: &Value) -> Option<f64> {
     match v {
-        Value::Int(n) => Some(*n as f64),
+        Value::Int(n) => Some(i64_to_f64(*n)),
         Value::Float(f) => Some(*f),
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         _ => None,
     }
 }
 
-fn numeric_fold(op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+#[allow(clippy::cast_precision_loss)]
+const fn i64_to_f64(value: i64) -> f64 {
+    value as f64
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn f64_to_i64_trunc(value: f64) -> i64 {
+    value as i64
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn i64_to_usize_index(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn numeric_fold(op: &str, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::native(format!(
             "{op} expects at least one argument"
@@ -6185,6 +6201,7 @@ fn numeric_fold(op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
 }
 
 /// `now()` 류 시간 함수가 반환할 오프셋.
+#[derive(Clone, Copy)]
 enum SystemTimeOffset {
     Now,
     Today,
@@ -6200,8 +6217,7 @@ fn time_value(offset: SystemTimeOffset) -> Value {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     // 날짜 단위 오프셋.
     let day_secs: i64 = 86_400;
     let base_secs = match offset {
@@ -6266,7 +6282,7 @@ const fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn month_lengths(year: i64) -> [i64; 12] {
+const fn month_lengths(year: i64) -> [i64; 12] {
     [
         31,
         if is_leap_year(year) { 29 } else { 28 },
@@ -6286,7 +6302,7 @@ fn month_lengths(year: i64) -> [i64; 12] {
 /// SPEC §4.9 `T.from(v)` 타입 변환 dispatcher.
 ///
 /// MVP 규약:
-/// - `int.from(str)` — 10진 정수 파싱, 실패 시 RuntimeError.
+/// - `int.from(str)` — 10진 정수 파싱, 실패 시 `RuntimeError`.
 /// - `int.from(float)` — truncate.
 /// - `int.from(bool)` — true→1, false→0.
 /// - `float.from(str)` — 부동소수점 파싱.
@@ -6296,7 +6312,7 @@ fn month_lengths(year: i64) -> [i64; 12] {
 fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
     match (type_name, v) {
         ("int", Value::Int(n)) => Ok(Value::Int(n)),
-        ("int", Value::Float(f)) => Ok(Value::Int(f as i64)),
+        ("int", Value::Float(f)) => Ok(Value::Int(f64_to_i64_trunc(f))),
         ("int", Value::Bool(b)) => Ok(Value::Int(i64::from(b))),
         ("int", Value::Str(s)) => s
             .trim()
@@ -6304,7 +6320,7 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
             .map(Value::Int)
             .map_err(|_| RuntimeError::native(format!("int.from failed to parse `{s}`"))),
         ("float", Value::Float(f)) => Ok(Value::Float(f)),
-        ("float", Value::Int(n)) => Ok(Value::Float(n as f64)),
+        ("float", Value::Int(n)) => Ok(Value::Float(i64_to_f64(n))),
         ("float", Value::Str(s)) => s
             .trim()
             .parse::<f64>()
@@ -6325,7 +6341,7 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
     }
 }
 
-/// C_db MVP 메서드 dispatcher.
+/// `C_db` MVP 메서드 dispatcher.
 ///
 /// 호출 규약:
 /// - `create(table, data)` — 새 row insert, id 자동.
@@ -6343,10 +6359,11 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 /// - `wal(path)` — JSONL WAL 을 replay 하고 이후 mutation 을 append+fsync.
 /// - `checkpoint()` — 현재 DB 상태를 WAL snapshot record 한 줄로 압축.
 /// - `savepoint()` / `rollback(savepoint)` — in-memory savepoint capture/restore.
+#[allow(clippy::too_many_lines)]
 fn call_db_method(
     db: &DbHandle,
     method: &str,
-    args: Vec<Value>,
+    args: &[Value],
     working_dir: Option<&Path>,
 ) -> Result<Value, RuntimeError> {
     let require_str = |v: &Value, what: &str| -> Result<String, RuntimeError> {
@@ -6475,8 +6492,7 @@ fn call_db_method(
             Ok(db.borrow().sum_query(&table, &parsed.query, field))
         }
         "transaction" => Ok(args.last().cloned().unwrap_or(Value::Void)),
-        "schema" => Ok(Value::Void),
-        "analyze" => Ok(Value::Void),
+        "schema" | "analyze" => Ok(Value::Void),
         "connect" => {
             if let Some(url) = args.first() {
                 let url = require_str(url, "db connect url")?;
@@ -6628,7 +6644,6 @@ fn parse_db_runtime_args(method: &str, args: &[Value]) -> Result<ParsedDbArgs, R
                 "__skip__" => parsed.query.skip = Some(db_usize(value, "`@skip`")?),
                 "__limit__" => parsed.query.limit = Some(db_usize(value, "`@limit`")?),
                 "__field__" => parse_db_field(value, &mut parsed.query)?,
-                "__rank__" => {}
                 "__near__" => parse_db_near(value, &mut parsed.query)?,
                 "__inc__" => parsed.inc.extend(db_object_fields(value, "`%inc`")?),
                 _ => {}
@@ -6843,7 +6858,7 @@ fn db_vector(value: &Value, what: &str) -> Result<Vec<f64>, RuntimeError> {
     items
         .iter()
         .map(|item| match item {
-            Value::Int(n) => Ok(*n as f64),
+            Value::Int(n) => Ok(i64_to_f64(*n)),
             Value::Float(n) => Ok(*n),
             other => Err(RuntimeError::native(format!(
                 "{what} expects numeric array, got {other}"
@@ -6950,7 +6965,7 @@ fn child_path(parent: &str, child: &str) -> String {
     }
 }
 
-fn has_side_effect(expr: &HirExpr) -> bool {
+const fn has_side_effect(expr: &HirExpr) -> bool {
     // `@html { ... }` 은 순수하게 값을 돌려주는 표현식이므로 side-effect
     // 목록에 넣지 않는다. 부수 효과가 있는 건 `@out`, 아직 미지원 도메인,
     // 대입, 제어 흐름 블록, 호출이다. `@route` 는 선언이므로 side-effect
@@ -7115,7 +7130,7 @@ fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
             "int" | "uint" | "byte" | "ubyte" | "short" | "ushort" | "long" | "ulong" => {
                 match value {
                     Value::Int(i) => Ok(Value::Int(i)),
-                    Value::Float(f) => Ok(Value::Int(f.trunc() as i64)),
+                    Value::Float(f) => Ok(Value::Int(f64_to_i64_trunc(f.trunc()))),
                     Value::Bool(b) => Ok(Value::Int(i64::from(b))),
                     Value::Str(s) => s.trim().parse::<i64>().map(Value::Int).map_err(|_| {
                         RuntimeError::native(format!("cannot cast string `{s}` to int"))
@@ -7125,8 +7140,7 @@ fn apply_cast(value: Value, ty: &HirTypeRef) -> Result<Value, RuntimeError> {
             }
             "float" | "double" => match value {
                 Value::Float(f) => Ok(Value::Float(f)),
-                #[allow(clippy::cast_precision_loss)]
-                Value::Int(i) => Ok(Value::Float(i as f64)),
+                Value::Int(i) => Ok(Value::Float(i64_to_f64(i))),
                 Value::Bool(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
                 Value::Str(s) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
                     RuntimeError::native(format!("cannot cast string `{s}` to float"))
@@ -7400,7 +7414,6 @@ fn placeholder_matches(name: &str, value: &str) -> bool {
         return value.len() == n && value.chars().all(|c| c.is_ascii_digit());
     }
     match name {
-        "string" => !value.is_empty(),
         "int" => value.parse::<i64>().is_ok(),
         "uint" => value.parse::<u64>().is_ok(),
         "float" => value.parse::<f64>().is_ok(),
@@ -7500,7 +7513,9 @@ fn apply_slice(
             let lo = resolve(start_i, 0, n);
             let hi = resolve(end_i, n, n);
             let (lo, hi) = if lo > hi { (lo, lo) } else { (lo, hi) };
-            let slice: String = chars[lo as usize..hi as usize].iter().collect();
+            let lo = i64_to_usize_index(lo);
+            let hi = i64_to_usize_index(hi);
+            let slice: String = chars[lo..hi].iter().collect();
             Ok(Value::Str(slice))
         }
         Value::Array(items) => {
@@ -7508,12 +7523,15 @@ fn apply_slice(
             let lo = resolve(start_i, 0, n);
             let hi = resolve(end_i, n, n);
             let (lo, hi) = if lo > hi { (lo, lo) } else { (lo, hi) };
-            Ok(Value::Array(items[lo as usize..hi as usize].to_vec()))
+            let lo = i64_to_usize_index(lo);
+            let hi = i64_to_usize_index(hi);
+            Ok(Value::Array(items[lo..hi].to_vec()))
         }
         other => Err(RuntimeError::native(format!("cannot slice {other}"))),
     }
 }
 
+#[allow(clippy::enum_glob_use)]
 fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     match (op, l, r) {
@@ -7544,7 +7562,7 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, RuntimeError>
         (BitOr, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
         (BitXor, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
         (Shl, Value::Int(a), Value::Int(b)) if (0..64).contains(&b) => {
-            Ok(Value::Int(((a as i128) << b) as i64))
+            Ok(Value::Int(a << u32::try_from(b).unwrap_or(0)))
         }
         (Shr, Value::Int(a), Value::Int(b)) if (0..64).contains(&b) => Ok(Value::Int(a >> b)),
         // 부동소수점 비교.

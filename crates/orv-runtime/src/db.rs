@@ -292,11 +292,11 @@ impl InMemoryDb {
                 continue;
             };
             match value {
-                Value::Int(n) if has_float => float_sum += *n as f64,
+                Value::Int(n) if has_float => float_sum += i64_to_f64(*n),
                 Value::Int(n) => int_sum += *n,
                 Value::Float(n) => {
                     if !has_float {
-                        float_sum = int_sum as f64;
+                        float_sum = i64_to_f64(int_sum);
                         has_float = true;
                     }
                     float_sum += *n;
@@ -1011,8 +1011,9 @@ fn wal_record_with_timestamp(record: &serde_json::Value) -> serde_json::Value {
 fn current_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |duration| {
+            duration.as_millis().try_into().unwrap_or(u64::MAX)
+        })
 }
 
 fn replay_wal_record(db: &mut InMemoryDb, record: &serde_json::Value) -> Result<(), String> {
@@ -1254,7 +1255,7 @@ fn matches_query(row: &[(String, Value)], query: &DbQuery) -> bool {
         let Some(rv) = row.iter().find(|(k, _)| k == &filter.field).map(|(_, v)| v) else {
             return false;
         };
-        if !matches_filter_op(rv, &filter.op, &filter.value) {
+        if !matches_filter_op(rv, filter.op, &filter.value) {
             return false;
         }
     }
@@ -1275,7 +1276,7 @@ fn project_row(row: Vec<(String, Value)>, fields: &[String]) -> Vec<(String, Val
         .collect()
 }
 
-fn matches_filter_op(row_value: &Value, op: &DbFilterOp, filter_value: &Value) -> bool {
+fn matches_filter_op(row_value: &Value, op: DbFilterOp, filter_value: &Value) -> bool {
     match op {
         DbFilterOp::Eq => values_eq(row_value, filter_value),
         DbFilterOp::Ne => !values_eq(row_value, filter_value),
@@ -1367,7 +1368,7 @@ fn value_to_vector(value: &Value) -> Option<Vec<f64>> {
     items
         .iter()
         .map(|item| match item {
-            Value::Int(n) => Some(*n as f64),
+            Value::Int(n) => Some(i64_to_f64(*n)),
             Value::Float(n) => Some(*n),
             _ => None,
         })
@@ -1378,8 +1379,8 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Int(x), Value::Float(y)) => i64_to_f64(*x).partial_cmp(y),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&i64_to_f64(*y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         _ => None,
@@ -1401,10 +1402,15 @@ fn incremented_value(current: &Value, delta: &Value) -> Value {
     match (current, delta) {
         (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
         (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
-        (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
-        (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+        (Value::Int(a), Value::Float(b)) => Value::Float(i64_to_f64(*a) + b),
+        (Value::Float(a), Value::Int(b)) => Value::Float(a + i64_to_f64(*b)),
         _ => delta.clone(),
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+const fn i64_to_f64(value: i64) -> f64 {
+    value as f64
 }
 
 fn values_eq(a: &Value, b: &Value) -> bool {
