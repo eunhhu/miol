@@ -13,6 +13,7 @@
 //! `orv add/remove`은 `orv.toml` dependency section 과 lockfile 을 함께 갱신한다.
 //! `orv verify-build <dir>`은 build manifest/plan target 을 검증한다.
 //! `orv deploy-env-check <dir>`은 production deploy credential env 를 검증한다.
+//! `orv benchmark-report <dir>`은 deploy benchmark evidence 를 JSON report 로 요약한다.
 //! `orv verify-artifact <file>`은 server runtime artifact 를 검증하고,
 //! `orv check-artifact <file>`은 source bundle 을 재분석하며,
 //! `orv check-build <dir>`은 build source bundle 을 재분석하며,
@@ -129,6 +130,14 @@ enum Command {
     DeployEnvCheck {
         /// 검사할 build artifact 디렉터리.
         dir: PathBuf,
+    },
+    /// deploy benchmark evidence를 검증하고 JSON report를 출력한다.
+    BenchmarkReport {
+        /// 검사할 build artifact 디렉터리.
+        dir: PathBuf,
+        /// report status가 passed가 아니면 실패 코드로 종료한다.
+        #[arg(long)]
+        require_pass: bool,
     },
     /// server runtime artifact를 검증한다.
     VerifyArtifact {
@@ -849,6 +858,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::BenchmarkReport { dir, require_pass } => {
+            match cmd_benchmark_report(&dir, require_pass) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::VerifyArtifact { file } => match cmd_verify_artifact(&file) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -2386,6 +2404,7 @@ orv check .\n\
 orv build . --prod --out dist\n\
 orv verify-build dist\n\
 orv deploy-env-check dist\n\
+orv benchmark-report dist\n\
 ```\n\
 \n\
 ## Run\n\
@@ -2438,9 +2457,10 @@ After `orv build . --prod --out dist`, use generated deploy runbook:\n\
 cd dist\n\
 PORT=8080 docker compose -f deploy/compose.yaml up --build -d\n\
 ./deploy/smoke-test.sh\n\
+orv benchmark-report .\n\
 ```\n\
 \n\
-The generated `deploy/benchmark-evidence.json` template records the 5-hour shop benchmark tasks and data-to-record fields against the same preflight hash that `orv verify-build` checks.\n\
+The generated `deploy/benchmark-evidence.json` template records the 5-hour shop benchmark tasks and data-to-record fields against the same preflight hash that `orv verify-build` checks. After a human run, fill the evidence file and run `orv benchmark-report dist --require-pass` from the project root, or `orv benchmark-report . --require-pass` from `dist`.\n\
 \n\
 ## Native Launcher\n\
 \n\
@@ -18807,6 +18827,237 @@ fn cmd_deploy_env_check(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_benchmark_report(dir: &Path, require_pass: bool) -> anyhow::Result<()> {
+    let report = benchmark_report_value(dir)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if require_pass && report.get("status").and_then(serde_json::Value::as_str) != Some("passed") {
+        anyhow::bail!("benchmark report status must be passed");
+    }
+    Ok(())
+}
+
+fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::Value> {
+    verify_build_dir(dir)?;
+    let deploy = read_json_value(&dir.join("deploy").join("manifest.json"))?;
+    let server = deploy
+        .get("server")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow::anyhow!("deploy manifest server target is required"))?;
+    let evidence_rel = json_str(server, "benchmark_evidence", "deploy server")?;
+    let evidence = read_json_value(&dir.join(evidence_rel))?;
+    let preflight_rel = json_str(&evidence, "preflight", "benchmark evidence")?;
+    let benchmark = evidence
+        .get("benchmark")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let max_elapsed_minutes = benchmark
+        .get("max_elapsed_minutes")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(300.0);
+    let task_report = benchmark_report_tasks(&evidence, max_elapsed_minutes)?;
+    let data_report = benchmark_report_data(&evidence)?;
+    let failed_task_count = json_array_count(task_report.get("failed_tasks"));
+    let missing_task_count = json_array_count(task_report.get("missing_tasks"));
+    let missing_data_count = json_array_count(data_report.get("missing_data"));
+    let total_elapsed_minutes = task_report
+        .get("total_elapsed_minutes")
+        .and_then(serde_json::Value::as_f64);
+    let time_over_limit = total_elapsed_minutes.is_some_and(|value| value > max_elapsed_minutes);
+    let status = if failed_task_count > 0 || time_over_limit {
+        "failed"
+    } else if missing_task_count > 0 || missing_data_count > 0 {
+        "incomplete"
+    } else {
+        "passed"
+    };
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.benchmark.shop_5h.report",
+        "build_dir": dir.display().to_string(),
+        "status": status,
+        "contract_verified": true,
+        "evidence": evidence_rel,
+        "preflight": preflight_rel,
+        "preflight_hash": evidence
+            .get("preflight_hash")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "recording_status": evidence
+            .get("recording_status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "max_elapsed_minutes": max_elapsed_minutes,
+        "total_elapsed_minutes": task_report
+            .get("total_elapsed_minutes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "time_over_limit": time_over_limit,
+        "tasks": task_report,
+        "data": data_report,
+        "automated_gate": benchmark
+            .get("automated_gate")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "success_criteria": benchmark
+            .get("success_criteria")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "limitations": [
+            "benchmark-report verifies artifact/evidence shape and summarizes recorded evidence; it does not run the generated smoke test",
+            "human-run claims require the recorded evidence file and raw participant notes/output to be retained",
+        ],
+    }))
+}
+
+fn benchmark_report_tasks(
+    evidence: &serde_json::Value,
+    max_elapsed_minutes: f64,
+) -> anyhow::Result<serde_json::Value> {
+    let entries = evidence
+        .get("task_entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("benchmark evidence task_entries must be an array"))?;
+    let mut tasks = Vec::with_capacity(entries.len());
+    let mut missing_tasks = Vec::new();
+    let mut failed_tasks = Vec::new();
+    let mut over_budget_tasks = Vec::new();
+    let mut recorded_task_count = 0usize;
+    let mut total_elapsed_minutes = 0.0f64;
+    let mut all_elapsed_recorded = true;
+    for entry in entries {
+        let task = json_str(entry, "task", "benchmark task")?;
+        let target_minutes = entry
+            .get("target_minutes")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("benchmark task target_minutes must be a number"))?;
+        let elapsed_minutes = entry
+            .get("elapsed_minutes")
+            .and_then(serde_json::Value::as_f64);
+        let status = entry
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not_recorded");
+        let notes = entry
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let recorded = elapsed_minutes.is_some() && !benchmark_report_status_is_missing(status);
+        if recorded {
+            recorded_task_count += 1;
+        } else {
+            all_elapsed_recorded = false;
+            missing_tasks.push(serde_json::json!({
+                "task": task,
+                "status": status,
+                "elapsed_minutes": elapsed_minutes,
+            }));
+        }
+        if let Some(elapsed) = elapsed_minutes {
+            total_elapsed_minutes += elapsed;
+            if elapsed > target_minutes {
+                over_budget_tasks.push(serde_json::json!({
+                    "task": task,
+                    "target_minutes": target_minutes,
+                    "elapsed_minutes": elapsed,
+                    "over_by_minutes": elapsed - target_minutes,
+                }));
+            }
+        } else {
+            all_elapsed_recorded = false;
+        }
+        if benchmark_report_status_is_failed(status) {
+            failed_tasks.push(serde_json::json!({
+                "task": task,
+                "status": status,
+                "elapsed_minutes": elapsed_minutes,
+            }));
+        }
+        tasks.push(serde_json::json!({
+            "task": task,
+            "target_minutes": target_minutes,
+            "elapsed_minutes": elapsed_minutes,
+            "status": status,
+            "notes": notes,
+            "recorded": recorded,
+        }));
+    }
+    let total = if all_elapsed_recorded {
+        serde_json::json!(total_elapsed_minutes)
+    } else {
+        serde_json::Value::Null
+    };
+    Ok(serde_json::json!({
+        "task_count": entries.len(),
+        "recorded_task_count": recorded_task_count,
+        "missing_task_count": missing_tasks.len(),
+        "failed_task_count": failed_tasks.len(),
+        "max_elapsed_minutes": max_elapsed_minutes,
+        "total_elapsed_minutes": total,
+        "missing_tasks": missing_tasks,
+        "failed_tasks": failed_tasks,
+        "over_budget_tasks": over_budget_tasks,
+        "entries": tasks,
+    }))
+}
+
+fn benchmark_report_data(evidence: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let data = evidence
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("benchmark evidence data must be an object"))?;
+    let mut missing = Vec::new();
+    for key in ["docs_help_lookups", "compiler_runtime_errors"] {
+        if data.get(key).is_none_or(serde_json::Value::is_null) {
+            missing.push(key.to_string());
+        }
+    }
+    let compiler_errors = data
+        .get("compiler_runtime_errors")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            data.get("compiler_runtime_errors")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| u64::try_from(value).ok())
+        });
+    if compiler_errors.is_some_and(|count| count > 0)
+        && data
+            .get("first_error_to_fix_minutes")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        missing.push("first_error_to_fix_minutes".to_string());
+    }
+    if data
+        .get("smoke_test_output")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        missing.push("smoke_test_output".to_string());
+    }
+    Ok(serde_json::json!({
+        "missing_data": missing,
+        "docs_help_lookups": data.get("docs_help_lookups").cloned().unwrap_or(serde_json::Value::Null),
+        "compiler_runtime_errors": data.get("compiler_runtime_errors").cloned().unwrap_or(serde_json::Value::Null),
+        "first_error_to_fix_minutes": data.get("first_error_to_fix_minutes").cloned().unwrap_or(serde_json::Value::Null),
+        "manual_config_edits": data.get("manual_config_edits").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "smoke_test_output": data.get("smoke_test_output").cloned().unwrap_or(serde_json::Value::Null),
+        "participant_notes": data.get("participant_notes").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+fn benchmark_report_status_is_missing(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "" | "not_recorded" | "missing" | "todo" | "incomplete"
+    )
+}
+
+fn benchmark_report_status_is_failed(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "failed" | "fail" | "blocked"
+    )
+}
+
 fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let manifest = read_json_value(&dir.join("build-manifest.json"))?;
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
@@ -32221,6 +32472,8 @@ test "checkout excluded failure" {
         assert!(guide.contains("orv build . --prod --out dist"));
         assert!(guide.contains("orv verify-build dist"));
         assert!(guide.contains("orv deploy-env-check dist"));
+        assert!(guide.contains("orv benchmark-report dist"));
+        assert!(guide.contains("orv benchmark-report dist --require-pass"));
         assert!(guide.contains("keeps the local reference server in the foreground"));
         assert!(guide.contains("sh dist/deploy/smoke-test.sh"));
         assert!(guide.contains("deploy/README.md"));
@@ -46633,6 +46886,85 @@ let sig count: int = 0
         write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
 
         cmd_verify_build(&out).expect("recorded benchmark evidence still verifies");
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn benchmark_report_marks_unrecorded_evidence_incomplete() {
+        let (src_dir, path) = prod_server_source("benchmark-report-incomplete-source");
+        let out = temp_output_dir("benchmark-report-incomplete");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let report = benchmark_report_value(&out).expect("benchmark report");
+
+        assert_eq!(report["kind"], "orv.benchmark.shop_5h.report");
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["contract_verified"], true);
+        assert_eq!(report["evidence"], "deploy/benchmark-evidence.json");
+        assert_eq!(report["preflight"], "deploy/preflight.json");
+        assert_eq!(report["max_elapsed_minutes"], 300.0);
+        assert_eq!(report["tasks"]["task_count"], 10);
+        assert_eq!(report["tasks"]["recorded_task_count"], 0);
+        assert_eq!(report["tasks"]["missing_task_count"], 10);
+        assert!(report["data"]["missing_data"]
+            .as_array()
+            .expect("missing data")
+            .iter()
+            .any(|item| item == "docs_help_lookups"));
+        assert!(report["data"]["missing_data"]
+            .as_array()
+            .expect("missing data")
+            .iter()
+            .any(|item| item == "smoke_test_output"));
+        assert!(cmd_benchmark_report(&out, true)
+            .expect_err("require pass rejects incomplete")
+            .to_string()
+            .contains("benchmark report status must be passed"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn benchmark_report_marks_recorded_evidence_passed() {
+        let (src_dir, path) = prod_server_source("benchmark-report-passed-source");
+        let out = temp_output_dir("benchmark-report-passed");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+        let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+        evidence["recording_status"] = serde_json::json!("recorded");
+        for entry in evidence["task_entries"]
+            .as_array_mut()
+            .expect("task entries")
+        {
+            entry["elapsed_minutes"] = serde_json::json!(10.0);
+            entry["status"] = serde_json::json!("passed");
+        }
+        evidence["data"]["docs_help_lookups"] = serde_json::json!(2);
+        evidence["data"]["compiler_runtime_errors"] = serde_json::json!(0);
+        evidence["data"]["manual_config_edits"] = serde_json::json!([]);
+        evidence["data"]["smoke_test_output"] = serde_json::json!("smoke passed");
+        evidence["data"]["participant_notes"] = serde_json::json!("no blockers");
+        write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
+
+        let report = benchmark_report_value(&out).expect("benchmark report");
+
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["time_over_limit"], false);
+        assert_eq!(report["total_elapsed_minutes"], 100.0);
+        assert_eq!(report["tasks"]["recorded_task_count"], 10);
+        assert_eq!(report["tasks"]["missing_task_count"], 0);
+        assert_eq!(report["tasks"]["failed_task_count"], 0);
+        assert_eq!(
+            report["data"]["missing_data"]
+                .as_array()
+                .expect("missing data")
+                .len(),
+            0
+        );
+        cmd_benchmark_report(&out, true).expect("require pass accepts recorded evidence");
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }

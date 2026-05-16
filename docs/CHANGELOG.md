@@ -30,6 +30,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Added a trace-enabled `orv run-build . --trace deploy/request-trace.json` preflight command and clearer trace-smoke failure guidance, aligning generated smoke with the runbook trace capture flow.
 - Mirrored the 5-hour shop benchmark contract into `deploy/preflight.json`, including automated gate commands, success criteria, time budget, and data-to-record fields, with verify-build drift checks.
 - Added checked `deploy/benchmark-evidence.json` generation so benchmark timing and observation records carry the same 5-hour shop contract, preflight hash, command list, linked artifacts, task budget, and data-to-record schema that `orv verify-build` validates.
+- Added `orv benchmark-report <dir> [--require-pass]` to summarize recorded benchmark evidence as pass/fail/incomplete JSON and optionally fail CI when the human-run evidence is incomplete or over the 5-hour budget.
 - Exposed CSRF, session cookie, auth role, and default route rate-limit requirements as shared `runtime_features` across build, server, deploy, and native plan artifacts.
 - Added explicit reference `@rateLimit key=... limit=... window=...` route policies plus `@rateLimit exempt`, with runtime enforcement, server artifact descriptors, and native route table fields.
 - Added source-backed `@csrf exempt` so intentional CSRF bypasses can execute without a token while still appearing in route policy artifacts.
