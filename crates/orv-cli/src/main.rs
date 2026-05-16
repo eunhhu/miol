@@ -9645,6 +9645,10 @@ fn editor_trace_frame_reveal_command_json(
     build_dir: &str,
     origin_id: Option<&str>,
 ) -> serde_json::Value {
+    editor_reveal_command_json(build_dir, origin_id)
+}
+
+fn editor_reveal_command_json(build_dir: &str, origin_id: Option<&str>) -> serde_json::Value {
     let Some(origin_id) = origin_id else {
         return serde_json::Value::Null;
     };
@@ -23406,6 +23410,7 @@ fn reveal_commerce_adapter_targets_impl(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "adapters": adapters,
+        "source_reveal_commands": adapter_source_reveal_commands(dir, &adapters),
         "matched_adapters": matched_adapters,
     })])
 }
@@ -23470,8 +23475,56 @@ fn reveal_db_adapter_targets_impl(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "adapters": adapters,
+        "source_reveal_commands": adapter_source_reveal_commands(dir, &adapters),
         "matched_adapters": matched_adapters,
     })])
+}
+
+fn adapter_source_reveal_commands(
+    dir: &Path,
+    adapters: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(adapters) = adapters.as_array() else {
+        return Vec::new();
+    };
+    let build_dir = dir.display().to_string();
+    adapters
+        .iter()
+        .enumerate()
+        .flat_map(|(index, adapter)| {
+            let build_dir = build_dir.clone();
+            adapter_source_origin_ids(adapter)
+                .into_iter()
+                .map(move |origin_id| {
+                    let command = editor_reveal_command_json(&build_dir, Some(&origin_id));
+                    serde_json::json!({
+                        "adapter_index": index,
+                        "kind": adapter
+                            .get("kind")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "provider": adapter
+                            .get("provider")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "env": adapter
+                            .get("env")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "endpoint": adapter
+                            .get("endpoint")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "record_path": adapter
+                            .get("record_path")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "source_origin_id": origin_id,
+                        "command": command,
+                    })
+                })
+        })
+        .collect()
 }
 
 fn reveal_adapter_origin_matches(
@@ -51194,6 +51247,42 @@ define Auth() -> { @out "auth" }
             state["production"]["commerce_adapters"][0]["path"],
             "deploy/commerce-adapters.json"
         );
+        let db_origin_id = state["production"]["db_adapters"][0]["adapters"][0]["source_origin_id"]
+            .as_str()
+            .expect("db adapter source origin");
+        let commerce_origin_id = state["production"]["commerce_adapters"][0]["adapters"][0]
+            ["source_origin_id"]
+            .as_str()
+            .expect("commerce adapter source origin");
+        assert_eq!(
+            state["production"]["db_adapters"][0]["source_reveal_commands"][0]["source_origin_id"],
+            db_origin_id
+        );
+        assert_eq!(
+            state["production"]["db_adapters"][0]["source_reveal_commands"][0]["command"],
+            serde_json::json!([
+                "orv",
+                "editor",
+                "reveal",
+                out.display().to_string(),
+                db_origin_id
+            ])
+        );
+        assert_eq!(
+            state["production"]["commerce_adapters"][0]["source_reveal_commands"][0]
+                ["source_origin_id"],
+            commerce_origin_id
+        );
+        assert_eq!(
+            state["production"]["commerce_adapters"][0]["source_reveal_commands"][0]["command"],
+            serde_json::json!([
+                "orv",
+                "editor",
+                "reveal",
+                out.display().to_string(),
+                commerce_origin_id
+            ])
+        );
         assert_eq!(
             state["production"]["preflight"][0]["path"],
             "deploy/preflight.json"
@@ -51232,6 +51321,37 @@ define Auth() -> { @out "auth" }
         assert_eq!(
             native_host["production"]["commerce_adapters"][0]["path"],
             "deploy/commerce-adapters.json"
+        );
+        assert_eq!(
+            native_host["production"]["db_adapters"][0]["source_reveal_commands"][0]
+                ["source_origin_id"],
+            db_origin_id
+        );
+        assert_eq!(
+            native_host["production"]["db_adapters"][0]["source_reveal_commands"][0]["command"],
+            serde_json::json!([
+                "orv",
+                "editor",
+                "reveal",
+                out.display().to_string(),
+                db_origin_id
+            ])
+        );
+        assert_eq!(
+            native_host["production"]["commerce_adapters"][0]["source_reveal_commands"][0]
+                ["source_origin_id"],
+            commerce_origin_id
+        );
+        assert_eq!(
+            native_host["production"]["commerce_adapters"][0]["source_reveal_commands"][0]
+                ["command"],
+            serde_json::json!([
+                "orv",
+                "editor",
+                "reveal",
+                out.display().to_string(),
+                commerce_origin_id
+            ])
         );
         assert_eq!(
             native_host["production"]["preflight"][0]["path"],
