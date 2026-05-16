@@ -30974,11 +30974,13 @@ done
         let catalog_origin = deploy_smoke_origin_var_ref("GET", "/catalog");
         let cart_origin = deploy_smoke_origin_var_ref("GET", "/cart");
         let checkout_origin = deploy_smoke_origin_var_ref("POST", "/checkout");
+        let admin_origin = deploy_smoke_origin_var_ref("GET", "/admin");
         let admin_summary_origin = deploy_smoke_origin_var_ref("GET", "/admin/summary");
         let admin_catalog_origin = deploy_smoke_origin_var_ref("GET", "/admin/catalog");
         let admin_orders_origin = deploy_smoke_origin_var_ref("GET", "/admin/orders");
         let admin_payments_origin = deploy_smoke_origin_var_ref("GET", "/admin/payments");
         let admin_shipments_origin = deploy_smoke_origin_var_ref("GET", "/admin/shipments");
+        let admin_webhooks_origin = deploy_smoke_origin_var_ref("GET", "/admin/webhooks");
         let admin_audit_origin = deploy_smoke_origin_var_ref("GET", "/admin/audit");
         let db_connect_origin = origin_map
             .entries
@@ -31012,13 +31014,15 @@ SMOKE_CATALOG_BODY="$(mktemp)"
 SMOKE_CART_BODY="$(mktemp)"
 SMOKE_ACCOUNT_BODY="$(mktemp)"
 SMOKE_CHECKOUT_BODY="$(mktemp)"
+SMOKE_ADMIN_BODY="$(mktemp)"
 SMOKE_ADMIN_SUMMARY_BODY="$(mktemp)"
 SMOKE_ADMIN_CATALOG_BODY="$(mktemp)"
 SMOKE_ADMIN_ORDERS_BODY="$(mktemp)"
 SMOKE_ADMIN_PAYMENTS_BODY="$(mktemp)"
 SMOKE_ADMIN_SHIPMENTS_BODY="$(mktemp)"
+SMOKE_ADMIN_WEBHOOKS_BODY="$(mktemp)"
 SMOKE_ADMIN_AUDIT_BODY="$(mktemp)"
-trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_HOME_BODY" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
+trap 'rm -f "$SMOKE_HEADERS" "$SMOKE_MEMBER_HEADERS" "$SMOKE_ADMIN_HEADERS" "$SMOKE_HOME_BODY" "$SMOKE_CATALOG_BODY" "$SMOKE_CART_BODY" "$SMOKE_ACCOUNT_BODY" "$SMOKE_CHECKOUT_BODY" "$SMOKE_ADMIN_BODY" "$SMOKE_ADMIN_SUMMARY_BODY" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_ADMIN_ORDERS_BODY" "$SMOKE_ADMIN_PAYMENTS_BODY" "$SMOKE_ADMIN_SHIPMENTS_BODY" "$SMOKE_ADMIN_WEBHOOKS_BODY" "$SMOKE_ADMIN_AUDIT_BODY"' EXIT
 
 orv_smoke_fetch_capture_origin "GET / home" "$SMOKE_HOME_BODY" "$SMOKE_HEADERS" "__ROOT_ORIGIN__" "$BASE_URL/"
 orv_smoke_body_contains "home title" "$SMOKE_HOME_BODY" 'Miol Shop'
@@ -31101,9 +31105,19 @@ if [ -z "$ADMIN_SESSION_COOKIE" ] || [ -z "$ADMIN_ROLE_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing admin session cookies\n' >&2
   exit 1
 fi
+orv_smoke_fetch_origin "GET /admin dashboard content" "$SMOKE_ADMIN_BODY" "__ADMIN_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin"
+orv_smoke_body_contains "admin dashboard title" "$SMOKE_ADMIN_BODY" 'Miol Shop Admin'
+orv_smoke_body_contains "admin dashboard summary link" "$SMOKE_ADMIN_BODY" '/admin/summary'
+orv_smoke_body_contains "admin dashboard webhook link" "$SMOKE_ADMIN_BODY" '/admin/webhooks'
+orv_smoke_body_contains "admin dashboard audit link" "$SMOKE_ADMIN_BODY" '/admin/audit'
+orv_smoke_body_contains "admin dashboard sqlite storage" "$SMOKE_ADMIN_BODY" 'data/shop.sqlite'
+orv_smoke_body_contains "admin dashboard payment storage" "$SMOKE_ADMIN_BODY" 'data/payments.jsonl'
+orv_smoke_body_contains "admin dashboard shipment storage" "$SMOKE_ADMIN_BODY" 'data/shipments.jsonl'
 orv_smoke_fetch_origin "GET /admin/summary content" "$SMOKE_ADMIN_SUMMARY_BODY" "__ADMIN_SUMMARY_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary"
 orv_smoke_body_contains "admin summary orders" "$SMOKE_ADMIN_SUMMARY_BODY" '"orders"'
 orv_smoke_body_contains "admin summary payments" "$SMOKE_ADMIN_SUMMARY_BODY" '"payments"'
+orv_smoke_body_contains "admin summary webhook events" "$SMOKE_ADMIN_SUMMARY_BODY" '"webhookEvents"'
+orv_smoke_body_contains "admin summary audit events" "$SMOKE_ADMIN_SUMMARY_BODY" '"auditEvents"'
 orv_smoke_fetch_origin "GET /admin/catalog content" "$SMOKE_ADMIN_CATALOG_BODY" "__ADMIN_CATALOG_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/catalog"
 orv_smoke_body_contains "admin catalog smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU"
 orv_smoke_body_contains "admin catalog second smoke product" "$SMOKE_ADMIN_CATALOG_BODY" "$SMOKE_SKU_SECOND"
@@ -31118,6 +31132,8 @@ orv_smoke_fetch_origin "GET /admin/payments content" "$SMOKE_ADMIN_PAYMENTS_BODY
 orv_smoke_body_contains "admin payments captured" "$SMOKE_ADMIN_PAYMENTS_BODY" 'captured'
 orv_smoke_fetch_origin "GET /admin/shipments content" "$SMOKE_ADMIN_SHIPMENTS_BODY" "__ADMIN_SHIPMENTS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/shipments"
 orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'
+orv_smoke_fetch_origin "GET /admin/webhooks content" "$SMOKE_ADMIN_WEBHOOKS_BODY" "__ADMIN_WEBHOOKS_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/webhooks"
+orv_smoke_body_contains "admin webhooks title" "$SMOKE_ADMIN_WEBHOOKS_BODY" 'Webhooks'
 orv_smoke_fetch_origin "GET /admin/audit content" "$SMOKE_ADMIN_AUDIT_BODY" "__ADMIN_AUDIT_ORIGIN__" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/audit"
 orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'
 orv_smoke_body_contains "admin audit payment" "$SMOKE_ADMIN_AUDIT_BODY" 'payment.capture'
@@ -31135,11 +31151,13 @@ orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipme
         .replace("__CATALOG_ORIGIN__", &catalog_origin)
         .replace("__CART_ORIGIN__", &cart_origin)
         .replace("__CHECKOUT_ORIGIN__", &checkout_origin)
+        .replace("__ADMIN_ORIGIN__", &admin_origin)
         .replace("__ADMIN_SUMMARY_ORIGIN__", &admin_summary_origin)
         .replace("__ADMIN_CATALOG_ORIGIN__", &admin_catalog_origin)
         .replace("__ADMIN_ORDERS_ORIGIN__", &admin_orders_origin)
         .replace("__ADMIN_PAYMENTS_ORIGIN__", &admin_payments_origin)
         .replace("__ADMIN_SHIPMENTS_ORIGIN__", &admin_shipments_origin)
+        .replace("__ADMIN_WEBHOOKS_ORIGIN__", &admin_webhooks_origin)
         .replace("__ADMIN_AUDIT_ORIGIN__", &admin_audit_origin);
         script.push_str(&shop_smoke);
         for route in server_artifact.routes.iter().filter(|route| {
@@ -33309,6 +33327,27 @@ test "checkout excluded failure" {
             r#"orv_smoke_curl_origin "GET /admin/summary" "$ORV_SMOKE_ORIGIN_GET_ADMIN_SUMMARY" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/summary""#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_fetch_origin "GET /admin dashboard content" "$SMOKE_ADMIN_BODY" "$ORV_SMOKE_ORIGIN_GET_ADMIN" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin dashboard title" "$SMOKE_ADMIN_BODY" 'Miol Shop Admin'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin dashboard summary link" "$SMOKE_ADMIN_BODY" '/admin/summary'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin dashboard webhook link" "$SMOKE_ADMIN_BODY" '/admin/webhooks'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin dashboard sqlite storage" "$SMOKE_ADMIN_BODY" 'data/shop.sqlite'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin summary webhook events" "$SMOKE_ADMIN_SUMMARY_BODY" '"webhookEvents"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin summary audit events" "$SMOKE_ADMIN_SUMMARY_BODY" '"auditEvents"'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#
         ));
         assert!(smoke_test.contains(
@@ -33358,6 +33397,12 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin shipments tracking" "$SMOKE_ADMIN_SHIPMENTS_BODY" 'TRK-LOCAL'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_fetch_origin "GET /admin/webhooks content" "$SMOKE_ADMIN_WEBHOOKS_BODY" "$ORV_SMOKE_ORIGIN_GET_ADMIN_WEBHOOKS" -H "cookie: ${ADMIN_SESSION_COOKIE}; ${ADMIN_ROLE_COOKIE}" "$BASE_URL/admin/webhooks""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_body_contains "admin webhooks title" "$SMOKE_ADMIN_WEBHOOKS_BODY" 'Webhooks'"#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_body_contains "admin audit checkout" "$SMOKE_ADMIN_AUDIT_BODY" 'checkout.complete'"#
