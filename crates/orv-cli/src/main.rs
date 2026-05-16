@@ -9336,6 +9336,9 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         "preflight_route_count": production_preflight_route_count(&preflight),
         "preflight_required_env_count": production_preflight_env_count(&preflight, "required_env"),
         "preflight_optional_env_count": production_preflight_env_count(&preflight, "optional_env"),
+        "preflight_smoke_summary_present_count": production_preflight_smoke_summary_present_count(&preflight),
+        "preflight_smoke_summary_missing_count": production_preflight_smoke_summary_missing_count(&preflight),
+        "preflight_smoke_summary_missing_marker_count": production_preflight_smoke_summary_missing_marker_count(&preflight),
         "route_policy_count": production_preflight_route_policy_count(&preflight),
         "route_policy_kind_counts": production_preflight_route_policy_kind_counts(&preflight),
         "db_target_count": db_adapters.len(),
@@ -9407,6 +9410,44 @@ fn production_preflight_route_count(targets: &[serde_json::Value]) -> usize {
         .iter()
         .map(|target| json_array_count(target.get("routes")))
         .sum()
+}
+
+fn production_preflight_smoke_summary_present_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .filter(|target| production_preflight_smoke_summary_present(target))
+        .count()
+}
+
+fn production_preflight_smoke_summary_missing_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .filter(|target| target.get("benchmark_evidence").is_some())
+        .filter(|target| !production_preflight_smoke_summary_present(target))
+        .count()
+}
+
+fn production_preflight_smoke_summary_missing_marker_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(production_preflight_smoke_summary_missing_marker_count_from_target)
+        .sum()
+}
+
+fn production_preflight_smoke_summary_present(target: &serde_json::Value) -> bool {
+    target
+        .pointer("/benchmark_evidence/smoke_test_summary/present")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn production_preflight_smoke_summary_missing_marker_count_from_target(
+    target: &serde_json::Value,
+) -> usize {
+    target
+        .pointer("/benchmark_evidence/smoke_test_summary/missing_markers")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn production_preflight_route_policy_count_from_value(production: &serde_json::Value) -> usize {
@@ -9488,6 +9529,12 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     let commerce_target_count = json_usize_field(&summary, "commerce_target_count");
     let preflight_target_count = json_usize_field(&summary, "preflight_target_count");
     let preflight_command_count = json_usize_field(&summary, "preflight_command_count");
+    let preflight_smoke_summary_present_count =
+        json_usize_field(&summary, "preflight_smoke_summary_present_count");
+    let preflight_smoke_summary_missing_count =
+        json_usize_field(&summary, "preflight_smoke_summary_missing_count");
+    let preflight_smoke_summary_missing_marker_count =
+        json_usize_field(&summary, "preflight_smoke_summary_missing_marker_count");
     let route_policy_count = json_usize_field(&summary, "route_policy_count");
     let client_target_count = json_usize_field(&summary, "client_target_count");
     let graph_contract_count = json_usize_field(&summary, "graph_contract_count");
@@ -9533,7 +9580,13 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Preflight Commands</span><b>{preflight_command_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Preflight Commands</span><b>{preflight_command_count}</b></div><div class=\"metric\"><span>Smoke Summary</span><b>{preflight_smoke_summary_present_count}/{preflight_target_count}</b></div><div class=\"metric\"><span>Smoke Gaps</span><b class=\"{}\">{}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        if preflight_smoke_summary_missing_count + preflight_smoke_summary_missing_marker_count == 0 {
+            ""
+        } else {
+            "bad"
+        },
+        preflight_smoke_summary_missing_count + preflight_smoke_summary_missing_marker_count,
         if missing_artifact_count == 0 { "" } else { "bad" }
     )?;
     writeln!(
@@ -10628,8 +10681,11 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         let optional_env = json_array_count(target.get("optional_env"));
         let route_count = json_array_count(target.get("routes"));
         let route_policies = production_preflight_route_policy_count(std::slice::from_ref(target));
+        let smoke_summary_present = production_preflight_smoke_summary_present(target);
+        let smoke_summary_missing_markers =
+            production_preflight_smoke_summary_missing_marker_count_from_target(target);
         lines.push(format!(
-            "Preflight {path} (commands {commands}, routes {route_count}, route_policies {route_policies}, required_env {required_env}, optional_env {optional_env})"
+            "Preflight {path} (commands {commands}, routes {route_count}, route_policies {route_policies}, required_env {required_env}, optional_env {optional_env}, smoke_summary_present {smoke_summary_present}, smoke_summary_missing_markers {smoke_summary_missing_markers})"
         ));
     }
     for target in production
@@ -54393,6 +54449,18 @@ define Auth() -> { @out "auth" }
             native_host["production"]["summary"]["preflight_optional_env_count"],
             5
         );
+        assert_eq!(
+            native_host["production"]["summary"]["preflight_smoke_summary_present_count"],
+            0
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["preflight_smoke_summary_missing_count"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["preflight_smoke_summary_missing_marker_count"],
+            0
+        );
         assert_eq!(native_host["production"]["summary"]["db_target_count"], 1);
         assert_eq!(
             native_host["production"]["summary"]["commerce_target_count"],
@@ -54472,6 +54540,7 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("Preflight"));
         assert!(html.contains("commands 11"));
         assert!(html.contains("route_policies 2"));
+        assert!(html.contains("smoke_summary_present false"));
         assert!(html.contains("DB Adapters"));
         assert!(html.contains("Commerce Adapters"));
         assert!(html.contains("deploy/db-adapters.json"));
@@ -54509,6 +54578,11 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("\"missing_task_count\": 10"));
         assert!(production_panel.contains("\"smoke_test_summary\""));
         assert!(production_panel.contains("\"present\": false"));
+        assert!(production_panel.contains("\"preflight_smoke_summary_present_count\": 0"));
+        assert!(production_panel.contains("\"preflight_smoke_summary_missing_count\": 1"));
+        assert!(production_panel.contains("\"preflight_smoke_summary_missing_marker_count\": 0"));
+        assert!(production_panel.contains("Smoke Summary</span><b>0/1</b>"));
+        assert!(production_panel.contains("Smoke Gaps</span><b class=\"bad\">1</b>"));
         assert!(production_panel.contains("\"smoke_test_output\""));
         assert!(production_panel.contains("Preflight Commands</span><b>11</b>"));
         assert!(production_panel.contains("Route Policies"));

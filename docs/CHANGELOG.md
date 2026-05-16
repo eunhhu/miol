@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Added native-host/editor Production panel counters for preflight smoke evidence summaries, including present, missing, and missing-marker gap counts.
 - Added reference-runtime `x-orv-response-origin-id` headers and request trace `response_origin_id` fields for executed `@respond` nodes, and wired editor/native-host trace payloads to expose separate response reveal navigation alongside route navigation.
 - Extended generated deploy smoke tests to verify exact `x-orv-response-origin-id` headers for covered routes with one unambiguous response origin, and made verify-build reject response-origin smoke drift.
 - Linked `@html` projection origins back to static page/client bundle artifacts and route-local HTML origins back to their containing route/native-server production targets in reveal/editor payloads.
