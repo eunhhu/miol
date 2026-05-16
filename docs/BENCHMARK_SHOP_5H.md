@@ -45,7 +45,7 @@ sh dist/deploy/smoke-test.sh
 
 This gate proves the implementation path first. Human 5-hour runs then measure authoring UX, not whether the scaffold can boot.
 
-Production builds mirror this benchmark contract into `deploy/preflight.json` under `benchmark`. That artifact records the automated gate, success criteria, time budget, and data-to-record fields so benchmark evidence stays tied to the same deploy preflight that `orv verify-build` checks.
+Production builds mirror this benchmark contract into `deploy/preflight.json` under `benchmark`. They also emit `deploy/benchmark-evidence.json`, a checked evidence template keyed to the same preflight hash. The evidence artifact carries the automated gate, success criteria, time budget, and data-to-record fields so benchmark reports stay tied to the same deploy preflight that `orv verify-build` checks.
 
 ## Success Criteria
 

@@ -2440,6 +2440,8 @@ PORT=8080 docker compose -f deploy/compose.yaml up --build -d\n\
 ./deploy/smoke-test.sh\n\
 ```\n\
 \n\
+The generated `deploy/benchmark-evidence.json` template records the 5-hour shop benchmark tasks and data-to-record fields against the same preflight hash that `orv verify-build` checks.\n\
+\n\
 ## Native Launcher\n\
 \n\
 ```sh\n\
@@ -2464,6 +2466,8 @@ docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n
 - `deploy/env.example`\n\
 - `deploy/db-adapters.json`\n\
 - `deploy/commerce-adapters.json`\n\
+- `deploy/preflight.json`\n\
+- `deploy/benchmark-evidence.json`\n\
 - `deploy/smoke-test.sh`\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
@@ -21852,6 +21856,10 @@ fn verify_deploy_server_target(
     if preflight != DEPLOY_PREFLIGHT_PATH {
         anyhow::bail!("deploy server preflight must be {DEPLOY_PREFLIGHT_PATH}");
     }
+    let benchmark_evidence = json_str(server, "benchmark_evidence", "deploy server")?;
+    if benchmark_evidence != DEPLOY_BENCHMARK_EVIDENCE_PATH {
+        anyhow::bail!("deploy server benchmark_evidence must be {DEPLOY_BENCHMARK_EVIDENCE_PATH}");
+    }
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -21943,20 +21951,30 @@ fn verify_deploy_server_target(
         &persistence,
         client,
     )?;
+    let deploy_artifacts = DeployRunbookArtifacts {
+        server_artifact: artifact_path,
+        compose,
+        env_example,
+        db_adapters,
+        commerce_adapters,
+        smoke_test,
+        preflight,
+        benchmark_evidence,
+        runbook,
+        routes: routes_artifact,
+    };
     verify_deploy_preflight_artifact(
         dir,
         preflight,
-        &DeployRunbookArtifacts {
-            server_artifact: artifact_path,
-            compose,
-            env_example,
-            db_adapters,
-            commerce_adapters,
-            smoke_test,
-            preflight,
-            runbook,
-            routes: routes_artifact,
-        },
+        &deploy_artifacts,
+        &artifact,
+        &persistence,
+        client,
+    )?;
+    verify_deploy_benchmark_evidence_artifact(
+        dir,
+        benchmark_evidence,
+        &deploy_artifacts,
         &artifact,
         &persistence,
         client,
@@ -21964,17 +21982,7 @@ fn verify_deploy_server_target(
     verify_deploy_runbook_artifact(
         dir,
         runbook,
-        &DeployRunbookArtifacts {
-            server_artifact: artifact_path,
-            compose,
-            env_example,
-            db_adapters,
-            commerce_adapters,
-            smoke_test,
-            preflight,
-            runbook,
-            routes: routes_artifact,
-        },
+        &deploy_artifacts,
         &artifact,
         &persistence,
         client,
@@ -22826,6 +22834,7 @@ fn verify_deploy_preflight_artifact(
         ("commerce_adapters", artifacts.commerce_adapters),
         ("smoke_test", artifacts.smoke_test),
         ("preflight", artifacts.preflight),
+        ("benchmark_evidence", artifacts.benchmark_evidence),
         ("runbook", artifacts.runbook),
     ] {
         let pointer = format!("/artifacts/{key}");
@@ -22878,6 +22887,200 @@ fn verify_deploy_preflight_artifact(
         anyhow::bail!("deploy preflight benchmark does not match 5-hour shop contract");
     }
     Ok(())
+}
+
+fn verify_deploy_benchmark_evidence_artifact(
+    dir: &Path,
+    path: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let evidence_path = dir.join(path);
+    if !evidence_path.is_file() {
+        anyhow::bail!(
+            "missing deploy benchmark evidence artifact: {}",
+            evidence_path.display()
+        );
+    }
+    let evidence = read_json_value(&evidence_path)?;
+    if evidence
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy benchmark evidence schema_version must be 1");
+    }
+    if json_str(&evidence, "kind", "deploy benchmark evidence")? != "orv.benchmark.shop_5h.evidence"
+    {
+        anyhow::bail!("deploy benchmark evidence kind must be orv.benchmark.shop_5h.evidence");
+    }
+    verify_json_pointer_str(
+        &evidence,
+        "/preflight",
+        artifacts.preflight,
+        "deploy benchmark evidence preflight",
+    )?;
+    let expected_preflight =
+        deploy_preflight_artifact_value(artifacts, artifact, persistence, client);
+    let expected_preflight_hash = stable_json_hash(&expected_preflight)?;
+    verify_json_pointer_str(
+        &evidence,
+        "/preflight_hash",
+        &expected_preflight_hash,
+        "deploy benchmark evidence preflight_hash",
+    )?;
+    if evidence.get("benchmark") != Some(&deploy_preflight_benchmark_value()) {
+        anyhow::bail!("deploy benchmark evidence benchmark does not match 5-hour shop contract");
+    }
+    if evidence.get("commands") != Some(&deploy_preflight_commands_value(artifacts)) {
+        anyhow::bail!("deploy benchmark evidence commands do not match deploy preflight");
+    }
+    if evidence.get("artifacts") != Some(&deploy_preflight_artifacts_value(artifacts)) {
+        anyhow::bail!("deploy benchmark evidence artifacts do not match deploy preflight");
+    }
+    verify_deploy_benchmark_evidence_task_entries(&evidence)?;
+    verify_deploy_benchmark_evidence_data(&evidence)?;
+    if evidence
+        .get("recording_status")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        anyhow::bail!("deploy benchmark evidence recording_status must be a string");
+    }
+    Ok(())
+}
+
+fn verify_deploy_benchmark_evidence_task_entries(
+    evidence: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let entries = evidence
+        .get("task_entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("deploy benchmark evidence task_entries must be an array")
+        })?;
+    let expected = deploy_benchmark_evidence_task_entries_value();
+    let expected_entries = expected
+        .as_array()
+        .expect("benchmark evidence task entries are an array");
+    if entries.len() != expected_entries.len() {
+        anyhow::bail!("deploy benchmark evidence task_entries do not match 5-hour time budget");
+    }
+    for (index, (entry, expected)) in entries.iter().zip(expected_entries.iter()).enumerate() {
+        if entry.get("task") != expected.get("task")
+            || entry.get("target_minutes") != expected.get("target_minutes")
+        {
+            anyhow::bail!("deploy benchmark evidence task_entries do not match 5-hour time budget");
+        }
+        if !entry
+            .as_object()
+            .is_some_and(|object| object.contains_key("elapsed_minutes"))
+        {
+            anyhow::bail!(
+                "deploy benchmark evidence task_entries[{index}] must include elapsed_minutes"
+            );
+        }
+        if !entry
+            .get("elapsed_minutes")
+            .is_some_and(json_null_or_number)
+        {
+            anyhow::bail!(
+                "deploy benchmark evidence task_entries[{index}] elapsed_minutes must be null or a number"
+            );
+        }
+        if entry
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            anyhow::bail!(
+                "deploy benchmark evidence task_entries[{index}] status must be a string"
+            );
+        }
+        if entry
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            anyhow::bail!("deploy benchmark evidence task_entries[{index}] notes must be a string");
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_benchmark_evidence_data(evidence: &serde_json::Value) -> anyhow::Result<()> {
+    let data = evidence
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("deploy benchmark evidence data must be an object"))?;
+    for key in [
+        "elapsed_time_per_task",
+        "docs_help_lookups",
+        "compiler_runtime_errors",
+        "first_error_to_fix_minutes",
+        "manual_config_edits",
+        "smoke_test_output",
+        "participant_notes",
+    ] {
+        if !data.contains_key(key) {
+            anyhow::bail!("deploy benchmark evidence data must include {key}");
+        }
+    }
+    if data
+        .get("elapsed_time_per_task")
+        .and_then(serde_json::Value::as_str)
+        != Some("task_entries[*].elapsed_minutes")
+    {
+        anyhow::bail!(
+            "deploy benchmark evidence data elapsed_time_per_task must reference task_entries"
+        );
+    }
+    for key in ["docs_help_lookups", "compiler_runtime_errors"] {
+        if !data.get(key).is_some_and(json_null_or_integer) {
+            anyhow::bail!("deploy benchmark evidence data {key} must be null or an integer");
+        }
+    }
+    if !data
+        .get("first_error_to_fix_minutes")
+        .is_some_and(json_null_or_number)
+    {
+        anyhow::bail!(
+            "deploy benchmark evidence data first_error_to_fix_minutes must be null or a number"
+        );
+    }
+    if !data
+        .get("manual_config_edits")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        anyhow::bail!("deploy benchmark evidence data manual_config_edits must be an array");
+    }
+    if !data
+        .get("smoke_test_output")
+        .is_some_and(json_null_or_string)
+    {
+        anyhow::bail!("deploy benchmark evidence data smoke_test_output must be null or a string");
+    }
+    if !data
+        .get("participant_notes")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        anyhow::bail!("deploy benchmark evidence data participant_notes must be a string");
+    }
+    Ok(())
+}
+
+fn json_null_or_integer(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_i64().is_some() || value.as_u64().is_some()
+}
+
+fn json_null_or_number(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_f64().is_some()
+}
+
+fn json_null_or_string(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_str().is_some()
 }
 
 fn verify_json_pointer_str(
@@ -23077,6 +23280,7 @@ struct DeployRunbookArtifacts<'a> {
     commerce_adapters: &'a str,
     smoke_test: &'a str,
     preflight: &'a str,
+    benchmark_evidence: &'a str,
     runbook: &'a str,
     routes: &'a str,
 }
@@ -23123,9 +23327,16 @@ fn verify_deploy_runbook_artifact(
         let preflight_path = artifacts.preflight;
         anyhow::bail!("deploy runbook must reference {preflight_path}");
     }
+    if !runbook.contains(artifacts.benchmark_evidence) {
+        let benchmark_evidence_path = artifacts.benchmark_evidence;
+        anyhow::bail!("deploy runbook must reference {benchmark_evidence_path}");
+    }
     let smoke_command = format!("./{}", artifacts.smoke_test);
     if !runbook.contains(&smoke_command) {
         anyhow::bail!("deploy runbook must document deploy smoke test command");
+    }
+    if !runbook.contains("## Benchmark Evidence") {
+        anyhow::bail!("deploy runbook must document benchmark evidence capture");
     }
     if !runbook.contains("./deploy/server.sh --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document request trace capture command");
@@ -24179,6 +24390,7 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
         })]);
     }
     let artifact = read_json_value(&target_path)?;
+    let benchmark_evidence = reveal_benchmark_evidence_summary(dir, &artifact)?;
     Ok(vec![serde_json::json!({
         "kind": "preflight",
         "path": path,
@@ -24199,6 +24411,7 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
             .get("benchmark")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "benchmark_evidence": benchmark_evidence,
         "runtime_features": artifact
             .get("runtime_features")
             .cloned()
@@ -24224,6 +24437,57 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
     })])
+}
+
+fn reveal_benchmark_evidence_summary(
+    dir: &Path,
+    preflight: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(path) = preflight
+        .pointer("/artifacts/benchmark_evidence")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let target_path = dir.join(path);
+    if !target_path.is_file() {
+        return Ok(serde_json::json!({
+            "path": path,
+            "exists": false,
+        }));
+    }
+    let evidence = read_json_value(&target_path)?;
+    let task_count = evidence
+        .get("task_entries")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let data_keys = evidence
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .map(|data| data.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "path": path,
+        "exists": true,
+        "kind": evidence
+            .get("kind")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "preflight": evidence
+            .get("preflight")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "preflight_hash": evidence
+            .get("preflight_hash")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "recording_status": evidence
+            .get("recording_status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "task_count": task_count,
+        "data_keys": data_keys,
+    }))
 }
 
 fn reveal_static_targets(
@@ -28878,6 +29142,7 @@ const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const DEPLOY_SMOKE_TEST_PATH: &str = "deploy/smoke-test.sh";
 const DEPLOY_PREFLIGHT_PATH: &str = "deploy/preflight.json";
+const DEPLOY_BENCHMARK_EVIDENCE_PATH: &str = "deploy/benchmark-evidence.json";
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
@@ -29384,6 +29649,7 @@ fn write_prod_deploy_artifacts(
         let commerce_adapters = "deploy/commerce-adapters.json";
         let smoke_test = DEPLOY_SMOKE_TEST_PATH;
         let preflight = DEPLOY_PREFLIGHT_PATH;
+        let benchmark_evidence = DEPLOY_BENCHMARK_EVIDENCE_PATH;
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -29414,37 +29680,37 @@ fn write_prod_deploy_artifacts(
             &persistence,
             &client,
         )?;
+        let deploy_artifacts = DeployRunbookArtifacts {
+            server_artifact: targets.server_artifact,
+            compose,
+            env_example,
+            db_adapters,
+            commerce_adapters,
+            smoke_test,
+            preflight,
+            benchmark_evidence,
+            runbook,
+            routes: routes_artifact,
+        };
         write_prod_preflight_artifact(
             out,
             preflight,
-            &DeployRunbookArtifacts {
-                server_artifact: targets.server_artifact,
-                compose,
-                env_example,
-                db_adapters,
-                commerce_adapters,
-                smoke_test,
-                preflight,
-                runbook,
-                routes: routes_artifact,
-            },
+            &deploy_artifacts,
+            server_artifact,
+            &persistence,
+            &client,
+        )?;
+        write_prod_benchmark_evidence_artifact(
+            out,
+            benchmark_evidence,
+            &deploy_artifacts,
             server_artifact,
             &persistence,
             &client,
         )?;
         write_prod_deploy_runbook(
             out,
-            &DeployRunbookArtifacts {
-                server_artifact: targets.server_artifact,
-                compose,
-                env_example,
-                db_adapters,
-                commerce_adapters,
-                smoke_test,
-                preflight,
-                runbook,
-                routes: routes_artifact,
-            },
+            &deploy_artifacts,
             server_artifact,
             &persistence,
             &client,
@@ -29468,6 +29734,7 @@ fn write_prod_deploy_artifacts(
             "commerce_adapters": commerce_adapters,
             "smoke_test": smoke_test,
             "preflight": preflight,
+            "benchmark_evidence": benchmark_evidence,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
@@ -29664,6 +29931,23 @@ fn write_prod_preflight_artifact(
     write_json(&out.join(path), &preflight)
 }
 
+fn write_prod_benchmark_evidence_artifact(
+    out: &Path,
+    path: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let evidence = deploy_benchmark_evidence_artifact_value(
+        artifacts,
+        server_artifact,
+        persistence,
+        Some(client),
+    )?;
+    write_json(&out.join(path), &evidence)
+}
+
 fn deploy_preflight_artifact_value(
     artifacts: &DeployRunbookArtifacts<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
@@ -29682,34 +29966,93 @@ fn deploy_preflight_artifact_value(
         "persistence": deploy_persistence_value(persistence),
         "required_env": deploy_preflight_env_values(server_artifact.listen.as_ref(), persistence, true),
         "optional_env": deploy_preflight_env_values(server_artifact.listen.as_ref(), persistence, false),
-        "commands": {
-            "verify_build": "orv verify-build .",
-            "env_check": "orv deploy-env-check .",
-            "run_build": "orv run-build .",
-            "smoke_test": format!("./{}", artifacts.smoke_test),
-            "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
-            "trace": "./deploy/server.sh --trace deploy/request-trace.json",
-            "trace_run_build": "orv run-build . --trace deploy/request-trace.json",
-            "editor_trace": "orv editor trace . --trace deploy/request-trace.json",
-            "trace_stream_smoke": format!("ORV_SMOKE_TRACE_STREAM=1 ./{}", artifacts.smoke_test),
-        },
-        "artifacts": {
-            "server": artifacts.server_artifact,
-            "routes": artifacts.routes,
-            "source_bundle": SOURCE_BUNDLE_PATH,
-            "project_graph": "project-graph.json",
-            "origin_map": "origin-map.json",
-            "build_manifest": "build-manifest.json",
-            "bundle_plan": "bundle-plan.json",
-            "env_example": artifacts.env_example,
-            "db_adapters": artifacts.db_adapters,
-            "commerce_adapters": artifacts.commerce_adapters,
-            "smoke_test": artifacts.smoke_test,
-            "preflight": artifacts.preflight,
-            "runbook": artifacts.runbook,
-        },
+        "commands": deploy_preflight_commands_value(artifacts),
+        "artifacts": deploy_preflight_artifacts_value(artifacts),
         "benchmark": deploy_preflight_benchmark_value(),
         "client": deploy_preflight_client_value(client),
+    })
+}
+
+fn deploy_preflight_commands_value(artifacts: &DeployRunbookArtifacts<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "verify_build": "orv verify-build .",
+        "env_check": "orv deploy-env-check .",
+        "run_build": "orv run-build .",
+        "smoke_test": format!("./{}", artifacts.smoke_test),
+        "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
+        "trace": "./deploy/server.sh --trace deploy/request-trace.json",
+        "trace_run_build": "orv run-build . --trace deploy/request-trace.json",
+        "editor_trace": "orv editor trace . --trace deploy/request-trace.json",
+        "trace_stream_smoke": format!("ORV_SMOKE_TRACE_STREAM=1 ./{}", artifacts.smoke_test),
+    })
+}
+
+fn deploy_preflight_artifacts_value(artifacts: &DeployRunbookArtifacts<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "server": artifacts.server_artifact,
+        "routes": artifacts.routes,
+        "source_bundle": SOURCE_BUNDLE_PATH,
+        "project_graph": "project-graph.json",
+        "origin_map": "origin-map.json",
+        "build_manifest": "build-manifest.json",
+        "bundle_plan": "bundle-plan.json",
+        "env_example": artifacts.env_example,
+        "db_adapters": artifacts.db_adapters,
+        "commerce_adapters": artifacts.commerce_adapters,
+        "smoke_test": artifacts.smoke_test,
+        "preflight": artifacts.preflight,
+        "benchmark_evidence": artifacts.benchmark_evidence,
+        "runbook": artifacts.runbook,
+    })
+}
+
+fn deploy_benchmark_evidence_artifact_value(
+    artifacts: &DeployRunbookArtifacts<'_>,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let preflight =
+        deploy_preflight_artifact_value(artifacts, server_artifact, persistence, client);
+    let preflight_hash = stable_json_hash(&preflight)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.benchmark.shop_5h.evidence",
+        "preflight": artifacts.preflight,
+        "preflight_hash": preflight_hash,
+        "benchmark": deploy_preflight_benchmark_value(),
+        "commands": deploy_preflight_commands_value(artifacts),
+        "artifacts": deploy_preflight_artifacts_value(artifacts),
+        "recording_status": "not_recorded",
+        "task_entries": deploy_benchmark_evidence_task_entries_value(),
+        "data": deploy_benchmark_evidence_data_value(),
+    }))
+}
+
+fn deploy_benchmark_evidence_task_entries_value() -> serde_json::Value {
+    serde_json::json!([
+        {"task": "Project creation and first run", "target_minutes": 15, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "First page/theme edit", "target_minutes": 30, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Product data entry", "target_minutes": 30, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Product field addition", "target_minutes": 45, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Form validation update", "target_minutes": 45, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Auth/member flow check", "target_minutes": 30, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Checkout/payment/shipping config", "target_minutes": 60, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Admin verification", "target_minutes": 30, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Prod build and env check", "target_minutes": 30, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+        {"task": "Smoke-test and issue fixing", "target_minutes": 45, "elapsed_minutes": null, "status": "not_recorded", "notes": ""},
+    ])
+}
+
+fn deploy_benchmark_evidence_data_value() -> serde_json::Value {
+    serde_json::json!({
+        "elapsed_time_per_task": "task_entries[*].elapsed_minutes",
+        "docs_help_lookups": null,
+        "compiler_runtime_errors": null,
+        "first_error_to_fix_minutes": null,
+        "manual_config_edits": [],
+        "smoke_test_output": null,
+        "participant_notes": "",
     })
 }
 
@@ -30493,6 +30836,7 @@ fn write_prod_deploy_runbook(
     let commerce_adapters_path = artifacts.commerce_adapters;
     let smoke_test_path = artifacts.smoke_test;
     let preflight_path = artifacts.preflight;
+    let benchmark_evidence_path = artifacts.benchmark_evidence;
     let routes_artifact = artifacts.routes;
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
@@ -30522,6 +30866,7 @@ fn write_prod_deploy_runbook(
 - Commerce adapters: {commerce_adapters_path}
 - Smoke test: {smoke_test_path}
 - Preflight: {preflight_path}
+- Benchmark evidence: {benchmark_evidence_path}
 - Routes: {routes_artifact}
 
 ## Native Launcher
@@ -30560,6 +30905,10 @@ orv deploy-env-check .
 ```sh
 ./{smoke_test_path}
 ```
+
+## Benchmark Evidence
+
+Record human-run timing and observation data in `{benchmark_evidence_path}` after the preflight and smoke commands pass. The file keeps the 5-hour shop benchmark tasks, data-to-record fields, and preflight hash together so benchmark reports stay tied to the checked build contract.
 
 {client_section}
 {persistence_section}
@@ -31879,6 +32228,9 @@ test "checkout excluded failure" {
         assert!(guide.contains("deploy/env.example"));
         assert!(guide.contains("deploy/db-adapters.json"));
         assert!(guide.contains("deploy/commerce-adapters.json"));
+        assert!(guide.contains("deploy/preflight.json"));
+        assert!(guide.contains("deploy/benchmark-evidence.json"));
+        assert!(guide.contains("5-hour shop benchmark"));
         assert!(guide.contains("deploy/smoke-test.sh"));
         assert!(guide.contains("server/native-server.json"));
         assert!(guide.contains("server/native/Cargo.toml"));
@@ -31981,6 +32333,9 @@ test "checkout excluded failure" {
             .expect("commerce adapters");
         let preflight =
             read_json_value(&out.join("deploy").join("preflight.json")).expect("preflight");
+        let benchmark_evidence =
+            read_json_value(&out.join("deploy").join("benchmark-evidence.json"))
+                .expect("benchmark evidence");
         let smoke_test =
             std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
         let native_routes =
@@ -32137,6 +32492,10 @@ test "checkout excluded failure" {
         assert_eq!(
             deploy["server"]["preflight"],
             serde_json::json!("deploy/preflight.json")
+        );
+        assert_eq!(
+            deploy["server"]["benchmark_evidence"],
+            serde_json::json!("deploy/benchmark-evidence.json")
         );
         assert_eq!(
             deploy["server"]["persistence"]["commerce_env"],
@@ -32307,6 +32666,10 @@ test "checkout excluded failure" {
         );
         assert_eq!(preflight["benchmark"]["kind"], "orv.benchmark.shop_5h");
         assert_eq!(preflight["benchmark"]["max_elapsed_minutes"], 300);
+        assert_eq!(
+            preflight["artifacts"]["benchmark_evidence"],
+            serde_json::json!("deploy/benchmark-evidence.json")
+        );
         assert!(preflight["benchmark"]["success_criteria"]
             .as_array()
             .expect("benchmark success criteria")
@@ -32319,6 +32682,24 @@ test "checkout excluded failure" {
             .expect("benchmark data")
             .iter()
             .any(|item| item == "smoke-test output"));
+        assert_eq!(
+            benchmark_evidence["kind"],
+            serde_json::json!("orv.benchmark.shop_5h.evidence")
+        );
+        assert_eq!(benchmark_evidence["benchmark"], preflight["benchmark"]);
+        assert_eq!(benchmark_evidence["commands"], preflight["commands"]);
+        assert_eq!(benchmark_evidence["artifacts"], preflight["artifacts"]);
+        assert_eq!(
+            benchmark_evidence["task_entries"]
+                .as_array()
+                .expect("benchmark evidence task entries")
+                .len(),
+            10
+        );
+        assert_eq!(
+            benchmark_evidence["data"]["smoke_test_output"],
+            serde_json::Value::Null
+        );
         assert!(preflight["optional_env"]
             .as_array()
             .expect("optional preflight env")
@@ -32560,6 +32941,8 @@ test "checkout excluded failure" {
         assert!(runbook.contains("deploy/commerce-adapters.json"));
         assert!(runbook.contains("deploy/smoke-test.sh"));
         assert!(runbook.contains("deploy/preflight.json"));
+        assert!(runbook.contains("deploy/benchmark-evidence.json"));
+        assert!(runbook.contains("## Benchmark Evidence"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
         assert!(runbook.contains("orv verify-build ."));
@@ -44061,6 +44444,7 @@ entry = "src/main.orv"
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let deploy_smoke_test_path = out.join("deploy").join("smoke-test.sh");
         let deploy_preflight_path = out.join("deploy").join("preflight.json");
+        let deploy_benchmark_evidence_path = out.join("deploy").join("benchmark-evidence.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         let native_server_plan_path = out.join("server").join("native-server.json");
         assert!(
@@ -44109,6 +44493,11 @@ entry = "src/main.orv"
             deploy_preflight_path.display()
         );
         assert!(
+            deploy_benchmark_evidence_path.is_file(),
+            "missing {}",
+            deploy_benchmark_evidence_path.display()
+        );
+        assert!(
             server_entrypoint_path.is_file(),
             "missing {}",
             server_entrypoint_path.display()
@@ -44132,6 +44521,10 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(deploy["server"]["smoke_test"], "deploy/smoke-test.sh");
         assert_eq!(deploy["server"]["preflight"], "deploy/preflight.json");
+        assert_eq!(
+            deploy["server"]["benchmark_evidence"],
+            "deploy/benchmark-evidence.json"
+        );
         assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
         assert_eq!(
             deploy["server"]["native_runtime_image_plan"],
@@ -44204,6 +44597,8 @@ entry = "src/main.orv"
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook.contains("deploy/preflight.json"));
+        assert!(runbook.contains("deploy/benchmark-evidence.json"));
+        assert!(runbook.contains("## Benchmark Evidence"));
         assert!(runbook.contains("orv verify-build ."));
         assert!(runbook.contains("orv deploy-env-check ."));
         assert!(runbook.contains("/__orv/trace/events"));
@@ -44257,6 +44652,10 @@ entry = "src/main.orv"
         assert_eq!(preflight["artifact"], "server/app.orv-runtime.json");
         assert_eq!(preflight["artifacts"]["smoke_test"], "deploy/smoke-test.sh");
         assert_eq!(preflight["artifacts"]["preflight"], "deploy/preflight.json");
+        assert_eq!(
+            preflight["artifacts"]["benchmark_evidence"],
+            "deploy/benchmark-evidence.json"
+        );
         assert_eq!(preflight["artifacts"]["source_bundle"], SOURCE_BUNDLE_PATH);
         assert_eq!(
             preflight["artifacts"]["project_graph"],
@@ -44293,6 +44692,31 @@ entry = "src/main.orv"
             preflight["runtime_features"],
             deploy["server"]["runtime_features"]
         );
+        let evidence =
+            read_json_value(&deploy_benchmark_evidence_path).expect("benchmark evidence");
+        assert_eq!(evidence["schema_version"], 1);
+        assert_eq!(evidence["kind"], "orv.benchmark.shop_5h.evidence");
+        assert_eq!(evidence["preflight"], "deploy/preflight.json");
+        assert!(evidence["preflight_hash"].as_str().is_some());
+        assert_eq!(evidence["benchmark"], preflight["benchmark"]);
+        assert_eq!(evidence["commands"], preflight["commands"]);
+        assert_eq!(evidence["artifacts"], preflight["artifacts"]);
+        assert_eq!(evidence["recording_status"], "not_recorded");
+        assert_eq!(
+            evidence["task_entries"]
+                .as_array()
+                .expect("benchmark tasks")
+                .len(),
+            10
+        );
+        assert_eq!(
+            evidence["data"]["elapsed_time_per_task"],
+            "task_entries[*].elapsed_minutes"
+        );
+        assert!(evidence["data"]
+            .as_object()
+            .expect("benchmark data")
+            .contains_key("smoke_test_output"));
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
@@ -46164,6 +46588,51 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy preflight benchmark does not match 5-hour shop contract"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_benchmark_evidence_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-benchmark-evidence-source");
+        let out = temp_output_dir("deploy-benchmark-evidence-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+        let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+        evidence["benchmark"]["max_elapsed_minutes"] = serde_json::json!(301);
+        write_json(&evidence_path, &evidence).expect("write corrupt benchmark evidence");
+
+        let err = cmd_verify_build(&out).expect_err("benchmark evidence mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy benchmark evidence benchmark does not match 5-hour shop contract"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_accepts_recorded_deploy_benchmark_evidence_values() {
+        let (src_dir, path) = prod_server_source("deploy-benchmark-evidence-recorded-source");
+        let out = temp_output_dir("deploy-benchmark-evidence-recorded");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+        let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+        evidence["recording_status"] = serde_json::json!("recorded");
+        evidence["task_entries"][0]["elapsed_minutes"] = serde_json::json!(12.5);
+        evidence["task_entries"][0]["status"] = serde_json::json!("recorded");
+        evidence["task_entries"][0]["notes"] = serde_json::json!("first run completed");
+        evidence["data"]["docs_help_lookups"] = serde_json::json!(3);
+        evidence["data"]["compiler_runtime_errors"] = serde_json::json!(1);
+        evidence["data"]["first_error_to_fix_minutes"] = serde_json::json!(4.5);
+        evidence["data"]["manual_config_edits"] = serde_json::json!(["none"]);
+        evidence["data"]["smoke_test_output"] = serde_json::json!("passed");
+        evidence["data"]["participant_notes"] = serde_json::json!("sample");
+        write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
+
+        cmd_verify_build(&out).expect("recorded benchmark evidence still verifies");
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -49049,8 +49518,13 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["commands"]["verify_build"] == "orv verify-build ."
                 && target["commands"]["env_check"] == "orv deploy-env-check ."
                 && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
+                && target["artifacts"]["benchmark_evidence"] == "deploy/benchmark-evidence.json"
                 && target["benchmark"]["kind"] == "orv.benchmark.shop_5h"
                 && target["benchmark"]["max_elapsed_minutes"] == 300
+                && target["benchmark_evidence"]["exists"] == true
+                && target["benchmark_evidence"]["path"] == "deploy/benchmark-evidence.json"
+                && target["benchmark_evidence"]["recording_status"] == "not_recorded"
+                && target["benchmark_evidence"]["task_count"] == 10
                 && target["routes"][0]["method"] == "GET"
                 && target["routes"][0]["path"] == "/ping"
                 && target["required_env"][0]["kind"] == "db"
@@ -52627,6 +53101,14 @@ define Auth() -> { @out "auth" }
             state["production"]["preflight"][0]["commands"]["verify_build"],
             "orv verify-build ."
         );
+        assert_eq!(
+            state["production"]["preflight"][0]["artifacts"]["benchmark_evidence"],
+            "deploy/benchmark-evidence.json"
+        );
+        assert_eq!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["recording_status"],
+            "not_recorded"
+        );
         let checkout_route = json_route(
             &state["production"]["preflight"][0]["routes"],
             "POST",
@@ -52855,6 +53337,7 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("DB Adapters"));
         assert!(production_panel.contains("Commerce Adapters"));
         assert!(production_panel.contains("deploy/preflight.json"));
+        assert!(production_panel.contains("deploy/benchmark-evidence.json"));
         assert!(production_panel.contains("deploy/db-adapters.json"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
