@@ -21943,9 +21943,11 @@ fn verify_deploy_smoke_test_artifact(
     }
     if !smoke.contains(r#"ORV_BIN="${ORV_BIN:-orv}""#)
         || !smoke.contains("orv_smoke_reveal_contains()")
+        || !smoke.contains("orv_smoke_editor_reveal_contains()")
+        || !smoke.contains("editor reveal")
         || !smoke.contains("orv deploy smoke test requires orv")
     {
-        anyhow::bail!("deploy smoke test must verify source reveal with the ORV CLI");
+        anyhow::bail!("deploy smoke test must verify source and editor reveal with the ORV CLI");
     }
     if !smoke.contains("orv_smoke_trace_stream()")
         || !smoke.contains("ORV_SMOKE_TRACE_STREAM")
@@ -22063,6 +22065,14 @@ fn verify_deploy_smoke_test_artifact(
                     r#"orv_smoke_reveal_contains "reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
                     route.path, response_origin_ref
                 ),
+                format!(
+                    r#"orv_smoke_editor_reveal_contains "editor reveal GET {} response source" "{}" '@respond'"#,
+                    route.path, response_origin_ref
+                ),
+                format!(
+                    r#"orv_smoke_editor_reveal_contains "editor reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
+                    route.path, response_origin_ref
+                ),
             ] {
                 if !smoke.contains(&required) {
                     let method = &route.method;
@@ -22141,6 +22151,8 @@ fn verify_deploy_smoke_test_artifact(
             r#"orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'"#,
             r#"orv_smoke_reveal_contains "reveal GET / source" "$ORV_SMOKE_ORIGIN_GET_ROOT" '@route GET /'"#,
             r#"orv_smoke_reveal_contains "reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#,
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET / source" "$ORV_SMOKE_ORIGIN_GET_ROOT" '@route GET /'"#,
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#,
             r#"orv_smoke_body_contains "catalog smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU""#,
             r#"orv_smoke_body_contains "catalog second smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_SECOND""#,
             r#"orv_smoke_body_contains "catalog third smoke product" "$SMOKE_CATALOG_BODY" "$SMOKE_SKU_THIRD""#,
@@ -22166,6 +22178,8 @@ fn verify_deploy_smoke_test_artifact(
                 r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
                 r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -22178,6 +22192,8 @@ fn verify_deploy_smoke_test_artifact(
                 r#"orv_smoke_reveal_contains "reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'"#,
                 r#"orv_smoke_reveal_contains "reveal payment record path" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'file://data/payments.jsonl'"#,
                 r#"orv_smoke_reveal_contains "reveal payment request kind" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'payment.capture'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -22190,6 +22206,8 @@ fn verify_deploy_smoke_test_artifact(
                 r#"orv_smoke_reveal_contains "reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'"#,
                 r#"orv_smoke_reveal_contains "reveal shipping record path" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'file://data/shipments.jsonl'"#,
                 r#"orv_smoke_reveal_contains "reveal shipping request kind" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'shipping.booking'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'"#,
+                r#"orv_smoke_editor_reveal_contains "editor reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -29308,6 +29326,24 @@ orv_smoke_reveal_contains() {{
   rm -f "$output_path"
 }}
 
+orv_smoke_editor_reveal_contains() {{
+  label="$1"
+  origin_id="$2"
+  pattern="$3"
+  output_path="$(mktemp)"
+  if ! "$ORV_BIN" editor reveal . "$origin_id" > "$output_path"; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s editor reveal command\n' "$label" >&2
+    exit 1
+  fi
+  if ! grep -F "$pattern" "$output_path" >/dev/null; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s editor reveal missing %s\n' "$label" "$pattern" >&2
+    exit 1
+  fi
+  rm -f "$output_path"
+}}
+
 orv_smoke_trace_stream() {{
   if [ "${{ORV_SMOKE_TRACE_STREAM:-0}}" != "1" ]; then
     return 0
@@ -29622,6 +29658,16 @@ done
                 r#"orv_smoke_reveal_contains "reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
                 route.path, response_origin_ref
             );
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_editor_reveal_contains "editor reveal GET {} response source" "{}" '@respond'"#,
+                route.path, response_origin_ref
+            );
+            let _ = writeln!(
+                script,
+                r#"orv_smoke_editor_reveal_contains "editor reveal GET {} response production" "{}" '"response_origin_dispatch": true'"#,
+                route.path, response_origin_ref
+            );
         } else {
             let _ = writeln!(
                 script,
@@ -29693,22 +29739,30 @@ orv_smoke_body_contains "home theme surface" "$SMOKE_HOME_BODY" 'background-colo
 orv_smoke_body_contains "home theme typography" "$SMOKE_HOME_BODY" 'font-family: Inter, system-ui, sans-serif'
 orv_smoke_reveal_contains "reveal GET / source" "__ROOT_ORIGIN__" '@route GET /'
 orv_smoke_reveal_contains "reveal GET / production" "__ROOT_ORIGIN__" '"path": "/"'
+orv_smoke_editor_reveal_contains "editor reveal GET / source" "__ROOT_ORIGIN__" '@route GET /'
+orv_smoke_editor_reveal_contains "editor reveal GET / production" "__ROOT_ORIGIN__" '"path": "/"'
 if [ -n "$ORV_SMOKE_DB_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
   orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'
+  orv_smoke_editor_reveal_contains "editor reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
+  orv_smoke_editor_reveal_contains "editor reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
 fi
 if [ -n "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'
   orv_smoke_reveal_contains "reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'
   orv_smoke_reveal_contains "reveal payment record path" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'file://data/payments.jsonl'
   orv_smoke_reveal_contains "reveal payment request kind" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'payment.capture'
+  orv_smoke_editor_reveal_contains "editor reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'
+  orv_smoke_editor_reveal_contains "editor reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'
 fi
 if [ -n "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'
   orv_smoke_reveal_contains "reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'
   orv_smoke_reveal_contains "reveal shipping record path" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'file://data/shipments.jsonl'
   orv_smoke_reveal_contains "reveal shipping request kind" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'shipping.booking'
+  orv_smoke_editor_reveal_contains "editor reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'
+  orv_smoke_editor_reveal_contains "editor reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'
 fi
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
 if [ -z "$CSRF_COOKIE" ]; then
