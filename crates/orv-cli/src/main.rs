@@ -27109,7 +27109,7 @@ fn external_db_adapter_provider(url: &str) -> Option<&'static str> {
 fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
     match provider {
         "postgres" => vec![
-            deploy_provider_env("ORV_DB_ADAPTER_POSTGRES_ENDPOINT", false, "bridge_endpoint"),
+            deploy_provider_env("ORV_DB_ADAPTER_POSTGRES_ENDPOINT", true, "bridge_endpoint"),
             deploy_provider_env(
                 "ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN",
                 false,
@@ -27117,7 +27117,7 @@ fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
             ),
         ],
         "mysql" => vec![
-            deploy_provider_env("ORV_DB_ADAPTER_MYSQL_ENDPOINT", false, "bridge_endpoint"),
+            deploy_provider_env("ORV_DB_ADAPTER_MYSQL_ENDPOINT", true, "bridge_endpoint"),
             deploy_provider_env(
                 "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
                 false,
@@ -42711,7 +42711,7 @@ let sig count: int = 0
                         "env": [
                             {
                                 "env": "ORV_DB_ADAPTER_MYSQL_ENDPOINT",
-                                "required": false,
+                                "required": true,
                                 "purpose": "bridge_endpoint"
                             },
                             {
@@ -42762,7 +42762,7 @@ let sig count: int = 0
                         "env": [
                             {
                                 "env": "ORV_DB_ADAPTER_POSTGRES_ENDPOINT",
-                                "required": false,
+                                "required": true,
                                 "purpose": "bridge_endpoint"
                             },
                             {
@@ -42793,16 +42793,16 @@ let sig count: int = 0
         assert!(env_example.contains("SHOP_DATABASE_URL=mysql://db.internal/shop"));
         assert!(env_example.contains("ORV_DB_ADAPTER_MYSQL_ENDPOINT="));
         assert!(env_example.contains("ORV_DB_ADAPTER_POSTGRES_ENDPOINT="));
-        assert!(preflight["optional_env"]
+        assert!(preflight["required_env"]
             .as_array()
-            .expect("optional preflight env")
+            .expect("required preflight env")
             .iter()
             .any(|env| env["env"] == "ORV_DB_ADAPTER_MYSQL_ENDPOINT"
                 && env["provider"] == "mysql"
                 && env["purpose"] == "bridge_endpoint"));
-        assert!(preflight["optional_env"]
+        assert!(preflight["required_env"]
             .as_array()
-            .expect("optional preflight env")
+            .expect("required preflight env")
             .iter()
             .any(|env| env["env"] == "ORV_DB_ADAPTER_POSTGRES_ENDPOINT"
                 && env["provider"] == "postgres"
@@ -42812,10 +42812,10 @@ let sig count: int = 0
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default mysql://db.internal/shop"));
         assert!(runbook.contains(
-            "- DB bridge env: mysql ORV_DB_ADAPTER_MYSQL_ENDPOINT optional bridge_endpoint"
+            "- DB bridge env: mysql ORV_DB_ADAPTER_MYSQL_ENDPOINT required bridge_endpoint"
         ));
         assert!(runbook.contains(
-            "- DB bridge env: postgres ORV_DB_ADAPTER_POSTGRES_ENDPOINT optional bridge_endpoint"
+            "- DB bridge env: postgres ORV_DB_ADAPTER_POSTGRES_ENDPOINT required bridge_endpoint"
         ));
         assert!(runbook.contains("deploy/db-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
@@ -43294,6 +43294,44 @@ let sig count: int = 0
             _ => None,
         })
         .expect("configured DB env passes");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn deploy_env_check_reports_missing_required_db_bridge_endpoint() {
+        let dir = temp_output_dir("deploy-env-check-db-bridge-source");
+        std::fs::create_dir_all(&dir).expect("create db bridge source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect "postgres://db.internal/shop"
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db bridge source");
+        let out = temp_output_dir("deploy-env-check-db-bridge");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+
+        let err =
+            deploy_env_check_with_lookup(&out, |_| None).expect_err("required DB bridge missing");
+        let message = err.to_string();
+        assert!(
+            message.contains("ORV_DB_ADAPTER_POSTGRES_ENDPOINT"),
+            "{message}"
+        );
+
+        deploy_env_check_with_lookup(&out, |env| match env {
+            "ORV_DB_ADAPTER_POSTGRES_ENDPOINT" => {
+                Some("http://db-adapter.internal/postgres".to_string())
+            }
+            _ => None,
+        })
+        .expect("configured DB bridge endpoint passes");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
@@ -49839,7 +49877,7 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_optional_env_count"],
-            4
+            3
         );
         assert_eq!(native_host["production"]["summary"]["db_target_count"], 1);
         assert_eq!(
