@@ -11255,6 +11255,7 @@ struct DapSession {
     launched: Option<DapLaunchState>,
     breakpoints: HashMap<PathBuf, Vec<DapBreakpoint>>,
     function_breakpoints: Vec<DapFunctionBreakpoint>,
+    instruction_breakpoints: Vec<DapInstructionBreakpoint>,
     data_breakpoints: Vec<DapDataBreakpoint>,
     exception_filters: Option<HashSet<String>>,
     pending_events: Vec<DapPendingEvent>,
@@ -11513,6 +11514,16 @@ struct DapDataBreakpoint {
 }
 
 #[derive(Clone)]
+struct DapInstructionBreakpoint {
+    id: u64,
+    instruction_reference: String,
+    offset: i64,
+    frame_index: Option<usize>,
+    verified: bool,
+    message: Option<String>,
+}
+
+#[derive(Clone)]
 struct DapRuntimeState {
     status: String,
     stdout: String,
@@ -11696,7 +11707,7 @@ impl DapSession {
             "setExceptionBreakpoints" => self.set_exception_breakpoints_result(request),
             "setBreakpoints" => self.set_breakpoints_result(request),
             "setFunctionBreakpoints" => self.set_function_breakpoints_result(request),
-            "setInstructionBreakpoints" => Ok(dap_instruction_breakpoints_response(request)),
+            "setInstructionBreakpoints" => self.set_instruction_breakpoints_result(request),
             "dataBreakpointInfo" => self.data_breakpoint_info_result(request),
             "setDataBreakpoints" => self.set_data_breakpoints_result(request),
             "breakpointLocations" => self.breakpoint_locations_result(request),
@@ -11809,6 +11820,7 @@ impl DapSession {
             attach_runtime_requested,
             attach_runtime_mode,
         );
+        self.revalidate_instruction_breakpoints(frames.len());
         let executable_lines = dap_launch_executable_lines(&entry_path, &frames);
         let current_frame_index = self.first_verified_breakpoint_frame(&frames).unwrap_or(0);
         let stopped_line = frames
@@ -12283,21 +12295,22 @@ impl DapSession {
                     })
                     .collect()
             });
-        self.function_breakpoints = breakpoints.clone();
+        let response_breakpoints = breakpoints
+            .iter()
+            .map(|breakpoint| {
+                let mut value = serde_json::json!({
+                    "id": breakpoint.id,
+                    "verified": breakpoint.verified,
+                });
+                if let Some(message) = &breakpoint.message {
+                    value["message"] = serde_json::Value::String(message.clone());
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        self.function_breakpoints = breakpoints;
         Ok(serde_json::json!({
-            "breakpoints": breakpoints
-                .iter()
-                .map(|breakpoint| {
-                    let mut value = serde_json::json!({
-                        "id": breakpoint.id,
-                        "verified": breakpoint.verified,
-                    });
-                    if let Some(message) = &breakpoint.message {
-                        value["message"] = serde_json::Value::String(message.clone());
-                    }
-                    value
-                })
-                .collect::<Vec<_>>(),
+            "breakpoints": response_breakpoints,
         }))
     }
 
@@ -12369,21 +12382,63 @@ impl DapSession {
                     })
                     .collect()
             });
-        self.data_breakpoints = breakpoints.clone();
+        let response_breakpoints = breakpoints
+            .iter()
+            .map(|breakpoint| {
+                let mut value = serde_json::json!({
+                    "id": breakpoint.id,
+                    "verified": breakpoint.verified,
+                });
+                if let Some(message) = &breakpoint.message {
+                    value["message"] = serde_json::Value::String(message.clone());
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        self.data_breakpoints = breakpoints;
         Ok(serde_json::json!({
-            "breakpoints": breakpoints
-                .iter()
-                .map(|breakpoint| {
-                    let mut value = serde_json::json!({
-                        "id": breakpoint.id,
-                        "verified": breakpoint.verified,
-                    });
-                    if let Some(message) = &breakpoint.message {
-                        value["message"] = serde_json::Value::String(message.clone());
-                    }
-                    value
-                })
-                .collect::<Vec<_>>(),
+            "breakpoints": response_breakpoints,
+        }))
+    }
+
+    fn set_instruction_breakpoints_result(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let frame_count = self.launched.as_ref().map(|launched| launched.frames.len());
+        let breakpoints = request
+            .pointer("/arguments/breakpoints")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(Vec::new, |items| {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, breakpoint)| {
+                        let instruction_reference = breakpoint
+                            .get("instructionReference")
+                            .and_then(serde_json::Value::as_str)
+                            .map_or("", str::trim)
+                            .to_string();
+                        let offset = breakpoint
+                            .get("offset")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
+                        dap_instruction_breakpoint(
+                            u64::try_from(index + 1).unwrap_or(u64::MAX),
+                            instruction_reference,
+                            offset,
+                            frame_count,
+                        )
+                    })
+                    .collect()
+            });
+        let response_breakpoints = breakpoints
+            .iter()
+            .map(dap_instruction_breakpoint_json)
+            .collect::<Vec<_>>();
+        self.instruction_breakpoints = breakpoints;
+        Ok(serde_json::json!({
+            "breakpoints": response_breakpoints,
         }))
     }
 
@@ -13305,6 +13360,17 @@ impl DapSession {
         });
     }
 
+    fn revalidate_instruction_breakpoints(&mut self, frame_count: usize) {
+        for breakpoint in &mut self.instruction_breakpoints {
+            *breakpoint = dap_instruction_breakpoint(
+                breakpoint.id,
+                breakpoint.instruction_reference.clone(),
+                breakpoint.offset,
+                Some(frame_count),
+            );
+        }
+    }
+
     fn set_current_local_value(&mut self, name: &str, value: &str) -> anyhow::Result<DapVariable> {
         let launched = self
             .launched
@@ -13427,6 +13493,9 @@ impl DapSession {
         if self.has_verified_function_breakpoint(frame) {
             return Some("function breakpoint");
         }
+        if self.has_verified_instruction_breakpoint(index) {
+            return Some("instruction breakpoint");
+        }
         self.has_verified_data_breakpoint(frames, index)
             .then_some("data breakpoint")
     }
@@ -13513,6 +13582,12 @@ impl DapSession {
         self.function_breakpoints
             .iter()
             .any(|breakpoint| breakpoint.verified && breakpoint.name == function_name)
+    }
+
+    fn has_verified_instruction_breakpoint(&self, index: usize) -> bool {
+        self.instruction_breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint.verified && breakpoint.frame_index == Some(index))
     }
 
     fn has_verified_data_breakpoint(&self, frames: &[DapFrameState], index: usize) -> bool {
@@ -14762,36 +14837,55 @@ fn dap_set_exception_breakpoints_result(request: &serde_json::Value) -> serde_js
     })
 }
 
-fn dap_instruction_breakpoints_response(request: &serde_json::Value) -> serde_json::Value {
-    let breakpoints = request
-        .pointer("/arguments/breakpoints")
-        .and_then(serde_json::Value::as_array)
-        .map_or_else(Vec::new, |items| {
-            items
-            .iter()
-            .enumerate()
-            .map(|(index, breakpoint)| {
-                let instruction_reference = breakpoint
-                    .get("instructionReference")
-                    .and_then(serde_json::Value::as_str)
-                    .map_or("", str::trim);
-                let offset = breakpoint
-                    .get("offset")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                serde_json::json!({
-                    "id": u64::try_from(index + 1).unwrap_or(u64::MAX),
-                    "verified": false,
-                    "instructionReference": instruction_reference,
-                    "offset": offset,
-                    "message": "ORV runtime has source frames, not stable instruction addresses",
-                })
-            })
-            .collect::<Vec<_>>()
-        });
-    serde_json::json!({
-        "breakpoints": breakpoints,
-    })
+fn dap_instruction_breakpoint(
+    id: u64,
+    instruction_reference: String,
+    offset: i64,
+    frame_count: Option<usize>,
+) -> DapInstructionBreakpoint {
+    let frame_index = frame_count.and_then(|count| {
+        dap_instruction_breakpoint_frame_index(count, &instruction_reference, offset)
+    });
+    let verified = frame_index.is_some();
+    let message = if verified {
+        None
+    } else if frame_count.is_none() {
+        Some("launch is required before verifying ORV instruction breakpoints".to_string())
+    } else {
+        Some(format!(
+            "unknown ORV instructionReference `{instruction_reference}`"
+        ))
+    };
+    DapInstructionBreakpoint {
+        id,
+        instruction_reference,
+        offset,
+        frame_index,
+        verified,
+        message,
+    }
+}
+
+fn dap_instruction_breakpoint_frame_index(
+    frame_count: usize,
+    instruction_reference: &str,
+    offset: i64,
+) -> Option<usize> {
+    let index = dap_disassemble_start_index(instruction_reference, offset).ok()?;
+    (index < frame_count).then_some(index)
+}
+
+fn dap_instruction_breakpoint_json(breakpoint: &DapInstructionBreakpoint) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": breakpoint.id,
+        "verified": breakpoint.verified,
+        "instructionReference": breakpoint.instruction_reference.as_str(),
+        "offset": breakpoint.offset,
+    });
+    if let Some(message) = &breakpoint.message {
+        value["message"] = serde_json::Value::String(message.clone());
+    }
+    value
 }
 
 fn dap_exception_info_json(runtime: &DapRuntimeState) -> serde_json::Value {
@@ -30175,7 +30269,7 @@ function greet(user: User): string -> "hello"
     }
 
     #[test]
-    fn dap_set_instruction_breakpoints_returns_unverified_entries() {
+    fn dap_set_instruction_breakpoints_requires_launch_for_verification() {
         let response = dap_protocol_response(&serde_json::json!({
             "seq": 77,
             "type": "request",
@@ -30200,8 +30294,85 @@ function greet(user: User): string -> "hello"
         assert_eq!(breakpoint["offset"], 4);
         assert_eq!(
             breakpoint["message"],
-            "ORV runtime has source frames, not stable instruction addresses"
+            "launch is required before verifying ORV instruction breakpoints"
         );
+    }
+
+    #[test]
+    fn dap_instruction_breakpoint_stops_continue_at_frame() {
+        let dir = temp_output_dir("dap-instruction-breakpoint");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        std::fs::write(
+            &source,
+            "let first: int = 1\nlet second: int = 2\nlet third: int = 3\n",
+        )
+        .expect("write source");
+        let mut session = DapSession::default();
+
+        session
+            .message_response(&serde_json::json!({
+                "seq": 82,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                },
+            }))
+            .expect("launch response");
+        let set_instruction_breakpoints = session
+            .message_response(&serde_json::json!({
+                "seq": 83,
+                "type": "request",
+                "command": "setInstructionBreakpoints",
+                "arguments": {
+                    "breakpoints": [
+                        {
+                            "instructionReference": "orv:frame:2",
+                            "offset": 0,
+                        }
+                    ],
+                },
+            }))
+            .expect("setInstructionBreakpoints response");
+        let continue_response = session
+            .message_response(&serde_json::json!({
+                "seq": 84,
+                "type": "request",
+                "command": "continue",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("continue response");
+        let events = session.drain_pending_events();
+        let stack = session
+            .message_response(&serde_json::json!({
+                "seq": 85,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {
+                    "threadId": 1,
+                },
+            }))
+            .expect("stack response");
+
+        assert_eq!(
+            set_instruction_breakpoints["body"]["breakpoints"][0]["verified"],
+            true
+        );
+        assert_eq!(
+            set_instruction_breakpoints["body"]["breakpoints"][0]["instructionReference"],
+            "orv:frame:2"
+        );
+        assert_eq!(continue_response["success"], true, "{continue_response}");
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 2);
+        assert!(events.iter().any(|event| {
+            event["type"] == "event"
+                && event["event"] == "stopped"
+                && event["body"]["reason"] == "instruction breakpoint"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

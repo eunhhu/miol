@@ -10,6 +10,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Strengthened `orv verify-build` so server route/listen/response origin ids must resolve through `origin-map.json` and server/deploy source snapshots must match `source-bundle.json`.
 - Added `project-graph.json` verification for source-bundle file nodes, semantic origin-map mirrors, semantic origin edges, and origin-link drift.
 - Made generated deploy smoke tests compare each `x-orv-origin-id` header against the exact route origin id from the server artifact instead of accepting any `ori_` value.
+- Made DAP `setInstructionBreakpoints` verify `orv:frame:N` pseudo-instruction references after launch and stop `continue` on matching runtime frames.
 
 ## 2026-05-06
 
