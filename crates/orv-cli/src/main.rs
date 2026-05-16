@@ -2402,6 +2402,8 @@ Successful `POST /members/login` responses set an `orv_session` cookie with `Htt
 \n\
 The account sessions view requires that login cookie through `@session required` and reads the current session with `@session.id`.\n\
 \n\
+The checkout form includes a reference `_csrf` hidden token. `POST /checkout` uses `@csrf`, which requires that token to match the `orv_csrf` cookie minted by HTML GET responses.\n\
+\n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, shipment, webhook, and audit rows in the SQLite file.\n\
 \n\
 Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to point the generated shop at a different supported DB adapter URL without editing source.\n\
@@ -28494,6 +28496,8 @@ test "checkout excluded failure" {
         assert!(guide.contains("Secure"));
         assert!(guide.contains("@session required"));
         assert!(guide.contains("@session.id"));
+        assert!(guide.contains("@csrf"));
+        assert!(guide.contains("orv_csrf"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /catalog"));
         assert!(guide.contains("GET /cart"));

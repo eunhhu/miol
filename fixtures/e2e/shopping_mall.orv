@@ -73,6 +73,7 @@
           }
           @form action="/checkout" method=post {
             @h3 "One-step checkout"
+            @input type=hidden name=_csrf value="orv-reference-csrf"
             @label "Member handle"
             @input type=text name=handle required
             @label "SKU"
@@ -459,6 +460,7 @@
   }
 
   @route POST /checkout {
+    @csrf
     let quantity: int = @body.quantity as int
     let total: int = @body.total as int
     let member = await shopdb.find("Member", { handle: @body.handle })

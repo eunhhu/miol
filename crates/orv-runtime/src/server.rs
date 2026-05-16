@@ -45,7 +45,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
     eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env_with_db, RequestCtx,
-    ResponseCtx, RuntimeError, Value,
+    ResponseCtx, RuntimeError, Value, ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN,
 };
 
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
@@ -1250,10 +1250,14 @@ fn response_from_respond(
 }
 
 fn response_extra_headers(method: &str, path: &str, resp: &ResponseCtx) -> Vec<(String, String)> {
-    login_session_cookie(method, path, resp)
-        .into_iter()
-        .map(|cookie| ("set-cookie".to_string(), cookie))
-        .collect()
+    let mut headers = Vec::new();
+    if let Some(cookie) = login_session_cookie(method, path, resp) {
+        headers.push(("set-cookie".to_string(), cookie));
+    }
+    if let Some(cookie) = csrf_cookie(method, resp) {
+        headers.push(("set-cookie".to_string(), cookie));
+    }
+    headers
 }
 
 fn login_session_cookie(method: &str, path: &str, resp: &ResponseCtx) -> Option<String> {
@@ -1278,6 +1282,19 @@ fn cookie_scalar_value(value: &Value) -> Option<String> {
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~'))
         .then_some(value)
+}
+
+fn csrf_cookie(method: &str, resp: &ResponseCtx) -> Option<String> {
+    if method != "GET" || !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let raw = resp.raw_body.as_ref()?;
+    if !raw.content_type.starts_with("text/html") {
+        return None;
+    }
+    Some(format!(
+        "{ORV_CSRF_COOKIE_NAME}={ORV_REFERENCE_CSRF_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax"
+    ))
 }
 
 fn object_field_value<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -2709,6 +2726,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csrf_route_checks_reference_cookie_and_token() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /checkout {
+                        @csrf
+                        @respond 200 { ok: true }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (missing_status, _, missing_body) =
+                send_request(addr, "POST", "/checkout", Some("{}".into())).await;
+            assert_eq!(missing_status, 403);
+            let missing: serde_json::Value =
+                serde_json::from_slice(&missing_body).expect("missing csrf json");
+            assert_eq!(missing["err"], serde_json::json!("csrf_token_required"));
+
+            let csrf_cookie = format!("{ORV_CSRF_COOKIE_NAME}={ORV_REFERENCE_CSRF_TOKEN}");
+            let (status, _, body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/checkout",
+                Some("{}".into()),
+                &[
+                    ("cookie", csrf_cookie.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
+            assert_eq!(status, 200);
+            let ok: serde_json::Value = serde_json::from_slice(&body).expect("csrf json");
+            assert_eq!(ok["ok"], serde_json::json!(true));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn serves_post_route_with_form_urlencoded_body() {
         run_on_localset(async {
             let ServerTestCase {
@@ -3181,9 +3253,22 @@ mod tests {
             .await
             .expect("spawn");
 
-            let (home_status, home_ct, home_body) = send_request(addr, "GET", "/", None).await;
+            let (home_status, home_ct, _home_origin, home_headers, home_body) =
+                send_request_full(addr, "GET", "/", None).await;
             assert_eq!(home_status, 200);
             assert_eq!(home_ct.as_deref(), Some("text/html; charset=utf-8"));
+            let csrf_cookie = home_headers
+                .get("set-cookie")
+                .expect("home csrf set-cookie");
+            assert!(csrf_cookie.contains(&format!(
+                "{ORV_CSRF_COOKIE_NAME}={ORV_REFERENCE_CSRF_TOKEN}"
+            )));
+            assert!(csrf_cookie.contains("SameSite=Lax"));
+            let csrf_cookie_pair = csrf_cookie
+                .split(';')
+                .next()
+                .expect("csrf cookie pair")
+                .to_string();
             let home_html = String::from_utf8(home_body).expect("home html");
             assert!(home_html.contains("<h1>Miol Shop</h1>"));
             assert!(home_html.contains("<form action=\"/products\" method=\"post\">"));
@@ -3191,6 +3276,8 @@ mod tests {
             assert!(home_html.contains("<form action=\"/orders\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/members/login\" method=\"post\">"));
             assert!(home_html.contains("<form action=\"/checkout\" method=\"post\">"));
+            assert!(home_html
+                .contains("<input type=\"hidden\" name=\"_csrf\" value=\"orv-reference-csrf\">"));
             assert!(home_html.contains("<form action=\"/cart/items\" method=\"post\">"));
             assert!(home_html.contains("<a href=\"/admin\">Admin dashboard</a>"));
             assert!(home_html.contains("<a href=\"/catalog\">Shop catalog</a>"));
@@ -3538,8 +3625,27 @@ mod tests {
                 "address": "Seoul"
             })
             .to_string();
-            let (checkout_status, _, checkout_body) =
-                send_request(addr, "POST", "/checkout", Some(checkout_payload)).await;
+            let (missing_checkout_status, _, missing_checkout_body) =
+                send_request(addr, "POST", "/checkout", Some(checkout_payload.clone())).await;
+            assert_eq!(missing_checkout_status, 403);
+            let missing_checkout: serde_json::Value =
+                serde_json::from_slice(&missing_checkout_body).expect("missing checkout json");
+            assert_eq!(
+                missing_checkout["err"],
+                serde_json::json!("csrf_token_required")
+            );
+
+            let (checkout_status, _, checkout_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/checkout",
+                Some(checkout_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
             assert_eq!(checkout_status, 201);
             let checkout: serde_json::Value =
                 serde_json::from_slice(&checkout_body).expect("checkout json");

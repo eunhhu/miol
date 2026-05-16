@@ -35,6 +35,9 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub(crate) const ORV_CSRF_COOKIE_NAME: &str = "orv_csrf";
+pub(crate) const ORV_REFERENCE_CSRF_TOKEN: &str = "orv-reference-csrf";
+
 /// B4 `@env` 테스트 override.
 ///
 /// `std::env::set_var` 는 Rust 2024 에서 `unsafe` 가 되었고 워크스페이스는
@@ -1149,6 +1152,9 @@ impl<W: Write> Interp<W> {
                 }
                 if name == "session" && self.request.is_some() {
                     return self.eval_session_domain(args);
+                }
+                if name == "csrf" && self.request.is_some() {
+                    return self.eval_csrf_domain(args);
                 }
                 // 요청 컨텍스트가 있다면 request-state 도메인을 해석한다.
                 if self.request.is_some() {
@@ -3587,6 +3593,32 @@ impl<W: Write> Interp<W> {
         cookie_value_from_headers(&ctx.headers, "orv_session")
     }
 
+    fn eval_csrf_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        if !args.is_empty() {
+            return Err(RuntimeError::native("`@csrf` expects no arguments"));
+        }
+        let Some(ctx) = self.request.as_ref() else {
+            return Ok(Value::Void);
+        };
+        if csrf_token_is_valid(ctx) {
+            Ok(Value::Object(vec![
+                ("status".to_string(), Value::Str("verified".to_string())),
+                (
+                    "cookie".to_string(),
+                    Value::Str(ORV_CSRF_COOKIE_NAME.to_string()),
+                ),
+            ]))
+        } else {
+            Ok(self.respond_value(
+                403,
+                Value::Object(vec![(
+                    "err".to_string(),
+                    Value::Str("csrf_token_required".to_string()),
+                )]),
+            ))
+        }
+    }
+
     /// HTML 모드에서 `@tag ...` 도메인 호출 하나를 현재 버퍼에 렌더한다.
     ///
     /// - `@tag { ... }` — block 인자면 블록 본문을 HTML 모드로 재귀 평가.
@@ -3770,6 +3802,41 @@ fn cookie_value_from_headers(
         let value = value.trim();
         (name.trim() == cookie_name && !value.is_empty()).then(|| value.to_string())
     })
+}
+
+fn csrf_token_is_valid(ctx: &RequestCtx) -> bool {
+    let Some(cookie) = cookie_value_from_headers(&ctx.headers, ORV_CSRF_COOKIE_NAME) else {
+        return false;
+    };
+    let Some(submitted) = submitted_csrf_token(ctx) else {
+        return false;
+    };
+    cookie == ORV_REFERENCE_CSRF_TOKEN && submitted == cookie
+}
+
+fn submitted_csrf_token(ctx: &RequestCtx) -> Option<String> {
+    header_value_case_insensitive(&ctx.headers, "x-csrf-token")
+        .or_else(|| header_value_case_insensitive(&ctx.headers, "x-orv-csrf-token"))
+        .or_else(|| object_value_string(&ctx.body, "_csrf"))
+        .or_else(|| object_value_string(&ctx.body, "csrf"))
+        .or_else(|| ctx.query.get("_csrf").cloned())
+}
+
+fn header_value_case_insensitive(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    headers.iter().find_map(|(header, value)| {
+        (header.eq_ignore_ascii_case(name) && !value.is_empty()).then(|| value.clone())
+    })
+}
+
+fn object_value_string(value: &Value, name: &str) -> Option<String> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    match object_field(fields, name) {
+        Some(Value::Str(value)) if !value.is_empty() => Some(value.clone()),
+        Some(Value::Int(value)) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn is_event_attr(name: &str) -> bool {
@@ -8166,6 +8233,72 @@ let third: int = 3
         };
         assert!(fields.iter().any(|(name, value)| {
             name == "err" && matches!(value, Value::Str(err) if err == "session_required")
+        }));
+    }
+
+    #[test]
+    fn csrf_domain_accepts_cookie_and_header_token() {
+        let ctx = RequestCtx {
+            headers: [
+                (
+                    "cookie".into(),
+                    format!("{ORV_CSRF_COOKIE_NAME}={ORV_REFERENCE_CSRF_TOKEN}"),
+                ),
+                ("x-csrf-token".into(), ORV_REFERENCE_CSRF_TOKEN.into()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"@csrf
+@out "after""#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "after\n");
+    }
+
+    #[test]
+    fn csrf_domain_accepts_cookie_and_body_token() {
+        let ctx = RequestCtx {
+            headers: [(
+                "cookie".into(),
+                format!("{ORV_CSRF_COOKIE_NAME}={ORV_REFERENCE_CSRF_TOKEN}"),
+            )]
+            .into_iter()
+            .collect(),
+            body: Value::Object(vec![(
+                "_csrf".to_string(),
+                Value::Str(ORV_REFERENCE_CSRF_TOKEN.to_string()),
+            )]),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"@csrf
+@out "after""#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "after\n");
+    }
+
+    #[test]
+    fn csrf_domain_records_forbidden_response() {
+        let (outcome, out) = eval_handler_outcome_src(
+            r#"@csrf
+@out "after""#,
+            RequestCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(out, "");
+        let response = outcome.response.expect("csrf response");
+        assert_eq!(response.status, 403);
+        let Value::Object(fields) = response.payload else {
+            panic!("expected object payload");
+        };
+        assert!(fields.iter().any(|(name, value)| {
+            name == "err" && matches!(value, Value::Str(err) if err == "csrf_token_required")
         }));
     }
 

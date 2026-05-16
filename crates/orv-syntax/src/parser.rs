@@ -4519,6 +4519,7 @@ fn is_zero_arg_state_domain(domain_name: &str) -> bool {
             | "body"
             | "request"
             | "context"
+            | "csrf"
             | "data"
             | "peer"
             | "candidate"
@@ -5326,6 +5327,32 @@ struct Registration {
         );
         assert!(r.diagnostics.is_empty());
         assert_eq!(r.program.items.len(), 3);
+    }
+
+    #[test]
+    fn csrf_domain_does_not_consume_following_respond() {
+        let r = parse_str(
+            r#"
+            @route POST /checkout {
+              @csrf
+              @respond 200 { ok: true }
+            }
+            "#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let args = route_args(&r.program.items[0]);
+        let ExprKind::Block(body) = &args[2].kind else {
+            panic!("route body must be block");
+        };
+        assert_eq!(body.stmts.len(), 2);
+        let Stmt::Expr(csrf) = &body.stmts[0] else {
+            panic!("expected csrf expr");
+        };
+        let ExprKind::Domain { name, args } = &csrf.kind else {
+            panic!("expected csrf domain");
+        };
+        assert_eq!(name.name, "csrf");
+        assert!(args.is_empty());
     }
 
     // ── 문자열 보간 ──
