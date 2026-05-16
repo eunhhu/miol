@@ -25079,6 +25079,18 @@ fn reveal_benchmark_evidence_summary(
         "missing_task_count": report_status.missing_task_count,
         "failed_task_count": report_status.failed_task_count,
         "missing_data_count": report_status.missing_data_count,
+        "missing_data": data_report
+            .get("missing_data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "smoke_test_output_source": data_report
+            .get("smoke_test_output_source")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "smoke_test_summary": data_report
+            .get("smoke_test_summary")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "data_keys": data_keys,
     }))
 }
@@ -50621,6 +50633,13 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["benchmark_evidence"]["recorded_task_count"] == 0
                 && target["benchmark_evidence"]["missing_task_count"] == 10
                 && target["benchmark_evidence"]["missing_data_count"] == 3
+                && target["benchmark_evidence"]["smoke_test_summary"]["present"] == false
+                && target["benchmark_evidence"]["smoke_test_output_source"].is_null()
+                && target["benchmark_evidence"]["missing_data"]
+                    .as_array()
+                    .expect("missing data")
+                    .iter()
+                    .any(|item| item == "smoke_test_output")
                 && target["routes"][0]["method"] == "GET"
                 && target["routes"][0]["path"] == "/ping"
                 && target["required_env"][0]["kind"] == "db"
@@ -54229,6 +54248,18 @@ define Auth() -> { @out "auth" }
             state["production"]["preflight"][0]["benchmark_evidence"]["missing_data_count"],
             3
         );
+        assert_eq!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["smoke_test_summary"]
+                ["present"],
+            false
+        );
+        assert!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["missing_data"]
+                .as_array()
+                .expect("missing data")
+                .iter()
+                .any(|item| item == "smoke_test_output")
+        );
         let checkout_route = json_route(
             &state["production"]["preflight"][0]["routes"],
             "POST",
@@ -54461,6 +54492,9 @@ define Auth() -> { @out "auth" }
         ));
         assert!(production_panel.contains("\"report_status\": \"incomplete\""));
         assert!(production_panel.contains("\"missing_task_count\": 10"));
+        assert!(production_panel.contains("\"smoke_test_summary\""));
+        assert!(production_panel.contains("\"present\": false"));
+        assert!(production_panel.contains("\"smoke_test_output\""));
         assert!(production_panel.contains("Preflight Commands</span><b>11</b>"));
         assert!(production_panel.contains("Route Policies"));
         assert!(production_panel.contains("Route Policy Summary"));
