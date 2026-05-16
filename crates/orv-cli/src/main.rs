@@ -18150,14 +18150,62 @@ fn cmd_deploy_env_check(dir: &Path) -> anyhow::Result<()> {
 fn verify_build_dir(dir: &Path) -> anyhow::Result<()> {
     let manifest = read_json_value(&dir.join("build-manifest.json"))?;
     let plan = read_json_value(&dir.join("bundle-plan.json"))?;
-    verify_bundle_targets(dir, &plan)?;
+    let origin_map = read_origin_map(dir)?;
+    verify_origin_map_contract(&origin_map)?;
+    let source_bundle = read_source_bundle_artifact(&dir.join("source-bundle.json"))?;
+    verify_bundle_targets(dir, &plan, &origin_map, &source_bundle)?;
     verify_manifest_artifacts(dir, &manifest)?;
-    verify_deploy_manifest_if_present(dir)?;
+    verify_deploy_manifest_if_present(dir, &origin_map, &source_bundle)?;
     verify_dev_hmr_session_if_present(dir, &plan)?;
     verify_dev_hmr_transport_if_present(dir)?;
     verify_dev_hmr_server_if_present(dir)?;
     verify_dev_watch_session_if_present(dir, &plan)?;
     verify_dev_watch_events_if_present(dir)
+}
+
+fn verify_origin_map_contract(origin_map: &orv_compiler::OriginMap) -> anyhow::Result<()> {
+    if origin_map.version != orv_compiler::ORIGIN_MAP_VERSION {
+        anyhow::bail!(
+            "origin-map.json version must be {}",
+            orv_compiler::ORIGIN_MAP_VERSION
+        );
+    }
+    let mut ids = HashSet::new();
+    for entry in &origin_map.entries {
+        if entry.id.trim().is_empty() {
+            anyhow::bail!("origin-map.json contains entry with empty id");
+        }
+        if !ids.insert(entry.id.as_str()) {
+            let id = &entry.id;
+            anyhow::bail!("origin-map.json contains duplicate entry id `{id}`");
+        }
+        if entry.kind.trim().is_empty() {
+            let id = &entry.id;
+            anyhow::bail!("origin-map.json entry `{id}` has empty kind");
+        }
+        if entry.name.trim().is_empty() {
+            let id = &entry.id;
+            anyhow::bail!("origin-map.json entry `{id}` has empty name");
+        }
+        if entry.span.start > entry.span.end {
+            let id = &entry.id;
+            anyhow::bail!("origin-map.json entry `{id}` has invalid span");
+        }
+    }
+    for edge in &origin_map.edges {
+        if edge.kind.trim().is_empty() {
+            anyhow::bail!("origin-map.json contains edge with empty kind");
+        }
+        if !ids.contains(edge.from.as_str()) {
+            let from = &edge.from;
+            anyhow::bail!("origin-map.json edge from `{from}` does not reference an entry");
+        }
+        if !ids.contains(edge.to.as_str()) {
+            let to = &edge.to;
+            anyhow::bail!("origin-map.json edge to `{to}` does not reference an entry");
+        }
+    }
+    Ok(())
 }
 
 fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow::Result<()> {
@@ -18184,7 +18232,12 @@ fn verify_manifest_artifacts(dir: &Path, manifest: &serde_json::Value) -> anyhow
     Ok(())
 }
 
-fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result<()> {
+fn verify_bundle_targets(
+    dir: &Path,
+    plan: &serde_json::Value,
+    origin_map: &orv_compiler::OriginMap,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<()> {
     let bundles = plan
         .get("bundles")
         .and_then(serde_json::Value::as_array)
@@ -18201,6 +18254,8 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
                 let artifact = read_server_artifact(&target)?;
                 orv_compiler::verify_server_runtime_artifact(&artifact)
                     .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+                verify_server_runtime_origin_contract(&artifact, origin_map)?;
+                verify_server_runtime_source_bundle_contract(&artifact, source_bundle)?;
             }
             "server_launcher" => verify_server_launcher_target(dir, &target)?,
             "native_server_plan" => verify_native_server_plan_target(dir, &target)?,
@@ -18234,6 +18289,195 @@ fn verify_bundle_targets(dir: &Path, plan: &serde_json::Value) -> anyhow::Result
             "client_js" => verify_client_js_target(&target)?,
             "client_wasm" => verify_client_wasm_target(dir, &target)?,
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn verify_server_runtime_origin_contract(
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<()> {
+    let entries_by_id: HashMap<&str, &orv_compiler::OriginEntry> = origin_map
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    let contains_edges: HashSet<(&str, &str)> = origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == "contains")
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect();
+    if let Some(listen) = &artifact.listen {
+        let Some(entry) = entries_by_id.get(listen.origin_id.as_str()).copied() else {
+            let origin_id = &listen.origin_id;
+            anyhow::bail!("server listen origin_id `{origin_id}` not found in origin-map.json");
+        };
+        if entry.kind != "listen" {
+            let origin_id = &listen.origin_id;
+            anyhow::bail!("server listen origin_id `{origin_id}` must reference origin-map listen");
+        }
+        if entry.name != listen.name {
+            let origin_id = &listen.origin_id;
+            anyhow::bail!("server listen origin_id `{origin_id}` name does not match origin-map");
+        }
+    }
+    let mut route_ids = HashSet::new();
+    for route in &artifact.routes {
+        if !route_ids.insert(route.origin_id.as_str()) {
+            let origin_id = &route.origin_id;
+            anyhow::bail!("server route origin_id `{origin_id}` is duplicated");
+        }
+        let Some(entry) = entries_by_id.get(route.origin_id.as_str()).copied() else {
+            let origin_id = &route.origin_id;
+            anyhow::bail!(
+                "server route {} {} origin_id `{origin_id}` not found in origin-map.json",
+                route.method,
+                route.path
+            );
+        };
+        if entry.kind != "route" {
+            let origin_id = &route.origin_id;
+            anyhow::bail!(
+                "server route {} {} origin_id `{origin_id}` must reference origin-map route",
+                route.method,
+                route.path
+            );
+        }
+        let expected_name = format!("{} {}", route.method, route.path);
+        if entry.name != expected_name {
+            let origin_id = &route.origin_id;
+            anyhow::bail!(
+                "server route {} {} origin_id `{origin_id}` name does not match origin-map",
+                route.method,
+                route.path
+            );
+        }
+        let expected_response_origin_ids =
+            origin_response_ids_for_route(origin_map, &route.origin_id);
+        if route.response_origin_ids != expected_response_origin_ids {
+            anyhow::bail!(
+                "server route {} {} response_origin_ids do not match origin-map contains edges",
+                route.method,
+                route.path
+            );
+        }
+        let mut response_ids = HashSet::new();
+        for response_origin_id in &route.response_origin_ids {
+            if !response_ids.insert(response_origin_id.as_str()) {
+                anyhow::bail!(
+                    "server route {} {} response_origin_id `{response_origin_id}` is duplicated",
+                    route.method,
+                    route.path
+                );
+            }
+            verify_route_response_origin(
+                route,
+                response_origin_id,
+                &entries_by_id,
+                &contains_edges,
+            )?;
+        }
+        for response in &route.responses {
+            if !route
+                .response_origin_ids
+                .iter()
+                .any(|origin_id| origin_id == &response.origin_id)
+            {
+                let origin_id = &response.origin_id;
+                anyhow::bail!(
+                    "server route {} {} response descriptor `{origin_id}` is missing from response_origin_ids",
+                    route.method,
+                    route.path
+                );
+            }
+            verify_route_response_origin(
+                route,
+                &response.origin_id,
+                &entries_by_id,
+                &contains_edges,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn origin_response_ids_for_route(
+    origin_map: &orv_compiler::OriginMap,
+    route_origin_id: &str,
+) -> Vec<String> {
+    origin_map
+        .edges
+        .iter()
+        .filter(|edge| edge.from == route_origin_id && edge.kind == "contains")
+        .filter_map(|edge| {
+            origin_map
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.id == edge.to && entry.kind == "domain" && entry.name == "respond"
+                })
+                .map(|entry| entry.id.clone())
+        })
+        .collect()
+}
+
+fn verify_route_response_origin(
+    route: &orv_compiler::ServerRouteArtifact,
+    response_origin_id: &str,
+    entries_by_id: &HashMap<&str, &orv_compiler::OriginEntry>,
+    contains_edges: &HashSet<(&str, &str)>,
+) -> anyhow::Result<()> {
+    let Some(entry) = entries_by_id.get(response_origin_id).copied() else {
+        anyhow::bail!(
+            "server route {} {} response_origin_id `{response_origin_id}` not found in origin-map.json",
+            route.method,
+            route.path
+        );
+    };
+    if entry.kind != "domain" || entry.name != "respond" {
+        anyhow::bail!(
+            "server route {} {} response_origin_id `{response_origin_id}` must reference origin-map respond domain",
+            route.method,
+            route.path
+        );
+    }
+    if !contains_edges.contains(&(route.origin_id.as_str(), response_origin_id)) {
+        anyhow::bail!(
+            "server route {} {} response_origin_id `{response_origin_id}` is not contained by route origin",
+            route.method,
+            route.path
+        );
+    }
+    Ok(())
+}
+
+fn verify_server_runtime_source_bundle_contract(
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<()> {
+    if artifact.entry != source_bundle.entry {
+        anyhow::bail!("server runtime entry does not match source-bundle artifact");
+    }
+    if artifact.source_bundle.files.len() != source_bundle.files.len() {
+        anyhow::bail!("server runtime source bundle does not match build source-bundle artifact");
+    }
+    for expected in &source_bundle.files {
+        let Some(actual) = artifact
+            .source_bundle
+            .files
+            .iter()
+            .find(|file| file.path == expected.path)
+        else {
+            let path = &expected.path;
+            anyhow::bail!("server runtime source bundle is missing source file {path}");
+        };
+        if actual.content_hash != expected.content_hash || actual.source != expected.source {
+            let path = &expected.path;
+            anyhow::bail!(
+                "server runtime source file {path} does not match build source-bundle artifact"
+            );
         }
     }
     Ok(())
@@ -20606,7 +20850,11 @@ fn read_wasm_i32_leb(bytes: &[u8], offset: &mut usize, limit: usize) -> anyhow::
     anyhow::bail!("client_wasm bundle has invalid i32 LEB128")
 }
 
-fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
+fn verify_deploy_manifest_if_present(
+    dir: &Path,
+    origin_map: &orv_compiler::OriginMap,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<()> {
     let deploy_manifest = dir.join("deploy").join("manifest.json");
     if !deploy_manifest.is_file() {
         return Ok(());
@@ -20622,8 +20870,14 @@ fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
     if deploy.get("profile").and_then(serde_json::Value::as_str) != Some("prod") {
         anyhow::bail!("deploy manifest profile must be prod");
     }
-    verify_deploy_source_bundle(dir, deploy.get("source_bundle"))?;
-    verify_deploy_server_target(dir, deploy.get("server"), deploy.get("client"))?;
+    verify_deploy_source_bundle(dir, deploy.get("source_bundle"), source_bundle)?;
+    verify_deploy_server_target(
+        dir,
+        deploy.get("server"),
+        deploy.get("client"),
+        origin_map,
+        source_bundle,
+    )?;
     verify_deploy_static_target(dir, deploy.get("static"))?;
     verify_deploy_client_target(dir, deploy.get("client"))
 }
@@ -20631,6 +20885,7 @@ fn verify_deploy_manifest_if_present(dir: &Path) -> anyhow::Result<()> {
 fn verify_deploy_source_bundle(
     dir: &Path,
     source_bundle: Option<&serde_json::Value>,
+    expected: &orv_compiler::SourceBundleArtifact,
 ) -> anyhow::Result<()> {
     let Some(path) = source_bundle.and_then(serde_json::Value::as_str) else {
         anyhow::bail!("deploy manifest source_bundle must be a string");
@@ -20639,7 +20894,10 @@ fn verify_deploy_source_bundle(
     if !target.is_file() {
         anyhow::bail!("missing deploy source bundle: {}", target.display());
     }
-    read_source_bundle_artifact(&target)?;
+    let artifact = read_source_bundle_artifact(&target)?;
+    if &artifact != expected {
+        anyhow::bail!("deploy manifest source_bundle does not match build source-bundle artifact");
+    }
     Ok(())
 }
 
@@ -20647,6 +20905,8 @@ fn verify_deploy_server_target(
     dir: &Path,
     server: Option<&serde_json::Value>,
     client: Option<&serde_json::Value>,
+    origin_map: &orv_compiler::OriginMap,
+    source_bundle: &orv_compiler::SourceBundleArtifact,
 ) -> anyhow::Result<()> {
     let Some(server) = server.filter(|value| !value.is_null()) else {
         return Ok(());
@@ -20678,6 +20938,8 @@ fn verify_deploy_server_target(
     let artifact = read_server_artifact(&dir.join(artifact_path))?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    verify_server_runtime_origin_contract(&artifact, origin_map)?;
+    verify_server_runtime_source_bundle_contract(&artifact, source_bundle)?;
     validate_prod_server_listen(Some(&artifact))?;
     let persistence = server_artifact_deploy_persistence(&artifact)?;
     verify_deploy_routes_artifact(
@@ -41775,6 +42037,78 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_server_route_origin_missing_from_origin_map() {
+        let (src_dir, path) = prod_server_source("server-route-origin-source");
+        let out = temp_output_dir("server-route-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact_path = out.join("server").join("app.orv-runtime.json");
+        let mut artifact = read_json_value(&artifact_path).expect("server artifact");
+        artifact["routes"][0]["origin_id"] = serde_json::json!("ori_missing_route");
+        write_json(&artifact_path, &artifact).expect("write corrupt server artifact");
+
+        let err = cmd_verify_build(&out).expect_err("route origin mismatch");
+
+        assert!(err.to_string().contains(
+            "server route GET /ping origin_id `ori_missing_route` not found in origin-map.json"
+        ));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_server_response_origin_drift_from_origin_map() {
+        let (src_dir, path) = prod_server_source("server-response-origin-source");
+        let out = temp_output_dir("server-response-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact_path = out.join("server").join("app.orv-runtime.json");
+        let mut artifact = read_json_value(&artifact_path).expect("server artifact");
+        artifact["routes"][0]["response_origin_ids"][0] = serde_json::json!("ori_missing_response");
+        write_json(&artifact_path, &artifact).expect("write corrupt server artifact");
+
+        let err = cmd_verify_build(&out).expect_err("response origin mismatch");
+
+        assert!(err.to_string().contains(
+            "server route GET /ping response_origin_ids do not match origin-map contains edges"
+        ));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_server_source_bundle_drift() {
+        let (src_dir, path) = prod_server_source("server-source-bundle-source");
+        let out = temp_output_dir("server-source-bundle-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact_path = out.join("server").join("app.orv-runtime.json");
+        let mut artifact = read_json_value(&artifact_path).expect("server artifact");
+        let source_path = artifact["source_bundle"]["files"][0]["path"]
+            .as_str()
+            .expect("source path")
+            .to_string();
+        let tampered_source =
+            "@server { @listen 8080 @route GET /wrong { @respond 200 { ok: true } } }\n";
+        let tampered_bundle = orv_compiler::source_bundle_artifact(
+            artifact["entry"].as_str().expect("entry"),
+            [(source_path.as_str(), tampered_source)],
+        );
+        artifact["source_bundle"]["files"][0]["source"] = serde_json::json!(tampered_source);
+        artifact["source_bundle"]["files"][0]["content_hash"] =
+            serde_json::json!(tampered_bundle.files[0].content_hash.clone());
+        write_json(&artifact_path, &artifact).expect("write corrupt server artifact");
+
+        let err = cmd_verify_build(&out).expect_err("server source bundle mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("does not match build source-bundle artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_deploy_container_mismatch() {
         let (src_dir, path) = prod_server_source("deploy-container-source");
         let out = temp_output_dir("deploy-container-mismatch");
@@ -44323,9 +44657,11 @@ models = { path = "../../shared/models", version = "2.0.0" }
 
         let err = cmd_verify_build(&build_out).expect_err("missing static page");
 
-        assert!(err
-            .to_string()
-            .contains("missing bundle target static_page"));
+        let message = err.to_string();
+        assert!(
+            message.contains("missing bundle target static_page"),
+            "unexpected error: {message}"
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 

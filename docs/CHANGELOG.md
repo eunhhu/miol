@@ -7,6 +7,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Strengthened generated production shop smoke tests so checkout/admin validation captures response bodies and checks checkout status, payment capture, shipment tracking, customer catalog/cart/session read models, and admin catalog/order/payment/shipment/audit read models.
 - Added generated production smoke checks for `x-orv-origin-id` route headers so deployed route reachability also proves the ProjectGraph/HIR origin contract is exposed at runtime.
 - Made `orv run-build <dir>` execute relative DB/WAL, `@serve`, `@fs`, and file-backed commerce adapter paths against the build directory so local deploy smoke runs do not leak persistence files into the caller's shell cwd.
+- Strengthened `orv verify-build` so server route/listen/response origin ids must resolve through `origin-map.json` and server/deploy source snapshots must match `source-bundle.json`.
 
 ## 2026-05-06
 
