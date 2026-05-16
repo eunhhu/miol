@@ -2658,6 +2658,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_required_route_checks_reference_session_cookie() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route GET /account {
+                        @session required
+                        @respond 200 { sessionId: @session.id }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (missing_status, _, missing_body) =
+                send_request(addr, "GET", "/account", None).await;
+            assert_eq!(missing_status, 401);
+            let missing: serde_json::Value =
+                serde_json::from_slice(&missing_body).expect("missing session json");
+            assert_eq!(missing["err"], serde_json::json!("session_required"));
+
+            let (status, _, body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/account",
+                None,
+                &[("cookie", "orv_session=abc_123")],
+            )
+            .await;
+            assert_eq!(status, 200);
+            let ok: serde_json::Value = serde_json::from_slice(&body).expect("session json");
+            assert_eq!(ok["sessionId"], serde_json::json!("abc_123"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn serves_post_route_with_form_urlencoded_body() {
         run_on_localset(async {
             let ServerTestCase {
@@ -3336,6 +3387,11 @@ mod tests {
             assert!(login_cookie.contains("HttpOnly"));
             assert!(login_cookie.contains("SameSite=Lax"));
             assert!(login_cookie.contains("Secure"));
+            let login_cookie_pair = login_cookie
+                .split(';')
+                .next()
+                .expect("login cookie pair")
+                .to_string();
             let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
             assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
             assert_eq!(login["session"]["status"], serde_json::json!("active"));
@@ -3364,8 +3420,24 @@ mod tests {
             assert!(cart_html.contains("mug"));
             assert!(cart_html.contains("quantity 1"));
 
-            let (sessions_status, sessions_ct, sessions_body) =
+            let (missing_sessions_status, _, missing_sessions_body) =
                 send_request(addr, "GET", "/account/sessions", None).await;
+            assert_eq!(missing_sessions_status, 401);
+            let missing_sessions: serde_json::Value =
+                serde_json::from_slice(&missing_sessions_body).expect("missing sessions json");
+            assert_eq!(
+                missing_sessions["err"],
+                serde_json::json!("session_required")
+            );
+
+            let (sessions_status, sessions_ct, sessions_body) = send_request_with_headers(
+                addr,
+                "GET",
+                "/account/sessions",
+                None,
+                &[("cookie", login_cookie_pair.as_str())],
+            )
+            .await;
             assert_eq!(sessions_status, 200);
             assert_eq!(sessions_ct.as_deref(), Some("text/html; charset=utf-8"));
             let sessions_html = String::from_utf8(sessions_body).expect("sessions html");

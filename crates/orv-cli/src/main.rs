@@ -2400,6 +2400,8 @@ Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipmen
 \n\
 Successful `POST /members/login` responses set an `orv_session` cookie with `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, and one-day `Max-Age` defaults.\n\
 \n\
+The account sessions view requires that login cookie through `@session required` and reads the current session with `@session.id`.\n\
+\n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, shipment, webhook, and audit rows in the SQLite file.\n\
 \n\
 Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to point the generated shop at a different supported DB adapter URL without editing source.\n\
@@ -28490,6 +28492,8 @@ test "checkout excluded failure" {
         assert!(guide.contains("HttpOnly"));
         assert!(guide.contains("SameSite=Lax"));
         assert!(guide.contains("Secure"));
+        assert!(guide.contains("@session required"));
+        assert!(guide.contains("@session.id"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /catalog"));
         assert!(guide.contains("GET /cart"));

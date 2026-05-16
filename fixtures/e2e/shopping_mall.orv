@@ -226,7 +226,9 @@
   }
 
   @route GET /account/sessions {
-    let sessions = await shopdb.findAll("Session", {})
+    @session required
+    let sessionId: int = @session.id as int
+    let sessions = await shopdb.findAll("Session", { id: sessionId })
     @serve @html {
       @body {
         @h1 "Account Sessions"

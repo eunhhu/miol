@@ -1147,6 +1147,9 @@ impl<W: Write> Interp<W> {
                     }
                     return Ok(Value::Void);
                 }
+                if name == "session" && self.request.is_some() {
+                    return self.eval_session_domain(args);
+                }
                 // 요청 컨텍스트가 있다면 request-state 도메인을 해석한다.
                 if self.request.is_some() {
                     if let Some(v) = self.eval_request_domain(name)? {
@@ -3498,6 +3501,19 @@ impl<W: Write> Interp<W> {
         Ok(Value::Void)
     }
 
+    fn respond_value(&mut self, status: i64, payload: Value) -> Value {
+        if self.response.is_none() {
+            self.response = Some(ResponseCtx {
+                status,
+                payload,
+                raw_body: None,
+                location: None,
+            });
+        }
+        self.pending_return = Some(Value::Void);
+        Value::Void
+    }
+
     /// 요청 컨텍스트가 있을 때 request-state 도메인 (`@param`, `@query`,
     /// `@header`, `@body`, `@request`) 을 평가한다. 맵 성격은 `Value::Object`
     /// 로 노출되어 기존 `.field` 접근 경로로 조회된다. 지원하지 않는 이름은
@@ -3518,6 +3534,7 @@ impl<W: Write> Interp<W> {
             "query" => map_to_object(&ctx.query),
             "header" => map_to_object(&ctx.headers),
             "body" => ctx.body.clone(),
+            "session" => self.session_value(),
             "request" => Value::Object(vec![
                 ("method".into(), Value::Str(ctx.method.clone())),
                 ("path".into(), Value::Str(ctx.path.clone())),
@@ -3537,6 +3554,37 @@ impl<W: Write> Interp<W> {
             }
             _ => return Ok(None),
         }))
+    }
+
+    fn eval_session_domain(&mut self, args: &[HirExpr]) -> Result<Value, RuntimeError> {
+        match args {
+            [] => Ok(self.session_value()),
+            [arg] if is_required_arg(arg) => {
+                if let Some(id) = self.session_id_from_cookie() {
+                    Ok(session_object(Some(id)))
+                } else {
+                    Ok(self.respond_value(
+                        401,
+                        Value::Object(vec![(
+                            "err".to_string(),
+                            Value::Str("session_required".to_string()),
+                        )]),
+                    ))
+                }
+            }
+            _ => Err(RuntimeError::native(
+                "`@session` expects no arguments or `required`",
+            )),
+        }
+    }
+
+    fn session_value(&self) -> Value {
+        session_object(self.session_id_from_cookie())
+    }
+
+    fn session_id_from_cookie(&self) -> Option<String> {
+        let ctx = self.request.as_ref()?;
+        cookie_value_from_headers(&ctx.headers, "orv_session")
     }
 
     /// HTML 모드에서 `@tag ...` 도메인 호출 하나를 현재 버퍼에 렌더한다.
@@ -3696,6 +3744,32 @@ fn response_headers_object(resp: &ResponseCtx) -> Value {
         ));
     }
     Value::Object(headers)
+}
+
+fn is_required_arg(expr: &HirExpr) -> bool {
+    matches!(&expr.kind, HirExprKind::Ident(ident) if ident.name == "required")
+}
+
+fn session_object(id: Option<String>) -> Value {
+    let present = id.is_some();
+    Value::Object(vec![
+        ("id".to_string(), id.map(Value::Str).unwrap_or(Value::Void)),
+        ("present".to_string(), Value::Bool(present)),
+    ])
+}
+
+fn cookie_value_from_headers(
+    headers: &HashMap<String, String>,
+    cookie_name: &str,
+) -> Option<String> {
+    let cookie_header = headers
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("cookie").then_some(value))?;
+    cookie_header.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        let value = value.trim();
+        (name.trim() == cookie_name && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn is_event_attr(name: &str) -> bool {
@@ -7923,7 +7997,10 @@ let third: int = 3
 
     // ── request-state 도메인 (@param/@query/@header/@body/@request) ──
 
-    fn eval_handler_src(src: &str, ctx: RequestCtx) -> Result<String, RuntimeError> {
+    fn eval_handler_outcome_src(
+        src: &str,
+        ctx: RequestCtx,
+    ) -> Result<(HandlerOutcome, String), RuntimeError> {
         let lx = lex(src, FileId(0));
         assert!(
             lx.diagnostics.is_empty(),
@@ -7943,13 +8020,28 @@ let third: int = 3
             resolved.diagnostics
         );
         let hir = lower(&pr.program, &resolved);
-        // 단일 표현식 프로그램을 가정 — 그 표현식을 handler 처럼 평가한다.
-        let orv_hir::HirStmt::Expr(expr) = &hir.items[0] else {
-            panic!("expected expr stmt");
+        let handler = if hir.items.len() == 1 {
+            let orv_hir::HirStmt::Expr(expr) = &hir.items[0] else {
+                panic!("expected expr stmt");
+            };
+            expr.clone()
+        } else {
+            orv_hir::HirExpr {
+                kind: orv_hir::HirExprKind::Block(orv_hir::HirBlock {
+                    stmts: hir.items.clone(),
+                    span: hir.span,
+                }),
+                ty: orv_hir::Type::Unknown,
+                span: hir.span,
+            }
         };
         let mut buf = Vec::new();
-        let _ = run_handler_with_request(expr, ctx, &mut buf)?;
-        Ok(String::from_utf8(buf).unwrap())
+        let outcome = run_handler_with_request(&handler, ctx, &mut buf)?;
+        Ok((outcome, String::from_utf8(buf).unwrap()))
+    }
+
+    fn eval_handler_src(src: &str, ctx: RequestCtx) -> Result<String, RuntimeError> {
+        eval_handler_outcome_src(src, ctx).map(|(_, output)| output)
     }
 
     #[test]
@@ -8027,6 +8119,54 @@ let third: int = 3
         };
         let out = eval_handler_src(r#"@out @request.rawBody"#, ctx).unwrap();
         assert_eq!(out, "{\"id\":\"evt_1\"}\n");
+    }
+
+    #[test]
+    fn request_session_domain_exposes_cookie_id() {
+        let ctx = RequestCtx {
+            headers: [("Cookie".into(), "theme=dark; orv_session=sess-42".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(r#"@out @session.id"#, ctx).unwrap();
+        assert_eq!(out, "sess-42\n");
+    }
+
+    #[test]
+    fn session_required_allows_cookie() {
+        let ctx = RequestCtx {
+            headers: [("cookie".into(), "orv_session=abc_123".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"@session required
+@out @session.id"#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "abc_123\n");
+    }
+
+    #[test]
+    fn session_required_records_unauthorized_response() {
+        let (outcome, out) = eval_handler_outcome_src(
+            r#"@session required
+@out "after""#,
+            RequestCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(out, "");
+        let response = outcome.response.expect("session response");
+        assert_eq!(response.status, 401);
+        let Value::Object(fields) = response.payload else {
+            panic!("expected object payload");
+        };
+        assert!(fields.iter().any(|(name, value)| {
+            name == "err" && matches!(value, Value::Str(err) if err == "session_required")
+        }));
     }
 
     #[test]
