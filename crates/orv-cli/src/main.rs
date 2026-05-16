@@ -21970,9 +21970,11 @@ fn verify_deploy_smoke_db_adapter_contract(
             .find(|env| env.purpose == "bridge_auth_token")
             .map(|env| env.env.as_str())
             .unwrap_or("");
+        let endpoint_expr = format!("${{{}:-${{ORV_DB_ADAPTER_ENDPOINT:-}}}}", endpoint_env.env);
+        let auth_expr = format!("${{{auth_env}:-${{ORV_DB_ADAPTER_AUTH_TOKEN:-}}}}");
         let command = format!(
-            r#"orv_smoke_db_bridge_schema "{} bridge" "${{{}}}" "{}" "{}" "${{{auth_env}:-}}""#,
-            adapter.provider, endpoint_env.env, adapter.provider, endpoint
+            r#"orv_smoke_db_bridge_schema "{} bridge" "{}" "{}" "{}" "{}""#,
+            adapter.provider, endpoint_expr, adapter.provider, endpoint, auth_expr
         );
         if !smoke.contains(&command) {
             let provider = &adapter.provider;
@@ -22259,6 +22261,7 @@ where
         if lookup(variable)
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+            || deploy_preflight_env_has_db_bridge_fallback(env, &mut *lookup)
         {
             continue;
         }
@@ -22273,12 +22276,52 @@ where
         if lookup(variable)
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+            || deploy_preflight_optional_env_has_db_bridge_fallback(env, &mut *lookup)
         {
             continue;
         }
         optional_missing.push(deploy_preflight_env_label(env)?);
     }
     Ok((missing, optional_missing))
+}
+
+fn deploy_preflight_env_has_db_bridge_fallback<F>(env: &serde_json::Value, lookup: &mut F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let kind = env.get("kind").and_then(serde_json::Value::as_str);
+    let purpose = env.get("purpose").and_then(serde_json::Value::as_str);
+    let variable = env.get("env").and_then(serde_json::Value::as_str);
+    if kind == Some("db")
+        && purpose == Some("bridge_endpoint")
+        && variable != Some("ORV_DB_ADAPTER_ENDPOINT")
+    {
+        return lookup("ORV_DB_ADAPTER_ENDPOINT")
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    false
+}
+
+fn deploy_preflight_optional_env_has_db_bridge_fallback<F>(
+    env: &serde_json::Value,
+    lookup: &mut F,
+) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let kind = env.get("kind").and_then(serde_json::Value::as_str);
+    let purpose = env.get("purpose").and_then(serde_json::Value::as_str);
+    let variable = env.get("env").and_then(serde_json::Value::as_str);
+    if kind == Some("db")
+        && purpose == Some("bridge_auth_token")
+        && variable != Some("ORV_DB_ADAPTER_AUTH_TOKEN")
+    {
+        return lookup("ORV_DB_ADAPTER_AUTH_TOKEN")
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    false
 }
 
 fn deploy_preflight_env_label(env: &serde_json::Value) -> anyhow::Result<String> {
@@ -27166,6 +27209,12 @@ fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
                 false,
                 "bridge_auth_token",
             ),
+            deploy_provider_env("ORV_DB_ADAPTER_ENDPOINT", false, "bridge_endpoint_fallback"),
+            deploy_provider_env(
+                "ORV_DB_ADAPTER_AUTH_TOKEN",
+                false,
+                "bridge_auth_token_fallback",
+            ),
         ],
         "mysql" => vec![
             deploy_provider_env("ORV_DB_ADAPTER_MYSQL_ENDPOINT", true, "bridge_endpoint"),
@@ -27173,6 +27222,12 @@ fn db_adapter_bridge_env(provider: &str) -> Vec<DeployProviderEnv> {
                 "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
                 false,
                 "bridge_auth_token",
+            ),
+            deploy_provider_env("ORV_DB_ADAPTER_ENDPOINT", false, "bridge_endpoint_fallback"),
+            deploy_provider_env(
+                "ORV_DB_ADAPTER_AUTH_TOKEN",
+                false,
+                "bridge_auth_token_fallback",
             ),
         ],
         _ => Vec::new(),
@@ -28931,10 +28986,12 @@ orv_smoke_grep "db adapter bridge retry" "deploy/db-adapters.json" '"retry"'
             .find(|env| env.purpose == "bridge_auth_token")
             .map(|env| env.env.as_str())
             .unwrap_or("");
+        let endpoint_expr = format!("${{{}:-${{ORV_DB_ADAPTER_ENDPOINT:-}}}}", endpoint_env.env);
+        let auth_expr = format!("${{{auth_env}:-${{ORV_DB_ADAPTER_AUTH_TOKEN:-}}}}");
         let _ = writeln!(
             out,
-            r#"orv_smoke_db_bridge_schema "{} bridge" "${{{}}}" "{}" "{}" "${{{auth_env}:-}}""#,
-            adapter.provider, endpoint_env.env, adapter.provider, endpoint
+            r#"orv_smoke_db_bridge_schema "{} bridge" "{}" "{}" "{}" "{}""#,
+            adapter.provider, endpoint_expr, adapter.provider, endpoint, auth_expr
         );
     }
     out.push('\n');
@@ -42838,6 +42895,16 @@ let sig count: int = 0
                                 "env": "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
                                 "required": false,
                                 "purpose": "bridge_auth_token"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_ENDPOINT",
+                                "required": false,
+                                "purpose": "bridge_endpoint_fallback"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_AUTH_TOKEN",
+                                "required": false,
+                                "purpose": "bridge_auth_token_fallback"
                             }
                         ]
                     }
@@ -42893,6 +42960,16 @@ let sig count: int = 0
                                 "env": "ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN",
                                 "required": false,
                                 "purpose": "bridge_auth_token"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_ENDPOINT",
+                                "required": false,
+                                "purpose": "bridge_endpoint_fallback"
+                            },
+                            {
+                                "env": "ORV_DB_ADAPTER_AUTH_TOKEN",
+                                "required": false,
+                                "purpose": "bridge_auth_token_fallback"
                             }
                         ]
                     }
@@ -42914,9 +42991,11 @@ let sig count: int = 0
         assert!(compose.contains(
             r#"ORV_DB_ADAPTER_POSTGRES_ENDPOINT: "${ORV_DB_ADAPTER_POSTGRES_ENDPOINT}""#
         ));
+        assert!(compose.contains(r#"ORV_DB_ADAPTER_ENDPOINT: "${ORV_DB_ADAPTER_ENDPOINT}""#));
         assert!(env_example.contains("SHOP_DATABASE_URL=mysql://db.internal/shop"));
         assert!(env_example.contains("ORV_DB_ADAPTER_MYSQL_ENDPOINT="));
         assert!(env_example.contains("ORV_DB_ADAPTER_POSTGRES_ENDPOINT="));
+        assert!(env_example.contains("ORV_DB_ADAPTER_ENDPOINT="));
         assert!(preflight["required_env"]
             .as_array()
             .expect("required preflight env")
@@ -42946,10 +43025,10 @@ let sig count: int = 0
             r#"orv_smoke_grep "db adapter bridge contract" "deploy/db-adapters.json" '"contract": "http-json-v1"'"#
         ));
         assert!(smoke_test.contains(
-            r#"orv_smoke_db_bridge_schema "mysql bridge" "${ORV_DB_ADAPTER_MYSQL_ENDPOINT}" "mysql" "mysql://db.internal/shop" "${ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN:-}""#
+            r#"orv_smoke_db_bridge_schema "mysql bridge" "${ORV_DB_ADAPTER_MYSQL_ENDPOINT:-${ORV_DB_ADAPTER_ENDPOINT:-}}" "mysql" "mysql://db.internal/shop" "${ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN:-${ORV_DB_ADAPTER_AUTH_TOKEN:-}}""#
         ));
         assert!(smoke_test.contains(
-            r#"orv_smoke_db_bridge_schema "postgres bridge" "${ORV_DB_ADAPTER_POSTGRES_ENDPOINT}" "postgres" "postgres://db.internal/shop" "${ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN:-}""#
+            r#"orv_smoke_db_bridge_schema "postgres bridge" "${ORV_DB_ADAPTER_POSTGRES_ENDPOINT:-${ORV_DB_ADAPTER_ENDPOINT:-}}" "postgres" "postgres://db.internal/shop" "${ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN:-${ORV_DB_ADAPTER_AUTH_TOKEN:-}}""#
         ));
         assert!(runbook.contains("deploy/db-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
@@ -43458,6 +43537,12 @@ let sig count: int = 0
             message.contains("ORV_DB_ADAPTER_POSTGRES_ENDPOINT"),
             "{message}"
         );
+
+        deploy_env_check_with_lookup(&out, |env| match env {
+            "ORV_DB_ADAPTER_ENDPOINT" => Some("http://db-adapter.internal/shared".to_string()),
+            _ => None,
+        })
+        .expect("generic DB bridge endpoint fallback passes");
 
         deploy_env_check_with_lookup(&out, |env| match env {
             "ORV_DB_ADAPTER_POSTGRES_ENDPOINT" => {
@@ -50011,7 +50096,7 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_optional_env_count"],
-            3
+            5
         );
         assert_eq!(native_host["production"]["summary"]["db_target_count"], 1);
         assert_eq!(
