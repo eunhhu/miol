@@ -9313,6 +9313,7 @@ fn editor_native_host_production_summary_json(production: &serde_json::Value) ->
         "client_manifest_count": production_client_manifest_count(&client),
         "client_capability_surface_count": production_client_capability_surface_count(&client),
         "preflight_target_count": preflight.len(),
+        "preflight_command_count": production_preflight_command_count(&preflight),
         "preflight_route_count": production_preflight_route_count(&preflight),
         "preflight_required_env_count": production_preflight_env_count(&preflight, "required_env"),
         "preflight_optional_env_count": production_preflight_env_count(&preflight, "optional_env"),
@@ -9372,6 +9373,13 @@ fn production_preflight_env_count(targets: &[serde_json::Value], key: &str) -> u
     targets
         .iter()
         .map(|target| json_array_count(target.get(key)))
+        .sum()
+}
+
+fn production_preflight_command_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(|target| json_object_count(target.get("commands")))
         .sum()
 }
 
@@ -9460,6 +9468,7 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     let db_target_count = json_usize_field(&summary, "db_target_count");
     let commerce_target_count = json_usize_field(&summary, "commerce_target_count");
     let preflight_target_count = json_usize_field(&summary, "preflight_target_count");
+    let preflight_command_count = json_usize_field(&summary, "preflight_command_count");
     let route_policy_count = json_usize_field(&summary, "route_policy_count");
     let client_target_count = json_usize_field(&summary, "client_target_count");
     let graph_contract_count = json_usize_field(&summary, "graph_contract_count");
@@ -9505,7 +9514,7 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Preflight Commands</span><b>{preflight_command_count}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
         if missing_artifact_count == 0 { "" } else { "bad" }
     )?;
     writeln!(
@@ -10595,12 +10604,13 @@ fn editor_production_summary_text(state: &serde_json::Value) -> String {
         .flatten()
     {
         let path = json_str_or_empty(target, "path");
+        let commands = json_object_count(target.get("commands"));
         let required_env = json_array_count(target.get("required_env"));
         let optional_env = json_array_count(target.get("optional_env"));
         let route_count = json_array_count(target.get("routes"));
         let route_policies = production_preflight_route_policy_count(std::slice::from_ref(target));
         lines.push(format!(
-            "Preflight {path} (routes {route_count}, route_policies {route_policies}, required_env {required_env}, optional_env {optional_env})"
+            "Preflight {path} (commands {commands}, routes {route_count}, route_policies {route_policies}, required_env {required_env}, optional_env {optional_env})"
         ));
     }
     for target in production
@@ -10656,6 +10666,12 @@ fn json_array_count(value: Option<&serde_json::Value>) -> usize {
     value
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len)
+}
+
+fn json_object_count(value: Option<&serde_json::Value>) -> usize {
+    value
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len)
 }
 
 fn html_escape_text(value: &str) -> String {
@@ -49914,6 +49930,9 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["exists"] == true
                 && target["commands"]["verify_build"] == "orv verify-build ."
                 && target["commands"]["env_check"] == "orv deploy-env-check ."
+                && target["commands"]["benchmark_report"] == "orv benchmark-report ."
+                && target["commands"]["benchmark_report_require_pass"]
+                    == "orv benchmark-report . --require-pass"
                 && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
                 && target["artifacts"]["benchmark_evidence"] == "deploy/benchmark-evidence.json"
                 && target["benchmark"]["kind"] == "orv.benchmark.shop_5h"
@@ -53499,6 +53518,14 @@ define Auth() -> { @out "auth" }
             "orv verify-build ."
         );
         assert_eq!(
+            state["production"]["preflight"][0]["commands"]["benchmark_report"],
+            "orv benchmark-report ."
+        );
+        assert_eq!(
+            state["production"]["preflight"][0]["commands"]["benchmark_report_require_pass"],
+            "orv benchmark-report . --require-pass"
+        );
+        assert_eq!(
             state["production"]["preflight"][0]["artifacts"]["benchmark_evidence"],
             "deploy/benchmark-evidence.json"
         );
@@ -53601,6 +53628,10 @@ define Auth() -> { @out "auth" }
             1
         );
         assert_eq!(
+            native_host["production"]["summary"]["preflight_command_count"],
+            11
+        );
+        assert_eq!(
             native_host["production"]["summary"]["preflight_route_count"],
             1
         );
@@ -53697,6 +53728,7 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("Production"));
         assert!(html.contains("Graph source_bundle source-bundle.json"));
         assert!(html.contains("Preflight"));
+        assert!(html.contains("commands 11"));
         assert!(html.contains("route_policies 2"));
         assert!(html.contains("DB Adapters"));
         assert!(html.contains("Commerce Adapters"));
@@ -53727,6 +53759,11 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("project-graph.json"));
         assert!(production_panel.contains("origin-map.json"));
         assert!(production_panel.contains("Preflight"));
+        assert!(production_panel.contains("\"benchmark_report\": \"orv benchmark-report .\""));
+        assert!(production_panel.contains(
+            "\"benchmark_report_require_pass\": \"orv benchmark-report . --require-pass\""
+        ));
+        assert!(production_panel.contains("Preflight Commands</span><b>11</b>"));
         assert!(production_panel.contains("Route Policies"));
         assert!(production_panel.contains("Route Policy Summary"));
         assert!(production_panel.contains("\"csrf\": 1"));

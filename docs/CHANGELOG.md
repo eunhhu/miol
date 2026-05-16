@@ -39,6 +39,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Exposed the checked deploy preflight contract through reveal/editor/LSP production payloads and the native editor production panel.
 - Added per-route security policy descriptors for source-backed auth/session/csrf domains and built-in rate-limit defaults, with verify-build origin containment checks and reveal production payload exposure.
 - Surfaced preflight route-policy counts and kind summaries in editor export/native-host production payloads and the generated production panel.
+- Surfaced preflight command counts and checked benchmark-report commands through reveal/editor/native production payload tests and production panel summaries.
 - Mirrored route security policy descriptors into generated native route table source so native artifacts carry the same source-backed policy contract.
 
 ## 2026-05-06
