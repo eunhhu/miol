@@ -22797,6 +22797,12 @@ fn verify_deploy_preflight_artifact(
     )?;
     verify_json_pointer_str(
         &preflight,
+        "/commands/trace_run_build",
+        "orv run-build . --trace deploy/request-trace.json",
+        "deploy preflight trace_run_build command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
         "/commands/editor_trace",
         "orv editor trace . --trace deploy/request-trace.json",
         "deploy preflight editor_trace command",
@@ -29676,6 +29682,7 @@ fn deploy_preflight_artifact_value(
             "smoke_test": format!("./{}", artifacts.smoke_test),
             "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
             "trace": "./deploy/server.sh --trace deploy/request-trace.json",
+            "trace_run_build": "orv run-build . --trace deploy/request-trace.json",
             "editor_trace": "orv editor trace . --trace deploy/request-trace.json",
             "trace_stream_smoke": format!("ORV_SMOKE_TRACE_STREAM=1 ./{}", artifacts.smoke_test),
         },
@@ -29805,7 +29812,7 @@ orv_smoke_trace_stream() {{
   if ! curl -fsS --max-time "${{ORV_SMOKE_TRACE_TIMEOUT:-2}}" "$BASE_URL/__orv/trace/events" > "$events_path" 2>/dev/null; then
     if ! grep -F 'event: orv:trace' "$events_path" >/dev/null 2>&1; then
       rm -f "$output_path"
-      printf 'orv deploy smoke test failed: live trace stream unavailable\n' >&2
+      printf 'orv deploy smoke test failed: live trace stream unavailable; start server with --trace deploy/request-trace.json\n' >&2
       exit 1
     fi
   fi
@@ -32194,6 +32201,10 @@ test "checkout excluded failure" {
         assert_eq!(
             preflight["commands"]["smoke_test"],
             serde_json::json!("./deploy/smoke-test.sh")
+        );
+        assert_eq!(
+            preflight["commands"]["trace_run_build"],
+            serde_json::json!("orv run-build . --trace deploy/request-trace.json")
         );
         assert_eq!(
             preflight["commands"]["trace_stream_smoke"],
@@ -44185,6 +44196,10 @@ entry = "src/main.orv"
         assert_eq!(preflight["commands"]["env_check"], "orv deploy-env-check .");
         assert_eq!(preflight["commands"]["run_build"], "orv run-build .");
         assert_eq!(
+            preflight["commands"]["trace_run_build"],
+            "orv run-build . --trace deploy/request-trace.json"
+        );
+        assert_eq!(
             preflight["commands"]["smoke_test"],
             "./deploy/smoke-test.sh"
         );
@@ -46073,6 +46088,27 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy preflight smoke_test command must be ./deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_trace_run_build_command_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-trace-run-build-source");
+        let out = temp_output_dir("deploy-preflight-trace-run-build-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["commands"]["trace_run_build"] =
+            serde_json::json!("orv run-build . --trace other.json");
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight trace run-build mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight trace_run_build command"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
