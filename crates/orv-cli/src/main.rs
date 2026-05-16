@@ -21488,6 +21488,7 @@ fn verify_deploy_server_target(
         smoke_test,
         artifact.listen.as_ref(),
         &artifact,
+        &persistence,
         client,
     )?;
     verify_deploy_preflight_artifact(
@@ -21779,6 +21780,7 @@ fn verify_deploy_smoke_test_artifact(
     path: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
     artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
     client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let smoke_path = dir.join(path);
@@ -21835,6 +21837,7 @@ fn verify_deploy_smoke_test_artifact(
         anyhow::bail!("deploy smoke test must inspect shop response bodies");
     }
     verify_deploy_smoke_client_contract(&smoke, client)?;
+    verify_deploy_smoke_db_adapter_contract(&smoke, persistence)?;
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
         if !smoke.contains(&ready_assignment) {
@@ -21930,6 +21933,50 @@ fn verify_deploy_smoke_test_artifact(
                 let path = &route.path;
                 anyhow::bail!("deploy smoke test must cover GET {path} with an admin role cookie");
             }
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_smoke_db_adapter_contract(
+    smoke: &str,
+    persistence: &DeployPersistence,
+) -> anyhow::Result<()> {
+    if persistence.db_adapters.is_empty() {
+        return Ok(());
+    }
+    if !smoke.contains(r#"orv_smoke_file "deploy/db-adapters.json""#)
+        || !smoke.contains(
+            r#"orv_smoke_grep "db adapter bridge contract" "deploy/db-adapters.json" '"contract": "http-json-v1"'"#,
+        )
+        || !smoke.contains("orv_smoke_db_bridge_schema()")
+    {
+        anyhow::bail!("deploy smoke test must check DB adapter bridge contract");
+    }
+    for adapter in &persistence.db_adapters {
+        let Some(endpoint_env) = adapter
+            .bridge_env
+            .iter()
+            .find(|env| env.purpose == "bridge_endpoint")
+        else {
+            continue;
+        };
+        let Some(endpoint) = &adapter.endpoint else {
+            continue;
+        };
+        let auth_env = adapter
+            .bridge_env
+            .iter()
+            .find(|env| env.purpose == "bridge_auth_token")
+            .map(|env| env.env.as_str())
+            .unwrap_or("");
+        let command = format!(
+            r#"orv_smoke_db_bridge_schema "{} bridge" "${{{}}}" "{}" "{}" "${{{auth_env}:-}}""#,
+            adapter.provider, endpoint_env.env, adapter.provider, endpoint
+        );
+        if !smoke.contains(&command) {
+            let provider = &adapter.provider;
+            anyhow::bail!("deploy smoke test must probe DB bridge endpoint for {provider}");
         }
     }
     Ok(())
@@ -28168,7 +28215,7 @@ fn write_prod_deploy_artifacts(
             targets.server_artifact,
             &persistence,
         )?;
-        write_prod_smoke_test_artifact(out, smoke_test, server_artifact, &client)?;
+        write_prod_smoke_test_artifact(out, smoke_test, server_artifact, &persistence, &client)?;
         write_prod_preflight_artifact(
             out,
             preflight,
@@ -28480,6 +28527,7 @@ fn write_prod_smoke_test_artifact(
     out: &Path,
     path: &str,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
     client: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let mut script = format!(
@@ -28604,6 +28652,47 @@ orv_smoke_body_contains() {{
   fi
 }}
 
+orv_smoke_file() {{
+  path="$1"
+  if [ ! -f "$path" ]; then
+    printf 'orv deploy smoke test missing file: %s\n' "$path" >&2
+    exit 1
+  fi
+}}
+
+orv_smoke_grep() {{
+  label="$1"
+  path="$2"
+  pattern="$3"
+  if ! grep -F "$pattern" "$path" >/dev/null; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
+orv_smoke_db_bridge_schema() {{
+  label="$1"
+  endpoint="$2"
+  provider="$3"
+  adapter_url="$4"
+  auth_token="$5"
+  if [ -z "$endpoint" ]; then
+    printf 'orv deploy smoke test failed: %s missing endpoint\n' "$label" >&2
+    exit 1
+  fi
+  if [ -n "$auth_token" ]; then
+    if ! curl -fsS -H 'content-type: application/json' -H 'accept: application/json' -H "authorization: Bearer ${{auth_token}}" --data "{{\"kind\":\"orv.db.adapter\",\"contract\":\"http-json-v1\",\"provider\":\"${{provider}}\",\"url\":\"${{adapter_url}}\",\"method\":\"schema\",\"args\":[]}}" "$endpoint" >/dev/null; then
+      printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+      exit 1
+    fi
+    return 0
+  fi
+  if ! curl -fsS -H 'content-type: application/json' -H 'accept: application/json' --data "{{\"kind\":\"orv.db.adapter\",\"contract\":\"http-json-v1\",\"provider\":\"${{provider}}\",\"url\":\"${{adapter_url}}\",\"method\":\"schema\",\"args\":[]}}" "$endpoint" >/dev/null; then
+    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
+    exit 1
+  fi
+}}
+
 orv_smoke_cookie_from_headers() {{
   cookie_name="$1"
   headers_path="$2"
@@ -28639,6 +28728,7 @@ orv_smoke_cookie_from_headers() {{
         script.push('\n');
     }
     script.push_str(&deploy_smoke_client_contract_section(client));
+    script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
     if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
         let _ = writeln!(
             script,
@@ -28800,25 +28890,7 @@ fn deploy_smoke_client_contract_section(client: &serde_json::Value) -> String {
     let loader = json_str_or_empty(client, "loader");
     let wasm = json_str_or_empty(client, "wasm");
     format!(
-        r#"orv_smoke_file() {{
-  path="$1"
-  if [ ! -f "$path" ]; then
-    printf 'orv deploy smoke test missing file: %s\n' "$path" >&2
-    exit 1
-  fi
-}}
-
-orv_smoke_grep() {{
-  label="$1"
-  path="$2"
-  pattern="$3"
-  if ! grep -F "$pattern" "$path" >/dev/null; then
-    printf 'orv deploy smoke test failed: %s\n' "$label" >&2
-    exit 1
-  fi
-}}
-
-orv_smoke_file "{manifest}"
+        r#"orv_smoke_file "{manifest}"
 orv_smoke_file "{page}"
 orv_smoke_file "{loader}"
 orv_smoke_file "{wasm}"
@@ -28829,6 +28901,44 @@ orv_smoke_grep "client loader bootstrap" "{loader}" 'ORV_CLIENT_BOOTSTRAP'
 
 "#
     )
+}
+
+fn deploy_smoke_db_adapter_contract_section(persistence: &DeployPersistence) -> String {
+    if persistence.db_adapters.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        r#"orv_smoke_file "deploy/db-adapters.json"
+orv_smoke_grep "db adapter artifact kind" "deploy/db-adapters.json" '"orv.deploy.db_adapters"'
+orv_smoke_grep "db adapter bridge contract" "deploy/db-adapters.json" '"contract": "http-json-v1"'
+orv_smoke_grep "db adapter bridge retry" "deploy/db-adapters.json" '"retry"'
+"#,
+    );
+    for adapter in &persistence.db_adapters {
+        let Some(endpoint_env) = adapter
+            .bridge_env
+            .iter()
+            .find(|env| env.purpose == "bridge_endpoint")
+        else {
+            continue;
+        };
+        let Some(endpoint) = &adapter.endpoint else {
+            continue;
+        };
+        let auth_env = adapter
+            .bridge_env
+            .iter()
+            .find(|env| env.purpose == "bridge_auth_token")
+            .map(|env| env.env.as_str())
+            .unwrap_or("");
+        let _ = writeln!(
+            out,
+            r#"orv_smoke_db_bridge_schema "{} bridge" "${{{}}}" "{}" "{}" "${{{auth_env}:-}}""#,
+            adapter.provider, endpoint_env.env, adapter.provider, endpoint
+        );
+    }
+    out.push('\n');
+    out
 }
 
 fn write_prod_deploy_runbook(
@@ -42660,6 +42770,8 @@ let sig count: int = 0
             std::fs::read_to_string(out.join("deploy").join("compose.yaml")).expect("compose");
         let env_example =
             std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
+        let smoke_test =
+            std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
         let preflight =
             read_json_value(&out.join("deploy").join("preflight.json")).expect("preflight");
         let runbook =
@@ -42828,6 +42940,16 @@ let sig count: int = 0
         ));
         assert!(runbook.contains(
             "- DB bridge env: postgres ORV_DB_ADAPTER_POSTGRES_ENDPOINT required bridge_endpoint"
+        ));
+        assert!(smoke_test.contains(r#"orv_smoke_file "deploy/db-adapters.json""#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_grep "db adapter bridge contract" "deploy/db-adapters.json" '"contract": "http-json-v1"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_db_bridge_schema "mysql bridge" "${ORV_DB_ADAPTER_MYSQL_ENDPOINT}" "mysql" "mysql://db.internal/shop" "${ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN:-}""#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_db_bridge_schema "postgres bridge" "${ORV_DB_ADAPTER_POSTGRES_ENDPOINT}" "postgres" "postgres://db.internal/shop" "${ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN:-}""#
         ));
         assert!(runbook.contains("deploy/db-adapters.json"));
         cmd_verify_build(&out).expect("verify prod build");
