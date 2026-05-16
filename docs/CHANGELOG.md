@@ -28,6 +28,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Made generated deploy smoke tests gate on the same build graph spine by checking `source-bundle.json`, `project-graph.json`, `origin-map.json`, and running `orv verify-build .` before live route checks.
 - Mirrored graph artifacts into `deploy/preflight.json` so preflight, smoke, runbook, and verify-build all name the same source-bundle/project-graph/origin-map contract paths.
 - Added a trace-enabled `orv run-build . --trace deploy/request-trace.json` preflight command and clearer trace-smoke failure guidance, aligning generated smoke with the runbook trace capture flow.
+- Mirrored the 5-hour shop benchmark contract into `deploy/preflight.json`, including automated gate commands, success criteria, time budget, and data-to-record fields, with verify-build drift checks.
 - Exposed CSRF, session cookie, auth role, and default route rate-limit requirements as shared `runtime_features` across build, server, deploy, and native plan artifacts.
 - Added explicit reference `@rateLimit key=... limit=... window=...` route policies plus `@rateLimit exempt`, with runtime enforcement, server artifact descriptors, and native route table fields.
 - Added source-backed `@csrf exempt` so intentional CSRF bypasses can execute without a token while still appearing in route policy artifacts.

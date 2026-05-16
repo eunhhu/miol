@@ -22874,6 +22874,9 @@ fn verify_deploy_preflight_artifact(
     if preflight.get("client") != Some(&deploy_preflight_client_value(client)) {
         anyhow::bail!("deploy preflight client does not match deploy manifest");
     }
+    if preflight.get("benchmark") != Some(&deploy_preflight_benchmark_value()) {
+        anyhow::bail!("deploy preflight benchmark does not match 5-hour shop contract");
+    }
     Ok(())
 }
 
@@ -24192,6 +24195,10 @@ fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>
             .get("artifacts")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({})),
+        "benchmark": artifact
+            .get("benchmark")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "runtime_features": artifact
             .get("runtime_features")
             .cloned()
@@ -29701,7 +29708,62 @@ fn deploy_preflight_artifact_value(
             "preflight": artifacts.preflight,
             "runbook": artifacts.runbook,
         },
+        "benchmark": deploy_preflight_benchmark_value(),
         "client": deploy_preflight_client_value(client),
+    })
+}
+
+fn deploy_preflight_benchmark_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.benchmark.shop_5h",
+        "goal": "non-developer builds and verifies a small shop without AI assistance in under 5 hours",
+        "max_elapsed_minutes": 300,
+        "automated_gate": [
+            "orv init my-shop --template shop",
+            "orv check .",
+            "orv build . --prod --out dist",
+            "orv verify-build dist",
+            "orv deploy-env-check dist",
+            "orv run-build dist",
+            "sh dist/deploy/smoke-test.sh",
+        ],
+        "success_criteria": [
+            "edit home page copy and theme tokens",
+            "create 3 products",
+            "add one product field and show it in catalog/admin",
+            "sign up and log in as a member",
+            "add an item to cart",
+            "complete checkout",
+            "capture mock payment",
+            "book mock shipping",
+            "view order/payment/shipment rows in admin",
+            "run prod build",
+            "pass deploy env check",
+            "pass generated smoke-test",
+            "reveal route/html/db-related execution output back to source through origin artifacts",
+        ],
+        "time_budget": [
+            {"task": "Project creation and first run", "target_minutes": 15},
+            {"task": "First page/theme edit", "target_minutes": 30},
+            {"task": "Product data entry", "target_minutes": 30},
+            {"task": "Product field addition", "target_minutes": 45},
+            {"task": "Form validation update", "target_minutes": 45},
+            {"task": "Auth/member flow check", "target_minutes": 30},
+            {"task": "Checkout/payment/shipping config", "target_minutes": 60},
+            {"task": "Admin verification", "target_minutes": 30},
+            {"task": "Prod build and env check", "target_minutes": 30},
+            {"task": "Smoke-test and issue fixing", "target_minutes": 45},
+        ],
+        "data_to_record": [
+            "elapsed time per task",
+            "number of docs/help lookups",
+            "number of compiler/runtime errors",
+            "time from first error to fix",
+            "all manual config edits",
+            "smoke-test output",
+            "participant notes on confusing concepts",
+        ],
     })
 }
 
@@ -32243,6 +32305,20 @@ test "checkout excluded failure" {
                 "session_cookies"
             ])
         );
+        assert_eq!(preflight["benchmark"]["kind"], "orv.benchmark.shop_5h");
+        assert_eq!(preflight["benchmark"]["max_elapsed_minutes"], 300);
+        assert!(preflight["benchmark"]["success_criteria"]
+            .as_array()
+            .expect("benchmark success criteria")
+            .iter()
+            .any(|criterion| criterion
+                .as_str()
+                .is_some_and(|value| value.contains("complete checkout"))));
+        assert!(preflight["benchmark"]["data_to_record"]
+            .as_array()
+            .expect("benchmark data")
+            .iter()
+            .any(|item| item == "smoke-test output"));
         assert!(preflight["optional_env"]
             .as_array()
             .expect("optional preflight env")
@@ -46073,6 +46149,26 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_deploy_preflight_benchmark_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-benchmark-source");
+        let out = temp_output_dir("deploy-preflight-benchmark-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["benchmark"]["max_elapsed_minutes"] = serde_json::json!(301);
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight benchmark mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight benchmark does not match 5-hour shop contract"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_deploy_preflight_smoke_command_mismatch() {
         let (src_dir, path) = prod_server_source("deploy-preflight-smoke-command-source");
         let out = temp_output_dir("deploy-preflight-smoke-command-mismatch");
@@ -48953,6 +49049,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["commands"]["verify_build"] == "orv verify-build ."
                 && target["commands"]["env_check"] == "orv deploy-env-check ."
                 && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
+                && target["benchmark"]["kind"] == "orv.benchmark.shop_5h"
+                && target["benchmark"]["max_elapsed_minutes"] == 300
                 && target["routes"][0]["method"] == "GET"
                 && target["routes"][0]["path"] == "/ping"
                 && target["required_env"][0]["kind"] == "db"
