@@ -23327,24 +23327,37 @@ fn run_build_with_writer_with_trace<W: std::io::Write>(
     trace: Option<&Path>,
     writer: &mut W,
 ) -> anyhow::Result<()> {
-    let plan_path = dir.join("bundle-plan.json");
+    let build_dir = dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("failed to resolve build dir {}: {e}", dir.display()))?;
+    let plan_path = build_dir.join("bundle-plan.json");
     if plan_path.is_file() {
         let plan = read_json_value(&plan_path)?;
         if let Some(launcher) = bundle_target_path(&plan, "server_launcher")? {
-            let launch_path = dir.join(launcher);
-            verify_server_launcher_target(dir, &launch_path)?;
+            let launch_path = build_dir.join(launcher);
+            verify_server_launcher_target(&build_dir, &launch_path)?;
             let launch = read_server_launch_artifact(&launch_path)?;
-            return run_artifact_with_writer_with_trace(&dir.join(launch.artifact), trace, writer);
+            return run_artifact_with_writer_with_build_dir(
+                &build_dir.join(launch.artifact),
+                &build_dir,
+                trace,
+                writer,
+            );
         }
-        return run_static_build_with_writer(dir, writer);
+        return run_static_build_with_writer(&build_dir, writer);
     }
-    let launch_path = dir.join("server").join("launch.json");
+    let launch_path = build_dir.join("server").join("launch.json");
     if launch_path.is_file() {
-        verify_server_launcher_target(dir, &launch_path)?;
+        verify_server_launcher_target(&build_dir, &launch_path)?;
         let launch = read_server_launch_artifact(&launch_path)?;
-        return run_artifact_with_writer_with_trace(&dir.join(launch.artifact), trace, writer);
+        return run_artifact_with_writer_with_build_dir(
+            &build_dir.join(launch.artifact),
+            &build_dir,
+            trace,
+            writer,
+        );
     }
-    run_static_build_with_writer(dir, writer)
+    run_static_build_with_writer(&build_dir, writer)
 }
 
 fn bundle_target_path(plan: &serde_json::Value, kind: &str) -> anyhow::Result<Option<String>> {
@@ -23405,13 +23418,43 @@ fn run_artifact_with_writer_with_trace<W: std::io::Write>(
     trace: Option<&Path>,
     writer: &mut W,
 ) -> anyhow::Result<()> {
+    let options = orv_runtime::RuntimeOptions {
+        request_trace_path: trace.map(Path::to_path_buf),
+        ..orv_runtime::RuntimeOptions::default()
+    };
+    run_artifact_with_writer_with_options(path, writer, options)
+}
+
+fn run_artifact_with_writer_with_build_dir<W: std::io::Write>(
+    path: &Path,
+    build_dir: &Path,
+    trace: Option<&Path>,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    let options = orv_runtime::RuntimeOptions {
+        request_trace_path: trace.map(|path| build_runtime_path(build_dir, path)),
+        working_dir: Some(build_dir.to_path_buf()),
+    };
+    run_artifact_with_writer_with_options(path, writer, options)
+}
+
+fn build_runtime_path(build_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        build_dir.join(path)
+    }
+}
+
+fn run_artifact_with_writer_with_options<W: std::io::Write>(
+    path: &Path,
+    writer: &mut W,
+    options: orv_runtime::RuntimeOptions,
+) -> anyhow::Result<()> {
     let artifact = read_server_artifact(path)?;
     orv_compiler::verify_server_runtime_artifact(&artifact)
         .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
     let lowered = lower_artifact_entry(&artifact)?;
-    let options = orv_runtime::RuntimeOptions {
-        request_trace_path: trace.map(Path::to_path_buf),
-    };
     orv_runtime::run_with_writer_with_options(&lowered.program, writer, options)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -47884,6 +47927,56 @@ define Auth() -> { @out "auth" }
             String::from_utf8(stdout).expect("stdout utf-8"),
             "build ok\n"
         );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn run_build_resolves_relative_persistence_under_build_dir() {
+        let out = temp_output_dir("run-build-persistence-cwd");
+        let unique = std::process::id();
+        let sqlite_name = format!("orv-run-build-cwd-{unique}.sqlite");
+        let record_name = format!("orv-run-build-cwd-{unique}.jsonl");
+        let cwd_data = std::env::current_dir().expect("cwd").join("data");
+        let cwd_sqlite = cwd_data.join(&sqlite_name);
+        let cwd_record = cwd_data.join(&record_name);
+        let _ = std::fs::remove_file(&cwd_sqlite);
+        let _ = std::fs::remove_file(&cwd_record);
+        let source = format!(
+            r#"let db = @db.connect "sqlite://data/{sqlite_name}"
+await db.create("Item", {{ name: "ok" }})
+let payments = @payment.connect("file://data/{record_name}")
+payments.capture({{ orderId: 1, amount: 100, method: "card" }})
+@out "ok""#
+        );
+        let artifact = out.join("server").join("app.orv-runtime.json");
+        write_reference_artifact(&artifact, "artifact.orv", &source);
+        let launch = orv_compiler::ServerLaunchArtifact {
+            schema_version: orv_compiler::SERVER_LAUNCH_ARTIFACT_VERSION,
+            runtime: "reference-interpreter".to_string(),
+            artifact: "server/app.orv-runtime.json".to_string(),
+            command: vec![
+                "orv".to_string(),
+                "run-artifact".to_string(),
+                "server/app.orv-runtime.json".to_string(),
+            ],
+            protocol: "http1".to_string(),
+            routes: Vec::new(),
+            listen: None,
+        };
+        write_json(
+            &out.join("server").join("launch.json"),
+            &serde_json::to_value(launch).expect("launch value"),
+        )
+        .expect("write launch");
+        let mut stdout = Vec::new();
+
+        run_build_with_writer(&out, &mut stdout).expect("run build");
+
+        assert_eq!(String::from_utf8(stdout).expect("stdout utf8"), "ok\n");
+        assert!(out.join("data").join(&sqlite_name).is_file());
+        assert!(out.join("data").join(&record_name).is_file());
+        assert!(!cwd_sqlite.exists());
+        assert!(!cwd_record.exists());
         let _ = std::fs::remove_dir_all(&out);
     }
 

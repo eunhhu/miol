@@ -43,6 +43,17 @@ pub(crate) const ORV_REFERENCE_CSRF_TOKEN: &str = "orv-reference-csrf";
 pub(crate) const ORV_SESSION_COOKIE_NAME: &str = "orv_session";
 pub(crate) const ORV_SESSION_ROLE_COOKIE_NAME: &str = "orv_session_role";
 
+fn resolve_runtime_path(path: &str, working_dir: Option<&Path>) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(working_dir) = working_dir {
+        working_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// B4 `@env` 테스트 override.
 ///
 /// `std::env::set_var` 는 Rust 2024 에서 `unsafe` 가 되었고 워크스페이스는
@@ -514,6 +525,8 @@ enum LoopSignal {
 pub struct RuntimeOptions {
     /// Optional path for `@server` request trace capture.
     pub request_trace_path: Option<PathBuf>,
+    /// Optional runtime working directory for relative file-backed adapters.
+    pub working_dir: Option<PathBuf>,
 }
 
 /// HIR 프로그램을 stdout 에 실행한다.
@@ -602,7 +615,25 @@ pub(crate) fn run_with_writer_in_env_and_types_with_db<W: Write>(
     db: DbHandle,
     writer: &mut W,
 ) -> Result<(HashMap<NameId, Value>, RuntimeTypeRegistry), RuntimeError> {
-    let mut interp = Interp::new_with_env(writer, env);
+    run_with_writer_in_env_and_types_with_db_and_options(
+        program,
+        env,
+        types,
+        db,
+        writer,
+        RuntimeOptions::default(),
+    )
+}
+
+pub(crate) fn run_with_writer_in_env_and_types_with_db_and_options<W: Write>(
+    program: &HirProgram,
+    env: HashMap<NameId, Value>,
+    types: RuntimeTypeRegistry,
+    db: DbHandle,
+    writer: &mut W,
+    options: RuntimeOptions,
+) -> Result<(HashMap<NameId, Value>, RuntimeTypeRegistry), RuntimeError> {
+    let mut interp = Interp::new_with_env_and_options(writer, env, options);
     interp.db = db;
     interp.apply_type_registry(types);
     interp.run(program)?;
@@ -667,7 +698,27 @@ pub(crate) fn run_handler_with_request_in_env_and_types<W: Write>(
     db: DbHandle,
     writer: &mut W,
 ) -> Result<HandlerOutcome, RuntimeError> {
-    let mut interp = Interp::new_with_env(writer, env);
+    run_handler_with_request_in_env_and_types_with_options(
+        handler,
+        request,
+        env,
+        types,
+        db,
+        writer,
+        RuntimeOptions::default(),
+    )
+}
+
+pub(crate) fn run_handler_with_request_in_env_and_types_with_options<W: Write>(
+    handler: &HirExpr,
+    request: RequestCtx,
+    env: HashMap<NameId, Value>,
+    types: RuntimeTypeRegistry,
+    db: DbHandle,
+    writer: &mut W,
+    options: RuntimeOptions,
+) -> Result<HandlerOutcome, RuntimeError> {
+    let mut interp = Interp::new_with_env_and_options(writer, env, options);
     interp.db = db;
     interp.apply_type_registry(types);
     // A3: 진입 시점의 env 키를 "server-level captured" 로 기록. handler 가
@@ -840,6 +891,10 @@ impl<W: Write> Interp<W> {
             debug: None,
             runtime_options: options,
         }
+    }
+
+    fn runtime_path(&self, path: &str) -> PathBuf {
+        resolve_runtime_path(path, self.runtime_options.working_dir.as_deref())
     }
 
     fn type_registry(&self) -> RuntimeTypeRegistry {
@@ -1123,14 +1178,14 @@ impl<W: Write> Interp<W> {
                 // server::run_server 내부의 current_thread 런타임 + block_on
                 // 으로 흡수한다. HIR 값(특히 Rc 기반 Value)이 !Send 라
                 // current_thread 가 자연스럽다.
-                crate::server::run_server_with_request_trace_path(
+                crate::server::run_server_with_options(
                     listen.as_deref(),
                     routes,
                     body_stmts,
                     self.env.clone(),
                     self.type_registry(),
                     self.db.clone(),
-                    self.runtime_options.request_trace_path.clone(),
+                    self.runtime_options.clone(),
                 )
             }
             HirExprKind::Respond { status, payload } => {
@@ -2327,7 +2382,8 @@ impl<W: Write> Interp<W> {
                 let Some(Value::Str(path)) = args.into_iter().next() else {
                     return Err(RuntimeError::native("`@fs.read` expects a string path"));
                 };
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let resolved_path = self.runtime_path(&path);
+                let content = std::fs::read_to_string(&resolved_path).unwrap_or_default();
                 let name = std::path::Path::new(&path)
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -2354,7 +2410,8 @@ impl<W: Write> Interp<W> {
                     Value::Str(s) => s,
                     other => format!("{other}"),
                 };
-                std::fs::write(&path, &content)
+                let resolved_path = self.runtime_path(&path);
+                std::fs::write(&resolved_path, &content)
                     .map(|_| Value::Void)
                     .map_err(|e| RuntimeError::native(format!("`@fs.write` failed: {e}")))
             }
@@ -2403,7 +2460,12 @@ impl<W: Write> Interp<W> {
                 if object_kind(&fields)
                     .is_some_and(|kind| matches!(kind, "payment.adapter" | "shipping.adapter")) =>
             {
-                call_commerce_adapter_method(&fields, method, &args)
+                call_commerce_adapter_method(
+                    &fields,
+                    method,
+                    &args,
+                    self.runtime_options.working_dir.as_deref(),
+                )
             }
             (
                 Value::Object(fields),
@@ -2425,7 +2487,7 @@ impl<W: Write> Interp<W> {
                 m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
                 | "count" | "sum" | "transaction" | "schema" | "connect" | "analyze" | "save"
                 | "load" | "wal" | "checkpoint" | "savepoint" | "rollback"),
-            ) => call_db_method(&db, m, args),
+            ) => call_db_method(&db, m, args, self.runtime_options.working_dir.as_deref()),
             (recv, m) => Err(RuntimeError::native(format!("no method `{m}` on {recv}"))),
         }
     }
@@ -3465,10 +3527,10 @@ impl<W: Write> Interp<W> {
                 "text/html; charset=utf-8".to_string(),
             );
         }
-        let declared = std::path::Path::new(&path_str);
+        let declared = self.runtime_path(&path_str);
 
         // 1) 대상 분류 — 파일이면 바로 서빙, 디렉토리면 rest join 후 재시도.
-        let meta = match std::fs::metadata(declared) {
+        let meta = match std::fs::metadata(&declared) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return self.respond_status(404);
@@ -3481,7 +3543,7 @@ impl<W: Write> Interp<W> {
         };
 
         let target_path: std::path::PathBuf = if meta.is_file() {
-            declared.to_path_buf()
+            declared
         } else if meta.is_dir() {
             let rest = self
                 .request
@@ -4346,6 +4408,7 @@ fn call_commerce_adapter_method(
     fields: &[(String, Value)],
     method: &str,
     args: &[Value],
+    working_dir: Option<&Path>,
 ) -> Result<Value, RuntimeError> {
     let provider = object_field(fields, "provider")
         .map(value_to_display)
@@ -4381,7 +4444,7 @@ fn call_commerce_adapter_method(
             )))
         }
     };
-    append_file_commerce_adapter_record(fields, &result)?;
+    append_file_commerce_adapter_record(fields, &result, working_dir)?;
     Ok(result)
 }
 
@@ -4601,6 +4664,7 @@ fn parse_http_adapter_url(url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
 fn append_file_commerce_adapter_record(
     fields: &[(String, Value)],
     record: &Value,
+    working_dir: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let Some(url) = object_field(fields, "url").map(value_to_display) else {
         return Ok(());
@@ -4613,7 +4677,7 @@ fn append_file_commerce_adapter_record(
             "file commerce adapter expects a JSONL record path",
         ));
     }
-    let path = Path::new(path);
+    let path = resolve_runtime_path(path, working_dir);
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -4628,7 +4692,7 @@ fn append_file_commerce_adapter_record(
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .map_err(|source| {
             RuntimeError::native(format!(
                 "commerce adapter failed to open {}: {source}",
@@ -6075,7 +6139,12 @@ fn convert_from(type_name: &str, v: Value) -> Result<Value, RuntimeError> {
 /// - `wal(path)` — JSONL WAL 을 replay 하고 이후 mutation 을 append+fsync.
 /// - `checkpoint()` — 현재 DB 상태를 WAL snapshot record 한 줄로 압축.
 /// - `savepoint()` / `rollback(savepoint)` — in-memory savepoint capture/restore.
-fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+fn call_db_method(
+    db: &DbHandle,
+    method: &str,
+    args: Vec<Value>,
+    working_dir: Option<&Path>,
+) -> Result<Value, RuntimeError> {
     let require_str = |v: &Value, what: &str| -> Result<String, RuntimeError> {
         match v {
             Value::Str(s) => Ok(s.clone()),
@@ -6216,7 +6285,8 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                             "`@db.connect` file adapter expects a WAL path",
                         ));
                     }
-                    let restored = InMemoryDb::load_wal(Path::new(path)).map_err(|e| {
+                    let path = resolve_runtime_path(path, working_dir);
+                    let restored = InMemoryDb::load_wal(&path).map_err(|e| {
                         RuntimeError::native(format!("db.connect file adapter failed: {e}"))
                     })?;
                     return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
@@ -6227,7 +6297,8 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                             "`@db.connect` sqlite adapter expects a database path",
                         ));
                     }
-                    let restored = InMemoryDb::load_sqlite(Path::new(path)).map_err(|e| {
+                    let path = resolve_runtime_path(path, working_dir);
+                    let restored = InMemoryDb::load_sqlite(&path).map_err(|e| {
                         RuntimeError::native(format!("db.connect sqlite adapter failed: {e}"))
                     })?;
                     return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
@@ -6258,8 +6329,9 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                 .first()
                 .ok_or_else(|| RuntimeError::native("`db.save` expects path"))?;
             let path = require_str(path, "path")?;
+            let path = resolve_runtime_path(&path, working_dir);
             db.borrow()
-                .save_snapshot(Path::new(&path))
+                .save_snapshot(&path)
                 .map_err(|e| RuntimeError::native(format!("db.save failed: {e}")))?;
             Ok(Value::Void)
         }
@@ -6268,7 +6340,8 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                 .first()
                 .ok_or_else(|| RuntimeError::native("`db.load` expects path"))?;
             let path = require_str(path, "path")?;
-            let restored = InMemoryDb::load_snapshot(Path::new(&path))
+            let path = resolve_runtime_path(&path, working_dir);
+            let restored = InMemoryDb::load_snapshot(&path)
                 .map_err(|e| RuntimeError::native(format!("db.load failed: {e}")))?;
             *db.borrow_mut() = restored;
             Ok(Value::Void)
@@ -6278,7 +6351,8 @@ fn call_db_method(db: &DbHandle, method: &str, args: Vec<Value>) -> Result<Value
                 .first()
                 .ok_or_else(|| RuntimeError::native("`db.wal` expects path"))?;
             let path = require_str(path, "path")?;
-            let restored = InMemoryDb::load_wal(Path::new(&path))
+            let path = resolve_runtime_path(&path, working_dir);
+            let restored = InMemoryDb::load_wal(&path)
                 .map_err(|e| RuntimeError::native(format!("db.wal failed: {e}")))?;
             *db.borrow_mut() = restored;
             Ok(Value::Void)
@@ -7320,6 +7394,7 @@ mod tests {
         let mut buf = Vec::new();
         let options = RuntimeOptions {
             request_trace_path: Some(std::path::PathBuf::from("target/request-trace.json")),
+            working_dir: None,
         };
 
         run_with_writer_with_options(&hir, &mut buf, options).expect("run with options");

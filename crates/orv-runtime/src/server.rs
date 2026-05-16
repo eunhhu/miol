@@ -44,10 +44,11 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
-    eval_expr_in_env, run_handler_with_request_in_env_and_types,
-    run_with_writer_in_env_and_types_with_db, RequestCtx, ResponseCtx, RuntimeError,
-    RuntimeTypeRegistry, Value, ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN,
-    ORV_SESSION_COOKIE_NAME, ORV_SESSION_ROLE_COOKIE_NAME,
+    eval_expr_in_env, run_handler_with_request_in_env_and_types_with_options,
+    run_with_writer_in_env_and_types_with_db, run_with_writer_in_env_and_types_with_db_and_options,
+    RequestCtx, ResponseCtx, RuntimeError, RuntimeOptions, RuntimeTypeRegistry, Value,
+    ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN, ORV_SESSION_COOKIE_NAME,
+    ORV_SESSION_ROLE_COOKIE_NAME,
 };
 
 /// MVP request body size limit (1MB). 초과 시 413 Payload Too Large.
@@ -329,14 +330,14 @@ pub struct ServerRequestFrame {
 /// - 바인딩 실패도 RuntimeError.
 /// - accept/serve 루프의 I/O 에러는 로그로 흘려보내고 다음 연결로 넘어간다
 ///   (한 커넥션 실패로 서버 전체가 죽지 않도록).
-pub(crate) fn run_server_with_request_trace_path(
+pub(crate) fn run_server_with_options(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
     captured_types: RuntimeTypeRegistry,
     db: DbHandle,
-    request_trace_path: Option<std::path::PathBuf>,
+    runtime_options: RuntimeOptions,
 ) -> Result<Value, RuntimeError> {
     let mut stdout = std::io::stdout().lock();
     let (port, entries, captured, db) = prepare_server_state(
@@ -347,6 +348,7 @@ pub(crate) fn run_server_with_request_trace_path(
         db,
         &mut stdout,
         false,
+        runtime_options.clone(),
     )?;
 
     // 4) tokio current_thread 런타임 생성. 전용 런타임이라 스레드 이동 제약이
@@ -358,7 +360,10 @@ pub(crate) fn run_server_with_request_trace_path(
         .build()
         .map_err(|e| RuntimeError::native(format!("tokio runtime init failed: {e}")))?;
 
-    let request_trace_path = request_trace_path.or_else(runtime_request_trace_path_from_env);
+    let request_trace_path = runtime_options
+        .request_trace_path
+        .clone()
+        .or_else(runtime_request_trace_path_from_env);
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(async move {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
@@ -377,6 +382,7 @@ pub(crate) fn run_server_with_request_trace_path(
             db,
             None,
             request_trace_path,
+            runtime_options,
             shutdown_signal(),
         )
         .await
@@ -519,6 +525,7 @@ fn run_attached_server_thread(
             LocalCapturedEnv::new(captured),
             db,
             Some(trace_state),
+            RuntimeOptions::default(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -574,6 +581,7 @@ fn attached_server_state<W: std::io::Write>(
         db,
         boot_writer,
         true,
+        RuntimeOptions::default(),
     )
 }
 
@@ -634,6 +642,7 @@ where
         new_db_handle(),
         &mut boot_buf,
         true,
+        RuntimeOptions::default(),
     )?;
 
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -645,7 +654,16 @@ where
     let table = LocalRoutes::new(entries);
     let captured_env = LocalCapturedEnv::new(captured);
     let handle = tokio::task::spawn_local(async move {
-        let _ = serve_loop(listener, table, captured_env, db, None, shutdown).await;
+        let _ = serve_loop(
+            listener,
+            table,
+            captured_env,
+            db,
+            None,
+            RuntimeOptions::default(),
+            shutdown,
+        )
+        .await;
     });
     Ok((addr, handle, boot_buf))
 }
@@ -672,6 +690,7 @@ where
         new_db_handle(),
         &mut boot_buf,
         true,
+        RuntimeOptions::default(),
     )?;
 
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -690,6 +709,7 @@ where
             db,
             None,
             Some(request_trace_path),
+            RuntimeOptions::default(),
             shutdown,
         )
         .await;
@@ -700,6 +720,7 @@ where
 /// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 런타임 상태, 공유 DB)`.
 type PreparedServerState = (u16, Vec<RouteEntry>, CapturedRuntimeState, DbHandle);
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_server_state<W: std::io::Write>(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
@@ -708,6 +729,7 @@ fn prepare_server_state<W: std::io::Write>(
     db: DbHandle,
     boot_writer: &mut W,
     allow_ephemeral_port: bool,
+    runtime_options: RuntimeOptions,
 ) -> Result<PreparedServerState, RuntimeError> {
     // 1) body_stmts 평가 — `@out` 같은 부트 출력뿐 아니라 server-level
     //    let/const/function 선언도 여기서 캡처된 환경 위에 쌓아 handler 가
@@ -720,12 +742,13 @@ fn prepare_server_state<W: std::io::Write>(
             items: body_stmts.to_vec(),
             span: body_stmts[0].span(),
         };
-        let (env, types) = run_with_writer_in_env_and_types_with_db(
+        let (env, types) = run_with_writer_in_env_and_types_with_db_and_options(
             &boot_program,
             captured.env,
             captured.types,
             db.clone(),
             boot_writer,
+            runtime_options,
         )?;
         CapturedRuntimeState::new(env, types)
     };
@@ -818,6 +841,7 @@ async fn serve_loop<S>(
     captured_env: LocalCapturedEnv,
     db: DbHandle,
     trace_state: Option<TraceState>,
+    runtime_options: RuntimeOptions,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
@@ -851,6 +875,7 @@ where
         let trace_state = trace_state.clone();
         let rate_limits = rate_limits.clone();
         let client_ip = peer.ip().to_string();
+        let runtime_options = runtime_options.clone();
         let service = service_fn(move |req| {
             let routes = routes.clone();
             let captured_env = captured_env.clone();
@@ -858,6 +883,7 @@ where
             let trace_state = trace_state.clone();
             let rate_limits = rate_limits.clone();
             let client_ip = client_ip.clone();
+            let runtime_options = runtime_options.clone();
             async move {
                 Ok::<_, Infallible>(
                     handle_request(
@@ -868,6 +894,7 @@ where
                         client_ip,
                         trace_state,
                         rate_limits,
+                        runtime_options,
                     )
                     .await,
                 )
@@ -886,6 +913,7 @@ where
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments)]
 async fn serve_loop_with_request_trace_file<S>(
     listener: TcpListener,
     routes: LocalRoutes,
@@ -893,6 +921,7 @@ async fn serve_loop_with_request_trace_file<S>(
     db: DbHandle,
     trace_state: Option<TraceState>,
     request_trace_path: Option<std::path::PathBuf>,
+    runtime_options: RuntimeOptions,
     shutdown: S,
 ) -> Result<(), RuntimeError>
 where
@@ -906,6 +935,7 @@ where
         captured_env,
         db,
         trace_state.clone(),
+        runtime_options,
         shutdown,
     )
     .await?;
@@ -922,6 +952,7 @@ fn runtime_request_trace_path_from_env() -> Option<std::path::PathBuf> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request<Incoming>,
     routes: LocalRoutes,
@@ -930,6 +961,7 @@ async fn handle_request(
     client_ip: String,
     trace_state: Option<TraceState>,
     rate_limits: RateLimitState,
+    runtime_options: RuntimeOptions,
 ) -> ServerResponse {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
@@ -1034,13 +1066,14 @@ async fn handle_request(
     // 콘솔이 아니라 요청 단위로 캡처해 반환 헤더에 싣는 편이 정석이지만
     // MVP 는 단순히 버린다.
     let mut sink = Vec::<u8>::new();
-    let outcome = match run_handler_with_request_in_env_and_types(
+    let outcome = match run_handler_with_request_in_env_and_types_with_options(
         &entry.handler,
         ctx,
         captured_env.snapshot(),
         captured_env.type_registry(),
         db.clone(),
         &mut sink,
+        runtime_options,
     ) {
         Ok(o) => o,
         Err(e) => {
