@@ -18,12 +18,15 @@
 use crate::db::{
     new_db_handle, DbFilter, DbFilterOp, DbHandle, DbNear, DbOrder, DbQuery, InMemoryDb,
 };
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use hmac::{Hmac, Mac};
 use orv_hir::{
     BinaryOp, HirBlock, HirConstraintValue, HirExpr, HirExprKind, HirFunctionBody, HirFunctionStmt,
     HirParam, HirPattern, HirProgram, HirStmt, HirStringSegment, HirTypeConstraint, HirTypeRef,
     HirTypeRefKind, NameId, UnaryOp,
 };
+use rand_core::OsRng;
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -1878,8 +1881,8 @@ impl<W: Write> Interp<W> {
                 return Ok(v.clone());
             }
         }
-        if debug_name == "audit" {
-            return Ok(Value::TypeName("audit".to_string()));
+        if matches!(debug_name, "audit" | "hash") {
+            return Ok(Value::TypeName(debug_name.to_string()));
         }
         // SPEC §4.9: env 에 없고 원시 타입 이름이면 namespace 핸들.
         if is_primitive_type_name(debug_name) {
@@ -2446,6 +2449,7 @@ impl<W: Write> Interp<W> {
                 call_ffi_method(method, args)
             }
             "audit" => call_audit_method(method, args),
+            "hash" => call_hash_method(method, args),
             _ if ns.starts_with("job.") && method == "enqueue" => {
                 let name = ns.strip_prefix("job.").unwrap_or(ns).to_string();
                 let payload = args.first().cloned().unwrap_or(Value::Void);
@@ -5085,6 +5089,44 @@ fn call_audit_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError
     }
 }
 
+fn call_hash_method(method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match method {
+        "sha256" => {
+            let input = string_arg(args, 0, "`hash.sha256` expects a string")?;
+            Ok(Value::Str(sha256_hex(input.as_bytes())))
+        }
+        "password" => {
+            let password = string_arg(args, 0, "`hash.password` expects a password string")?;
+            let salt = SaltString::generate(&mut OsRng);
+            let encoded = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|err| RuntimeError::native(format!("password hash failed: {err}")))?
+                .to_string();
+            Ok(Value::Str(encoded))
+        }
+        "verify" => {
+            let password = string_arg(args, 0, "`hash.verify` expects (password, hash)")?;
+            let expected = string_arg(args, 1, "`hash.verify` expects (password, hash)")?;
+            let parsed = PasswordHash::new(&expected)
+                .map_err(|err| RuntimeError::native(format!("invalid password hash: {err}")))?;
+            Ok(Value::Bool(
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok(),
+            ))
+        }
+        _ => Err(RuntimeError::native(format!(
+            "no method `{method}` on <type hash>"
+        ))),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
 fn regex_contains(haystack: &str, pattern: &str, flags: &str) -> Result<bool, RuntimeError> {
     let mut builder = regex::RegexBuilder::new(pattern);
     for flag in flags.chars() {
@@ -5131,7 +5173,7 @@ fn eval_reference_domain(name: &str, args: &[HirExpr]) -> Option<Value> {
             }
         }
         "sync" | "mail" | "media" | "push" | "payment" | "shipping" | "offline" | "cache"
-        | "net" | "plugin" | "gpu" | "observability" | "ffi"
+        | "net" | "plugin" | "gpu" | "observability" | "ffi" | "hash"
             if args.is_empty() =>
         {
             Some(Value::TypeName(name.to_string()))
@@ -5219,6 +5261,7 @@ fn is_reference_namespace(ns: &str) -> bool {
             | "observability"
             | "ffi"
             | "audit"
+            | "hash"
     )
 }
 
@@ -5245,6 +5288,7 @@ fn is_reference_namespace_method(ns: &str, method: &str) -> bool {
         "observability" => method == "configure",
         "ffi" => matches!(method, "library" | "load"),
         "audit" => method == "log",
+        "hash" => matches!(method, "sha256" | "password" | "verify"),
         _ => ns.starts_with("job.") && method == "enqueue",
     }
 }
@@ -8987,6 +9031,24 @@ let third: int = 3
         );
         let out = run_str(&src).unwrap();
         assert_eq!(out, "8080\n");
+    }
+
+    #[test]
+    fn hash_namespace_supports_sha256_password_and_verify() {
+        let out = run_str(
+            r#"let digest = hash.sha256("data")
+let passwordHash = await hash.password("correct horse battery staple")
+@out digest
+@out passwordHash.contains("correct horse battery staple")
+@out passwordHash.contains("$argon2")
+@out await hash.verify("correct horse battery staple", passwordHash)
+@out await hash.verify("wrong password", passwordHash)"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7\nfalse\ntrue\ntrue\nfalse\n"
+        );
     }
 
     // ── C_middleware 도메인 (@before/@after/@next/@context) ──

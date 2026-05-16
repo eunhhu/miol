@@ -13,6 +13,8 @@ orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
 orv-syntax = { workspace = true }
 hmac = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }

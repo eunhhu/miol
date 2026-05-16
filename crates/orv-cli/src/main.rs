@@ -2398,6 +2398,8 @@ Browser home: http://localhost:8080/ provides product, member signup/login, orde
 \n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths. Admin routes are protected by `@Auth required role=\"admin\"`; the starter seeds a reference admin member `admin` / `admin@example.test` for local smoke sessions.\n\
 \n\
+Signup stores an Argon2 `passwordHash` through `hash.password`; login uses `hash.verify` and never persists plaintext passwords.\n\
+\n\
 Successful `POST /members/login` responses set an `orv_session` cookie with `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, and one-day `Max-Age` defaults. When the session has a role, the reference runtime also sets an `orv_session_role` cookie for declarative `@Auth` role checks.\n\
 \n\
 The account sessions view requires that login cookie through `@session required` and reads the current session with `@session.id`.\n\
@@ -27145,6 +27147,7 @@ SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
 SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
+SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
 SMOKE_HEADERS="$(mktemp)"
 SMOKE_MEMBER_HEADERS="$(mktemp)"
 SMOKE_ADMIN_HEADERS="$(mktemp)"
@@ -27159,8 +27162,8 @@ fi
 CSRF_TOKEN="${CSRF_COOKIE#orv_csrf=}"
 
 orv_smoke_curl "POST /products" -X POST "$BASE_URL/products" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"sku\":\"${SMOKE_SKU}\",\"name\":\"ORV Smoke Product\",\"price\":1000,\"stock\":5}"
-orv_smoke_curl "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\"}"
-orv_smoke_curl "POST /members/login smoke" -D "$SMOKE_MEMBER_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\"}"
+orv_smoke_curl "POST /members" -X POST "$BASE_URL/members" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"name\":\"ORV Smoke Member\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
+orv_smoke_curl "POST /members/login smoke" -D "$SMOKE_MEMBER_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"email\":\"${SMOKE_EMAIL}\",\"password\":\"${SMOKE_PASSWORD}\"}"
 MEMBER_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_MEMBER_HEADERS")"
 if [ -z "$MEMBER_SESSION_COOKIE" ]; then
   printf 'orv deploy smoke test failed: missing member session cookie\n' >&2
@@ -27169,7 +27172,7 @@ fi
 orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions"
 orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1}"
 orv_smoke_curl "POST /checkout" -X POST "$BASE_URL/checkout" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"${SMOKE_HANDLE}\",\"sku\":\"${SMOKE_SKU}\",\"quantity\":1,\"total\":1000,\"method\":\"card\",\"carrier\":\"post\",\"address\":\"ORV smoke address\"}"
-orv_smoke_curl "POST /members/login admin" -D "$SMOKE_ADMIN_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\"}"
+orv_smoke_curl "POST /members/login admin" -D "$SMOKE_ADMIN_HEADERS" -X POST "$BASE_URL/members/login" -H 'content-type: application/json' -H "cookie: ${CSRF_COOKIE}" -H "x-csrf-token: ${CSRF_TOKEN}" --data "{\"handle\":\"admin\",\"email\":\"admin@example.test\",\"password\":\"admin-reference-password\"}"
 ADMIN_SESSION_COOKIE="$(orv_smoke_cookie_from_headers orv_session "$SMOKE_ADMIN_HEADERS")"
 ADMIN_ROLE_COOKIE="$(orv_smoke_cookie_from_headers orv_session_role "$SMOKE_ADMIN_HEADERS")"
 if [ -z "$ADMIN_SESSION_COOKIE" ] || [ -z "$ADMIN_ROLE_COOKIE" ]; then
@@ -28489,12 +28492,17 @@ test "checkout excluded failure" {
         assert!(source.contains("@form action=\"/products\" method=post"));
         assert!(source.contains("@input type=number name=stock required"));
         assert!(source.contains("@form action=\"/checkout\" method=post"));
+        assert!(source.contains("@input type=password name=password required"));
         assert!(source.contains("@input type=hidden name=_csrf value=\"orv-reference-csrf\""));
         assert!(source.matches("@csrf").count() >= 8);
         assert!(source.contains("@route POST /checkout"));
         assert!(source.contains("One-step checkout"));
         assert!(source.contains("@route POST /members"));
         assert!(source.contains(r#"role: "member""#));
+        assert!(source.contains("hash.password(@body.password)"));
+        assert!(source.contains("hash.verify(@body.password, member.passwordHash)"));
+        assert!(source.contains("admin-reference-password"));
+        assert!(source.contains("passwordHash: passwordHash"));
         assert!(source.contains("@form action=\"/members/login\" method=post"));
         assert!(source.contains("@route POST /members/login"));
         assert!(source.contains(r#"shopdb.create("Session""#));
@@ -28587,6 +28595,10 @@ test "checkout excluded failure" {
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
         assert!(guide.contains("@Auth required role=\"admin\""));
         assert!(guide.contains("admin@example.test"));
+        assert!(guide.contains("Argon2"));
+        assert!(guide.contains("hash.password"));
+        assert!(guide.contains("hash.verify"));
+        assert!(guide.contains("never persists plaintext passwords"));
         assert!(guide.contains("orv_session"));
         assert!(guide.contains("orv_session_role"));
         assert!(guide.contains("HttpOnly"));
@@ -28871,6 +28883,8 @@ test "checkout excluded failure" {
             r#"orv_smoke_curl "GET /account/sessions" -H "cookie: ${MEMBER_SESSION_COOKIE}" "$BASE_URL/account/sessions""#
         ));
         assert!(smoke_test.contains(r#"SMOKE_HANDLE="orv-smoke-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}""#));
+        assert!(smoke_test.contains(r#"\"password\":\"${SMOKE_PASSWORD}\""#));
         assert!(smoke_test
             .contains(r#"orv_smoke_curl "POST /cart/items" -X POST "$BASE_URL/cart/items""#));
         assert!(

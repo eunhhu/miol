@@ -3519,7 +3519,8 @@ mod tests {
 
             let admin_login_payload = serde_json::json!({
                 "handle": "admin",
-                "email": "admin@example.test"
+                "email": "admin@example.test",
+                "password": "admin-reference-password"
             })
             .to_string();
             let (admin_login_status, _, _, admin_login_headers, admin_login_body) =
@@ -3741,7 +3742,8 @@ mod tests {
             let member_payload = serde_json::json!({
                 "handle": "ada",
                 "name": "Ada Lovelace",
-                "email": "ada@example.test"
+                "email": "ada@example.test",
+                "password": "correct horse battery staple"
             })
             .to_string();
             let (create_member_status, _, create_member_body) = send_request_with_headers(
@@ -3769,10 +3771,43 @@ mod tests {
                 found_member["member"]["email"],
                 serde_json::json!("ada@example.test")
             );
+            assert_ne!(
+                found_member["member"]["passwordHash"],
+                serde_json::json!("correct horse battery staple")
+            );
+            assert!(found_member["member"]["passwordHash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("$argon2")));
+
+            let wrong_login_payload = serde_json::json!({
+                "handle": "ada",
+                "email": "ada@example.test",
+                "password": "wrong password"
+            })
+            .to_string();
+            let (wrong_login_status, _, wrong_login_body) = send_request_with_headers(
+                addr,
+                "POST",
+                "/members/login",
+                Some(wrong_login_payload),
+                &[
+                    ("cookie", csrf_cookie_pair.as_str()),
+                    ("x-csrf-token", ORV_REFERENCE_CSRF_TOKEN),
+                ],
+            )
+            .await;
+            assert_eq!(wrong_login_status, 401);
+            let wrong_login: serde_json::Value =
+                serde_json::from_slice(&wrong_login_body).expect("wrong login json");
+            assert_eq!(
+                wrong_login["err"],
+                serde_json::json!("invalid_member_login")
+            );
 
             let login_payload = serde_json::json!({
                 "handle": "ada",
-                "email": "ada@example.test"
+                "email": "ada@example.test",
+                "password": "correct horse battery staple"
             })
             .to_string();
             let (login_status, _, _, login_headers, login_body) = send_request_full_with_headers(

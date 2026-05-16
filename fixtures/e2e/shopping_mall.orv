@@ -12,10 +12,12 @@
   let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
   let adminMember = await shopdb.find("Member", { handle: "admin" })
   if adminMember == void {
+    let adminPasswordHash = await hash.password("admin-reference-password")
     await shopdb.create("Member", {
       handle: "admin",
       name: "Admin",
       email: "admin@example.test",
+      passwordHash: adminPasswordHash,
       role: "admin"
     })
   }
@@ -60,6 +62,8 @@
             @input type=text name=name required
             @label "Email"
             @input type=email name=email required
+            @label "Password"
+            @input type=password name=password required
             @button type=submit "Create member"
           }
           @form action="/members/login" method=post {
@@ -69,6 +73,8 @@
             @input type=text name=handle required
             @label "Email"
             @input type=email name=email required
+            @label "Password"
+            @input type=password name=password required
             @button type=submit "Create session"
           }
           @form action="/orders" method=post {
@@ -382,10 +388,12 @@
 
   @route POST /members {
     @csrf
+    let passwordHash = await hash.password(@body.password)
     let member = await shopdb.create("Member", {
       handle: @body.handle,
       name: @body.name,
       email: @body.email,
+      passwordHash: passwordHash,
       role: "member"
     })
     await shopdb.create("AuditEvent", {
@@ -410,6 +418,10 @@
       @respond 404 { err: "member_not_found", handle: @body.handle }
     }
     if member.email != @body.email {
+      @respond 401 { err: "invalid_member_login", handle: @body.handle }
+    }
+    let passwordValid = await hash.verify(@body.password, member.passwordHash)
+    if !passwordValid {
       @respond 401 { err: "invalid_member_login", handle: @body.handle }
     }
     let session = await shopdb.create("Session", {
