@@ -22701,6 +22701,11 @@ fn verify_deploy_smoke_test_artifact(
     }
     if !smoke.contains(r#"ORV_SMOKE_OUTPUT="${ORV_SMOKE_OUTPUT:-deploy/smoke-output.txt}""#)
         || !smoke.contains(r#"> "$ORV_SMOKE_OUTPUT""#)
+        || !smoke.contains("orv_smoke_write_output()")
+        || !smoke.contains("\norv_smoke_write_output\n")
+        || !smoke.contains("graph_contract=verified")
+        || !smoke.contains("server_routes=")
+        || !smoke.contains("trace_stream_requested=%s")
     {
         anyhow::bail!("deploy smoke test must write deploy smoke output artifact");
     }
@@ -23096,6 +23101,11 @@ fn verify_deploy_smoke_client_contract(
         format!(
             r#"orv_smoke_grep "client manifest reactive plan path" "{manifest}" '"reactive_plan": "{reactive_plan}"'"#
         ),
+        format!("client_manifest={manifest}"),
+        format!("client_reactive_plan={reactive_plan}"),
+        format!("client_page={page}"),
+        format!("client_loader={loader}"),
+        format!("client_wasm={}", json_str(client, "wasm", "deploy client")?),
         format!(
             r#"orv_smoke_grep "client manifest reactive plan hash" "{manifest}" '"reactive_plan_hash"'"#
         ),
@@ -30978,6 +30988,10 @@ orv_smoke_cookie_from_headers() {{
     script.push_str("orv_smoke_graph_contract\n");
     script.push_str(&deploy_smoke_client_contract_section(client));
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
+    script.push_str(&deploy_smoke_output_function_section(
+        server_artifact.routes.len(),
+        client,
+    ));
     if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
         let _ = writeln!(
             script,
@@ -31256,12 +31270,47 @@ orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipme
         }
     }
     script.push_str("orv_smoke_trace_stream\n");
-    script.push_str(
-        "printf 'orv deploy smoke test passed\\n' > \"$ORV_SMOKE_OUTPUT\"\nprintf 'orv deploy smoke test passed\\n'\n",
-    );
+    script.push_str("orv_smoke_write_output\nprintf 'orv deploy smoke test passed\\n'\n");
     let target = out.join(path);
     write_text(&target, &script)?;
     set_executable_if_supported(&target)
+}
+
+fn deploy_smoke_output_function_section(route_count: usize, client: &serde_json::Value) -> String {
+    let mut out = format!(
+        r#"orv_smoke_write_output() {{
+  {{
+    printf 'orv deploy smoke test passed\n'
+    printf 'build_dir=%s\n' "$ORV_SMOKE_BUILD_DIR"
+    printf 'base_url=%s\n' "$BASE_URL"
+    printf 'graph_contract=verified\n'
+    printf 'server_routes={route_count}\n'
+    printf 'trace_stream_requested=%s\n' "${{ORV_SMOKE_TRACE_STREAM:-0}}"
+"#,
+    );
+    if !client.is_null() {
+        let manifest = json_str_or_empty(client, "manifest");
+        let reactive_plan = json_str_or_empty(client, "reactive_plan");
+        let page = json_str_or_empty(client, "page");
+        let loader = json_str_or_empty(client, "loader");
+        let wasm = json_str_or_empty(client, "wasm");
+        for line in [
+            format!("    printf 'client_manifest={manifest}\\n'\n"),
+            format!("    printf 'client_reactive_plan={reactive_plan}\\n'\n"),
+            format!("    printf 'client_page={page}\\n'\n"),
+            format!("    printf 'client_loader={loader}\\n'\n"),
+            format!("    printf 'client_wasm={wasm}\\n'\n"),
+        ] {
+            out.push_str(&line);
+        }
+    }
+    out.push_str(
+        r#"  } > "$ORV_SMOKE_OUTPUT"
+}
+
+"#,
+    );
+    out
 }
 
 fn deploy_smoke_client_contract_section(client: &serde_json::Value) -> String {
@@ -45199,6 +45248,11 @@ entry = "src/main.orv"
         assert!(smoke_test
             .contains(r#"ORV_SMOKE_OUTPUT="${ORV_SMOKE_OUTPUT:-deploy/smoke-output.txt}""#));
         assert!(smoke_test.contains(r#"> "$ORV_SMOKE_OUTPUT""#));
+        assert!(smoke_test.contains("orv_smoke_write_output()"));
+        assert!(smoke_test.contains("\norv_smoke_write_output\n"));
+        assert!(smoke_test.contains("graph_contract=verified"));
+        assert!(smoke_test.contains("server_routes=1"));
+        assert!(smoke_test.contains("trace_stream_requested=%s"));
         assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_editor_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_lsp_reveal_contains()"));
@@ -45403,6 +45457,10 @@ let sig count: int = 0
         assert!(smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#));
         assert!(smoke.contains("orv_smoke_file()"));
         assert!(smoke.contains("orv_smoke_grep()"));
+        assert!(smoke.contains("orv_smoke_write_output()"));
+        assert!(smoke.contains("graph_contract=verified"));
+        assert!(smoke.contains("server_routes=1"));
+        assert!(smoke.contains("trace_stream_requested=%s"));
         assert!(smoke.contains(r#"orv_smoke_file "client/manifest.json""#));
         assert!(smoke.contains(r#"orv_smoke_file "client/reactive-plan.json""#));
         assert!(smoke.contains(r#"orv_smoke_file "pages/index.html""#));
@@ -45414,6 +45472,11 @@ let sig count: int = 0
         assert!(smoke.contains(
             r#"orv_smoke_grep "client manifest reactive plan path" "client/manifest.json" '"reactive_plan": "client/reactive-plan.json"'"#
         ));
+        assert!(smoke.contains("client_manifest=client/manifest.json"));
+        assert!(smoke.contains("client_reactive_plan=client/reactive-plan.json"));
+        assert!(smoke.contains("client_page=pages/index.html"));
+        assert!(smoke.contains("client_loader=client/app.js"));
+        assert!(smoke.contains("client_wasm=client/app.wasm"));
         assert!(smoke.contains(
             r#"orv_smoke_grep "client manifest reactive plan hash" "client/manifest.json" '"reactive_plan_hash"'"#
         ));
