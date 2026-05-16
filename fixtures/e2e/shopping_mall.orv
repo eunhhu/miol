@@ -10,6 +10,70 @@
 @server {
   @listen 0
   let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "sqlite://data/shop.sqlite")
+
+  struct ProductInput {
+    _csrf: string?
+    sku: string(trim, min=1)
+    name: string(trim, min=1)
+    price: int(min=0)
+    stock: int(min=0)
+  }
+
+  struct MemberSignupInput {
+    _csrf: string?
+    handle: string(trim, min=1)
+    name: string(trim, min=1)
+    email: string(trim, lower, min=3)
+    password: string(min=8)
+  }
+
+  struct MemberLoginInput {
+    _csrf: string?
+    handle: string(trim, min=1)
+    email: string(trim, lower, min=3)
+    password: string(min=1)
+  }
+
+  struct CartItemInput {
+    _csrf: string?
+    handle: string(trim, min=1)
+    sku: string(trim, min=1)
+    quantity: int(min=1)
+  }
+
+  struct OrderInput {
+    _csrf: string?
+    customer: string(trim, min=1)
+    sku: string(trim, min=1)
+    quantity: int(min=1)
+    total: int(min=0)
+  }
+
+  struct CheckoutInput {
+    _csrf: string?
+    handle: string(trim, min=1)
+    sku: string(trim, min=1)
+    quantity: int(min=1)
+    total: int(min=0)
+    method: string(trim, min=1)
+    carrier: string(trim, min=1)
+    address: string(trim, min=1)
+  }
+
+  struct PaymentInput {
+    _csrf: string?
+    orderId: int(min=1)
+    amount: int(min=0)
+    method: string(trim, min=1)
+  }
+
+  struct ShipmentInput {
+    _csrf: string?
+    orderId: int(min=1)
+    carrier: string(trim, min=1)
+    address: string(trim, min=1)
+  }
+
   let adminMember = await shopdb.find("Member", { handle: "admin" })
   if adminMember == void {
     let adminPasswordHash = await hash.password("admin-reference-password")
@@ -358,6 +422,7 @@
 
   @route POST /products {
     @csrf
+    @body: ProductInput
     let price: int = @body.price as int
     let stock: int = @body.stock as int
     let product = await shopdb.create("Product", {
@@ -388,6 +453,7 @@
 
   @route POST /members {
     @csrf
+    @body: MemberSignupInput
     let passwordHash = await hash.password(@body.password)
     let member = await shopdb.create("Member", {
       handle: @body.handle,
@@ -413,6 +479,7 @@
 
   @route POST /members/login {
     @csrf
+    @body: MemberLoginInput
     let member = await shopdb.find("Member", { handle: @body.handle })
     if member == void {
       @respond 404 { err: "member_not_found", handle: @body.handle }
@@ -442,6 +509,7 @@
 
   @route POST /cart/items {
     @csrf
+    @body: CartItemInput
     let quantity: int = @body.quantity as int
     let member = await shopdb.find("Member", { handle: @body.handle })
     if member == void {
@@ -473,6 +541,7 @@
 
   @route POST /orders {
     @csrf
+    @body: OrderInput
     let quantity: int = @body.quantity as int
     let total: int = @body.total as int
     let product = await shopdb.find("Product", { sku: @body.sku })
@@ -508,6 +577,7 @@
 
   @route POST /checkout {
     @csrf
+    @body: CheckoutInput
     let quantity: int = @body.quantity as int
     let total: int = @body.total as int
     let member = await shopdb.find("Member", { handle: @body.handle })
@@ -595,6 +665,7 @@
 
   @route POST /payments {
     @csrf
+    @body: PaymentInput
     let orderId: int = @body.orderId as int
     let amount: int = @body.amount as int
     let order = await shopdb.find("Order", { id: orderId })
@@ -709,6 +780,7 @@
 
   @route POST /shipments {
     @csrf
+    @body: ShipmentInput
     let orderId: int = @body.orderId as int
     let payment = await shopdb.find("Payment", { orderId: orderId })
     if payment == void {

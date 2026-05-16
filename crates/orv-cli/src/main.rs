@@ -28495,6 +28495,16 @@ test "checkout excluded failure" {
         assert!(source.contains("@input type=password name=password required"));
         assert!(source.contains("@input type=hidden name=_csrf value=\"orv-reference-csrf\""));
         assert!(source.matches("@csrf").count() >= 8);
+        assert!(source.contains("struct ProductInput"));
+        assert!(source.contains("struct CheckoutInput"));
+        assert!(source.contains("@body: ProductInput"));
+        assert!(source.contains("@body: MemberSignupInput"));
+        assert!(source.contains("@body: MemberLoginInput"));
+        assert!(source.contains("@body: CartItemInput"));
+        assert!(source.contains("@body: OrderInput"));
+        assert!(source.contains("@body: CheckoutInput"));
+        assert!(source.contains("@body: PaymentInput"));
+        assert!(source.contains("@body: ShipmentInput"));
         assert!(source.contains("@route POST /checkout"));
         assert!(source.contains("One-step checkout"));
         assert!(source.contains("@route POST /members"));
