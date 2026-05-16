@@ -18872,25 +18872,12 @@ fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::Value> {
         .unwrap_or(300.0);
     let task_report = benchmark_report_tasks(&evidence, max_elapsed_minutes)?;
     let data_report = benchmark_report_data(&evidence)?;
-    let failed_task_count = json_array_count(task_report.get("failed_tasks"));
-    let missing_task_count = json_array_count(task_report.get("missing_tasks"));
-    let missing_data_count = json_array_count(data_report.get("missing_data"));
-    let total_elapsed_minutes = task_report
-        .get("total_elapsed_minutes")
-        .and_then(serde_json::Value::as_f64);
-    let time_over_limit = total_elapsed_minutes.is_some_and(|value| value > max_elapsed_minutes);
-    let status = if failed_task_count > 0 || time_over_limit {
-        "failed"
-    } else if missing_task_count > 0 || missing_data_count > 0 {
-        "incomplete"
-    } else {
-        "passed"
-    };
+    let status = benchmark_report_status_summary(&task_report, &data_report, max_elapsed_minutes);
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.benchmark.shop_5h.report",
         "build_dir": dir.display().to_string(),
-        "status": status,
+        "status": status.status,
         "contract_verified": true,
         "evidence": evidence_rel,
         "preflight": preflight_rel,
@@ -18907,7 +18894,7 @@ fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::Value> {
             .get("total_elapsed_minutes")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "time_over_limit": time_over_limit,
+        "time_over_limit": status.time_over_limit,
         "tasks": task_report,
         "data": data_report,
         "automated_gate": benchmark
@@ -18923,6 +18910,44 @@ fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::Value> {
             "human-run claims require the recorded evidence file and raw participant notes/output to be retained",
         ],
     }))
+}
+
+struct BenchmarkReportStatusSummary {
+    status: &'static str,
+    failed_task_count: usize,
+    missing_task_count: usize,
+    missing_data_count: usize,
+    total_elapsed_minutes: Option<f64>,
+    time_over_limit: bool,
+}
+
+fn benchmark_report_status_summary(
+    task_report: &serde_json::Value,
+    data_report: &serde_json::Value,
+    max_elapsed_minutes: f64,
+) -> BenchmarkReportStatusSummary {
+    let failed_task_count = json_array_count(task_report.get("failed_tasks"));
+    let missing_task_count = json_array_count(task_report.get("missing_tasks"));
+    let missing_data_count = json_array_count(data_report.get("missing_data"));
+    let total_elapsed_minutes = task_report
+        .get("total_elapsed_minutes")
+        .and_then(serde_json::Value::as_f64);
+    let time_over_limit = total_elapsed_minutes.is_some_and(|value| value > max_elapsed_minutes);
+    let status = if failed_task_count > 0 || time_over_limit {
+        "failed"
+    } else if missing_task_count > 0 || missing_data_count > 0 {
+        "incomplete"
+    } else {
+        "passed"
+    };
+    BenchmarkReportStatusSummary {
+        status,
+        failed_task_count,
+        missing_task_count,
+        missing_data_count,
+        total_elapsed_minutes,
+        time_over_limit,
+    }
 }
 
 fn benchmark_report_tasks(
@@ -24751,6 +24776,14 @@ fn reveal_benchmark_evidence_summary(
         .and_then(serde_json::Value::as_object)
         .map(|data| data.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    let max_elapsed_minutes = preflight
+        .pointer("/benchmark/max_elapsed_minutes")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(300.0);
+    let task_report = benchmark_report_tasks(&evidence, max_elapsed_minutes)?;
+    let data_report = benchmark_report_data(&evidence)?;
+    let report_status =
+        benchmark_report_status_summary(&task_report, &data_report, max_elapsed_minutes);
     Ok(serde_json::json!({
         "path": path,
         "exists": true,
@@ -24770,7 +24803,20 @@ fn reveal_benchmark_evidence_summary(
             .get("recording_status")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "report_status": report_status.status,
+        "max_elapsed_minutes": max_elapsed_minutes,
+        "total_elapsed_minutes": report_status
+            .total_elapsed_minutes
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+        "time_over_limit": report_status.time_over_limit,
         "task_count": task_count,
+        "recorded_task_count": task_report
+            .get("recorded_task_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "missing_task_count": report_status.missing_task_count,
+        "failed_task_count": report_status.failed_task_count,
+        "missing_data_count": report_status.missing_data_count,
         "data_keys": data_keys,
     }))
 }
@@ -49940,7 +49986,11 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["benchmark_evidence"]["exists"] == true
                 && target["benchmark_evidence"]["path"] == "deploy/benchmark-evidence.json"
                 && target["benchmark_evidence"]["recording_status"] == "not_recorded"
+                && target["benchmark_evidence"]["report_status"] == "incomplete"
                 && target["benchmark_evidence"]["task_count"] == 10
+                && target["benchmark_evidence"]["recorded_task_count"] == 0
+                && target["benchmark_evidence"]["missing_task_count"] == 10
+                && target["benchmark_evidence"]["missing_data_count"] == 3
                 && target["routes"][0]["method"] == "GET"
                 && target["routes"][0]["path"] == "/ping"
                 && target["required_env"][0]["kind"] == "db"
@@ -53533,6 +53583,18 @@ define Auth() -> { @out "auth" }
             state["production"]["preflight"][0]["benchmark_evidence"]["recording_status"],
             "not_recorded"
         );
+        assert_eq!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["report_status"],
+            "incomplete"
+        );
+        assert_eq!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["missing_task_count"],
+            10
+        );
+        assert_eq!(
+            state["production"]["preflight"][0]["benchmark_evidence"]["missing_data_count"],
+            3
+        );
         let checkout_route = json_route(
             &state["production"]["preflight"][0]["routes"],
             "POST",
@@ -53763,6 +53825,8 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains(
             "\"benchmark_report_require_pass\": \"orv benchmark-report . --require-pass\""
         ));
+        assert!(production_panel.contains("\"report_status\": \"incomplete\""));
+        assert!(production_panel.contains("\"missing_task_count\": 10"));
         assert!(production_panel.contains("Preflight Commands</span><b>11</b>"));
         assert!(production_panel.contains("Route Policies"));
         assert!(production_panel.contains("Route Policy Summary"));

@@ -32,6 +32,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Added checked `deploy/benchmark-evidence.json` generation so benchmark timing and observation records carry the same 5-hour shop contract, preflight hash, command list, linked artifacts, task budget, and data-to-record schema that `orv verify-build` validates.
 - Added `orv benchmark-report <dir> [--require-pass]` to summarize recorded benchmark evidence as pass/fail/incomplete JSON and optionally fail CI when the human-run evidence is incomplete or over the 5-hour budget.
 - Mirrored `orv benchmark-report .` and `orv benchmark-report . --require-pass` into generated deploy preflight/runbook contracts so benchmark reporting is a checked deploy gate instead of a standalone command.
+- Added benchmark evidence report-status and missing-evidence counters to reveal/editor/native production preflight payloads, reusing the same pass/fail/incomplete calculation as `orv benchmark-report`.
 - Exposed CSRF, session cookie, auth role, and default route rate-limit requirements as shared `runtime_features` across build, server, deploy, and native plan artifacts.
 - Added explicit reference `@rateLimit key=... limit=... window=...` route policies plus `@rateLimit exempt`, with runtime enforcement, server artifact descriptors, and native route table fields.
 - Added source-backed `@csrf exempt` so intentional CSRF bypasses can execute without a token while still appearing in route policy artifacts.
