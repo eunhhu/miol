@@ -48,7 +48,7 @@ This gate proves the implementation path first. Human 5-hour runs then measure a
 
 Production builds mirror this benchmark contract into `deploy/preflight.json` under `benchmark`, and the checked preflight command list includes both `orv benchmark-report .` and `orv benchmark-report . --require-pass`. They also emit `deploy/benchmark-evidence.json`, a checked evidence template keyed to the same preflight hash, and generated smoke tests write `deploy/smoke-output.txt` on success with the checked graph/client/route/trace summary. The evidence artifact carries the automated gate, success criteria, time budget, and data-to-record fields so benchmark reports stay tied to the same deploy preflight that `orv verify-build` checks.
 
-After a human run, fill the recorded fields in `deploy/benchmark-evidence.json` and run `orv benchmark-report dist --require-pass` to turn elapsed task time, required observation data, generated smoke output, and the 5-hour limit into a checked JSON report.
+After a human run, fill the recorded fields in `deploy/benchmark-evidence.json` and run `orv benchmark-report dist --require-pass` to turn elapsed task time, required observation data, generated smoke output, and the 5-hour limit into a checked JSON report. The report parses `deploy/smoke-output.txt` and requires the generated pass, graph-contract, route-count, and trace-request markers instead of trusting a manually typed "passed" string.
 
 ## Success Criteria
 

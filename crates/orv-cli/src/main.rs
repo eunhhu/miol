@@ -19101,6 +19101,16 @@ fn benchmark_report_data(
     {
         missing.push("smoke_test_output".to_string());
     }
+    let smoke_test_summary = benchmark_smoke_test_output_summary(&smoke_test_output);
+    for marker in smoke_test_summary
+        .get("missing_markers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        missing.push(format!("smoke_test_output.{marker}"));
+    }
     Ok(serde_json::json!({
         "missing_data": missing,
         "docs_help_lookups": data.get("docs_help_lookups").cloned().unwrap_or(serde_json::Value::Null),
@@ -19109,8 +19119,116 @@ fn benchmark_report_data(
         "manual_config_edits": data.get("manual_config_edits").cloned().unwrap_or_else(|| serde_json::json!([])),
         "smoke_test_output": smoke_test_output,
         "smoke_test_output_source": smoke_test_output_source,
+        "smoke_test_summary": smoke_test_summary,
         "participant_notes": data.get("participant_notes").cloned().unwrap_or(serde_json::Value::Null),
     }))
+}
+
+fn benchmark_smoke_test_output_summary(output: &serde_json::Value) -> serde_json::Value {
+    let Some(output) = output.as_str().filter(|value| !value.trim().is_empty()) else {
+        return serde_json::json!({
+            "present": false,
+            "passed_marker": false,
+            "graph_contract_verified": false,
+            "server_routes": null,
+            "trace_stream_requested": null,
+            "build_dir": null,
+            "base_url": null,
+            "client": null,
+            "missing_markers": [],
+        });
+    };
+    let fields = benchmark_smoke_test_output_fields(output);
+    let passed_marker = output
+        .lines()
+        .any(|line| line.trim() == "orv deploy smoke test passed");
+    let graph_contract_verified = fields
+        .get("graph_contract")
+        .is_some_and(|value| value == "verified");
+    let server_routes = fields
+        .get("server_routes")
+        .and_then(|value| value.parse::<u64>().ok());
+    let trace_stream_requested = fields
+        .get("trace_stream_requested")
+        .and_then(|value| benchmark_smoke_test_output_bool(value));
+    let build_dir = fields
+        .get("build_dir")
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    let base_url = fields
+        .get("base_url")
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    let mut missing_markers = Vec::new();
+    if !passed_marker {
+        missing_markers.push("pass_marker");
+    }
+    if build_dir.is_none() {
+        missing_markers.push("build_dir");
+    }
+    if base_url.is_none() {
+        missing_markers.push("base_url");
+    }
+    if !graph_contract_verified {
+        missing_markers.push("graph_contract");
+    }
+    if server_routes.is_none_or(|routes| routes == 0) {
+        missing_markers.push("server_routes");
+    }
+    if trace_stream_requested.is_none() {
+        missing_markers.push("trace_stream_requested");
+    }
+    let client = benchmark_smoke_test_output_client_summary(&fields);
+    serde_json::json!({
+        "present": true,
+        "passed_marker": passed_marker,
+        "graph_contract_verified": graph_contract_verified,
+        "server_routes": server_routes,
+        "trace_stream_requested": trace_stream_requested,
+        "build_dir": build_dir,
+        "base_url": base_url,
+        "client": client,
+        "missing_markers": missing_markers,
+    })
+}
+
+fn benchmark_smoke_test_output_fields(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .filter(|(key, _)| !key.is_empty())
+        .collect()
+}
+
+fn benchmark_smoke_test_output_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn benchmark_smoke_test_output_client_summary(
+    fields: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    let mut client = serde_json::Map::new();
+    for (field, key) in [
+        ("manifest", "client_manifest"),
+        ("reactive_plan", "client_reactive_plan"),
+        ("page", "client_page"),
+        ("loader", "client_loader"),
+        ("wasm", "client_wasm"),
+    ] {
+        if let Some(value) = fields.get(key).filter(|value| !value.trim().is_empty()) {
+            client.insert(field.to_string(), serde_json::json!(value));
+        }
+    }
+    if client.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(client)
+    }
 }
 
 fn benchmark_smoke_test_output_value(
@@ -47428,7 +47546,9 @@ let sig count: int = 0
         evidence["data"]["docs_help_lookups"] = serde_json::json!(2);
         evidence["data"]["compiler_runtime_errors"] = serde_json::json!(0);
         evidence["data"]["manual_config_edits"] = serde_json::json!([]);
-        evidence["data"]["smoke_test_output"] = serde_json::json!("smoke passed");
+        evidence["data"]["smoke_test_output"] = serde_json::json!(
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\nserver_routes=1\ntrace_stream_requested=0\n"
+        );
         evidence["data"]["participant_notes"] = serde_json::json!("no blockers");
         write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
 
@@ -47440,6 +47560,12 @@ let sig count: int = 0
         assert_eq!(report["tasks"]["recorded_task_count"], 10);
         assert_eq!(report["tasks"]["missing_task_count"], 0);
         assert_eq!(report["tasks"]["failed_task_count"], 0);
+        assert_eq!(report["data"]["smoke_test_summary"]["passed_marker"], true);
+        assert_eq!(
+            report["data"]["smoke_test_summary"]["graph_contract_verified"],
+            true
+        );
+        assert_eq!(report["data"]["smoke_test_summary"]["server_routes"], 1);
         assert_eq!(
             report["data"]["missing_data"]
                 .as_array()
@@ -47448,6 +47574,46 @@ let sig count: int = 0
             0
         );
         cmd_benchmark_report(&out, true).expect("require pass accepts recorded evidence");
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn benchmark_report_marks_weak_smoke_output_incomplete() {
+        let (src_dir, path) = prod_server_source("benchmark-report-weak-smoke-source");
+        let out = temp_output_dir("benchmark-report-weak-smoke");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+        let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+        evidence["recording_status"] = serde_json::json!("recorded");
+        for entry in evidence["task_entries"]
+            .as_array_mut()
+            .expect("task entries")
+        {
+            entry["elapsed_minutes"] = serde_json::json!(10.0);
+            entry["status"] = serde_json::json!("passed");
+        }
+        evidence["data"]["docs_help_lookups"] = serde_json::json!(2);
+        evidence["data"]["compiler_runtime_errors"] = serde_json::json!(0);
+        evidence["data"]["manual_config_edits"] = serde_json::json!([]);
+        evidence["data"]["smoke_test_output"] = serde_json::json!("smoke passed");
+        evidence["data"]["participant_notes"] = serde_json::json!("weak smoke output");
+        write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
+
+        let report = benchmark_report_value(&out).expect("benchmark report");
+
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["data"]["smoke_test_summary"]["passed_marker"], false);
+        assert!(report["data"]["missing_data"]
+            .as_array()
+            .expect("missing data")
+            .iter()
+            .any(|item| item == "smoke_test_output.graph_contract"));
+        assert!(cmd_benchmark_report(&out, true)
+            .expect_err("require pass rejects weak smoke output")
+            .to_string()
+            .contains("benchmark report status must be passed"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -47474,19 +47640,26 @@ let sig count: int = 0
         evidence["data"]["manual_config_edits"] = serde_json::json!([]);
         evidence["data"]["participant_notes"] = serde_json::json!("smoke output from artifact");
         write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
-        std::fs::write(&smoke_output_path, "orv deploy smoke test passed\n")
-            .expect("write smoke output");
+        std::fs::write(
+            &smoke_output_path,
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\nserver_routes=1\ntrace_stream_requested=1\n",
+        )
+        .expect("write smoke output");
 
         let report = benchmark_report_value(&out).expect("benchmark report");
 
         assert_eq!(report["status"], "passed");
         assert_eq!(
             report["data"]["smoke_test_output"],
-            "orv deploy smoke test passed\n"
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\nserver_routes=1\ntrace_stream_requested=1\n"
         );
         assert_eq!(
             report["data"]["smoke_test_output_source"],
             "deploy/smoke-output.txt"
+        );
+        assert_eq!(
+            report["data"]["smoke_test_summary"]["trace_stream_requested"],
+            true
         );
         assert_eq!(
             report["data"]["missing_data"]
