@@ -12134,6 +12134,9 @@ fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usi
     }
     for entry in &origin_map.entries {
         match (entry.kind.as_str(), entry.name.as_str()) {
+            ("route", route) if route_has_default_rate_limit(route) => {
+                features.insert("rate_limit");
+            }
             ("domain", "db") => {
                 features.insert("in_memory_db");
             }
@@ -12155,10 +12158,26 @@ fn runtime_features(origin_map: &OriginMap, has_server: bool, server_routes: usi
             ("domain", "serve") => {
                 features.insert("static_file_server");
             }
+            ("domain", "csrf") => {
+                features.insert("csrf_protection");
+            }
+            ("domain", "session") => {
+                features.insert("session_cookies");
+            }
+            ("domain", "Auth") => {
+                features.insert("auth_roles");
+            }
             _ => {}
         }
     }
     features.into_iter().map(str::to_string).collect()
+}
+
+fn route_has_default_rate_limit(route: &str) -> bool {
+    matches!(
+        route.split_once(' '),
+        Some(("POST", "/members/login" | "/checkout" | "/webhooks/stripe"))
+    )
 }
 
 #[derive(Default)]
@@ -12867,6 +12886,49 @@ function greet(name: string): string -> "hi {name}""#,
             .capabilities
             .runtime_features
             .contains(&"shipping_adapter".to_string()));
+    }
+
+    #[test]
+    fn build_manifest_declares_security_runtime_features() {
+        let program = lower(
+            r#"@server {
+  @listen 8080
+  @route GET /admin {
+    @Auth required role="admin"
+    @respond 200 { ok: true }
+  }
+  @route GET /account/sessions {
+    @session required
+    @respond 200 { sessionId: @session.id }
+  }
+  @route POST /members/login {
+    @csrf
+    @respond 201 { ok: true }
+  }
+  @route POST /checkout {
+    @csrf
+    @respond 201 { ok: true }
+  }
+}"#,
+        );
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+
+        for feature in [
+            "auth_roles",
+            "csrf_protection",
+            "rate_limit",
+            "session_cookies",
+        ] {
+            assert!(
+                manifest
+                    .capabilities
+                    .runtime_features
+                    .contains(&feature.to_string()),
+                "missing {feature} in {:?}",
+                manifest.capabilities.runtime_features
+            );
+        }
     }
 
     #[test]

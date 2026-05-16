@@ -29578,7 +29578,14 @@ test "checkout excluded failure" {
             ));
             assert!(native_routes_source_includes(&native_routes, method, path));
         }
-        for feature in ["payment_adapter", "shipping_adapter"] {
+        for feature in [
+            "auth_roles",
+            "csrf_protection",
+            "payment_adapter",
+            "rate_limit",
+            "session_cookies",
+            "shipping_adapter",
+        ] {
             assert!(manifest["capabilities"]["runtime_features"]
                 .as_array()
                 .expect("manifest runtime features")
