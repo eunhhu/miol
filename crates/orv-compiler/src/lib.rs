@@ -7,6 +7,14 @@
 //! declare native server plan/package/source/command contracts without claiming
 //! final native codegen yet.
 
+#![allow(
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::needless_raw_string_hashes,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps
+)]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
