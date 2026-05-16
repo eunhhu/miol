@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Threaded build-backed production graph and summary context into editor debug metadata, standalone DAP runner artifacts, native-host debug metadata, run-debug results, and debug result panels.
 - Added graph-contract and production summary counters to `orv reveal`, `orv editor reveal`, and `orv lsp reveal` production payloads, and made generated deploy smoke checks assert the smoke-evidence summary counter is present across all three reveal surfaces.
 - Added state/native-host/editor Production panel counters for preflight smoke evidence summaries, including present, missing, and missing-marker gap counts.
 - Added reference-runtime `x-orv-response-origin-id` headers and request trace `response_origin_id` fields for executed `@respond` nodes, and wired editor/native-host trace payloads to expose separate response reveal navigation alongside route navigation.

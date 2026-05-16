@@ -6775,6 +6775,10 @@ fn editor_debug_runner_session_json(
         "kind": "orv.editor.debug.runner.result",
         "state": state_path.display().to_string(),
         "runner": runner,
+        "production_context": runner
+            .get("production_context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "debug": debug,
         "panels": editor_debug_runner_result_panels_json(&runner, &debug),
     }))
@@ -6835,6 +6839,10 @@ fn editor_debug_runner_result_panels_json(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let production_context = runner
+        .get("production_context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let session_summary = editor_debug_session_summary_json(
         debug,
         &selected_frame,
@@ -6846,6 +6854,7 @@ fn editor_debug_runner_result_panels_json(
     serde_json::json!({
         "debug": {
             "schema_version": 1,
+            "production_context": production_context,
             "session_summary": session_summary,
             "result_artifact": runner
                 .get("result")
@@ -6938,6 +6947,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
         "schema_version": 1,
         "root": "panels.debug",
         "sections": [
+            {
+                "name": "production_context",
+                "path": "panels.debug.production_context",
+                "kind": "object",
+            },
             {
                 "name": "session_summary",
                 "path": "panels.debug.session_summary",
@@ -7091,6 +7105,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .pointer("/panels/debug/session_summary")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let production_context = value
+        .pointer("/panels/debug/production_context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let source_navigation = value
         .pointer("/panels/debug/source_navigation")
         .cloned()
@@ -7216,6 +7234,13 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         &session_summary,
     )));
     html.push_str("</pre></section>\n");
+    if !production_context.is_null() {
+        html.push_str("<section class=\"panel wide\"><h2>Production Context</h2><pre>");
+        html.push_str(&html_escape_text(&serde_json::to_string_pretty(
+            &production_context,
+        )?));
+        html.push_str("</pre></section>\n");
+    }
     html.push_str("<section class=\"panel\"><h2>Selected Frame</h2><pre>");
     html.push_str(&html_escape_text(&editor_debug_frame_summary(
         &selected_frame,
@@ -8742,6 +8767,7 @@ fn editor_export_state_json_with_trace(
                 "production".to_string(),
                 editor_production_summary_json(build)?,
             );
+        editor_debug_attach_production_context(&mut state);
     }
     if let Some(trace) = trace {
         let build = build.ok_or_else(|| anyhow::anyhow!("--build is required with --trace"))?;
@@ -8751,6 +8777,50 @@ fn editor_export_state_json_with_trace(
             .insert("trace".to_string(), editor_trace_json(build, trace)?);
     }
     Ok(state)
+}
+
+fn editor_debug_attach_production_context(state: &mut serde_json::Value) {
+    let production_context = editor_debug_production_context_json(
+        state.get("production").unwrap_or(&serde_json::Value::Null),
+    );
+    if production_context.is_null() {
+        return;
+    }
+    let Some(debug) = state
+        .get_mut("debug")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    debug.insert("production_context".to_string(), production_context.clone());
+    if let Some(runner) = debug
+        .get_mut("session_runner")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        runner.insert("production_context".to_string(), production_context);
+    }
+}
+
+fn editor_debug_production_context_json(production: &serde_json::Value) -> serde_json::Value {
+    if production.is_null() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.debug.production_context",
+        "build_dir": production
+            .get("build_dir")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "graph_contract": production
+            .get("graph_contract")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "summary": production
+            .get("summary")
+            .cloned()
+            .unwrap_or_else(|| production_summary_json(production)),
+    })
 }
 
 fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Value> {
@@ -8923,6 +8993,11 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
         })
     });
     let source_count = json_array_count(source_inventory.get("sources"));
+    let production_context = debug
+        .get("production_context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let debug_production_context = !production_context.is_null();
     let breakpoint_count = debug
         .get("breakpoint_sources")
         .and_then(serde_json::Value::as_array)
@@ -9021,6 +9096,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "configuration_count": configuration_count,
             "source_inventory": source_inventory,
             "source_count": source_count,
+            "production_context": production_context,
             "control_commands": control_commands,
             "breakpoint_commands": breakpoint_commands,
             "function_breakpoint_commands": function_breakpoint_commands,
@@ -9095,6 +9171,7 @@ fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> 
             "runtime_inspection": true,
             "dap_controls": controls > 0,
             "dap_sources": source_count > 0,
+            "dap_production_context": debug_production_context,
             "production_adapters": production_adapters,
             "production_preflight": production_preflight,
             "production_route_policies": production_route_policies,
@@ -9709,6 +9786,11 @@ fn editor_native_host_debug_panel_contract_json() -> serde_json::Value {
             {
                 "name": "source_inventory",
                 "path": "debug.source_inventory",
+                "kind": "object",
+            },
+            {
+                "name": "production_context",
+                "path": "debug.production_context",
                 "kind": "object",
             },
             {
@@ -52679,6 +52761,89 @@ define Auth() -> { @out "auth" }
             .expect("panel source snapshots")
             .iter()
             .any(|snapshot| snapshot["source"]["name"] == "user.orv"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_export_with_build_carries_production_context_into_debug_runner() {
+        let dir = temp_output_dir("editor-export-debug-production-context");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(&path, "let total: int = 41\n@out total\n").expect("write source");
+        let build_out = dir.join("dist");
+        let editor_out = dir.join("editor");
+
+        cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&build_out), None)
+            .expect("editor export with build");
+
+        let state = read_json_value(&editor_out.join("state.json")).expect("editor state");
+        let runner =
+            read_json_value(&editor_out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH)).expect("runner");
+        let native_host = read_json_value(&editor_out.join(EDITOR_NATIVE_HOST_MANIFEST_PATH))
+            .expect("native host");
+        let production_context = &state["debug"]["production_context"];
+
+        assert_eq!(
+            production_context["kind"],
+            "orv.editor.debug.production_context"
+        );
+        assert_eq!(
+            production_context["build_dir"],
+            build_out.display().to_string()
+        );
+        assert_eq!(
+            production_context["summary"]["graph_contract_count"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            production_context["summary"]["source_bundle_file_count"],
+            serde_json::json!(1)
+        );
+        assert!(production_context["graph_contract"]
+            .as_array()
+            .expect("graph contract")
+            .iter()
+            .any(|target| target["path"] == SOURCE_BUNDLE_PATH));
+        assert_eq!(runner["production_context"], *production_context);
+        assert_eq!(
+            native_host["debug"]["production_context"],
+            *production_context
+        );
+        assert_eq!(native_host["capabilities"]["dap_production_context"], true);
+        assert!(native_host["debug"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("native host debug sections")
+            .iter()
+            .any(|section| section["name"] == "production_context"
+                && section["path"] == "debug.production_context"));
+
+        let run = editor_debug_runner_session_json(
+            &editor_out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug runner with production context");
+        assert_eq!(run["production_context"], *production_context);
+        assert_eq!(
+            run["panels"]["debug"]["production_context"],
+            *production_context
+        );
+        assert!(
+            run["panels"]["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("debug result panel sections")
+                .iter()
+                .any(|section| section["name"] == "production_context"
+                    && section["path"] == "panels.debug.production_context")
+        );
+        let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
+        assert!(result_html.contains("Production Context"));
+        assert!(result_html.contains("source-bundle.json"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
