@@ -328,6 +328,31 @@ pub struct ServerRouteArtifact {
     /// Lowered `@respond` descriptors contained in this route handler.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses: Vec<ServerResponseArtifact>,
+    /// Route-local security and traffic policies discovered from the handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<ServerRoutePolicyArtifact>,
+}
+
+/// One route-local policy advertised by server/deploy/native artifacts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServerRoutePolicyArtifact {
+    /// Policy kind, for example `csrf`, `session`, `auth`, or `rate_limit`.
+    pub kind: String,
+    /// Source origin id for declarative policy domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_id: Option<String>,
+    /// Whether the policy requires an authenticated/session-backed request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Required role for auth role policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Request limit for built-in route rate limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Rate-limit window in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u32>,
 }
 
 /// One source-backed response descriptor contained by a route.
@@ -948,7 +973,14 @@ pub fn server_runtime_artifact(
     sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
 ) -> ServerRuntimeArtifact {
     let responses_by_route = HashMap::new();
-    server_runtime_artifact_with_responses(manifest, origin_map, &responses_by_route, sources)
+    let policies_by_route = HashMap::new();
+    server_runtime_artifact_with_responses(
+        manifest,
+        origin_map,
+        &responses_by_route,
+        &policies_by_route,
+        sources,
+    )
 }
 
 /// Build a server runtime descriptor and lower static route response metadata.
@@ -960,20 +992,30 @@ pub fn server_runtime_artifact_with_program(
     sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
 ) -> ServerRuntimeArtifact {
     let responses_by_route = route_response_artifacts(program);
-    server_runtime_artifact_with_responses(manifest, origin_map, &responses_by_route, sources)
+    let policies_by_route = route_policy_artifacts(program);
+    server_runtime_artifact_with_responses(
+        manifest,
+        origin_map,
+        &responses_by_route,
+        &policies_by_route,
+        sources,
+    )
 }
 
 fn server_runtime_artifact_with_responses(
     manifest: &BuildManifest,
     origin_map: &OriginMap,
     responses_by_route: &HashMap<String, Vec<ServerResponseArtifact>>,
+    policies_by_route: &HashMap<String, Vec<ServerRoutePolicyArtifact>>,
     sources: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
 ) -> ServerRuntimeArtifact {
     let routes = origin_map
         .entries
         .iter()
         .filter(|entry| entry.kind == "route")
-        .filter_map(|entry| route_artifact(entry, origin_map, responses_by_route))
+        .filter_map(|entry| {
+            route_artifact(entry, origin_map, responses_by_route, policies_by_route)
+        })
         .collect();
     let listen = origin_map
         .entries
@@ -11753,6 +11795,9 @@ pub fn verify_server_runtime_artifact(artifact: &ServerRuntimeArtifact) -> Resul
                 route.method, route.path
             ));
         }
+        for policy in &route.policies {
+            verify_route_policy_artifact(route, policy, &mut errors);
+        }
     }
     if let Some(listen) = &artifact.listen {
         if listen.origin_id.is_empty() {
@@ -11766,6 +11811,54 @@ pub fn verify_server_runtime_artifact(artifact: &ServerRuntimeArtifact) -> Resul
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn verify_route_policy_artifact(
+    route: &ServerRouteArtifact,
+    policy: &ServerRoutePolicyArtifact,
+    errors: &mut Vec<String>,
+) {
+    if policy.kind.is_empty() {
+        errors.push(format!(
+            "route {} {} has policy with empty kind",
+            route.method, route.path
+        ));
+        return;
+    }
+    match policy.kind.as_str() {
+        "csrf" | "session" | "auth" => {
+            if policy.origin_id.as_deref().is_none_or(str::is_empty) {
+                errors.push(format!(
+                    "route {} {} {} policy has empty origin id",
+                    route.method, route.path, policy.kind
+                ));
+            }
+            if policy.required != Some(true) {
+                errors.push(format!(
+                    "route {} {} {} policy must be required",
+                    route.method, route.path, policy.kind
+                ));
+            }
+        }
+        "rate_limit" => {
+            if policy.limit.unwrap_or_default() == 0 {
+                errors.push(format!(
+                    "route {} {} rate_limit policy must have a positive limit",
+                    route.method, route.path
+                ));
+            }
+            if policy.window_seconds.unwrap_or_default() == 0 {
+                errors.push(format!(
+                    "route {} {} rate_limit policy must have a positive window_seconds",
+                    route.method, route.path
+                ));
+            }
+        }
+        _ => errors.push(format!(
+            "route {} {} has unknown policy kind {}",
+            route.method, route.path, policy.kind
+        )),
     }
 }
 
@@ -11812,6 +11905,7 @@ fn route_artifact(
     entry: &OriginEntry,
     origin_map: &OriginMap,
     responses_by_route: &HashMap<String, Vec<ServerResponseArtifact>>,
+    policies_by_route: &HashMap<String, Vec<ServerRoutePolicyArtifact>>,
 ) -> Option<ServerRouteArtifact> {
     let (method, path) = entry.name.split_once(' ')?;
     Some(ServerRouteArtifact {
@@ -11823,7 +11917,360 @@ fn route_artifact(
             .get(&entry.id)
             .cloned()
             .unwrap_or_default(),
+        policies: policies_by_route
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_default(),
     })
+}
+
+fn route_policy_artifacts(program: &HirProgram) -> HashMap<String, Vec<ServerRoutePolicyArtifact>> {
+    let mut out = HashMap::new();
+    for stmt in &program.items {
+        collect_stmt_policy_artifacts(stmt, None, &mut out);
+    }
+    out
+}
+
+fn collect_stmt_policy_artifacts(
+    stmt: &HirStmt,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerRoutePolicyArtifact>>,
+) {
+    match stmt {
+        HirStmt::Let(stmt) => collect_expr_policy_artifacts(&stmt.init, route_origin_id, out),
+        HirStmt::Const(stmt) => collect_expr_policy_artifacts(&stmt.init, route_origin_id, out),
+        HirStmt::Function(stmt) => {
+            collect_function_body_policy_artifacts(&stmt.body, route_origin_id, out);
+        }
+        HirStmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                collect_expr_policy_artifacts(value, route_origin_id, out);
+            }
+        }
+        HirStmt::Expr(expr) => collect_expr_policy_artifacts(expr, route_origin_id, out),
+        HirStmt::Struct(_) | HirStmt::Enum(_) | HirStmt::TypeAlias(_) | HirStmt::Import(_) => {}
+    }
+}
+
+fn collect_block_policy_artifacts(
+    block: &HirBlock,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerRoutePolicyArtifact>>,
+) {
+    for stmt in &block.stmts {
+        collect_stmt_policy_artifacts(stmt, route_origin_id, out);
+    }
+}
+
+fn collect_function_body_policy_artifacts(
+    body: &HirFunctionBody,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerRoutePolicyArtifact>>,
+) {
+    match body {
+        HirFunctionBody::Block(block) => {
+            collect_block_policy_artifacts(block, route_origin_id, out);
+        }
+        HirFunctionBody::Expr(expr) => collect_expr_policy_artifacts(expr, route_origin_id, out),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn collect_expr_policy_artifacts(
+    expr: &HirExpr,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerRoutePolicyArtifact>>,
+) {
+    match &expr.kind {
+        HirExprKind::Route {
+            method,
+            path,
+            handler,
+            ..
+        } => {
+            let name = format!("{method} {path}");
+            let route_origin = origin_id("route", &name, expr.span);
+            let defaults = default_route_policy_artifacts(method, path);
+            if !defaults.is_empty() {
+                out.entry(route_origin.clone())
+                    .or_default()
+                    .extend(defaults);
+            }
+            collect_block_policy_artifacts(handler, Some(&route_origin), out);
+        }
+        HirExprKind::Domain { name, args, .. } => {
+            if let Some(route_origin_id) = route_origin_id {
+                if let Some(policy) = route_policy_artifact_from_domain(expr, name, args) {
+                    out.entry(route_origin_id.to_string())
+                        .or_default()
+                        .push(policy);
+                }
+            }
+            for arg in args {
+                collect_expr_policy_artifacts(arg, route_origin_id, out);
+            }
+        }
+        HirExprKind::Server {
+            listen,
+            routes,
+            body_stmts,
+        } => {
+            if let Some(listen) = listen {
+                collect_expr_policy_artifacts(listen, route_origin_id, out);
+            }
+            for route in routes {
+                collect_expr_policy_artifacts(route, route_origin_id, out);
+            }
+            for stmt in body_stmts {
+                collect_stmt_policy_artifacts(stmt, route_origin_id, out);
+            }
+        }
+        HirExprKind::Out(inner)
+        | HirExprKind::Unary { expr: inner, .. }
+        | HirExprKind::Paren(inner)
+        | HirExprKind::Throw(inner)
+        | HirExprKind::Await(inner)
+        | HirExprKind::Cast { expr: inner, .. } => {
+            collect_expr_policy_artifacts(inner, route_origin_id, out);
+        }
+        HirExprKind::Respond { status, payload } => {
+            collect_expr_policy_artifacts(status, route_origin_id, out);
+            collect_expr_policy_artifacts(payload, route_origin_id, out);
+        }
+        HirExprKind::Html(block) | HirExprKind::Block(block) => {
+            collect_block_policy_artifacts(block, route_origin_id, out);
+        }
+        HirExprKind::Call { callee, args } => {
+            collect_expr_policy_artifacts(callee, route_origin_id, out);
+            for arg in args {
+                collect_expr_policy_artifacts(arg, route_origin_id, out);
+            }
+        }
+        HirExprKind::String(segments) => {
+            for segment in segments {
+                if let HirStringSegment::Interp(expr) = segment {
+                    collect_expr_policy_artifacts(expr, route_origin_id, out);
+                }
+            }
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_expr_policy_artifacts(lhs, route_origin_id, out);
+            collect_expr_policy_artifacts(rhs, route_origin_id, out);
+        }
+        HirExprKind::If {
+            cond,
+            then,
+            else_branch,
+        } => {
+            collect_expr_policy_artifacts(cond, route_origin_id, out);
+            collect_block_policy_artifacts(then, route_origin_id, out);
+            if let Some(expr) = else_branch {
+                collect_expr_policy_artifacts(expr, route_origin_id, out);
+            }
+        }
+        HirExprKind::When { scrutinee, arms } => {
+            collect_expr_policy_artifacts(scrutinee, route_origin_id, out);
+            for arm in arms {
+                collect_pattern_policy_artifacts(&arm.pattern, route_origin_id, out);
+                collect_expr_policy_artifacts(&arm.body, route_origin_id, out);
+            }
+        }
+        HirExprKind::Assign { value, .. } => {
+            collect_expr_policy_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::AssignField { object, value, .. } => {
+            collect_expr_policy_artifacts(object, route_origin_id, out);
+            collect_expr_policy_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::AssignIndex {
+            object,
+            index,
+            value,
+        } => {
+            collect_expr_policy_artifacts(object, route_origin_id, out);
+            collect_expr_policy_artifacts(index, route_origin_id, out);
+            collect_expr_policy_artifacts(value, route_origin_id, out);
+        }
+        HirExprKind::For { iter, body, .. } => {
+            collect_expr_policy_artifacts(iter, route_origin_id, out);
+            collect_block_policy_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::While { cond, body } => {
+            collect_expr_policy_artifacts(cond, route_origin_id, out);
+            collect_block_policy_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::Range { start, end, .. } => {
+            collect_expr_policy_artifacts(start, route_origin_id, out);
+            collect_expr_policy_artifacts(end, route_origin_id, out);
+        }
+        HirExprKind::Array(items) | HirExprKind::Tuple(items) => {
+            for item in items {
+                collect_expr_policy_artifacts(item, route_origin_id, out);
+            }
+        }
+        HirExprKind::Object(fields) | HirExprKind::TypedObject { fields, .. } => {
+            for field in fields {
+                collect_expr_policy_artifacts(&field.value, route_origin_id, out);
+            }
+        }
+        HirExprKind::Index { target, index } => {
+            collect_expr_policy_artifacts(target, route_origin_id, out);
+            collect_expr_policy_artifacts(index, route_origin_id, out);
+        }
+        HirExprKind::Slice { target, start, end } => {
+            collect_expr_policy_artifacts(target, route_origin_id, out);
+            if let Some(start) = start {
+                collect_expr_policy_artifacts(start, route_origin_id, out);
+            }
+            if let Some(end) = end {
+                collect_expr_policy_artifacts(end, route_origin_id, out);
+            }
+        }
+        HirExprKind::Field { target, .. } | HirExprKind::OptionalField { target, .. } => {
+            collect_expr_policy_artifacts(target, route_origin_id, out);
+        }
+        HirExprKind::Lambda { body, .. } => {
+            collect_function_body_policy_artifacts(body, route_origin_id, out);
+        }
+        HirExprKind::Try { try_block, catch } => {
+            collect_block_policy_artifacts(try_block, route_origin_id, out);
+            if let Some(catch) = catch {
+                collect_block_policy_artifacts(&catch.body, route_origin_id, out);
+            }
+        }
+        HirExprKind::Integer(_)
+        | HirExprKind::Float(_)
+        | HirExprKind::Regex { .. }
+        | HirExprKind::True
+        | HirExprKind::False
+        | HirExprKind::Void
+        | HirExprKind::TypeName(_)
+        | HirExprKind::Ident(_)
+        | HirExprKind::Break
+        | HirExprKind::Continue => {}
+    }
+}
+
+fn collect_pattern_policy_artifacts(
+    pattern: &HirPattern,
+    route_origin_id: Option<&str>,
+    out: &mut HashMap<String, Vec<ServerRoutePolicyArtifact>>,
+) {
+    match pattern {
+        HirPattern::Literal(expr)
+        | HirPattern::Guard(expr)
+        | HirPattern::Not(expr)
+        | HirPattern::Contains(expr) => collect_expr_policy_artifacts(expr, route_origin_id, out),
+        HirPattern::Range { start, end, .. } => {
+            collect_expr_policy_artifacts(start, route_origin_id, out);
+            collect_expr_policy_artifacts(end, route_origin_id, out);
+        }
+        HirPattern::Wildcard => {}
+    }
+}
+
+fn route_policy_artifact_from_domain(
+    expr: &HirExpr,
+    name: &str,
+    args: &[HirExpr],
+) -> Option<ServerRoutePolicyArtifact> {
+    let origin_id = Some(origin_id("domain", name, expr.span));
+    match name {
+        "csrf" if args.is_empty() => Some(ServerRoutePolicyArtifact {
+            kind: "csrf".to_string(),
+            origin_id,
+            required: Some(true),
+            role: None,
+            limit: None,
+            window_seconds: None,
+        }),
+        "session" if args.iter().any(is_required_policy_arg) => Some(ServerRoutePolicyArtifact {
+            kind: "session".to_string(),
+            origin_id,
+            required: Some(true),
+            role: None,
+            limit: None,
+            window_seconds: None,
+        }),
+        "Auth" => {
+            let (required, role) = auth_policy_args(args);
+            if required || role.is_some() {
+                Some(ServerRoutePolicyArtifact {
+                    kind: "auth".to_string(),
+                    origin_id,
+                    required: Some(true),
+                    role,
+                    limit: None,
+                    window_seconds: None,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn default_route_policy_artifacts(method: &str, path: &str) -> Vec<ServerRoutePolicyArtifact> {
+    let Some((limit, window_seconds)) = default_route_rate_limit(method, path) else {
+        return Vec::new();
+    };
+    vec![ServerRoutePolicyArtifact {
+        kind: "rate_limit".to_string(),
+        origin_id: None,
+        required: None,
+        role: None,
+        limit: Some(limit),
+        window_seconds: Some(window_seconds),
+    }]
+}
+
+fn default_route_rate_limit(method: &str, path: &str) -> Option<(u32, u32)> {
+    match (method, path) {
+        ("POST", "/members/login" | "/checkout") => Some((10, 60)),
+        ("POST", "/webhooks/stripe") => Some((60, 60)),
+        _ => None,
+    }
+}
+
+fn is_required_policy_arg(arg: &HirExpr) -> bool {
+    matches!(&arg.kind, HirExprKind::Ident(ident) if ident.name == "required")
+        || matches!(&arg.kind, HirExprKind::Assign { target, value }
+            if target.name == "required" && matches!(&value.kind, HirExprKind::True))
+}
+
+fn auth_policy_args(args: &[HirExpr]) -> (bool, Option<String>) {
+    let mut required = false;
+    let mut role = None;
+    for arg in args {
+        match &arg.kind {
+            HirExprKind::Ident(ident) if ident.name == "required" => {
+                required = true;
+            }
+            HirExprKind::Assign { target, value } if target.name == "required" => {
+                required = matches!(&value.kind, HirExprKind::True);
+            }
+            HirExprKind::Assign { target, value } if target.name == "role" => {
+                role = static_string_literal(value);
+            }
+            _ => {}
+        }
+    }
+    if role.is_some() {
+        required = true;
+    }
+    (required, role)
+}
+
+fn static_string_literal(expr: &HirExpr) -> Option<String> {
+    let HirExprKind::String(segments) = &expr.kind else {
+        return None;
+    };
+    let [HirStringSegment::Str(value)] = segments.as_slice() else {
+        return None;
+    };
+    Some(value.clone())
 }
 
 fn route_response_artifacts(program: &HirProgram) -> HashMap<String, Vec<ServerResponseArtifact>> {
@@ -13256,6 +13703,81 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(artifact.source_bundle.files[0]
             .content_hash
             .starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn server_runtime_artifact_records_route_security_policies() {
+        let src = r#"@server {
+  @listen 8080
+  @route GET /admin {
+    @Auth required role="admin"
+    @respond 200 { ok: true }
+  }
+  @route GET /account/sessions {
+    @session required
+    @respond 200 { ok: true }
+  }
+  @route POST /checkout {
+    @csrf
+    @respond 201 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+
+        let admin = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/admin")
+            .expect("admin route");
+        assert!(admin.policies.iter().any(|policy| {
+            policy.kind == "auth"
+                && policy.required == Some(true)
+                && policy.role.as_deref() == Some("admin")
+                && policy
+                    .origin_id
+                    .as_deref()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))
+        }));
+
+        let sessions = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/account/sessions")
+            .expect("sessions route");
+        assert!(sessions.policies.iter().any(|policy| {
+            policy.kind == "session"
+                && policy.required == Some(true)
+                && policy
+                    .origin_id
+                    .as_deref()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))
+        }));
+
+        let checkout = artifact
+            .routes
+            .iter()
+            .find(|route| route.path == "/checkout")
+            .expect("checkout route");
+        assert!(checkout.policies.iter().any(|policy| {
+            policy.kind == "csrf"
+                && policy.required == Some(true)
+                && policy
+                    .origin_id
+                    .as_deref()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))
+        }));
+        assert!(checkout.policies.iter().any(|policy| {
+            policy.kind == "rate_limit"
+                && policy.origin_id.is_none()
+                && policy.limit == Some(10)
+                && policy.window_seconds == Some(60)
+        }));
+
+        verify_server_runtime_artifact(&artifact).expect("policy artifact verifies");
     }
 
     #[test]

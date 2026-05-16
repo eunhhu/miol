@@ -18757,6 +18757,9 @@ fn verify_server_runtime_origin_contract(
                 &contains_edges,
             )?;
         }
+        for policy in &route.policies {
+            verify_route_policy_origin(route, policy, &entries_by_id, &contains_edges)?;
+        }
     }
     Ok(())
 }
@@ -18806,6 +18809,48 @@ fn verify_route_response_origin(
             "server route {} {} response_origin_id `{response_origin_id}` is not contained by route origin",
             route.method,
             route.path
+        );
+    }
+    Ok(())
+}
+
+fn verify_route_policy_origin(
+    route: &orv_compiler::ServerRouteArtifact,
+    policy: &orv_compiler::ServerRoutePolicyArtifact,
+    entries_by_id: &HashMap<&str, &orv_compiler::OriginEntry>,
+    contains_edges: &HashSet<(&str, &str)>,
+) -> anyhow::Result<()> {
+    let Some(policy_origin_id) = policy.origin_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(entry) = entries_by_id.get(policy_origin_id).copied() else {
+        anyhow::bail!(
+            "server route {} {} policy `{}` origin_id `{policy_origin_id}` not found in origin-map.json",
+            route.method,
+            route.path,
+            policy.kind
+        );
+    };
+    let expected_domain = match policy.kind.as_str() {
+        "auth" => "Auth",
+        "csrf" => "csrf",
+        "session" => "session",
+        _ => return Ok(()),
+    };
+    if entry.kind != "domain" || entry.name != expected_domain {
+        anyhow::bail!(
+            "server route {} {} policy `{}` origin_id `{policy_origin_id}` must reference origin-map {expected_domain} domain",
+            route.method,
+            route.path,
+            policy.kind
+        );
+    }
+    if !contains_edges.contains(&(route.origin_id.as_str(), policy_origin_id)) {
+        anyhow::bail!(
+            "server route {} {} policy `{}` origin_id `{policy_origin_id}` is not contained by route origin",
+            route.method,
+            route.path,
+            policy.kind
         );
     }
     Ok(())
@@ -22704,6 +22749,7 @@ fn reveal_routes(
                 "method": route.method,
                 "path": route.path,
                 "origin_id": route.origin_id,
+                "policies": route.policies,
             }));
         }
     }
@@ -29536,6 +29582,16 @@ entry = "src/main.orv"
         })
     }
 
+    fn json_route<'a>(
+        routes: &'a serde_json::Value,
+        method: &str,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        routes.as_array()?.iter().find(|route| {
+            route["method"] == serde_json::json!(method) && route["path"] == serde_json::json!(path)
+        })
+    }
+
     fn native_routes_source_includes(source: &str, method: &str, path: &str) -> bool {
         source.contains(&format!(
             "OrvNativeRoute {{ method: {method:?}, path: {path:?},"
@@ -30092,6 +30148,46 @@ test "checkout excluded failure" {
                 .iter()
                 .any(|item| item == feature));
         }
+        let admin_route = json_route(&runtime["routes"], "GET", "/admin").expect("admin route");
+        assert!(admin_route["policies"]
+            .as_array()
+            .expect("admin policies")
+            .iter()
+            .any(|policy| policy["kind"] == "auth"
+                && policy["role"] == "admin"
+                && policy["required"] == true
+                && policy["origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        let account_sessions_route =
+            json_route(&runtime["routes"], "GET", "/account/sessions").expect("sessions route");
+        assert!(account_sessions_route["policies"]
+            .as_array()
+            .expect("session policies")
+            .iter()
+            .any(|policy| policy["kind"] == "session"
+                && policy["required"] == true
+                && policy["origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        let checkout_route =
+            json_route(&preflight["routes"], "POST", "/checkout").expect("checkout route");
+        assert!(checkout_route["policies"]
+            .as_array()
+            .expect("checkout policies")
+            .iter()
+            .any(|policy| policy["kind"] == "csrf"
+                && policy["required"] == true
+                && policy["origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        assert!(checkout_route["policies"]
+            .as_array()
+            .expect("checkout policies")
+            .iter()
+            .any(|policy| policy["kind"] == "rate_limit"
+                && policy["limit"] == 10
+                && policy["window_seconds"] == 60));
         assert_eq!(
             deploy["server"]["native_routes_source"],
             serde_json::json!("server/native/routes.rs")
@@ -43187,6 +43283,40 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_server_policy_origin_drift_from_origin_map() {
+        let dir = temp_output_dir("server-policy-origin-source");
+        std::fs::create_dir_all(&dir).expect("create policy origin source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route POST /checkout {
+    @csrf
+    @respond 201 { ok: true }
+  }
+}
+"#,
+        )
+        .expect("write policy source");
+        let out = temp_output_dir("server-policy-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let artifact_path = out.join("server").join("app.orv-runtime.json");
+        let mut artifact = read_json_value(&artifact_path).expect("server artifact");
+        artifact["routes"][0]["policies"][1]["origin_id"] = serde_json::json!("ori_missing_policy");
+        write_json(&artifact_path, &artifact).expect("write corrupt server artifact");
+
+        let err = cmd_verify_build(&out).expect_err("policy origin mismatch");
+
+        assert!(err.to_string().contains(
+            "server route POST /checkout policy `csrf` origin_id `ori_missing_policy` not found in origin-map.json"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_server_source_bundle_drift() {
         let (src_dir, path) = prod_server_source("server-source-bundle-source");
         let out = temp_output_dir("server-source-bundle-mismatch");
@@ -45961,6 +46091,58 @@ models = { path = "../../shared/models", version = "2.0.0" }
                     .all(|item| item != "native-codegen")
         }));
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reveal_origin_exposes_route_policy_contract() {
+        let dir = temp_output_dir("reveal-route-policy-source");
+        std::fs::create_dir_all(&dir).expect("create route policy reveal source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  @route POST /checkout {
+    @csrf
+    @respond 201 { ok: true }
+  }
+}
+"#,
+        )
+        .expect("write route policy reveal source");
+        let out = temp_output_dir("reveal-route-policy");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let route = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "route" && entry.name == "POST /checkout")
+            .expect("checkout route origin");
+
+        let reveal = reveal_origin_json(&out, &route.id).expect("reveal origin");
+        let routes = reveal["production"]["routes"]
+            .as_array()
+            .expect("production routes");
+        let route = routes
+            .iter()
+            .find(|route| route["method"] == "POST" && route["path"] == "/checkout")
+            .expect("checkout production route");
+        let policies = route["policies"].as_array().expect("route policies");
+
+        assert!(policies.iter().any(|policy| policy["kind"] == "csrf"
+            && policy["required"] == true
+            && policy["origin_id"]
+                .as_str()
+                .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        assert!(policies.iter().any(|policy| policy["kind"] == "rate_limit"
+            && policy["limit"] == 10
+            && policy["window_seconds"] == 60));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
