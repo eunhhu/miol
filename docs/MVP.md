@@ -22,7 +22,7 @@
 | Commerce | local/file payment and shipping reference adapter, HTTP checked stub, Stripe webhook verification reference path |
 | Shop scaffold | member, cart, catalog, checkout, payment, shipping, audit rows, admin read models, deploy runbook |
 | Build contract | source bundle, project graph, origin map, server runtime artifact, deploy manifest |
-| Verification | `orv verify-build`, `orv deploy-env-check`, generated smoke-test |
+| Verification | `orv verify-build`, `orv deploy-env-check`, generated preflight artifact, generated smoke-test |
 | Reveal | `orv origins`, `orv graph`, `orv reveal`, LSP/editor reveal payload |
 | Editor bootstrap | static editor snapshot/export/runtime/debug artifacts, first-party native editor UI still roadmap |
 | External tools | LSP/DAP bootstrap and Tree-sitter package |
@@ -44,6 +44,7 @@ The product MVP is not "all language features". It is the smallest slice that ca
 - `orv dev`
 - `orv build --prod`
 - `orv deploy-env-check`
+- generated preflight artifact
 - generated smoke-test
 
 Everything else must either support this path directly or stay outside the MVP.

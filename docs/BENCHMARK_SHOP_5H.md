@@ -22,7 +22,7 @@ The primary benchmark uses local reference adapters:
 - SQLite-backed shop DB via `SHOP_DATABASE_URL` default.
 - Mock/local payment capture.
 - Mock/local shipping booking.
-- Local deploy artifact and generated smoke-test.
+- Local deploy/preflight artifacts and generated smoke-test.
 
 Provider-backed Stripe/carrier runs are separate advanced variants.
 

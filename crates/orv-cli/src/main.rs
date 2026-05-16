@@ -21241,6 +21241,10 @@ fn verify_deploy_server_target(
     if smoke_test != DEPLOY_SMOKE_TEST_PATH {
         anyhow::bail!("deploy server smoke_test must be {DEPLOY_SMOKE_TEST_PATH}");
     }
+    let preflight = json_str(server, "preflight", "deploy server")?;
+    if preflight != DEPLOY_PREFLIGHT_PATH {
+        anyhow::bail!("deploy server preflight must be {DEPLOY_PREFLIGHT_PATH}");
+    }
     let runbook = json_str(server, "runbook", "deploy server")?;
     let runtime_image = json_str(server, "runtime_image", "deploy server")?;
     if runtime_image != ORV_REFERENCE_RUNTIME_IMAGE {
@@ -21325,15 +21329,36 @@ fn verify_deploy_server_target(
         &artifact,
         client,
     )?;
-    verify_deploy_runbook_artifact(
+    verify_deploy_preflight_artifact(
         dir,
-        runbook,
+        preflight,
         &DeployRunbookArtifacts {
+            server_artifact: artifact_path,
             compose,
             env_example,
             db_adapters,
             commerce_adapters,
             smoke_test,
+            preflight,
+            runbook,
+            routes: routes_artifact,
+        },
+        &artifact,
+        &persistence,
+        client,
+    )?;
+    verify_deploy_runbook_artifact(
+        dir,
+        runbook,
+        &DeployRunbookArtifacts {
+            server_artifact: artifact_path,
+            compose,
+            env_example,
+            db_adapters,
+            commerce_adapters,
+            smoke_test,
+            preflight,
+            runbook,
             routes: routes_artifact,
         },
         &artifact,
@@ -21782,10 +21807,168 @@ fn verify_deploy_smoke_client_contract(
     Ok(())
 }
 
+fn verify_deploy_preflight_artifact(
+    dir: &Path,
+    path: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let preflight_path = dir.join(path);
+    if !preflight_path.is_file() {
+        anyhow::bail!(
+            "missing deploy preflight artifact: {}",
+            preflight_path.display()
+        );
+    }
+    let preflight = read_json_value(&preflight_path)?;
+    if preflight
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy preflight schema_version must be 1");
+    }
+    if json_str(&preflight, "kind", "deploy preflight")? != "orv.deploy.preflight" {
+        anyhow::bail!("deploy preflight kind must be orv.deploy.preflight");
+    }
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/verify_build",
+        "orv verify-build .",
+        "deploy preflight verify_build command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/env_check",
+        "orv deploy-env-check .",
+        "deploy preflight env_check command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/run_build",
+        "orv run-build .",
+        "deploy preflight run_build command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/smoke_test",
+        &format!("./{}", artifacts.smoke_test),
+        "deploy preflight smoke_test command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/compose_up",
+        &format!("docker compose -f {} up --build -d", artifacts.compose),
+        "deploy preflight compose_up command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/trace",
+        "./deploy/server.sh --trace deploy/request-trace.json",
+        "deploy preflight trace command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/editor_trace",
+        "orv editor trace . --trace deploy/request-trace.json",
+        "deploy preflight editor_trace command",
+    )?;
+    for (key, expected) in [
+        ("server", artifacts.server_artifact),
+        ("routes", artifacts.routes),
+        ("env_example", artifacts.env_example),
+        ("db_adapters", artifacts.db_adapters),
+        ("commerce_adapters", artifacts.commerce_adapters),
+        ("smoke_test", artifacts.smoke_test),
+        ("preflight", artifacts.preflight),
+        ("runbook", artifacts.runbook),
+    ] {
+        let pointer = format!("/artifacts/{key}");
+        verify_json_pointer_str(
+            &preflight,
+            &pointer,
+            expected,
+            &format!("deploy preflight artifact {key}"),
+        )?;
+    }
+    if preflight.get("runtime").and_then(serde_json::Value::as_str)
+        != Some(artifact.runtime.as_str())
+    {
+        anyhow::bail!("deploy preflight runtime does not match runtime artifact");
+    }
+    if preflight.get("runtime_features") != Some(&serde_json::to_value(&artifact.runtime_features)?)
+    {
+        anyhow::bail!("deploy preflight runtime_features do not match runtime artifact");
+    }
+    if preflight.get("security_features")
+        != Some(&serde_json::to_value(deploy_security_runtime_features(
+            &artifact.runtime_features,
+        ))?)
+    {
+        anyhow::bail!("deploy preflight security_features do not match runtime artifact");
+    }
+    if preflight.get("listen") != Some(&serde_json::to_value(&artifact.listen)?) {
+        anyhow::bail!("deploy preflight listen does not match runtime artifact");
+    }
+    if preflight.get("routes") != Some(&serde_json::to_value(&artifact.routes)?) {
+        anyhow::bail!("deploy preflight routes do not match runtime artifact");
+    }
+    if preflight.get("persistence") != Some(&deploy_persistence_value(persistence)) {
+        anyhow::bail!("deploy preflight persistence does not match runtime artifact");
+    }
+    let expected_required_env =
+        deploy_preflight_env_values(artifact.listen.as_ref(), persistence, true);
+    if preflight.get("required_env") != Some(&expected_required_env) {
+        anyhow::bail!("deploy preflight required_env does not match runtime artifact");
+    }
+    let expected_optional_env =
+        deploy_preflight_env_values(artifact.listen.as_ref(), persistence, false);
+    if preflight.get("optional_env") != Some(&expected_optional_env) {
+        anyhow::bail!("deploy preflight optional_env does not match runtime artifact");
+    }
+    if preflight.get("client") != Some(&deploy_preflight_client_value(client)) {
+        anyhow::bail!("deploy preflight client does not match deploy manifest");
+    }
+    Ok(())
+}
+
+fn verify_json_pointer_str(
+    root: &serde_json::Value,
+    pointer: &str,
+    expected: &str,
+    context: &str,
+) -> anyhow::Result<()> {
+    if root.pointer(pointer).and_then(serde_json::Value::as_str) != Some(expected) {
+        anyhow::bail!("{context} must be {expected}");
+    }
+    Ok(())
+}
+
 fn deploy_env_check_with_lookup<F>(dir: &Path, mut lookup: F) -> anyhow::Result<()>
 where
     F: FnMut(&str) -> Option<String>,
 {
+    let preflight_path = dir.join(DEPLOY_PREFLIGHT_PATH);
+    if !preflight_path.is_file() {
+        anyhow::bail!(
+            "missing deploy preflight artifact: {}",
+            preflight_path.display()
+        );
+    }
+    let preflight = read_json_value(&preflight_path)?;
+    if preflight
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        anyhow::bail!("deploy preflight schema_version must be 1");
+    }
+    if json_str(&preflight, "kind", "deploy preflight")? != "orv.deploy.preflight" {
+        anyhow::bail!("deploy preflight kind must be orv.deploy.preflight");
+    }
+
     let db_adapters_path = dir.join("deploy").join("db-adapters.json");
     if !db_adapters_path.is_file() {
         anyhow::bail!(
@@ -21825,77 +22008,24 @@ where
     {
         anyhow::bail!("deploy commerce adapters kind must be orv.deploy.commerce_adapters");
     }
-    let mut missing = Vec::new();
-    let mut optional_missing = Vec::new();
-    for adapter in db_adapters
+    if db_adapters
         .get("adapters")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("deploy DB adapters must include adapters array"))?
+        .is_none()
     {
-        let Some(variable) = adapter.get("env").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if adapter
-            .get("default")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|default| !default.trim().is_empty())
-        {
-            continue;
-        }
-        if lookup(variable)
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            continue;
-        }
-        let provider = adapter
-            .get("provider")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("db");
-        missing.push(format!("db {provider} {variable}"));
+        anyhow::bail!("deploy DB adapters must include adapters array");
     }
-    for adapter in commerce_adapters
+    if commerce_adapters
         .get("adapters")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("deploy commerce adapters must include adapters array"))?
+        .is_none()
     {
-        let kind = adapter
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("commerce");
-        let provider = adapter
-            .get("provider")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("provider");
-        let Some(envs) = adapter
-            .get("provider_env")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for env in envs {
-            let variable = json_str(env, "env", "provider env")?;
-            let required = env
-                .get("required")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let configured = lookup(variable)
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            if configured {
-                continue;
-            }
-            let label = format!("{kind} {provider} {variable}");
-            if required {
-                missing.push(label);
-            } else {
-                optional_missing.push(label);
-            }
-        }
+        anyhow::bail!("deploy commerce adapters must include adapters array");
     }
+    let (missing, optional_missing) = deploy_env_check_preflight_missing(&preflight, &mut lookup)?;
     if !missing.is_empty() {
         anyhow::bail!(
-            "missing required provider env: {}; optional missing: {}",
+            "missing required deploy env: {}; optional missing: {}",
             missing.join(", "),
             optional_missing.join(", ")
         );
@@ -21903,12 +22033,64 @@ where
     Ok(())
 }
 
+fn deploy_env_check_preflight_missing<F>(
+    preflight: &serde_json::Value,
+    lookup: &mut F,
+) -> anyhow::Result<(Vec<String>, Vec<String>)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut missing = Vec::new();
+    let mut optional_missing = Vec::new();
+    let required_env = preflight
+        .get("required_env")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy preflight required_env must be an array"))?;
+    for env in required_env {
+        let variable = json_str(env, "env", "deploy preflight env")?;
+        if lookup(variable)
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            continue;
+        }
+        missing.push(deploy_preflight_env_label(env)?);
+    }
+    let optional_env = preflight
+        .get("optional_env")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deploy preflight optional_env must be an array"))?;
+    for env in optional_env {
+        let variable = json_str(env, "env", "deploy preflight env")?;
+        if lookup(variable)
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            continue;
+        }
+        optional_missing.push(deploy_preflight_env_label(env)?);
+    }
+    Ok((missing, optional_missing))
+}
+
+fn deploy_preflight_env_label(env: &serde_json::Value) -> anyhow::Result<String> {
+    let kind = json_str(env, "kind", "deploy preflight env")?;
+    let variable = json_str(env, "env", "deploy preflight env")?;
+    if let Some(provider) = env.get("provider").and_then(serde_json::Value::as_str) {
+        return Ok(format!("{kind} {provider} {variable}"));
+    }
+    Ok(format!("{kind} {variable}"))
+}
+
 struct DeployRunbookArtifacts<'a> {
+    server_artifact: &'a str,
     compose: &'a str,
     env_example: &'a str,
     db_adapters: &'a str,
     commerce_adapters: &'a str,
     smoke_test: &'a str,
+    preflight: &'a str,
+    runbook: &'a str,
     routes: &'a str,
 }
 
@@ -21950,6 +22132,10 @@ fn verify_deploy_runbook_artifact(
         let smoke_test_path = artifacts.smoke_test;
         anyhow::bail!("deploy runbook must reference {smoke_test_path}");
     }
+    if !runbook.contains(artifacts.preflight) {
+        let preflight_path = artifacts.preflight;
+        anyhow::bail!("deploy runbook must reference {preflight_path}");
+    }
     let smoke_command = format!("./{}", artifacts.smoke_test);
     if !runbook.contains(&smoke_command) {
         anyhow::bail!("deploy runbook must document deploy smoke test command");
@@ -21962,6 +22148,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("orv deploy-env-check .") {
         anyhow::bail!("deploy runbook must document deploy env preflight command");
+    }
+    if !runbook.contains("orv verify-build .") {
+        anyhow::bail!("deploy runbook must document build verification preflight command");
     }
     if !runbook.contains("cargo build --manifest-path server/native/Cargo.toml --release") {
         anyhow::bail!("deploy runbook must document native launcher build command");
@@ -25860,6 +26049,16 @@ struct DeployProviderEnv {
     purpose: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DeployPreflightEnv {
+    kind: String,
+    env: String,
+    required: bool,
+    purpose: String,
+    default: Option<String>,
+    provider: Option<String>,
+}
+
 #[derive(Default)]
 struct DeployPersistenceAccumulator {
     wal_paths: Vec<String>,
@@ -25974,6 +26173,94 @@ fn deploy_persistence_value(persistence: &DeployPersistence) -> serde_json::Valu
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn deploy_security_runtime_features(runtime_features: &[String]) -> Vec<String> {
+    let mut features = runtime_features
+        .iter()
+        .filter(|feature| {
+            matches!(
+                feature.as_str(),
+                "auth_roles" | "csrf_protection" | "rate_limit" | "session_cookies"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    features.sort();
+    features
+}
+
+fn deploy_preflight_env_values(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+    required: bool,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        deploy_preflight_env_contract(listen, persistence)
+            .into_iter()
+            .filter(|env| env.required == required)
+            .map(|env| {
+                serde_json::json!({
+                    "kind": env.kind,
+                    "env": env.env,
+                    "required": env.required,
+                    "purpose": env.purpose,
+                    "default": env.default,
+                    "provider": env.provider,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn deploy_preflight_env_contract(
+    listen: Option<&orv_compiler::ServerListenArtifact>,
+    persistence: &DeployPersistence,
+) -> Vec<DeployPreflightEnv> {
+    let mut envs = BTreeSet::new();
+    if let Some(env) = listen.and_then(|listen| listen.env.as_ref()) {
+        envs.insert(DeployPreflightEnv {
+            kind: "listen".to_string(),
+            env: env.variable.clone(),
+            required: env.default_port.is_none(),
+            purpose: "port".to_string(),
+            default: env.default_port.map(|port| port.to_string()),
+            provider: None,
+        });
+    }
+    for env in &persistence.db_env {
+        envs.insert(DeployPreflightEnv {
+            kind: "db".to_string(),
+            env: env.env.clone(),
+            required: env.default.is_none(),
+            purpose: "adapter_url".to_string(),
+            default: env.default.clone(),
+            provider: None,
+        });
+    }
+    for adapter in &persistence.commerce_adapters {
+        if let Some(env) = &adapter.env {
+            envs.insert(DeployPreflightEnv {
+                kind: adapter.kind.clone(),
+                env: env.clone(),
+                required: adapter.default.is_none(),
+                purpose: "adapter_url".to_string(),
+                default: adapter.default.clone(),
+                provider: adapter.provider.clone(),
+            });
+        }
+        for env in &adapter.provider_env {
+            envs.insert(DeployPreflightEnv {
+                kind: adapter.kind.clone(),
+                env: env.env.clone(),
+                required: env.required,
+                purpose: env.purpose.clone(),
+                default: None,
+                provider: adapter.provider.clone(),
+            });
+        }
+    }
+    envs.into_iter().collect()
 }
 
 fn deploy_db_adapter_value(adapters: &[DeployDbAdapter]) -> Vec<serde_json::Value> {
@@ -27019,6 +27306,7 @@ const CLIENT_WASM_PATH: &str = "client/app.wasm";
 const CLIENT_WASM_SOURCE_BUNDLE_PATH: &str = "../source-bundle.json";
 const ORV_REFERENCE_RUNTIME_IMAGE: &str = "ghcr.io/orv-lang/orv-reference:latest";
 const DEPLOY_SMOKE_TEST_PATH: &str = "deploy/smoke-test.sh";
+const DEPLOY_PREFLIGHT_PATH: &str = "deploy/preflight.json";
 const SERVER_ARTIFACT_PATH: &str = "server/app.orv-runtime.json";
 const SERVER_LAUNCH_PATH: &str = "server/launch.json";
 const NATIVE_SERVER_PLAN_PATH: &str = "server/native-server.json";
@@ -27523,6 +27811,7 @@ fn write_prod_deploy_artifacts(
         let db_adapters = "deploy/db-adapters.json";
         let commerce_adapters = "deploy/commerce-adapters.json";
         let smoke_test = DEPLOY_SMOKE_TEST_PATH;
+        let preflight = DEPLOY_PREFLIGHT_PATH;
         let runbook = "deploy/README.md";
         let persistence = server_artifact_deploy_persistence(server_artifact)?;
         write_prod_server_entrypoint(out, targets.server_artifact)?;
@@ -27546,14 +27835,35 @@ fn write_prod_deploy_artifacts(
             &persistence,
         )?;
         write_prod_smoke_test_artifact(out, smoke_test, server_artifact, &client)?;
-        write_prod_deploy_runbook(
+        write_prod_preflight_artifact(
             out,
+            preflight,
             &DeployRunbookArtifacts {
+                server_artifact: targets.server_artifact,
                 compose,
                 env_example,
                 db_adapters,
                 commerce_adapters,
                 smoke_test,
+                preflight,
+                runbook,
+                routes: routes_artifact,
+            },
+            server_artifact,
+            &persistence,
+            &client,
+        )?;
+        write_prod_deploy_runbook(
+            out,
+            &DeployRunbookArtifacts {
+                server_artifact: targets.server_artifact,
+                compose,
+                env_example,
+                db_adapters,
+                commerce_adapters,
+                smoke_test,
+                preflight,
+                runbook,
                 routes: routes_artifact,
             },
             server_artifact,
@@ -27578,6 +27888,7 @@ fn write_prod_deploy_artifacts(
             "db_adapters": db_adapters,
             "commerce_adapters": commerce_adapters,
             "smoke_test": smoke_test,
+            "preflight": preflight,
             "runbook": runbook,
             "runtime_image": ORV_REFERENCE_RUNTIME_IMAGE,
             "protocol": "http1",
@@ -27759,6 +28070,76 @@ fn write_prod_db_adapters_artifact(
         "adapters": deploy_db_adapter_value(&persistence.db_adapters),
     });
     write_json(&out.join(path), &artifact)
+}
+
+fn write_prod_preflight_artifact(
+    out: &Path,
+    path: &str,
+    artifacts: &DeployRunbookArtifacts<'_>,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let preflight =
+        deploy_preflight_artifact_value(artifacts, server_artifact, persistence, Some(client));
+    write_json(&out.join(path), &preflight)
+}
+
+fn deploy_preflight_artifact_value(
+    artifacts: &DeployRunbookArtifacts<'_>,
+    server_artifact: &orv_compiler::ServerRuntimeArtifact,
+    persistence: &DeployPersistence,
+    client: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.deploy.preflight",
+        "artifact": artifacts.server_artifact,
+        "runtime": server_artifact.runtime.clone(),
+        "runtime_features": server_artifact.runtime_features.clone(),
+        "security_features": deploy_security_runtime_features(&server_artifact.runtime_features),
+        "listen": server_artifact.listen.clone(),
+        "routes": server_artifact.routes.clone(),
+        "persistence": deploy_persistence_value(persistence),
+        "required_env": deploy_preflight_env_values(server_artifact.listen.as_ref(), persistence, true),
+        "optional_env": deploy_preflight_env_values(server_artifact.listen.as_ref(), persistence, false),
+        "commands": {
+            "verify_build": "orv verify-build .",
+            "env_check": "orv deploy-env-check .",
+            "run_build": "orv run-build .",
+            "smoke_test": format!("./{}", artifacts.smoke_test),
+            "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
+            "trace": "./deploy/server.sh --trace deploy/request-trace.json",
+            "editor_trace": "orv editor trace . --trace deploy/request-trace.json",
+        },
+        "artifacts": {
+            "server": artifacts.server_artifact,
+            "routes": artifacts.routes,
+            "env_example": artifacts.env_example,
+            "db_adapters": artifacts.db_adapters,
+            "commerce_adapters": artifacts.commerce_adapters,
+            "smoke_test": artifacts.smoke_test,
+            "preflight": artifacts.preflight,
+            "runbook": artifacts.runbook,
+        },
+        "client": deploy_preflight_client_value(client),
+    })
+}
+
+fn deploy_preflight_client_value(client: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(client) = client.filter(|value| !value.is_null()) else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "manifest": client.get("manifest").and_then(serde_json::Value::as_str),
+        "page": client.get("page").and_then(serde_json::Value::as_str),
+        "loader": client.get("loader").and_then(serde_json::Value::as_str),
+        "wasm": client.get("wasm").and_then(serde_json::Value::as_str),
+        "runtime_features": client.get("runtime_features").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "capabilities": client.get("capabilities").cloned().unwrap_or(serde_json::Value::Null),
+        "blocked_by": client.get("blocked_by").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "blockers": client.get("blockers").cloned().unwrap_or_else(|| serde_json::json!([])),
+    })
 }
 
 fn write_prod_smoke_test_artifact(
@@ -28128,6 +28509,7 @@ fn write_prod_deploy_runbook(
     let db_adapters_path = artifacts.db_adapters;
     let commerce_adapters_path = artifacts.commerce_adapters;
     let smoke_test_path = artifacts.smoke_test;
+    let preflight_path = artifacts.preflight;
     let routes_artifact = artifacts.routes;
     let port_prefix = deploy_runbook_port_assignment(server_artifact.listen.as_ref())
         .map(|port| format!("{port} "))
@@ -28156,6 +28538,7 @@ fn write_prod_deploy_runbook(
 - DB adapters: {db_adapters_path}
 - Commerce adapters: {commerce_adapters_path}
 - Smoke test: {smoke_test_path}
+- Preflight: {preflight_path}
 - Routes: {routes_artifact}
 
 ## Native Launcher
@@ -28184,6 +28567,7 @@ orv editor trace . --trace deploy/request-trace.json
 ## Deploy Preflight
 
 ```sh
+orv verify-build .
 orv deploy-env-check .
 ```
 
@@ -29540,6 +29924,8 @@ test "checkout excluded failure" {
             std::fs::read_to_string(out.join("deploy").join("env.example")).expect("env example");
         let commerce_adapters = read_json_value(&out.join("deploy").join("commerce-adapters.json"))
             .expect("commerce adapters");
+        let preflight =
+            read_json_value(&out.join("deploy").join("preflight.json")).expect("preflight");
         let smoke_test =
             std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
         let native_routes =
@@ -29646,6 +30032,10 @@ test "checkout excluded failure" {
             serde_json::json!("deploy/smoke-test.sh")
         );
         assert_eq!(
+            deploy["server"]["preflight"],
+            serde_json::json!("deploy/preflight.json")
+        );
+        assert_eq!(
             deploy["server"]["persistence"]["commerce_env"],
             serde_json::json!([
                 {
@@ -29750,6 +30140,46 @@ test "checkout excluded failure" {
         assert!(env_example.contains("SHIPPING_ADAPTER_URL=file://data/shipments.jsonl"));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET="));
         assert!(env_example.contains("STRIPE_WEBHOOK_SECRET_PREVIOUS="));
+        assert_eq!(preflight["schema_version"], serde_json::json!(1));
+        assert_eq!(preflight["kind"], serde_json::json!("orv.deploy.preflight"));
+        assert_eq!(
+            preflight["commands"]["verify_build"],
+            serde_json::json!("orv verify-build .")
+        );
+        assert_eq!(
+            preflight["commands"]["env_check"],
+            serde_json::json!("orv deploy-env-check .")
+        );
+        assert_eq!(
+            preflight["commands"]["smoke_test"],
+            serde_json::json!("./deploy/smoke-test.sh")
+        );
+        assert_eq!(
+            preflight["artifacts"]["commerce_adapters"],
+            serde_json::json!("deploy/commerce-adapters.json")
+        );
+        assert_eq!(
+            preflight["security_features"],
+            serde_json::json!([
+                "auth_roles",
+                "csrf_protection",
+                "rate_limit",
+                "session_cookies"
+            ])
+        );
+        assert!(preflight["optional_env"]
+            .as_array()
+            .expect("optional preflight env")
+            .iter()
+            .any(|env| env["env"] == "SHOP_DATABASE_URL"
+                && env["default"] == "sqlite://data/shop.sqlite"));
+        assert!(preflight["optional_env"]
+            .as_array()
+            .expect("optional preflight env")
+            .iter()
+            .any(|env| env["env"] == "STRIPE_WEBHOOK_SECRET"
+                && env["provider"] == "stripe"
+                && env["required"] == false));
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
@@ -29842,7 +30272,9 @@ test "checkout excluded failure" {
         assert!(runbook.contains("deploy/env.example"));
         assert!(runbook.contains("deploy/commerce-adapters.json"));
         assert!(runbook.contains("deploy/smoke-test.sh"));
+        assert!(runbook.contains("deploy/preflight.json"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
+        assert!(runbook.contains("orv verify-build ."));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
         assert!(runbook.contains("- Record log: data/payments.jsonl"));
@@ -41337,6 +41769,7 @@ entry = "src/main.orv"
         let deploy_runbook_path = out.join("deploy").join("README.md");
         let deploy_routes_path = out.join("deploy").join("routes.json");
         let deploy_smoke_test_path = out.join("deploy").join("smoke-test.sh");
+        let deploy_preflight_path = out.join("deploy").join("preflight.json");
         let server_entrypoint_path = out.join("deploy").join("server.sh");
         let native_server_plan_path = out.join("server").join("native-server.json");
         assert!(
@@ -41380,6 +41813,11 @@ entry = "src/main.orv"
             deploy_smoke_test_path.display()
         );
         assert!(
+            deploy_preflight_path.is_file(),
+            "missing {}",
+            deploy_preflight_path.display()
+        );
+        assert!(
             server_entrypoint_path.is_file(),
             "missing {}",
             server_entrypoint_path.display()
@@ -41402,6 +41840,7 @@ entry = "src/main.orv"
         assert_eq!(deploy["server"]["env_example"], "deploy/env.example");
         assert_eq!(deploy["server"]["runbook"], "deploy/README.md");
         assert_eq!(deploy["server"]["smoke_test"], "deploy/smoke-test.sh");
+        assert_eq!(deploy["server"]["preflight"], "deploy/preflight.json");
         assert_eq!(deploy["server"]["native_plan"], "server/native-server.json");
         assert_eq!(
             deploy["server"]["native_runtime_image_plan"],
@@ -41473,6 +41912,9 @@ entry = "src/main.orv"
         assert!(runbook.contains("ORV_BUILD_DIR is an explicit override"));
         assert!(runbook.contains("./deploy/server.sh --trace deploy/request-trace.json"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
+        assert!(runbook.contains("deploy/preflight.json"));
+        assert!(runbook.contains("orv verify-build ."));
+        assert!(runbook.contains("orv deploy-env-check ."));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
         assert!(runbook.contains("- GET /ping"));
@@ -41495,6 +41937,29 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(
             r#"orv_smoke_curl_origin "GET /ping" "$ORV_SMOKE_ORIGIN_GET_PING" "$BASE_URL/ping""#
         ));
+        let preflight = read_json_value(&deploy_preflight_path).expect("deploy preflight");
+        assert_eq!(preflight["schema_version"], 1);
+        assert_eq!(preflight["kind"], "orv.deploy.preflight");
+        assert_eq!(preflight["artifact"], "server/app.orv-runtime.json");
+        assert_eq!(preflight["artifacts"]["smoke_test"], "deploy/smoke-test.sh");
+        assert_eq!(preflight["artifacts"]["preflight"], "deploy/preflight.json");
+        assert_eq!(preflight["commands"]["verify_build"], "orv verify-build .");
+        assert_eq!(preflight["commands"]["env_check"], "orv deploy-env-check .");
+        assert_eq!(preflight["commands"]["run_build"], "orv run-build .");
+        assert_eq!(
+            preflight["commands"]["smoke_test"],
+            "./deploy/smoke-test.sh"
+        );
+        assert_eq!(
+            preflight["commands"]["compose_up"],
+            "docker compose -f deploy/compose.yaml up --build -d"
+        );
+        assert_eq!(preflight["listen"], deploy["server"]["listen"]);
+        assert_eq!(preflight["routes"], deploy["server"]["routes"]);
+        assert_eq!(
+            preflight["runtime_features"],
+            deploy["server"]["runtime_features"]
+        );
         let script = std::fs::read_to_string(&server_entrypoint_path).expect("server entrypoint");
         assert!(script.contains("orv run-artifact"));
 
@@ -42945,6 +43410,46 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy runbook must list route GET /ping"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_runtime_feature_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-runtime-feature-source");
+        let out = temp_output_dir("deploy-preflight-runtime-feature-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["runtime_features"] = serde_json::json!(["http_server"]);
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight runtime feature mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight runtime_features do not match runtime artifact"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_smoke_command_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-smoke-command-source");
+        let out = temp_output_dir("deploy-preflight-smoke-command-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["commands"]["smoke_test"] = serde_json::json!("./deploy/other-smoke.sh");
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight smoke command mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight smoke_test command must be ./deploy/smoke-test.sh"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
