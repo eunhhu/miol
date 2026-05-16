@@ -88,14 +88,13 @@ fn e2e_fixture_lex_list_covers_directory() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/e2e");
     let mut actual = std::fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", root.display()))
-        .map(|entry| {
-            entry
-                .expect("fixture dir entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
+        .filter_map(|entry| {
+            let entry = entry.expect("fixture dir entry");
+            let path = entry.path();
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("orv"))
+                .then(|| entry.file_name().to_string_lossy().into_owned())
         })
-        .filter(|name| name.ends_with(".orv"))
         .collect::<Vec<_>>();
     actual.sort();
 

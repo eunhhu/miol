@@ -4615,6 +4615,8 @@ fn token_source_repr(kind: &TokenKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_raw_string_hashes)]
+
     use super::*;
     use crate::lex;
     use orv_diagnostics::FileId;

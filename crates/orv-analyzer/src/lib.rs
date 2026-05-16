@@ -2322,6 +2322,8 @@ fn matches_iso_date(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_raw_string_hashes, clippy::single_char_pattern)]
+
     use super::*;
     use orv_diagnostics::FileId;
     use orv_syntax::{lex, parse};
