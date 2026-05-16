@@ -2583,6 +2583,17 @@ pub struct OrvNativeRoute {
     pub path: &'static str,
     pub origin_id: &'static str,
     pub response_origin_ids: &'static [&'static str],
+    pub policies: &'static [OrvNativeRoutePolicy],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrvNativeRoutePolicy {
+    pub kind: &'static str,
+    pub origin_id: Option<&'static str>,
+    pub required: Option<bool>,
+    pub role: Option<&'static str>,
+    pub limit: Option<u32>,
+    pub window_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2606,7 +2617,7 @@ pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
     for route in &artifact.routes {
         let _ = writeln!(
             source,
-            "    OrvNativeRoute {{ method: {}, path: {}, origin_id: {}, response_origin_ids: &[{}] }},",
+            "    OrvNativeRoute {{ method: {}, path: {}, origin_id: {}, response_origin_ids: &[{}], policies: &[{}] }},",
             rust_string_literal(&route.method),
             rust_string_literal(&route.path),
             rust_string_literal(&route.origin_id),
@@ -2614,6 +2625,12 @@ pub const ORV_NATIVE_ROUTES: &[OrvNativeRoute] = &[
                 .response_origin_ids
                 .iter()
                 .map(|id| rust_string_literal(id))
+                .collect::<Vec<_>>()
+                .join(", "),
+            route
+                .policies
+                .iter()
+                .map(native_route_policy_literal)
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -7849,6 +7866,33 @@ fn rust_string_literal(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn rust_option_string_literal(value: Option<&str>) -> String {
+    value.map_or_else(
+        || "None".to_string(),
+        |value| format!("Some({})", rust_string_literal(value)),
+    )
+}
+
+fn rust_option_bool_literal(value: Option<bool>) -> String {
+    value.map_or_else(|| "None".to_string(), |value| format!("Some({value})"))
+}
+
+fn rust_option_u32_literal(value: Option<u32>) -> String {
+    value.map_or_else(|| "None".to_string(), |value| format!("Some({value})"))
+}
+
+fn native_route_policy_literal(policy: &ServerRoutePolicyArtifact) -> String {
+    format!(
+        "OrvNativeRoutePolicy {{ kind: {}, origin_id: {}, required: {}, role: {}, limit: {}, window_seconds: {} }}",
+        rust_string_literal(&policy.kind),
+        rust_option_string_literal(policy.origin_id.as_deref()),
+        rust_option_bool_literal(policy.required),
+        rust_option_string_literal(policy.role.as_deref()),
+        rust_option_u32_literal(policy.limit),
+        rust_option_u32_literal(policy.window_seconds),
+    )
 }
 
 fn static_integer(expr: &HirExpr) -> Option<i64> {
@@ -19868,6 +19912,8 @@ function greet(name: string): string -> "hi {name}""#,
 
         assert!(source.contains("pub struct OrvNativeRoute"));
         assert!(source.contains("pub response_origin_ids: &'static [&'static str]"));
+        assert!(source.contains("pub policies: &'static [OrvNativeRoutePolicy]"));
+        assert!(source.contains("pub struct OrvNativeRoutePolicy"));
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute { method: \"GET\", path: \"/ping\", origin_id:"));
         assert!(source.contains("pub fn orv_native_match_route("));
@@ -19880,6 +19926,38 @@ function greet(name: string): string -> "hi {name}""#,
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );
+    }
+
+    #[test]
+    fn native_server_routes_source_declares_route_policy_table() {
+        let src = r#"@server {
+  @listen 8080
+  @route POST /checkout {
+    @csrf
+    @respond 201 { ok: true }
+  }
+}"#;
+        let program = lower(src);
+        let map = origin_map(&program);
+        let manifest = build_manifest("server.orv", &map);
+        let artifact =
+            server_runtime_artifact_with_program(&manifest, &map, &program, [("server.orv", src)]);
+        let source = native_server_routes_source(&artifact);
+        let csrf_origin = artifact.routes[0]
+            .policies
+            .iter()
+            .find(|policy| policy.kind == "csrf")
+            .and_then(|policy| policy.origin_id.as_deref())
+            .expect("csrf policy origin");
+
+        assert!(source.contains("pub struct OrvNativeRoutePolicy"));
+        assert!(source.contains("policies: &[OrvNativeRoutePolicy"));
+        assert!(source.contains("kind: \"csrf\""));
+        assert!(source.contains(&format!("origin_id: Some(\"{csrf_origin}\")")));
+        assert!(source.contains("required: Some(true)"));
+        assert!(source.contains("kind: \"rate_limit\""));
+        assert!(source.contains("limit: Some(10)"));
+        assert!(source.contains("window_seconds: Some(60)"));
     }
 
     #[test]

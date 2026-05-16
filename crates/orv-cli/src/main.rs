@@ -30281,6 +30281,14 @@ test "checkout excluded failure" {
         assert!(native_routes.contains("pub fn orv_native_match_route("));
         assert!(native_routes.contains("pub struct OrvNativeRouteMatch"));
         assert!(native_routes.contains("pub struct OrvNativeParam"));
+        assert!(native_routes.contains("pub struct OrvNativeRoutePolicy"));
+        assert!(native_routes.contains("pub policies: &'static [OrvNativeRoutePolicy]"));
+        assert!(native_routes.contains("kind: \"auth\""));
+        assert!(native_routes.contains("role: Some(\"admin\")"));
+        assert!(native_routes.contains("kind: \"csrf\""));
+        assert!(native_routes.contains("kind: \"rate_limit\""));
+        assert!(native_routes.contains("limit: Some(10)"));
+        assert!(native_routes.contains("window_seconds: Some(60)"));
         assert!(native_routes.contains("orv_native_route_path_params(route.path, path)"));
         assert!(native_routes.contains("orv_native_match_route_segment(pattern_segment"));
         assert!(native_routes.contains("fn orv_native_route_param_segment(segment: &str)"));
@@ -39842,6 +39850,8 @@ entry = "src/main.orv"
         assert_eq!(native_plan["routes_source"], "server/native/routes.rs");
         assert!(source.contains("pub struct OrvNativeRoute"));
         assert!(source.contains("pub response_origin_ids: &'static [&'static str]"));
+        assert!(source.contains("pub policies: &'static [OrvNativeRoutePolicy]"));
+        assert!(source.contains("pub struct OrvNativeRoutePolicy"));
         assert!(source.contains("pub const ORV_NATIVE_ROUTES"));
         assert!(source.contains("OrvNativeRoute {"));
         assert!(source.contains("method: \"GET\""));
@@ -39850,6 +39860,7 @@ entry = "src/main.orv"
         assert!(source.contains("orv_native_route_path_params(route.path, path)"));
         assert!(source.contains(&format!("origin_id: \"{route_origin}\"")));
         assert!(source.contains(&format!("response_origin_ids: &[\"{response_origin}\"]")));
+        assert!(source.contains("policies: &[]"));
         assert!(
             source.contains("pub const ORV_NATIVE_ROUTE_COUNT: usize = ORV_NATIVE_ROUTES.len();")
         );
