@@ -44,8 +44,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::db::{new_db_handle, DbHandle};
 use crate::interp::{
-    eval_expr_in_env, run_handler_with_request_in_env, run_with_writer_in_env_with_db, RequestCtx,
-    ResponseCtx, RuntimeError, Value, ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN,
+    eval_expr_in_env, run_handler_with_request_in_env_and_types,
+    run_with_writer_in_env_and_types_with_db, RequestCtx, ResponseCtx, RuntimeError,
+    RuntimeTypeRegistry, Value, ORV_CSRF_COOKIE_NAME, ORV_REFERENCE_CSRF_TOKEN,
     ORV_SESSION_COOKIE_NAME, ORV_SESSION_ROLE_COOKIE_NAME,
 };
 
@@ -102,15 +103,37 @@ impl LocalRoutes {
 /// explicit local wrapper makes the current-thread invariant visible at the
 /// function boundary.
 #[derive(Clone)]
-struct LocalCapturedEnv(Rc<HashMap<NameId, Value>>);
+struct CapturedRuntimeState {
+    env: HashMap<NameId, Value>,
+    types: RuntimeTypeRegistry,
+}
+
+impl CapturedRuntimeState {
+    fn new(env: HashMap<NameId, Value>, types: RuntimeTypeRegistry) -> Self {
+        Self { env, types }
+    }
+}
+
+#[derive(Clone)]
+struct LocalCapturedEnv {
+    env: Rc<HashMap<NameId, Value>>,
+    types: Rc<RuntimeTypeRegistry>,
+}
 
 impl LocalCapturedEnv {
-    fn new(captured_env: HashMap<NameId, Value>) -> Self {
-        Self(Rc::new(captured_env))
+    fn new(captured: CapturedRuntimeState) -> Self {
+        Self {
+            env: Rc::new(captured.env),
+            types: Rc::new(captured.types),
+        }
     }
 
     fn snapshot(&self) -> HashMap<NameId, Value> {
-        self.0.as_ref().clone()
+        self.env.as_ref().clone()
+    }
+
+    fn type_registry(&self) -> RuntimeTypeRegistry {
+        self.types.as_ref().clone()
     }
 }
 
@@ -311,15 +334,16 @@ pub(crate) fn run_server_with_request_trace_path(
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
     captured_env: HashMap<NameId, Value>,
+    captured_types: RuntimeTypeRegistry,
     db: DbHandle,
     request_trace_path: Option<std::path::PathBuf>,
 ) -> Result<Value, RuntimeError> {
     let mut stdout = std::io::stdout().lock();
-    let (port, entries, captured_env, db) = prepare_server_state(
+    let (port, entries, captured, db) = prepare_server_state(
         listen,
         routes,
         body_stmts,
-        captured_env,
+        CapturedRuntimeState::new(captured_env, captured_types),
         db,
         &mut stdout,
         false,
@@ -349,7 +373,7 @@ pub(crate) fn run_server_with_request_trace_path(
         serve_loop_with_request_trace_file(
             listener,
             LocalRoutes::new(entries),
-            LocalCapturedEnv::new(captured_env),
+            LocalCapturedEnv::new(captured),
             db,
             None,
             request_trace_path,
@@ -464,7 +488,7 @@ fn run_attached_server_thread(
     startup: &mpsc::SyncSender<AttachedStartup>,
 ) -> Result<(), String> {
     let mut boot_output = Vec::new();
-    let (port, entries, captured_env, db) =
+    let (port, entries, captured, db) =
         attached_server_state(program, &mut boot_output).map_err(|e| e.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -492,7 +516,7 @@ fn run_attached_server_thread(
         serve_loop(
             listener,
             LocalRoutes::new(entries),
-            LocalCapturedEnv::new(captured_env),
+            LocalCapturedEnv::new(captured),
             db,
             Some(trace_state),
             async move {
@@ -514,8 +538,8 @@ fn attached_server_state<W: std::io::Write>(
         .iter()
         .position(|stmt| matches!(stmt, HirStmt::Expr(expr) if matches!(expr.kind, HirExprKind::Server { .. })))
         .ok_or_else(|| RuntimeError::native("attached runtime requires an `@server` expression"))?;
-    let captured_env = if server_idx == 0 {
-        HashMap::new()
+    let (captured_env, captured_types) = if server_idx == 0 {
+        (HashMap::new(), RuntimeTypeRegistry::default())
     } else {
         let prefix = HirProgram {
             items: program.items[..server_idx].to_vec(),
@@ -523,7 +547,13 @@ fn attached_server_state<W: std::io::Write>(
                 .span()
                 .join(program.items[server_idx - 1].span()),
         };
-        run_with_writer_in_env_with_db(&prefix, HashMap::new(), db.clone(), boot_writer)?
+        run_with_writer_in_env_and_types_with_db(
+            &prefix,
+            HashMap::new(),
+            RuntimeTypeRegistry::default(),
+            db.clone(),
+            boot_writer,
+        )?
     };
     let HirStmt::Expr(expr) = &program.items[server_idx] else {
         return Err(RuntimeError::native("attached runtime expected expression"));
@@ -540,7 +570,7 @@ fn attached_server_state<W: std::io::Write>(
         listen.as_deref(),
         routes,
         body_stmts,
-        captured_env,
+        CapturedRuntimeState::new(captured_env, captured_types),
         db,
         boot_writer,
         true,
@@ -596,11 +626,11 @@ where
     S: std::future::Future<Output = ()> + 'static,
 {
     let mut boot_buf: Vec<u8> = Vec::new();
-    let (port, entries, captured_env, db) = prepare_server_state(
+    let (port, entries, captured, db) = prepare_server_state(
         listen,
         routes,
         body_stmts,
-        captured_env,
+        CapturedRuntimeState::new(captured_env, RuntimeTypeRegistry::default()),
         new_db_handle(),
         &mut boot_buf,
         true,
@@ -613,7 +643,7 @@ where
         .local_addr()
         .map_err(|e| RuntimeError::native(format!("local_addr failed: {e}")))?;
     let table = LocalRoutes::new(entries);
-    let captured_env = LocalCapturedEnv::new(captured_env);
+    let captured_env = LocalCapturedEnv::new(captured);
     let handle = tokio::task::spawn_local(async move {
         let _ = serve_loop(listener, table, captured_env, db, None, shutdown).await;
     });
@@ -634,11 +664,11 @@ where
     S: std::future::Future<Output = ()> + 'static,
 {
     let mut boot_buf: Vec<u8> = Vec::new();
-    let (port, entries, captured_env, db) = prepare_server_state(
+    let (port, entries, captured, db) = prepare_server_state(
         listen,
         routes,
         body_stmts,
-        captured_env,
+        CapturedRuntimeState::new(captured_env, RuntimeTypeRegistry::default()),
         new_db_handle(),
         &mut boot_buf,
         true,
@@ -651,7 +681,7 @@ where
         .local_addr()
         .map_err(|e| RuntimeError::native(format!("local_addr failed: {e}")))?;
     let table = LocalRoutes::new(entries);
-    let captured_env = LocalCapturedEnv::new(captured_env);
+    let captured_env = LocalCapturedEnv::new(captured);
     let handle = tokio::task::spawn_local(async move {
         let _ = serve_loop_with_request_trace_file(
             listener,
@@ -667,14 +697,14 @@ where
     Ok((addr, handle, boot_buf))
 }
 
-/// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 환경, 공유 DB)`.
-type PreparedServerState = (u16, Vec<RouteEntry>, HashMap<NameId, Value>, DbHandle);
+/// 서버 기동 전 상태 — `(포트, 라우트 테이블, 캡처 런타임 상태, 공유 DB)`.
+type PreparedServerState = (u16, Vec<RouteEntry>, CapturedRuntimeState, DbHandle);
 
 fn prepare_server_state<W: std::io::Write>(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
     body_stmts: &[orv_hir::HirStmt],
-    captured_env: HashMap<NameId, Value>,
+    captured: CapturedRuntimeState,
     db: DbHandle,
     boot_writer: &mut W,
     allow_ephemeral_port: bool,
@@ -683,25 +713,32 @@ fn prepare_server_state<W: std::io::Write>(
     //    let/const/function 선언도 여기서 캡처된 환경 위에 쌓아 handler 가
     //    볼 수 있게 만든다. `@listen port` 같은 표현식도 이 환경을 보게 하기
     //    위해 포트 결정보다 먼저 수행한다.
-    let captured_env = if body_stmts.is_empty() {
-        captured_env
+    let captured = if body_stmts.is_empty() {
+        captured
     } else {
         let boot_program = HirProgram {
             items: body_stmts.to_vec(),
             span: body_stmts[0].span(),
         };
-        run_with_writer_in_env_with_db(&boot_program, captured_env, db.clone(), boot_writer)?
+        let (env, types) = run_with_writer_in_env_and_types_with_db(
+            &boot_program,
+            captured.env,
+            captured.types,
+            db.clone(),
+            boot_writer,
+        )?;
+        CapturedRuntimeState::new(env, types)
     };
 
     // 2) listen 포트 결정. 운영 경로는 @listen 없으면 에러, 테스트 경로는 `0`
     //    을 허용해 OS 임의 포트 바인딩을 사용할 수 있다.
-    let port = resolve_listen_port(listen, &captured_env, allow_ephemeral_port)?;
+    let port = resolve_listen_port(listen, &captured.env, allow_ephemeral_port)?;
 
     // 3) routes → RouteEntry 로 평평하게. analyzer 가 routes 벡터에 Route
     //    variant 만 넣기로 계약했으므로 그 외는 에러.
     let entries = collect_routes(routes)?;
 
-    Ok((port, entries, captured_env, db))
+    Ok((port, entries, captured, db))
 }
 
 fn resolve_listen_port(
@@ -986,19 +1023,22 @@ async fn handle_request(
         ip: client_ip,
         params,
         query,
+        query_value: None,
         headers,
         raw_body,
         body: body_value,
+        form: None,
     };
 
     // handler 평가는 동기. stdout 은 버리는 버퍼로 흘려 — `@out` 은 서버
     // 콘솔이 아니라 요청 단위로 캡처해 반환 헤더에 싣는 편이 정석이지만
     // MVP 는 단순히 버린다.
     let mut sink = Vec::<u8>::new();
-    let outcome = match run_handler_with_request_in_env(
+    let outcome = match run_handler_with_request_in_env_and_types(
         &entry.handler,
         ctx,
         captured_env.snapshot(),
+        captured_env.type_registry(),
         db.clone(),
         &mut sink,
     ) {
@@ -3272,6 +3312,98 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(json["ok"], serde_json::json!(true));
             assert_eq!(json["msg"], serde_json::json!("pong"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declarative_request_bindings_validate_query_and_form() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    struct SearchQuery {
+                      page: int(min=1)
+                      q: string(trim, lower, min=1)
+                    }
+                    struct SignupForm {
+                      email: string(trim, lower)
+                      age: int(min=13)
+                    }
+                    @route GET /search {
+                      @query: SearchQuery
+                      @respond 200 { page: @query.page, q: @query.q }
+                    }
+                    @route POST /signup {
+                      @form: SignupForm
+                      @respond 200 { email: @form.email, age: @form.age }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (search_status, _, search_body) =
+                send_request(addr, "GET", "/search?page=2&q=%20HELLO%20", None).await;
+            assert_eq!(search_status, 200);
+            let search: serde_json::Value =
+                serde_json::from_slice(&search_body).expect("search json");
+            assert_eq!(search["page"], serde_json::json!(2));
+            assert_eq!(search["q"], serde_json::json!("hello"));
+
+            let (bad_search_status, _, bad_search_body) =
+                send_request(addr, "GET", "/search?page=0&q=hello", None).await;
+            assert_eq!(bad_search_status, 400);
+            let bad_search: serde_json::Value =
+                serde_json::from_slice(&bad_search_body).expect("bad search json");
+            assert_eq!(bad_search["error"], serde_json::json!("validation_failed"));
+            assert!(bad_search["fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty()));
+
+            let (signup_status, _, signup_body) = send_request_with_content_type(
+                addr,
+                "POST",
+                "/signup",
+                "email=%20USER%40ORV.DEV%20&age=15".to_string(),
+                "application/x-www-form-urlencoded",
+            )
+            .await;
+            assert_eq!(signup_status, 200);
+            let signup: serde_json::Value =
+                serde_json::from_slice(&signup_body).expect("signup json");
+            assert_eq!(signup["email"], serde_json::json!("user@orv.dev"));
+            assert_eq!(signup["age"], serde_json::json!(15));
+
+            let (bad_signup_status, _, bad_signup_body) = send_request_with_content_type(
+                addr,
+                "POST",
+                "/signup",
+                "email=ok%40orv.dev&age=12".to_string(),
+                "application/x-www-form-urlencoded",
+            )
+            .await;
+            assert_eq!(bad_signup_status, 400);
+            let bad_signup: serde_json::Value =
+                serde_json::from_slice(&bad_signup_body).expect("bad signup json");
+            assert_eq!(bad_signup["error"], serde_json::json!("validation_failed"));
+            assert!(bad_signup["fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty()));
 
             handle.abort();
         })

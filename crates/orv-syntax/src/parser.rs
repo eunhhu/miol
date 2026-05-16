@@ -2391,6 +2391,11 @@ impl Parser {
         if name_ident.name == "server" {
             return self.parse_server_call(name_ident);
         }
+        if is_request_binding_domain(&name_ident.name)
+            && matches!(self.peek_kind(), TokenKind::Colon)
+        {
+            return self.parse_request_binding_call(name_ident, at_tok.span);
+        }
         if name_ident.name == "redirect" {
             return self.parse_redirect_call(name_ident);
         }
@@ -2664,6 +2669,37 @@ impl Parser {
                 args,
             },
             span: at_tok.span.join(end_span),
+        })
+    }
+
+    /// `@body: Type`, `@query: Type`, `@form: Type` 를 request-state validation
+    /// domain 으로 보존한다. Runtime 은 인자를 타입 핸들로 평가해 요청 값을
+    /// 검증하고 성공 시 해당 request-state 값을 정규화된 값으로 교체한다.
+    fn parse_request_binding_call(&mut self, name_ident: Ident, at_span: Span) -> Option<Expr> {
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let ty = self.parse_type()?;
+        let (type_name, type_span) = match ty.kind {
+            TypeRefKind::Named(id) if ty.constraints.is_empty() && ty.where_clause.is_none() => {
+                (id.name, id.span)
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error("request binding type must be a named schema")
+                        .with_primary(ty.span, "expected a struct or type alias name"),
+                );
+                ("<invalid>".to_string(), ty.span)
+            }
+        };
+        let type_expr = Expr {
+            kind: ExprKind::TypeName(type_name),
+            span: type_span,
+        };
+        Some(Expr {
+            span: at_span.join(type_expr.span),
+            kind: ExprKind::Domain {
+                name: name_ident,
+                args: vec![type_expr],
+            },
         })
     }
 
@@ -4526,6 +4562,10 @@ fn is_zero_arg_state_domain(domain_name: &str) -> bool {
     )
 }
 
+fn is_request_binding_domain(domain_name: &str) -> bool {
+    matches!(domain_name, "body" | "query" | "form")
+}
+
 /// `@route` 경로 합성용 — 각 토큰을 소스에 실제로 적힌 문자열로 복원한다.
 /// 공백이 없다고 가정되는 path 영역에서만 쓰이므로 완벽한 round-trip 은
 /// 필요 없다. 경로에 실제 등장할 수 있는 토큰만 처리.
@@ -5388,6 +5428,36 @@ struct Registration {
             &args[1].kind,
             ExprKind::Assign { target, value }
                 if target.name == "role" && matches!(value.kind, ExprKind::String(_))
+        ));
+    }
+
+    #[test]
+    fn request_binding_domain_parses_named_schema() {
+        let r = parse_str(
+            r#"
+            @route POST /checkout {
+              @body: CheckoutForm
+              @respond 200 { sku: @body.sku }
+            }
+            "#,
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let args = route_args(&r.program.items[0]);
+        let ExprKind::Block(body) = &args[2].kind else {
+            panic!("route body must be block");
+        };
+        assert_eq!(body.stmts.len(), 2);
+        let Stmt::Expr(binding) = &body.stmts[0] else {
+            panic!("expected request binding expr");
+        };
+        let ExprKind::Domain { name, args } = &binding.kind else {
+            panic!("expected request binding domain");
+        };
+        assert_eq!(name.name, "body");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(
+            &args[0].kind,
+            ExprKind::TypeName(type_name) if type_name == "CheckoutForm"
         ));
     }
 

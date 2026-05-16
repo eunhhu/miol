@@ -95,6 +95,8 @@ pub struct RequestCtx {
     pub params: HashMap<String, String>,
     /// 쿼리 매개변수.
     pub query: HashMap<String, String>,
+    /// `@query: Type` 검증 후 노출할 정규화된 query 값.
+    pub query_value: Option<Value>,
     /// 요청 헤더.
     pub headers: HashMap<String, String>,
     /// UTF-8/lossy 원문 요청 body. Webhook signature checks need the exact body
@@ -103,6 +105,10 @@ pub struct RequestCtx {
     /// 파싱된 body. JSON/form bodies are exposed as objects; unknown content
     /// types remain raw strings, and empty bodies are void.
     pub body: Value,
+    /// `@form: Type` 검증 후 노출할 정규화된 form 값. URL-encoded form input은
+    /// 최초에는 `body` 와 같은 object 로 들어오며, binding 성공 후 `@form`
+    /// 이 이 값을 우선 노출한다.
+    pub form: Option<Value>,
 }
 
 impl Default for RequestCtx {
@@ -113,9 +119,11 @@ impl Default for RequestCtx {
             ip: String::new(),
             params: HashMap::new(),
             query: HashMap::new(),
+            query_value: None,
             headers: HashMap::new(),
             raw_body: String::new(),
             body: Value::Void,
+            form: None,
         }
     }
 }
@@ -171,6 +179,18 @@ pub struct HandlerOutcome {
     /// 를 사용하라" 는 신호를 준다. 호출자(`handle_request`)가 stderr 로
     /// 흘려보낸다.
     pub warnings: Vec<String>,
+}
+
+/// Runtime schema/type registry captured across interpreter boundaries.
+///
+/// HTTP server boot evaluates server-level statements once, then each request
+/// runs in a fresh interpreter. The lexical env alone is not enough for
+/// `@body: SignupForm` because struct fields and type aliases live in these
+/// validator maps, so server code carries this registry alongside env values.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeTypeRegistry {
+    pub type_structs: HashMap<String, Vec<(String, HirTypeRef)>>,
+    pub type_aliases: HashMap<String, HirTypeRef>,
 }
 
 /// Result of a reference-runtime debug run.
@@ -565,10 +585,29 @@ pub(crate) fn run_with_writer_in_env_with_db<W: Write>(
     db: DbHandle,
     writer: &mut W,
 ) -> Result<HashMap<NameId, Value>, RuntimeError> {
+    run_with_writer_in_env_and_types_with_db(
+        program,
+        env,
+        RuntimeTypeRegistry::default(),
+        db,
+        writer,
+    )
+    .map(|(env, _)| env)
+}
+
+pub(crate) fn run_with_writer_in_env_and_types_with_db<W: Write>(
+    program: &HirProgram,
+    env: HashMap<NameId, Value>,
+    types: RuntimeTypeRegistry,
+    db: DbHandle,
+    writer: &mut W,
+) -> Result<(HashMap<NameId, Value>, RuntimeTypeRegistry), RuntimeError> {
     let mut interp = Interp::new_with_env(writer, env);
     interp.db = db;
+    interp.apply_type_registry(types);
     interp.run(program)?;
-    Ok(interp.env)
+    let types = interp.type_registry();
+    Ok((interp.env, types))
 }
 
 pub(crate) fn run_with_writer_in_env_with_options<W: Write>(
@@ -610,8 +649,27 @@ pub(crate) fn run_handler_with_request_in_env<W: Write>(
     db: DbHandle,
     writer: &mut W,
 ) -> Result<HandlerOutcome, RuntimeError> {
+    run_handler_with_request_in_env_and_types(
+        handler,
+        request,
+        env,
+        RuntimeTypeRegistry::default(),
+        db,
+        writer,
+    )
+}
+
+pub(crate) fn run_handler_with_request_in_env_and_types<W: Write>(
+    handler: &HirExpr,
+    request: RequestCtx,
+    env: HashMap<NameId, Value>,
+    types: RuntimeTypeRegistry,
+    db: DbHandle,
+    writer: &mut W,
+) -> Result<HandlerOutcome, RuntimeError> {
     let mut interp = Interp::new_with_env(writer, env);
     interp.db = db;
+    interp.apply_type_registry(types);
     // A3: 진입 시점의 env 키를 "server-level captured" 로 기록. handler 가
     // 이 이름을 재할당하면 경고를 적립한다 (기능은 허용).
     interp.captured_names = interp.env.keys().copied().collect();
@@ -782,6 +840,18 @@ impl<W: Write> Interp<W> {
             debug: None,
             runtime_options: options,
         }
+    }
+
+    fn type_registry(&self) -> RuntimeTypeRegistry {
+        RuntimeTypeRegistry {
+            type_structs: self.type_structs.clone(),
+            type_aliases: self.type_aliases.clone(),
+        }
+    }
+
+    fn apply_type_registry(&mut self, types: RuntimeTypeRegistry) {
+        self.type_structs = types.type_structs;
+        self.type_aliases = types.type_aliases;
     }
 
     fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
@@ -1058,6 +1128,7 @@ impl<W: Write> Interp<W> {
                     routes,
                     body_stmts,
                     self.env.clone(),
+                    self.type_registry(),
                     self.db.clone(),
                     self.runtime_options.request_trace_path.clone(),
                 )
@@ -1167,6 +1238,9 @@ impl<W: Write> Interp<W> {
                 }
                 // 요청 컨텍스트가 있다면 request-state 도메인을 해석한다.
                 if self.request.is_some() {
+                    if let Some(v) = self.eval_request_binding_domain(name, args)? {
+                        return Ok(v);
+                    }
                     if let Some(v) = self.eval_request_domain(name)? {
                         return Ok(v);
                     }
@@ -1968,7 +2042,7 @@ impl<W: Write> Interp<W> {
                 Ok(_) => Value::Array(Vec::new()),
                 Err(errors) => Value::Array(errors),
             }),
-            "is" => Ok(Value::Bool(result.is_ok())),
+            "is" | "validate" => Ok(Value::Bool(result.is_ok())),
             _ => unreachable!("field access only exposes known validator methods"),
         }
     }
@@ -2240,7 +2314,7 @@ impl<W: Write> Interp<W> {
                 })?;
                 convert_from(&type_name, arg)
             }
-            (Value::TypeName(type_name), "parse" | "safeParse" | "errors" | "is") => {
+            (Value::TypeName(type_name), "parse" | "safeParse" | "errors" | "is" | "validate") => {
                 self.call_type_validation_method(&type_name, method, args)
             }
             // ── SPEC 부록 @fs.read / @fs.write ──
@@ -2989,8 +3063,29 @@ impl<W: Write> Interp<W> {
                     }
                     self.debug_capture(f.span);
                 }
-                HirStmt::Struct(_) => {}
-                HirStmt::TypeAlias(_) => {}
+                HirStmt::Struct(s) => {
+                    self.type_structs.insert(
+                        s.name.name.clone(),
+                        s.fields
+                            .iter()
+                            .map(|field| (field.name.clone(), field.annotation.clone()))
+                            .collect(),
+                    );
+                    self.env
+                        .insert(s.name.id, Value::TypeName(s.name.name.clone()));
+                    self.debug_register_ident(&s.name);
+                    self.debug_capture(s.span);
+                }
+                HirStmt::TypeAlias(alias) => {
+                    if alias.params.is_empty() {
+                        self.type_aliases
+                            .insert(alias.name.name.clone(), alias.ty.clone());
+                    }
+                    self.env
+                        .insert(alias.name.id, Value::TypeName(alias.name.name.clone()));
+                    self.debug_register_ident(&alias.name);
+                    self.debug_capture(alias.span);
+                }
                 HirStmt::Enum(e) => {
                     let mut fields: Vec<(String, Value)> = Vec::with_capacity(e.variants.len());
                     for v in &e.variants {
@@ -3530,6 +3625,71 @@ impl<W: Write> Interp<W> {
         Value::Void
     }
 
+    /// SPEC §4.10 HTTP/Form binding: `@body: T`, `@query: T`, `@form: T`.
+    ///
+    /// The parser lowers this syntax to a request-state domain with one type
+    /// handle argument. Success replaces the request-state value with the
+    /// parsed/normalized value. Failure short-circuits the route with the
+    /// standard validation response shape.
+    fn eval_request_binding_domain(
+        &mut self,
+        name: &str,
+        args: &[HirExpr],
+    ) -> Result<Option<Value>, RuntimeError> {
+        if !matches!(name, "body" | "query" | "form") || args.is_empty() {
+            return Ok(None);
+        }
+        if args.len() != 1 {
+            return Err(RuntimeError::native(format!(
+                "`@{name}: Type` expects exactly one schema type"
+            )));
+        }
+        let schema = self.eval(&args[0])?;
+        let Value::TypeName(type_name) = schema else {
+            return Err(RuntimeError::native(format!(
+                "`@{name}: Type` expects a schema type, got {schema}"
+            )));
+        };
+        let input = {
+            let ctx = self
+                .request
+                .as_ref()
+                .ok_or_else(|| RuntimeError::native("request binding requires a request"))?;
+            match name {
+                "body" => ctx.body.clone(),
+                "query" => ctx
+                    .query_value
+                    .clone()
+                    .unwrap_or_else(|| request_map_to_object(&ctx.query)),
+                "form" => ctx.form.clone().unwrap_or_else(|| ctx.body.clone()),
+                _ => unreachable!("request binding domain checked above"),
+            }
+        };
+        match self.validate_type_name(&type_name, input, "$") {
+            Ok(value) => {
+                if let Some(ctx) = &mut self.request {
+                    match name {
+                        "body" => ctx.body = value,
+                        "query" => ctx.query_value = Some(value),
+                        "form" => ctx.form = Some(value),
+                        _ => unreachable!("request binding domain checked above"),
+                    }
+                }
+                Ok(Some(Value::Void))
+            }
+            Err(errors) => {
+                let payload = Value::Object(vec![
+                    (
+                        "error".to_string(),
+                        Value::Str("validation_failed".to_string()),
+                    ),
+                    ("fields".to_string(), Value::Array(errors)),
+                ]);
+                Ok(Some(self.respond_value(400, payload)))
+            }
+        }
+    }
+
     /// 요청 컨텍스트가 있을 때 request-state 도메인 (`@param`, `@query`,
     /// `@header`, `@body`, `@request`) 을 평가한다. 맵 성격은 `Value::Object`
     /// 로 노출되어 기존 `.field` 접근 경로로 조회된다. 지원하지 않는 이름은
@@ -3538,18 +3698,15 @@ impl<W: Write> Interp<W> {
         let Some(ctx) = &self.request else {
             return Ok(None);
         };
-        let map_to_object = |m: &HashMap<String, String>| -> Value {
-            Value::Object(
-                m.iter()
-                    .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
-                    .collect(),
-            )
-        };
         Ok(Some(match name {
-            "param" => map_to_object(&ctx.params),
-            "query" => map_to_object(&ctx.query),
-            "header" => map_to_object(&ctx.headers),
+            "param" => request_map_to_object(&ctx.params),
+            "query" => ctx
+                .query_value
+                .clone()
+                .unwrap_or_else(|| request_map_to_object(&ctx.query)),
+            "header" => request_map_to_object(&ctx.headers),
             "body" => ctx.body.clone(),
+            "form" => ctx.form.clone().unwrap_or_else(|| ctx.body.clone()),
             "session" => self.session_value(),
             "request" => Value::Object(vec![
                 ("method".into(), Value::Str(ctx.method.clone())),
@@ -3865,6 +4022,14 @@ fn string_literal_from_expr(expr: &HirExpr) -> Option<String> {
         out.push_str(s);
     }
     Some(out)
+}
+
+fn request_map_to_object(map: &HashMap<String, String>) -> Value {
+    Value::Object(
+        map.iter()
+            .map(|(key, value)| (key.clone(), Value::Str(value.clone())))
+            .collect(),
+    )
 }
 
 fn html_attr_stmt(stmt: &HirStmt) -> Option<(&str, &HirExpr)> {
@@ -5336,10 +5501,12 @@ fn field_value(t: Value, field: &str, missing_object_is_void: bool) -> Result<Va
             receiver: Box::new(t),
             method: field.to_string(),
         }),
-        (Value::TypeName(_), "parse" | "safeParse" | "errors" | "is") => Ok(Value::BoundMethod {
-            receiver: Box::new(t),
-            method: field.to_string(),
-        }),
+        (Value::TypeName(_), "parse" | "safeParse" | "errors" | "is" | "validate") => {
+            Ok(Value::BoundMethod {
+                receiver: Box::new(t),
+                method: field.to_string(),
+            })
+        }
         (Value::TypeName(ns), "read" | "write") if ns == "fs" => Ok(Value::BoundMethod {
             receiver: Box::new(t),
             method: field.to_string(),
@@ -8336,6 +8503,64 @@ let third: int = 3
         };
         let out = eval_handler_src(r#"@out @body"#, ctx).unwrap();
         assert_eq!(out, "raw body\n");
+    }
+
+    #[test]
+    fn request_body_binding_validates_and_normalizes() {
+        let ctx = RequestCtx {
+            body: Value::Object(vec![
+                ("email".into(), Value::Str(" USER@ORV.DEV ".into())),
+                ("age".into(), Value::Str("15".into())),
+            ]),
+            ..Default::default()
+        };
+        let out = eval_handler_src(
+            r#"struct SignupForm {
+  email: string(trim, lower)
+  age: int(min=13)
+}
+@body: SignupForm
+@out @body.email
+@out @body.age"#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "user@orv.dev\n15\n");
+    }
+
+    #[test]
+    fn request_body_binding_returns_validation_response() {
+        let ctx = RequestCtx {
+            body: Value::Object(vec![
+                ("email".into(), Value::Str("ok@orv.dev".into())),
+                ("age".into(), Value::Str("12".into())),
+            ]),
+            ..Default::default()
+        };
+        let (outcome, out) = eval_handler_outcome_src(
+            r#"struct SignupForm {
+  email: string(trim, lower)
+  age: int(min=13)
+}
+@body: SignupForm
+@out "unreachable""#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(out, "");
+        let response = outcome.response.expect("validation response");
+        assert_eq!(response.status, 400);
+        let Value::Object(fields) = response.payload else {
+            panic!("validation payload must be object");
+        };
+        assert!(matches!(
+            object_field(&fields, "error"),
+            Some(Value::Str(error)) if error == "validation_failed"
+        ));
+        assert!(matches!(
+            object_field(&fields, "fields"),
+            Some(Value::Array(errors)) if !errors.is_empty()
+        ));
     }
 
     #[test]
