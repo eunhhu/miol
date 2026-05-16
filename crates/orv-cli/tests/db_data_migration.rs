@@ -1,3 +1,5 @@
+#![allow(clippy::needless_raw_string_hashes, clippy::too_many_lines)]
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

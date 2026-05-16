@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

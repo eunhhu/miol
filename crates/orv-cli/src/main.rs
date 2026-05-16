@@ -22,6 +22,25 @@
 //! `orv reveal <dir> <origin-id>`는 build artifact 에서 origin id 를 원본
 //! `.orv` span 과 production descriptor 로 되짚는다.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::format_collect,
+    clippy::literal_string_with_formatting_args,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::needless_raw_string_hashes,
+    clippy::option_if_let_else,
+    clippy::redundant_clone,
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unreadable_literal,
+    clippy::unused_self
+)]
+
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
