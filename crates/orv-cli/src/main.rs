@@ -22093,6 +22093,16 @@ fn verify_deploy_smoke_test_artifact(
         {
             anyhow::bail!("deploy smoke test must declare a DB connect source origin");
         }
+        if deploy_smoke_has_commerce_record(persistence, "payment", "data/payments.jsonl")
+            && !smoke.contains(r#"ORV_SMOKE_PAYMENT_CONNECT_ORIGIN="ori_"#)
+        {
+            anyhow::bail!("deploy smoke test must declare a payment connect source origin");
+        }
+        if deploy_smoke_has_commerce_record(persistence, "shipping", "data/shipments.jsonl")
+            && !smoke.contains(r#"ORV_SMOKE_SHIPPING_CONNECT_ORIGIN="ori_"#)
+        {
+            anyhow::bail!("deploy smoke test must declare a shipping connect source origin");
+        }
         if !smoke.contains(r#"SMOKE_SKU_SECOND="orv-smoke-sku-${SMOKE_ID}-2""#)
             || !smoke.contains(r#"SMOKE_SKU_THIRD="orv-smoke-sku-${SMOKE_ID}-3""#)
         {
@@ -22150,6 +22160,30 @@ fn verify_deploy_smoke_test_artifact(
                 r#"orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'"#,
                 r#"orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'"#,
                 r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#,
+            ] {
+                if !smoke.contains(required) {
+                    anyhow::bail!("deploy smoke test must include {required}");
+                }
+            }
+        }
+        if deploy_smoke_has_commerce_record(persistence, "payment", "data/payments.jsonl") {
+            for required in [
+                r#"orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'"#,
+                r#"orv_smoke_reveal_contains "reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'"#,
+                r#"orv_smoke_reveal_contains "reveal payment record path" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'file://data/payments.jsonl'"#,
+                r#"orv_smoke_reveal_contains "reveal payment request kind" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'payment.capture'"#,
+            ] {
+                if !smoke.contains(required) {
+                    anyhow::bail!("deploy smoke test must include {required}");
+                }
+            }
+        }
+        if deploy_smoke_has_commerce_record(persistence, "shipping", "data/shipments.jsonl") {
+            for required in [
+                r#"orv_smoke_reveal_contains "reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'"#,
+                r#"orv_smoke_reveal_contains "reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'"#,
+                r#"orv_smoke_reveal_contains "reveal shipping record path" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'file://data/shipments.jsonl'"#,
+                r#"orv_smoke_reveal_contains "reveal shipping request kind" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'shipping.booking'"#,
             ] {
                 if !smoke.contains(required) {
                     anyhow::bail!("deploy smoke test must include {required}");
@@ -28312,6 +28346,31 @@ fn deploy_smoke_unique_response_origin(route: &orv_compiler::ServerRouteArtifact
     }
 }
 
+fn deploy_smoke_has_commerce_record(
+    persistence: &DeployPersistence,
+    kind: &str,
+    record_path: &str,
+) -> bool {
+    persistence
+        .commerce_adapters
+        .iter()
+        .any(|adapter| adapter.kind == kind && adapter.record_path.as_deref() == Some(record_path))
+}
+
+fn deploy_smoke_commerce_record_origin(
+    persistence: &DeployPersistence,
+    kind: &str,
+    record_path: &str,
+) -> String {
+    persistence
+        .commerce_adapters
+        .iter()
+        .find(|adapter| adapter.kind == kind && adapter.record_path.as_deref() == Some(record_path))
+        .and_then(|adapter| adapter.source_origin_ids.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn deploy_smoke_ready_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> Option<&str> {
     artifact
         .routes
@@ -29541,6 +29600,10 @@ done
             .find(|entry| entry.kind == "call" && entry.name == "@db.connect")
             .map(|entry| entry.id.clone())
             .unwrap_or_default();
+        let payment_connect_origin =
+            deploy_smoke_commerce_record_origin(persistence, "payment", "data/payments.jsonl");
+        let shipping_connect_origin =
+            deploy_smoke_commerce_record_origin(persistence, "shipping", "data/shipments.jsonl");
         let shop_smoke = r#"
 SMOKE_ID="${ORV_SMOKE_ID:-$(date +%s)}"
 SMOKE_SKU="orv-smoke-sku-${SMOKE_ID}"
@@ -29553,6 +29616,8 @@ SMOKE_HANDLE="orv-smoke-${SMOKE_ID}"
 SMOKE_EMAIL="${SMOKE_HANDLE}@example.invalid"
 SMOKE_PASSWORD="orv-smoke-password-${SMOKE_ID}"
 ORV_SMOKE_DB_CONNECT_ORIGIN="__DB_CONNECT_ORIGIN__"
+ORV_SMOKE_PAYMENT_CONNECT_ORIGIN="__PAYMENT_CONNECT_ORIGIN__"
+ORV_SMOKE_SHIPPING_CONNECT_ORIGIN="__SHIPPING_CONNECT_ORIGIN__"
 SMOKE_HEADERS="$(mktemp)"
 SMOKE_MEMBER_HEADERS="$(mktemp)"
 SMOKE_ADMIN_HEADERS="$(mktemp)"
@@ -29580,6 +29645,18 @@ if [ -n "$ORV_SMOKE_DB_CONNECT_ORIGIN" ]; then
   orv_smoke_reveal_contains "reveal DB source" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '@db.connect'
   orv_smoke_reveal_contains "reveal DB preflight" "$ORV_SMOKE_DB_CONNECT_ORIGIN" '"preflight"'
   orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'
+fi
+if [ -n "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" ]; then
+  orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'
+  orv_smoke_reveal_contains "reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'
+  orv_smoke_reveal_contains "reveal payment record path" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'file://data/payments.jsonl'
+  orv_smoke_reveal_contains "reveal payment request kind" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'payment.capture'
+fi
+if [ -n "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" ]; then
+  orv_smoke_reveal_contains "reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'
+  orv_smoke_reveal_contains "reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'
+  orv_smoke_reveal_contains "reveal shipping record path" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'file://data/shipments.jsonl'
+  orv_smoke_reveal_contains "reveal shipping request kind" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'shipping.booking'
 fi
 CSRF_COOKIE="$(orv_smoke_cookie_from_headers orv_csrf "$SMOKE_HEADERS")"
 if [ -z "$CSRF_COOKIE" ]; then
@@ -29646,6 +29723,8 @@ orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipme
 "#
         .replace("__ROOT_ORIGIN__", &root_origin)
         .replace("__DB_CONNECT_ORIGIN__", &db_connect_origin)
+        .replace("__PAYMENT_CONNECT_ORIGIN__", &payment_connect_origin)
+        .replace("__SHIPPING_CONNECT_ORIGIN__", &shipping_connect_origin)
         .replace("__PRODUCTS_ORIGIN__", &products_origin)
         .replace("__MEMBERS_ORIGIN__", &members_origin)
         .replace("__LOGIN_ORIGIN__", &login_origin)
@@ -31609,6 +31688,32 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal DB sqlite path" "$ORV_SMOKE_DB_CONNECT_ORIGIN" 'sqlite://data/shop.sqlite'"#
+        ));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_PAYMENT_CONNECT_ORIGIN="ori_"#));
+        assert!(smoke_test.contains(r#"ORV_SMOKE_SHIPPING_CONNECT_ORIGIN="ori_"#));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal payment source" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '@payment.connect'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal payment match" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" '"matched": true'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal payment record path" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'file://data/payments.jsonl'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal payment request kind" "$ORV_SMOKE_PAYMENT_CONNECT_ORIGIN" 'payment.capture'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal shipping source" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '@shipping.connect'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal shipping match" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" '"matched": true'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal shipping record path" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'file://data/shipments.jsonl'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal shipping request kind" "$ORV_SMOKE_SHIPPING_CONNECT_ORIGIN" 'shipping.booking'"#
         ));
         assert!(smoke_test.contains(
             "CSRF_COOKIE=\"$(orv_smoke_cookie_from_headers orv_csrf \"$SMOKE_HEADERS\")\""
