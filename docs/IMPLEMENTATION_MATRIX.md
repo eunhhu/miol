@@ -84,7 +84,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 | Native server plan/source | artifact only | unstable | M4+ | `orv-compiler`, `orv-cli` | build artifact tests | `orv build` | Contract first; full native optimizer planned |
 | Deploy artifacts | implemented | experimental | M2 | `orv-cli`, `orv-compiler` | deploy artifact tests | `orv build --prod`, `orv deploy-env-check` | Manifest/container/Compose/runbook/env/preflight/smoke-test contracts |
 | `orv reveal` / editor reveal payload | implemented | experimental | M3 | `orv-cli`, `orv-compiler` | reveal CLI tests | `orv reveal`, `orv editor reveal` | Build origin to source/production payload |
-| Runtime trace JSON / trace stream | implemented | experimental | M3 | `orv-runtime`, `orv-cli` | editor trace tests | `orv editor trace`, `orv editor trace-stream` | Shared trace schema for reveal |
+| Runtime trace JSON / trace stream | implemented | experimental | M3 | `orv-runtime`, `orv-cli` | editor trace tests, optional generated smoke trace-stream check | `orv editor trace`, `orv editor trace-stream` | Shared trace schema for reveal; trace-enabled deploy smoke can capture `/__orv/trace/events` and normalize it through editor trace-stream |
 | LSP bootstrap | implemented | experimental | M3 | `orv-cli` | LSP CLI tests | `orv lsp serve` | Symbols/diagnostics/navigation/format/completion subsets |
 | DAP bootstrap | implemented | experimental | M3 | `orv-cli`, `orv-runtime` | DAP CLI tests | `orv dap serve` | Runtime frame/locals/debug control subsets; `orv:frame:N` instruction breakpoints verify against pseudo-instruction frames |
 | Static editor export | implemented | experimental | M3 | `orv-cli` | editor export tests | `orv editor export` | Graph/panel/trace HTML artifacts |

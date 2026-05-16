@@ -21947,6 +21947,12 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must verify source reveal with the ORV CLI");
     }
+    if !smoke.contains("orv_smoke_trace_stream()")
+        || !smoke.contains("ORV_SMOKE_TRACE_STREAM")
+        || !smoke.contains("editor trace-stream")
+    {
+        anyhow::bail!("deploy smoke test must optionally verify live trace stream");
+    }
     if !smoke.contains("ORV_SMOKE_BUILD_DIR=") || !smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#) {
         anyhow::bail!("deploy smoke test must run from its build directory");
     }
@@ -22354,6 +22360,12 @@ fn verify_deploy_preflight_artifact(
         "orv editor trace . --trace deploy/request-trace.json",
         "deploy preflight editor_trace command",
     )?;
+    verify_json_pointer_str(
+        &preflight,
+        "/commands/trace_stream_smoke",
+        "ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh",
+        "deploy preflight trace_stream_smoke command",
+    )?;
     for (key, expected) in [
         ("server", artifacts.server_artifact),
         ("routes", artifacts.routes),
@@ -22665,6 +22677,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("orv editor trace . --trace deploy/request-trace.json") {
         anyhow::bail!("deploy runbook must document editor trace navigation command");
+    }
+    if !runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh") {
+        anyhow::bail!("deploy runbook must document trace stream smoke command");
     }
     if !runbook.contains("orv deploy-env-check .") {
         anyhow::bail!("deploy runbook must document deploy env preflight command");
@@ -29216,6 +29231,7 @@ fn deploy_preflight_artifact_value(
             "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
             "trace": "./deploy/server.sh --trace deploy/request-trace.json",
             "editor_trace": "orv editor trace . --trace deploy/request-trace.json",
+            "trace_stream_smoke": format!("ORV_SMOKE_TRACE_STREAM=1 ./{}", artifacts.smoke_test),
         },
         "artifacts": {
             "server": artifacts.server_artifact,
@@ -29289,6 +29305,42 @@ orv_smoke_reveal_contains() {{
     printf 'orv deploy smoke test failed: %s reveal missing %s\n' "$label" "$pattern" >&2
     exit 1
   fi
+  rm -f "$output_path"
+}}
+
+orv_smoke_trace_stream() {{
+  if [ "${{ORV_SMOKE_TRACE_STREAM:-0}}" != "1" ]; then
+    return 0
+  fi
+  events_path="${{ORV_SMOKE_TRACE_EVENTS:-deploy/trace-events.sse}}"
+  output_path="$(mktemp)"
+  rm -f "$events_path"
+  if ! curl -fsS --max-time "${{ORV_SMOKE_TRACE_TIMEOUT:-2}}" "$BASE_URL/__orv/trace/events" > "$events_path" 2>/dev/null; then
+    if ! grep -F 'event: orv:trace' "$events_path" >/dev/null 2>&1; then
+      rm -f "$output_path"
+      printf 'orv deploy smoke test failed: live trace stream unavailable\n' >&2
+      exit 1
+    fi
+  fi
+  for pattern in 'event: orv:trace' 'orv.production.trace' 'event: orv:trace.frame'; do
+    if ! grep -F "$pattern" "$events_path" >/dev/null; then
+      rm -f "$output_path"
+      printf 'orv deploy smoke test failed: live trace stream missing %s\n' "$pattern" >&2
+      exit 1
+    fi
+  done
+  if ! "$ORV_BIN" editor trace-stream . --events "$events_path" > "$output_path"; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: editor trace-stream command\n' >&2
+    exit 1
+  fi
+  for pattern in '"kind": "orv.editor.trace.stream"' '"strategy": "event-source-snapshot"' '"response_navigation"'; do
+    if ! grep -F "$pattern" "$output_path" >/dev/null; then
+      rm -f "$output_path"
+      printf 'orv deploy smoke test failed: editor trace-stream missing %s\n' "$pattern" >&2
+      exit 1
+    fi
+  done
   rm -f "$output_path"
 }}
 
@@ -29751,6 +29803,7 @@ orv_smoke_body_contains "admin audit shipment" "$SMOKE_ADMIN_AUDIT_BODY" 'shipme
             );
         }
     }
+    script.push_str("orv_smoke_trace_stream\n");
     script.push_str("printf 'orv deploy smoke test passed\\n'\n");
     let target = out.join(path);
     write_text(&target, &script)?;
@@ -29884,6 +29937,7 @@ docker build -f server/native/Dockerfile -t orv-native-server:latest .
 ./deploy/server.sh --trace deploy/request-trace.json
 curl -N {trace_events_url}
 orv editor trace . --trace deploy/request-trace.json
+ORV_SMOKE_TRACE_STREAM=1 ./{smoke_test_path}
 ```
 
 ## Deploy Preflight
@@ -31603,6 +31657,10 @@ test "checkout excluded failure" {
             serde_json::json!("./deploy/smoke-test.sh")
         );
         assert_eq!(
+            preflight["commands"]["trace_stream_smoke"],
+            serde_json::json!("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh")
+        );
+        assert_eq!(
             preflight["artifacts"]["commerce_adapters"],
             serde_json::json!("deploy/commerce-adapters.json")
         );
@@ -31634,6 +31692,10 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires orv"));
         assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
+        assert!(smoke_test.contains("orv_smoke_trace_stream()"));
+        assert!(smoke_test.contains("ORV_SMOKE_TRACE_STREAM"));
+        assert!(smoke_test.contains("editor trace-stream"));
+        assert!(smoke_test.contains("orv deploy smoke test failed: live trace stream"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
@@ -31829,6 +31891,7 @@ test "checkout excluded failure" {
         assert!(runbook.contains("deploy/smoke-test.sh"));
         assert!(runbook.contains("deploy/preflight.json"));
         assert!(runbook.contains("./deploy/smoke-test.sh"));
+        assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
         assert!(runbook.contains("orv verify-build ."));
         assert!(runbook
             .contains("- DB adapter env: SHOP_DATABASE_URL default sqlite://data/shop.sqlite"));
@@ -43475,6 +43538,7 @@ entry = "src/main.orv"
         assert!(runbook.contains("orv deploy-env-check ."));
         assert!(runbook.contains("/__orv/trace/events"));
         assert!(runbook.contains("orv editor trace . --trace deploy/request-trace.json"));
+        assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
         assert!(runbook.contains("- GET /ping"));
         let routes = read_json_value(&deploy_routes_path).expect("deploy routes");
         assert_eq!(routes["schema_version"], 1);
@@ -43484,6 +43548,9 @@ entry = "src/main.orv"
         assert!(smoke_test.contains(r#"BASE_URL="${ORV_BASE_URL:-http://127.0.0.1:8080}""#));
         assert!(smoke_test.contains("command -v curl"));
         assert!(smoke_test.contains("orv deploy smoke test requires curl"));
+        assert!(smoke_test.contains("orv_smoke_trace_stream()"));
+        assert!(smoke_test.contains("ORV_SMOKE_TRACE_STREAM"));
+        assert!(smoke_test.contains("editor trace-stream"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
@@ -43516,6 +43583,10 @@ entry = "src/main.orv"
         assert_eq!(
             preflight["commands"]["smoke_test"],
             "./deploy/smoke-test.sh"
+        );
+        assert_eq!(
+            preflight["commands"]["trace_stream_smoke"],
+            "ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"
         );
         assert_eq!(
             preflight["commands"]["compose_up"],
