@@ -48815,6 +48815,59 @@ let sig quantity: int = 1
     }
 
     #[test]
+    fn lsp_reveal_exposes_db_adapter_origin_match() {
+        let dir = temp_output_dir("lsp-reveal-db-adapter");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let db_connect = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "@db.connect")
+            .expect("db connect origin");
+
+        let reveal = lsp_reveal_json(&out, &db_connect.id).expect("lsp reveal");
+        let db_adapters = reveal["production"]["db_adapters"]
+            .as_array()
+            .expect("db adapters");
+        let target = db_adapters
+            .iter()
+            .find(|target| target["path"] == "deploy/db-adapters.json")
+            .expect("db adapter target");
+        let matched = target["matched_adapters"]
+            .as_array()
+            .expect("matched db adapters");
+
+        assert_eq!(reveal["origin"]["id"], db_connect.id);
+        assert_eq!(target["matched"], true);
+        assert_eq!(target["selected_origin_id"], db_connect.id);
+        assert_eq!(target["matched_adapter_count"], 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["source_origin_id"], db_connect.id);
+        assert_eq!(matched[0]["matched_origin_id"], db_connect.id);
+        assert_eq!(matched[0]["match"], "direct");
+        assert_eq!(matched[0]["provider"], "postgres");
+        assert_eq!(matched[0]["bridge"]["contract"], "http-json-v1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn editor_reveal_focuses_route_origin_for_native_navigation() {
         let dir = temp_output_dir("editor-reveal");
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -48857,6 +48910,64 @@ let sig quantity: int = 1
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_reveal_exposes_commerce_adapter_origin_match() {
+        let dir = temp_output_dir("editor-reveal-commerce-adapter");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    @respond 200 { payment: captured.status }
+  }
+}
+"#,
+        )
+        .expect("write source");
+        let out = dir.join("dist");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let payment_connect = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "@payment.connect")
+            .expect("payment connect origin");
+
+        let reveal = editor_reveal_json(&out, &payment_connect.id).expect("editor reveal");
+        let commerce = reveal["production"]["commerce_adapters"]
+            .as_array()
+            .expect("commerce adapters");
+        let target = commerce
+            .iter()
+            .find(|target| target["path"] == "deploy/commerce-adapters.json")
+            .expect("commerce adapter target");
+        let matched = target["matched_adapters"]
+            .as_array()
+            .expect("matched commerce adapters");
+
+        assert_eq!(reveal["origin"]["id"], payment_connect.id);
+        assert_eq!(reveal["focus"]["origin_id"], payment_connect.id);
+        assert_eq!(reveal["focus"]["panel"], "source");
+        assert_eq!(target["matched"], true);
+        assert_eq!(target["selected_origin_id"], payment_connect.id);
+        assert_eq!(target["matched_adapter_count"], 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["source_origin_id"], payment_connect.id);
+        assert_eq!(matched[0]["matched_origin_id"], payment_connect.id);
+        assert_eq!(matched[0]["match"], "direct");
+        assert_eq!(matched[0]["kind"], "payment");
+        assert_eq!(matched[0]["endpoint"], "http://payments.internal/capture");
         let _ = std::fs::remove_dir_all(dir);
     }
 
