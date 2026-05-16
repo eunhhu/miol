@@ -21523,8 +21523,14 @@ fn verify_deploy_server_target(
         &persistence,
     )?;
     verify_deploy_env_example_artifact(dir, env_example, artifact.listen.as_ref(), &persistence)?;
-    verify_deploy_db_adapters_artifact(dir, db_adapters, artifact_path, &persistence)?;
-    verify_deploy_commerce_adapters_artifact(dir, commerce_adapters, artifact_path, &persistence)?;
+    verify_deploy_db_adapters_artifact(dir, db_adapters, artifact_path, &persistence, origin_map)?;
+    verify_deploy_commerce_adapters_artifact(
+        dir,
+        commerce_adapters,
+        artifact_path,
+        &persistence,
+        origin_map,
+    )?;
     verify_deploy_smoke_test_artifact(
         dir,
         smoke_test,
@@ -21748,6 +21754,7 @@ fn verify_deploy_commerce_adapters_artifact(
     path: &str,
     artifact_path: &str,
     persistence: &DeployPersistence,
+    origin_map: &orv_compiler::OriginMap,
 ) -> anyhow::Result<()> {
     let adapters_path = dir.join(path);
     if !adapters_path.is_file() {
@@ -21777,6 +21784,7 @@ fn verify_deploy_commerce_adapters_artifact(
     {
         anyhow::bail!("deploy commerce adapters do not match runtime artifact persistence");
     }
+    verify_deploy_commerce_adapter_source_origins(origin_map, &persistence.commerce_adapters)?;
     Ok(())
 }
 
@@ -21785,6 +21793,7 @@ fn verify_deploy_db_adapters_artifact(
     path: &str,
     artifact_path: &str,
     persistence: &DeployPersistence,
+    origin_map: &orv_compiler::OriginMap,
 ) -> anyhow::Result<()> {
     let adapters_path = dir.join(path);
     if !adapters_path.is_file() {
@@ -21813,6 +21822,86 @@ fn verify_deploy_db_adapters_artifact(
         )))
     {
         anyhow::bail!("deploy DB adapters do not match runtime artifact persistence");
+    }
+    verify_deploy_db_adapter_source_origins(origin_map, &persistence.db_adapters)?;
+    Ok(())
+}
+
+fn verify_deploy_db_adapter_source_origins(
+    origin_map: &orv_compiler::OriginMap,
+    adapters: &[DeployDbAdapter],
+) -> anyhow::Result<()> {
+    let entries_by_id = origin_entries_by_id(origin_map);
+    for adapter in adapters {
+        if adapter.source_origin_ids.is_empty() {
+            let provider = &adapter.provider;
+            anyhow::bail!("deploy DB adapter {provider} is missing source_origin_ids");
+        }
+        for origin_id in &adapter.source_origin_ids {
+            verify_deploy_adapter_source_origin(
+                &entries_by_id,
+                origin_id,
+                "deploy DB adapter",
+                "@db.connect",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_deploy_commerce_adapter_source_origins(
+    origin_map: &orv_compiler::OriginMap,
+    adapters: &[DeployCommerceAdapter],
+) -> anyhow::Result<()> {
+    let entries_by_id = origin_entries_by_id(origin_map);
+    for adapter in adapters {
+        if adapter.source_origin_ids.is_empty() {
+            let kind = &adapter.kind;
+            anyhow::bail!("deploy commerce adapter {kind} is missing source_origin_ids");
+        }
+        let expected_call = match adapter.kind.as_str() {
+            "payment" => "@payment.connect",
+            "shipping" => "@shipping.connect",
+            kind => {
+                anyhow::bail!("deploy commerce adapter {kind} has unknown source kind");
+            }
+        };
+        let context = format!("deploy commerce adapter {}", adapter.kind);
+        for origin_id in &adapter.source_origin_ids {
+            verify_deploy_adapter_source_origin(
+                &entries_by_id,
+                origin_id,
+                &context,
+                expected_call,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn origin_entries_by_id(
+    origin_map: &orv_compiler::OriginMap,
+) -> HashMap<&str, &orv_compiler::OriginEntry> {
+    origin_map
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect()
+}
+
+fn verify_deploy_adapter_source_origin(
+    entries_by_id: &HashMap<&str, &orv_compiler::OriginEntry>,
+    origin_id: &str,
+    context: &str,
+    expected_call: &str,
+) -> anyhow::Result<()> {
+    let Some(entry) = entries_by_id.get(origin_id).copied() else {
+        anyhow::bail!("{context} source_origin_id `{origin_id}` not found in origin-map.json");
+    };
+    if entry.kind != "call" || entry.name != expected_call {
+        anyhow::bail!(
+            "{context} source_origin_id `{origin_id}` must reference origin-map call {expected_call}"
+        );
     }
     Ok(())
 }
@@ -30177,6 +30266,30 @@ mod tests {
                 .remove("source_origin_ids");
         }
         value
+    }
+
+    fn corrupt_origin_entry_kind_and_graph(
+        build_dir: &Path,
+        origin_id: &str,
+        kind: &str,
+        name: &str,
+    ) {
+        let origin_map_path = build_dir.join("origin-map.json");
+        let mut origin_map = read_json_value(&origin_map_path).expect("origin map");
+        let entry = origin_map["entries"]
+            .as_array_mut()
+            .expect("origin entries")
+            .iter_mut()
+            .find(|entry| entry["id"] == origin_id)
+            .expect("origin entry");
+        entry["kind"] = serde_json::json!(kind);
+        entry["name"] = serde_json::json!(name);
+        write_json(&origin_map_path, &origin_map).expect("write corrupt origin map");
+
+        let graph_path = build_dir.join("project-graph.json");
+        let mut graph = read_json_value(&graph_path).expect("project graph");
+        graph["semantic"]["origin_map"] = origin_map;
+        write_json(&graph_path, &graph).expect("write corrupt graph origin map");
     }
 
     fn workspace_build_fixture(name: &str) -> PathBuf {
@@ -44122,6 +44235,47 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_deploy_commerce_adapter_origin_drift_from_origin_map() {
+        let dir = temp_output_dir("deploy-commerce-adapter-origin-source");
+        std::fs::create_dir_all(&dir).expect("create commerce adapter origin source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let payments = @payment.connect(@env.PAYMENT_ADAPTER_URL ?? "http://payments.internal/capture")
+  @route POST /checkout {
+    let captured = payments.capture({ orderId: "o_1", amount: 42, method: "card" })
+    @respond 200 { payment: captured.status }
+  }
+}
+"#,
+        )
+        .expect("write commerce adapter origin source");
+        let out = temp_output_dir("deploy-commerce-adapter-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let adapters_path = out.join("deploy").join("commerce-adapters.json");
+        let adapters = read_json_value(&adapters_path).expect("commerce adapters");
+        let origin_id = adapters["adapters"][0]["source_origin_id"]
+            .as_str()
+            .expect("commerce source origin")
+            .to_string();
+        corrupt_origin_entry_kind_and_graph(&out, &origin_id, "domain", "payment");
+
+        let err = cmd_verify_build(&out).expect_err("commerce adapter origin mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy commerce adapter payment source_origin_id"));
+        assert!(err
+            .to_string()
+            .contains("must reference origin-map call @payment.connect"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
     fn verify_build_rejects_deploy_db_adapter_mismatch() {
         let dir = temp_output_dir("deploy-db-adapters-source");
         std::fs::create_dir_all(&dir).expect("create db adapter source dir");
@@ -44149,6 +44303,44 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy DB adapters do not match runtime artifact persistence"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_db_adapter_origin_drift_from_origin_map() {
+        let dir = temp_output_dir("deploy-db-adapter-origin-source");
+        std::fs::create_dir_all(&dir).expect("create db adapter origin source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db adapter origin source");
+        let out = temp_output_dir("deploy-db-adapter-origin-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let adapters_path = out.join("deploy").join("db-adapters.json");
+        let adapters = read_json_value(&adapters_path).expect("db adapters");
+        let origin_id = adapters["adapters"][0]["source_origin_id"]
+            .as_str()
+            .expect("db source origin")
+            .to_string();
+        corrupt_origin_entry_kind_and_graph(&out, &origin_id, "domain", "db");
+
+        let err = cmd_verify_build(&out).expect_err("db adapter origin mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy DB adapter source_origin_id"));
+        assert!(err
+            .to_string()
+            .contains("must reference origin-map call @db.connect"));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }

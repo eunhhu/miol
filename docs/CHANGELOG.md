@@ -9,6 +9,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 - Linked `@html` projection origins back to static page/client bundle artifacts and route-local HTML origins back to their containing route/native-server production targets in reveal/editor payloads.
 - Linked generated DB adapter contracts back to the source `@db.connect` origin through `source_origin_id`, and made reveal production payloads expose `matched_adapters` for the selected origin.
 - Linked generated commerce adapter contracts back to source `@payment.connect` and `@shipping.connect` origins through `source_origin_id`, with matching reveal `matched_adapters` payloads.
+- Strengthened `orv verify-build` so DB and commerce adapter `source_origin_id(s)` must resolve to the expected connect call entries in `origin-map.json`.
 - Added a reference HTTP bridge for PostgreSQL/MySQL `@db.connect` handles: configured `ORV_DB_ADAPTER_POSTGRES_ENDPOINT`, `ORV_DB_ADAPTER_MYSQL_ENDPOINT`, or `ORV_DB_ADAPTER_ENDPOINT` values turn external DB handles from explicit unsupported status into checked `http-json-v1` POST adapter calls, with optional bearer tokens from provider-specific or generic DB adapter auth envs.
 - Made `@design` token lookup work inside HTML render attributes and added editable color/spacing/typography tokens to the shop starter home shell.
 - Added an end-to-end editable product field path to the shop starter: `ProductInput.badge` now flows through the product form, `POST /products`, customer catalog, admin catalog, and generated smoke-test body checks.
