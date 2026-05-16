@@ -2398,6 +2398,8 @@ Browser home: http://localhost:8080/ provides product, member signup/login, orde
 \n\
 Admin dashboard: http://localhost:8080/admin shows catalog/order/payment/shipment/webhook/audit read-model links, operations summary, and persistent storage paths.\n\
 \n\
+Successful `POST /members/login` responses set an `orv_session` cookie with `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, and one-day `Max-Age` defaults.\n\
+\n\
 Persistent database: `data/shop.sqlite`. The runtime opens this SQLite adapter on startup and stores product, member, order, payment, shipment, webhook, and audit rows in the SQLite file.\n\
 \n\
 Database adapter override: set `SHOP_DATABASE_URL` before Compose launch to point the generated shop at a different supported DB adapter URL without editing source.\n\
@@ -28484,6 +28486,10 @@ test "checkout excluded failure" {
         assert!(guide.contains("Browser home"));
         assert!(guide.contains("http://localhost:8080/"));
         assert!(guide.contains("Admin dashboard: http://localhost:8080/admin"));
+        assert!(guide.contains("orv_session"));
+        assert!(guide.contains("HttpOnly"));
+        assert!(guide.contains("SameSite=Lax"));
+        assert!(guide.contains("Secure"));
         assert!(guide.contains("GET /"));
         assert!(guide.contains("GET /catalog"));
         assert!(guide.contains("GET /cart"));

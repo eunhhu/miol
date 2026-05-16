@@ -1019,7 +1019,10 @@ async fn handle_request(
     }
 
     let response = match outcome.response {
-        Some(resp) => response_from_respond(resp, Some(&entry.origin_id)),
+        Some(resp) => {
+            let extra_headers = response_extra_headers(&entry.method, &entry.path, &resp);
+            response_from_respond(resp, Some(&entry.origin_id), &extra_headers)
+        }
         None => default_response(&outcome.value, Some(&entry.origin_id)),
     };
     record_request_frame(
@@ -1201,7 +1204,11 @@ fn request_body_display(value: &Value) -> String {
     serde_json::to_string(&value_to_json(value)).unwrap_or_default()
 }
 
-fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> ServerResponse {
+fn response_from_respond(
+    resp: ResponseCtx,
+    origin_id: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> ServerResponse {
     let status = u16::try_from(resp.status)
         .ok()
         .and_then(|s| StatusCode::from_u16(s).ok())
@@ -1210,8 +1217,8 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> ServerRe
     // SPEC §11.9: `@redirect` 가 기록한 Location 이 있으면 body 없이
     // `Location:` 헤더 + 상태로 응답한다. payload/raw_body 는 무시.
     if let Some(loc) = resp.location {
-        return response_builder(status, origin_id)
-            .header("location", loc)
+        let builder = response_builder(status, origin_id).header("location", loc);
+        return apply_extra_response_headers(builder, extra_headers)
             .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
@@ -1220,8 +1227,8 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> ServerRe
     // body 금지 상태(204/304/1xx)에서도 파일은 있을 수 없는 조합이라 일반
     // 경로보다 먼저 잡는다.
     if let Some(raw) = resp.raw_body {
-        return response_builder(status, origin_id)
-            .header("content-type", raw.content_type)
+        let builder = response_builder(status, origin_id).header("content-type", raw.content_type);
+        return apply_extra_response_headers(builder, extra_headers)
             .body(RuntimeBody::full(Bytes::from(raw.bytes)))
             .expect("valid response");
     }
@@ -1230,16 +1237,67 @@ fn response_from_respond(resp: ResponseCtx, origin_id: Option<&str>) -> ServerRe
     // 빈 body 로 보낸다. SPEC 도 `@respond 204 {}` 에서 body 인코더 제거를
     // 기대하므로, payload 값과 무관하게 no-body 경로를 우선한다.
     if status_disallows_body(status) || matches!(resp.payload, Value::Void) {
-        return response_builder(status, origin_id)
+        return apply_extra_response_headers(response_builder(status, origin_id), extra_headers)
             .body(RuntimeBody::full(Bytes::new()))
             .expect("valid response");
     }
     let json = value_to_json(&resp.payload);
     let body = serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec());
-    response_builder(status, origin_id)
-        .header("content-type", "application/json")
+    let builder = response_builder(status, origin_id).header("content-type", "application/json");
+    apply_extra_response_headers(builder, extra_headers)
         .body(RuntimeBody::full(Bytes::from(body)))
         .expect("valid response")
+}
+
+fn response_extra_headers(method: &str, path: &str, resp: &ResponseCtx) -> Vec<(String, String)> {
+    login_session_cookie(method, path, resp)
+        .into_iter()
+        .map(|cookie| ("set-cookie".to_string(), cookie))
+        .collect()
+}
+
+fn login_session_cookie(method: &str, path: &str, resp: &ResponseCtx) -> Option<String> {
+    if method != "POST" || path != "/members/login" || !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let session = object_field_value(&resp.payload, "session")?;
+    let session_id = object_field_value(session, "id")?;
+    let cookie_value = cookie_scalar_value(session_id)?;
+    Some(format!(
+        "orv_session={cookie_value}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure"
+    ))
+}
+
+fn cookie_scalar_value(value: &Value) -> Option<String> {
+    let value = match value {
+        Value::Int(id) => id.to_string(),
+        Value::Str(id) if !id.is_empty() => id.clone(),
+        _ => return None,
+    };
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~'))
+        .then_some(value)
+}
+
+fn object_field_value<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    fields
+        .iter()
+        .rev()
+        .find_map(|(field, value)| (field == name).then_some(value))
+}
+
+fn apply_extra_response_headers(
+    mut builder: hyper::http::response::Builder,
+    headers: &[(String, String)],
+) -> hyper::http::response::Builder {
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
 }
 
 fn status_disallows_body(status: StatusCode) -> bool {
@@ -1932,7 +1990,13 @@ mod tests {
         method: &str,
         path: &str,
         body: Option<String>,
-    ) -> (u16, Option<String>, Option<String>, Vec<u8>) {
+    ) -> (
+        u16,
+        Option<String>,
+        Option<String>,
+        HashMap<String, String>,
+        Vec<u8>,
+    ) {
         let stream = TcpStream::connect(addr).await.expect("connect");
         let io = TokioIo::new(stream);
         let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
@@ -1967,8 +2031,18 @@ mod tests {
             .get(TEST_ORIGIN_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(std::string::ToString::to_string);
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
         let bytes = resp.collect().await.expect("body").to_bytes().to_vec();
-        (status, ct, origin, bytes)
+        (status, ct, origin, headers, bytes)
     }
 
     async fn open_trace_event_stream(
@@ -2078,7 +2152,8 @@ mod tests {
         path: &str,
         body: Option<String>,
     ) -> (u16, Option<String>, Vec<u8>) {
-        let (status, ct, _origin, bytes) = send_request_full(addr, method, path, body).await;
+        let (status, ct, _origin, _headers, bytes) =
+            send_request_full(addr, method, path, body).await;
         (status, ct, bytes)
     }
 
@@ -2394,7 +2469,8 @@ mod tests {
             .await
             .expect("spawn");
 
-            let (status, ct, origin, body) = send_request_full(addr, "GET", "/ping", None).await;
+            let (status, ct, origin, _headers, body) =
+                send_request_full(addr, "GET", "/ping", None).await;
             assert_eq!(status, 200);
             assert_eq!(ct.as_deref(), Some("application/json"));
             assert_eq!(origin.as_deref(), Some(expected_origin.as_str()));
@@ -2517,6 +2593,68 @@ mod tests {
             handle.abort();
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn member_login_sets_reference_session_cookie_defaults() {
+        run_on_localset(async {
+            let ServerTestCase {
+                listen,
+                routes,
+                body_stmts,
+                captured_env,
+            } = extract_server_case(
+                r#"@server {
+                    @listen 0
+                    @route POST /members/login {
+                        @respond 201 {
+                          session: { id: 42, handle: "ada", status: "active" }
+                        }
+                    }
+                }"#,
+            );
+            let (addr, handle, _boot) = spawn_for_test(
+                listen.as_deref(),
+                &routes,
+                &body_stmts,
+                captured_env,
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect("spawn");
+
+            let (status, _, _, headers, _) =
+                send_request_full(addr, "POST", "/members/login", Some("{}".into())).await;
+            assert_eq!(status, 201);
+            let cookie = headers.get("set-cookie").expect("set-cookie header");
+            assert!(cookie.contains("orv_session=42"));
+            assert!(cookie.contains("Path=/"));
+            assert!(cookie.contains("Max-Age=86400"));
+            assert!(cookie.contains("HttpOnly"));
+            assert!(cookie.contains("SameSite=Lax"));
+            assert!(cookie.contains("Secure"));
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[test]
+    fn member_login_cookie_rejects_unsafe_session_id() {
+        let resp = ResponseCtx {
+            status: 201,
+            payload: Value::Object(vec![(
+                "session".to_string(),
+                Value::Object(vec![(
+                    "id".to_string(),
+                    Value::Str("bad value; Path=/".to_string()),
+                )]),
+            )]),
+            raw_body: None,
+            location: None,
+        };
+
+        assert_eq!(login_session_cookie("POST", "/members/login", &resp), None);
     }
 
     #[tokio::test]
@@ -3188,9 +3326,16 @@ mod tests {
                 "email": "ada@example.test"
             })
             .to_string();
-            let (login_status, _, login_body) =
-                send_request(addr, "POST", "/members/login", Some(login_payload)).await;
+            let (login_status, _, _, login_headers, login_body) =
+                send_request_full(addr, "POST", "/members/login", Some(login_payload)).await;
             assert_eq!(login_status, 201);
+            let login_cookie = login_headers.get("set-cookie").expect("login set-cookie");
+            assert!(login_cookie.contains("orv_session=1"));
+            assert!(login_cookie.contains("Path=/"));
+            assert!(login_cookie.contains("Max-Age=86400"));
+            assert!(login_cookie.contains("HttpOnly"));
+            assert!(login_cookie.contains("SameSite=Lax"));
+            assert!(login_cookie.contains("Secure"));
             let login: serde_json::Value = serde_json::from_slice(&login_body).expect("login json");
             assert_eq!(login["session"]["handle"], serde_json::json!("ada"));
             assert_eq!(login["session"]["status"], serde_json::json!("active"));
