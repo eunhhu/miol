@@ -597,22 +597,6 @@ pub(crate) fn run_with_writer_in_env<W: Write>(
     run_with_writer_in_env_with_options(program, env, writer, RuntimeOptions::default())
 }
 
-pub(crate) fn run_with_writer_in_env_with_db<W: Write>(
-    program: &HirProgram,
-    env: HashMap<NameId, Value>,
-    db: DbHandle,
-    writer: &mut W,
-) -> Result<HashMap<NameId, Value>, RuntimeError> {
-    run_with_writer_in_env_and_types_with_db(
-        program,
-        env,
-        RuntimeTypeRegistry::default(),
-        db,
-        writer,
-    )
-    .map(|(env, _)| env)
-}
-
 pub(crate) fn run_with_writer_in_env_and_types_with_db<W: Write>(
     program: &HirProgram,
     env: HashMap<NameId, Value>,
