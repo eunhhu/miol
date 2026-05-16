@@ -79,6 +79,12 @@ struct FunctionFlags {
     is_pub: bool,
 }
 
+#[derive(Clone, Copy)]
+enum AssignmentOp {
+    Simple,
+    Compound(BinaryOp),
+}
+
 impl Parser {
     const fn new(tokens: Vec<Token>, file: FileId, newlines: Vec<u32>) -> Self {
         Self {
@@ -452,22 +458,17 @@ impl Parser {
         }
     }
 
-    fn peek_assignment_op(&self) -> Option<Option<BinaryOp>> {
+    fn peek_assignment_op(&self) -> Option<AssignmentOp> {
         match self.peek_kind() {
-            TokenKind::Eq => Some(None),
-            TokenKind::PlusEq => Some(Some(BinaryOp::Add)),
-            TokenKind::MinusEq => Some(Some(BinaryOp::Sub)),
+            TokenKind::Eq => Some(AssignmentOp::Simple),
+            TokenKind::PlusEq => Some(AssignmentOp::Compound(BinaryOp::Add)),
+            TokenKind::MinusEq => Some(AssignmentOp::Compound(BinaryOp::Sub)),
             _ => None,
         }
     }
 
-    fn assignment_expr(
-        &mut self,
-        lhs: Expr,
-        compound_op: Option<BinaryOp>,
-        rhs: Expr,
-    ) -> Option<Expr> {
-        let value = if let Some(op) = compound_op {
+    fn assignment_expr(&mut self, lhs: Expr, assignment_op: AssignmentOp, rhs: Expr) -> Expr {
+        let value = if let AssignmentOp::Compound(op) = assignment_op {
             let span = lhs.span.join(rhs.span);
             Expr {
                 kind: ExprKind::Binary {
@@ -482,32 +483,32 @@ impl Parser {
         };
         let span = lhs.span.join(value.span);
         match &lhs.kind {
-            ExprKind::Ident(target) => Some(Expr {
+            ExprKind::Ident(target) => Expr {
                 kind: ExprKind::Assign {
                     target: target.clone(),
                     value: Box::new(value),
                 },
                 span,
-            }),
-            ExprKind::Field { target, field } => Some(Expr {
+            },
+            ExprKind::Field { target, field } => Expr {
                 kind: ExprKind::AssignField {
                     object: Box::new((**target).clone()),
                     field: field.clone(),
                     value: Box::new(value),
                 },
                 span,
-            }),
-            ExprKind::Index { target, index } => Some(Expr {
+            },
+            ExprKind::Index { target, index } => Expr {
                 kind: ExprKind::AssignIndex {
                     object: Box::new((**target).clone()),
                     index: Box::new((**index).clone()),
                     value: Box::new(value),
                 },
                 span,
-            }),
+            },
             _ => {
                 self.error("assignment target must be an identifier, `obj.field`, or `obj[key]`");
-                Some(lhs)
+                lhs
             }
         }
     }
@@ -986,7 +987,7 @@ impl Parser {
                 }
                 self.advance(); // `=` / `+=` / `-=`
                 let rhs = self.parse_expr()?;
-                lhs = self.assignment_expr(lhs, compound_op, rhs)?;
+                lhs = self.assignment_expr(lhs, compound_op, rhs);
                 continue;
             }
             // SPEC §4.9 `expr as <type>` — 타입 캐스팅. 후위 연산자로 처리해
@@ -2996,41 +2997,8 @@ impl Parser {
             },
             span: callee_span,
         };
-        if matches!(self.peek_kind(), TokenKind::LParen)
-            && !self.newline_before_cur()
-            && callee.span.range.end == self.peek().span.range.start
-        {
-            self.advance(); // `(`
-            let mut args = Vec::new();
-            while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                let arg = if self.looks_like_prop_arg() {
-                    let key = self.parse_prop_key("argument name")?;
-                    self.expect(&TokenKind::Eq, "`=`")?;
-                    let value = self.parse_expr()?;
-                    let span = key.span.join(value.span);
-                    Expr {
-                        kind: ExprKind::Assign {
-                            target: key,
-                            value: Box::new(value),
-                        },
-                        span,
-                    }
-                } else {
-                    self.parse_expr()?
-                };
-                args.push(arg);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            let rparen = self.expect(&TokenKind::RParen, "`)`")?;
-            return Some(Expr {
-                kind: ExprKind::Call {
-                    callee: Box::new(callee),
-                    args,
-                },
-                span: at_span.join(rparen.span),
-            });
+        if self.has_attached_call_after(callee.span) {
+            return self.finish_parenthesized_db_domain_call(callee, at_span);
         }
 
         if method_name == "transaction" {
@@ -3089,6 +3057,46 @@ impl Parser {
                 args,
             },
             span: at_span.join(end_span),
+        })
+    }
+
+    fn has_attached_call_after(&self, span: Span) -> bool {
+        matches!(self.peek_kind(), TokenKind::LParen)
+            && !self.newline_before_cur()
+            && span.range.end == self.peek().span.range.start
+    }
+
+    fn finish_parenthesized_db_domain_call(&mut self, callee: Expr, at_span: Span) -> Option<Expr> {
+        self.advance(); // `(`
+        let mut args = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            let arg = if self.looks_like_prop_arg() {
+                let key = self.parse_prop_key("argument name")?;
+                self.expect(&TokenKind::Eq, "`=`")?;
+                let value = self.parse_expr()?;
+                let span = key.span.join(value.span);
+                Expr {
+                    kind: ExprKind::Assign {
+                        target: key,
+                        value: Box::new(value),
+                    },
+                    span,
+                }
+            } else {
+                self.parse_expr()?
+            };
+            args.push(arg);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+        Some(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span: at_span.join(rparen.span),
         })
     }
 
@@ -3206,10 +3214,10 @@ impl Parser {
                 TokenKind::At(name) if name == "where" => args.push(self.parse_db_where_arg()?),
                 TokenKind::At(name) if name == "order" => args.push(self.parse_db_order_arg()?),
                 TokenKind::At(name) if name == "skip" => {
-                    args.push(self.parse_db_int_arg("__skip__")?)
+                    args.push(self.parse_db_int_arg("__skip__")?);
                 }
                 TokenKind::At(name) if name == "limit" => {
-                    args.push(self.parse_db_int_arg("__limit__")?)
+                    args.push(self.parse_db_int_arg("__limit__")?);
                 }
                 TokenKind::At(name) if name == "field" => args.push(self.parse_db_field_arg()?),
                 TokenKind::At(name) if name == "match" => args.push(self.parse_db_match_arg()?),
@@ -3243,7 +3251,7 @@ impl Parser {
             self.advance(); // `in`
             self.advance(); // `=`
             let value = self.parse_expr_bp(22)?;
-            return Some(Self::db_filter_object(key, "__in", value, at_tok.span));
+            return Some(Self::db_filter_object(&key, "__in", value, at_tok.span));
         }
 
         let suffix = match self.peek_kind() {
@@ -3262,7 +3270,7 @@ impl Parser {
         };
         self.advance();
         let value = self.parse_expr_bp(22)?;
-        Some(Self::db_filter_object(key, suffix, value, at_tok.span))
+        Some(Self::db_filter_object(&key, suffix, value, at_tok.span))
     }
 
     fn parse_db_order_arg(&mut self) -> Option<Expr> {
@@ -3405,14 +3413,14 @@ impl Parser {
         self.expect(&TokenKind::Eq, "`=`")?;
         let value = self.parse_expr_bp(1)?;
         Some(Self::db_filter_object(
-            key,
+            &key,
             "__contains",
             value,
             at_tok.span,
         ))
     }
 
-    fn db_filter_object(key: Ident, suffix: &str, value: Expr, start: Span) -> Expr {
+    fn db_filter_object(key: &Ident, suffix: &str, value: Expr, start: Span) -> Expr {
         let span = key.span.join(value.span);
         let name = Ident {
             name: format!("{}{suffix}", key.name),
@@ -3534,7 +3542,7 @@ impl Parser {
         let mut args = Vec::new();
         let mut end_span = name_ident.span;
         if matches!(self.peek_kind(), TokenKind::Slash) {
-            let path = self.parse_path_string_until_block()?;
+            let path = self.parse_path_string_until_block();
             end_span = path.span;
             args.push(path);
         }
@@ -3619,7 +3627,7 @@ impl Parser {
         })
     }
 
-    fn parse_path_string_until_block(&mut self) -> Option<Expr> {
+    fn parse_path_string_until_block(&mut self) -> Expr {
         let start = self.peek().span;
         let mut end = start;
         let mut text = String::new();
@@ -3630,10 +3638,10 @@ impl Parser {
             end = tok.span;
             text.push_str(&token_source_repr(&tok.kind));
         }
-        Some(Expr {
+        Expr {
             kind: ExprKind::String(vec![StringSegment::Str(text)]),
             span: start.join(end),
-        })
+        }
     }
 
     fn try_parse_event_name(&mut self) -> Option<Expr> {
@@ -4358,7 +4366,7 @@ fn describe(k: &TokenKind) -> String {
     }
 }
 
-fn keyword_text(kw: Keyword) -> &'static str {
+const fn keyword_text(kw: Keyword) -> &'static str {
     match kw {
         Keyword::Let => "let",
         Keyword::Mut => "mut",
@@ -4532,7 +4540,7 @@ fn is_reference_parenless_callee(expr: &Expr) -> bool {
     )
 }
 
-fn keyword_lexeme(keyword: Keyword) -> &'static str {
+const fn keyword_lexeme(keyword: Keyword) -> &'static str {
     match keyword {
         Keyword::Let => "let",
         Keyword::Mut => "mut",

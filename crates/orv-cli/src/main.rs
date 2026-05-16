@@ -22825,7 +22825,7 @@ fn reveal_origin_json(dir: &Path, origin_id: &str) -> anyhow::Result<serde_json:
             "native_server": reveal_native_server_targets(dir, origin_id, &origin_map)?,
             "preflight": reveal_preflight_targets(dir)?,
             "static": reveal_static_targets(dir, origin_id, &origin_map)?,
-            "db_adapters": reveal_db_adapter_targets(dir)?,
+            "db_adapters": reveal_db_adapter_targets_for_origin(dir, origin_id, &origin_map)?,
             "commerce_adapters": reveal_commerce_adapter_targets(dir)?,
             "client": reveal_client_targets(dir, origin_id, entry, &origin_map)?,
         },
@@ -23295,6 +23295,22 @@ fn reveal_commerce_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json:
 }
 
 fn reveal_db_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    reveal_db_adapter_targets_impl(dir, None, None)
+}
+
+fn reveal_db_adapter_targets_for_origin(
+    dir: &Path,
+    origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    reveal_db_adapter_targets_impl(dir, Some(origin_id), Some(origin_map))
+}
+
+fn reveal_db_adapter_targets_impl(
+    dir: &Path,
+    origin_id: Option<&str>,
+    origin_map: Option<&orv_compiler::OriginMap>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let deploy_manifest_path = dir.join("deploy").join("manifest.json");
     if !deploy_manifest_path.is_file() {
         return Ok(Vec::new());
@@ -23316,19 +23332,66 @@ fn reveal_db_adapter_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value
         })]);
     }
     let artifact = read_json_value(&target_path)?;
+    let adapters = artifact
+        .get("adapters")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let matched_adapters = origin_id
+        .zip(origin_map)
+        .map(|(origin_id, origin_map)| {
+            reveal_adapter_origin_matches(&adapters, origin_id, origin_map)
+        })
+        .unwrap_or_default();
     Ok(vec![serde_json::json!({
         "kind": "db_adapters",
         "path": path,
         "exists": true,
+        "selected_origin_id": origin_id,
+        "matched": !matched_adapters.is_empty(),
+        "matched_adapter_count": matched_adapters.len(),
         "artifact": artifact
             .get("artifact")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "adapters": artifact
-            .get("adapters")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([])),
+        "adapters": adapters,
+        "matched_adapters": matched_adapters,
     })])
+}
+
+fn reveal_adapter_origin_matches(
+    adapters: &serde_json::Value,
+    origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
+) -> Vec<serde_json::Value> {
+    let Some(adapters) = adapters.as_array() else {
+        return Vec::new();
+    };
+    adapters
+        .iter()
+        .filter_map(|adapter| {
+            let source_origin_id = adapter
+                .get("source_origin_id")
+                .and_then(serde_json::Value::as_str)?;
+            let match_kind = if source_origin_id == origin_id {
+                "direct"
+            } else if origin_contains(origin_map, source_origin_id, origin_id) {
+                "source_contains_selected"
+            } else if origin_contains(origin_map, origin_id, source_origin_id) {
+                "selected_contains_source"
+            } else {
+                return None;
+            };
+            let mut value = adapter.clone();
+            if let Some(adapter) = value.as_object_mut() {
+                adapter.insert("match".to_string(), serde_json::json!(match_kind));
+                adapter.insert(
+                    "matched_origin_id".to_string(),
+                    serde_json::json!(origin_id),
+                );
+            }
+            Some(value)
+        })
+        .collect()
 }
 
 fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -26511,6 +26574,7 @@ struct DeployDbAdapter {
     endpoint: Option<String>,
     adapter_status: String,
     bridge_env: Vec<DeployProviderEnv>,
+    source_origin_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -26770,6 +26834,7 @@ fn deploy_db_adapter_value(adapters: &[DeployDbAdapter]) -> Vec<serde_json::Valu
                 "default": adapter.default.as_deref(),
                 "endpoint": adapter.endpoint.as_deref(),
                 "adapter_status": adapter.adapter_status,
+                "source_origin_id": adapter.source_origin_id.as_deref(),
                 "runtime": {
                     "status": adapter.adapter_status,
                     "query_methods": ["create", "find", "update", "delete", "transaction"],
@@ -27092,7 +27157,11 @@ fn collect_expr_persistence_paths(expr: &orv_hir::HirExpr, out: &mut DeployPersi
             }
         } else if call_name == "@db.connect" {
             if let Some(arg) = args.first() {
-                collect_db_adapter_persistence_arg(arg, out);
+                collect_db_adapter_persistence_arg(
+                    arg,
+                    hir_source_origin_id("call", &call_name, expr.span),
+                    out,
+                );
             }
         } else if matches!(call_name.as_str(), "@payment.connect" | "@shipping.connect") {
             if let Some(arg) = args.first() {
@@ -27299,14 +27368,21 @@ fn http_adapter_endpoint(url: &str) -> Option<String> {
 
 fn collect_db_adapter_persistence_arg(
     arg: &orv_hir::HirExpr,
+    source_origin_id: Option<String>,
     out: &mut DeployPersistenceAccumulator,
 ) {
     if let Some(url) = hir_static_string(arg) {
-        collect_db_adapter_url(&url, None, None, out);
+        collect_db_adapter_url(&url, None, None, source_origin_id.clone(), out);
     }
     if let Some(env) = hir_env_configured_string(arg) {
         if let Some(default) = &env.default {
-            collect_db_adapter_url(default, Some(env.env.clone()), Some(default.clone()), out);
+            collect_db_adapter_url(
+                default,
+                Some(env.env.clone()),
+                Some(default.clone()),
+                source_origin_id.clone(),
+                out,
+            );
         } else {
             out.db_adapters.push(DeployDbAdapter {
                 mode: "env".to_string(),
@@ -27316,6 +27392,7 @@ fn collect_db_adapter_persistence_arg(
                 endpoint: None,
                 adapter_status: "env_required".to_string(),
                 bridge_env: Vec::new(),
+                source_origin_id: source_origin_id.clone(),
             });
         }
         out.db_env.push(env);
@@ -27326,6 +27403,7 @@ fn collect_db_adapter_url(
     url: &str,
     env: Option<String>,
     default: Option<String>,
+    source_origin_id: Option<String>,
     out: &mut DeployPersistenceAccumulator,
 ) {
     if let Some(path) = file_adapter_path(url) {
@@ -27344,8 +27422,13 @@ fn collect_db_adapter_url(
             endpoint: Some(url.to_string()),
             adapter_status: "unsupported_runtime".to_string(),
             bridge_env: db_adapter_bridge_env(provider),
+            source_origin_id,
         });
     }
+}
+
+fn hir_source_origin_id(kind: &str, name: &str, span: Span) -> Option<String> {
+    (span.file != FileId::DUMMY).then(|| orv_hir::origin_id(kind, name, span))
 }
 
 fn external_db_adapter_provider(url: &str) -> Option<&'static str> {
@@ -43120,8 +43203,23 @@ let sig count: int = 0
         assert_eq!(deploy["server"]["db_adapters"], "deploy/db-adapters.json");
         assert_eq!(db_adapters["schema_version"], 1);
         assert_eq!(db_adapters["artifact"], "server/app.orv-runtime.json");
+        let adapters = db_adapters["adapters"].as_array().expect("db adapters");
+        assert_eq!(adapters.len(), 2);
+        assert!(adapters.iter().all(|adapter| adapter["source_origin_id"]
+            .as_str()
+            .is_some_and(|origin_id| origin_id.starts_with("ori_"))));
+        let mut adapters_without_source = db_adapters["adapters"].clone();
+        for adapter in adapters_without_source
+            .as_array_mut()
+            .expect("db adapters without source")
+        {
+            adapter
+                .as_object_mut()
+                .expect("db adapter object")
+                .remove("source_origin_id");
+        }
         assert_eq!(
-            db_adapters["adapters"],
+            adapters_without_source,
             serde_json::json!([
                 {
                     "kind": "db",
@@ -47202,7 +47300,63 @@ models = { path = "../../shared/models", version = "2.0.0" }
                 && target["adapters"][0]["env"] == "SHOP_DATABASE_URL"
                 && target["adapters"][0]["endpoint"] == "postgres://db.internal/shop"
                 && target["adapters"][0]["adapter_status"] == "unsupported_runtime"
+                && target["adapters"][0]["source_origin_id"]
+                    .as_str()
+                    .is_some_and(|origin_id| origin_id.starts_with("ori_"))
         }));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn reveal_origin_links_db_connect_to_deploy_adapter_contract() {
+        let dir = temp_output_dir("reveal-db-connect-origin-source");
+        std::fs::create_dir_all(&dir).expect("create db connect reveal source dir");
+        let path = dir.join("app.orv");
+        std::fs::write(
+            &path,
+            r#"@server {
+  @listen 8080
+  let shopdb = @db.connect(@env.SHOP_DATABASE_URL ?? "postgres://db.internal/shop")
+  @route GET /ping { @respond 200 { ok: true } }
+}
+"#,
+        )
+        .expect("write db connect reveal source");
+        let out = temp_output_dir("reveal-db-connect-origin");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let origin_map: orv_compiler::OriginMap = serde_json::from_str(
+            &std::fs::read_to_string(out.join("origin-map.json")).expect("origin map"),
+        )
+        .expect("origin map json");
+        let db_connect = origin_map
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "call" && entry.name == "@db.connect")
+            .expect("db connect origin");
+
+        let reveal = reveal_origin_json(&out, &db_connect.id).expect("reveal db connect origin");
+        let db_adapters = reveal["production"]["db_adapters"]
+            .as_array()
+            .expect("db adapters");
+        let target = db_adapters
+            .iter()
+            .find(|target| target["path"] == "deploy/db-adapters.json")
+            .expect("db adapter target");
+        let matched = target["matched_adapters"]
+            .as_array()
+            .expect("matched db adapters");
+
+        assert_eq!(target["matched"], true);
+        assert_eq!(target["selected_origin_id"], db_connect.id);
+        assert_eq!(target["matched_adapter_count"], 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["source_origin_id"], db_connect.id);
+        assert_eq!(matched[0]["matched_origin_id"], db_connect.id);
+        assert_eq!(matched[0]["match"], "direct");
+        assert_eq!(matched[0]["provider"], "postgres");
+        assert_eq!(matched[0]["bridge"]["contract"], "http-json-v1");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out);
     }
