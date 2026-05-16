@@ -1075,9 +1075,10 @@ async fn shutdown_signal() {
 /// `body_stmts` 는 `@server { @out "boot" @listen 0 ... }` 처럼 @server 블록
 /// 최상단에 있던 non-route 문장들이다. [`run_server`] 는 이들을 accept 시작
 /// 전에 **공용 stdout** 으로 흘린다. 테스트에서는 stdout 을 가로챌 수 없어
-/// 같은 순서로 `Vec<u8>` writer 에 캡처해 돌려준다 — C5c 의 body_stmts 패치가
+/// 같은 순서로 `Vec<u8>` writer 에 캡처해 돌려준다 — C5c 의 `body_stmts` 패치가
 /// 실제로 런타임에 도달하는지 fixture 수준에서 증명하기 위함.
 #[cfg(test)]
+#[allow(clippy::future_not_send)]
 pub(crate) async fn spawn_for_test<S>(
     listen: Option<&HirExpr>,
     routes: &[HirExpr],
@@ -2190,6 +2191,16 @@ fn json_to_value(j: serde_json::Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::items_after_statements,
+        clippy::needless_raw_string_hashes,
+        clippy::too_many_lines,
+        clippy::single_match_else,
+        clippy::match_same_arms,
+        clippy::manual_assert,
+        clippy::future_not_send
+    )]
+
     use super::*;
     use hmac::{Hmac, Mac};
     use hyper::client::conn::http1 as client_http1;

@@ -63,6 +63,7 @@ fn resolve_runtime_path(path: &str, working_dir: Option<&Path>) -> PathBuf {
 /// arm 에서 `@env` 평가 시 이 맵을 병합한다. production 빌드에는 이 모듈이
 /// 남지 않는다.
 #[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) mod test_env {
     use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -7649,6 +7650,15 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::needless_raw_string_hashes,
+        clippy::iter_on_single_items,
+        clippy::single_char_pattern,
+        clippy::significant_drop_tightening,
+        clippy::into_iter_on_ref,
+        clippy::useless_vec
+    )]
+
     use super::*;
     use orv_analyzer::lower;
     use orv_diagnostics::FileId;
