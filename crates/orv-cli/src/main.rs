@@ -22353,6 +22353,15 @@ fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must optionally verify live trace stream");
     }
+    if !smoke.contains("orv_smoke_graph_contract()")
+        || !smoke.contains("\norv_smoke_graph_contract\n")
+        || !smoke.contains(r#""$ORV_BIN" verify-build ."#)
+        || !smoke.contains("source-bundle.json")
+        || !smoke.contains("project-graph.json")
+        || !smoke.contains("origin-map.json")
+    {
+        anyhow::bail!("deploy smoke test must verify the build graph contract");
+    }
     if !smoke.contains("ORV_SMOKE_BUILD_DIR=") || !smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#) {
         anyhow::bail!("deploy smoke test must run from its build directory");
     }
@@ -29981,6 +29990,21 @@ orv_smoke_grep() {{
   fi
 }}
 
+orv_smoke_graph_contract() {{
+  for path in source-bundle.json project-graph.json origin-map.json build-manifest.json; do
+    orv_smoke_file "$path"
+  done
+  orv_smoke_grep "source bundle schema" "source-bundle.json" '"schema_version": 1'
+  orv_smoke_grep "source bundle files" "source-bundle.json" '"files"'
+  orv_smoke_grep "project graph semantic origin map" "project-graph.json" '"origin_map"'
+  orv_smoke_grep "project graph origin links" "project-graph.json" '"origin_links"'
+  orv_smoke_grep "origin map entries" "origin-map.json" '"entries"'
+  if ! "$ORV_BIN" verify-build . >/dev/null; then
+    printf 'orv deploy smoke test failed: verify-build graph contract\n' >&2
+    exit 1
+  fi
+}}
+
 orv_smoke_db_bridge_schema() {{
   label="$1"
   endpoint="$2"
@@ -30046,6 +30070,7 @@ orv_smoke_cookie_from_headers() {{
     if !server_artifact.routes.is_empty() {
         script.push('\n');
     }
+    script.push_str("orv_smoke_graph_contract\n");
     script.push_str(&deploy_smoke_client_contract_section(client));
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
     if let Some(ready_path) = deploy_smoke_ready_path(server_artifact) {
@@ -32203,6 +32228,12 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("ORV_SMOKE_TRACE_STREAM"));
         assert!(smoke_test.contains("editor trace-stream"));
         assert!(smoke_test.contains("orv deploy smoke test failed: live trace stream"));
+        assert!(smoke_test.contains("orv_smoke_graph_contract()"));
+        assert!(smoke_test.contains("\norv_smoke_graph_contract\n"));
+        assert!(smoke_test.contains(r#""$ORV_BIN" verify-build ."#));
+        assert!(smoke_test.contains("source-bundle.json"));
+        assert!(smoke_test.contains("project-graph.json"));
+        assert!(smoke_test.contains("origin-map.json"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
         assert!(smoke_test.contains("orv_smoke_origin_header()"));
         assert!(smoke_test.contains("orv_smoke_response_origin_header()"));
@@ -45354,6 +45385,29 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy server smoke_test must be deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_smoke_graph_contract_missing() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-graph-source");
+        let out = temp_output_dir("deploy-smoke-graph-missing");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        write_text(
+            &smoke_path,
+            &smoke.replace("\norv_smoke_graph_contract\n", "\n"),
+        )
+        .expect("write corrupt smoke test");
+
+        let err = cmd_verify_build(&out).expect_err("smoke graph contract mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test must verify the build graph contract"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(out);
     }
