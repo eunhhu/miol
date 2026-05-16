@@ -2475,7 +2475,7 @@ impl<W: Write> Interp<W> {
                 m @ ("create" | "find" | "findAll" | "update" | "delete" | "upsert" | "search"
                 | "count" | "sum" | "transaction" | "schema" | "analyze"),
             ) if object_kind(&fields).is_some_and(|kind| kind == "db.adapter") => {
-                call_external_db_adapter_method(&fields, m)
+                call_external_db_adapter_method(&fields, m, &args)
             }
             // ── C_db 메서드 ──
             //
@@ -4611,17 +4611,54 @@ fn call_commerce_adapter_method(
 fn call_external_db_adapter_method(
     fields: &[(String, Value)],
     method: &str,
+    args: &[Value],
 ) -> Result<Value, RuntimeError> {
-    match method {
-        "analyze" | "schema" => Ok(Value::Object(fields.to_vec())),
-        _ => {
-            let provider =
-                object_string_field(fields, "provider").unwrap_or_else(|| "external".to_string());
-            Err(RuntimeError::native(format!(
-                "external db adapter {provider} is not implemented in the reference runtime"
-            )))
-        }
+    if method == "analyze" {
+        return Ok(Value::Object(fields.to_vec()));
     }
+    let provider =
+        object_string_field(fields, "provider").unwrap_or_else(|| "external".to_string());
+    if let Some(endpoint) = object_string_field(fields, "bridgeEndpoint") {
+        return external_db_adapter_bridge_value(fields, &provider, &endpoint, method, args);
+    }
+    if method == "schema" {
+        return Ok(Value::Object(fields.to_vec()));
+    }
+    Err(RuntimeError::native(format!(
+        "external db adapter {provider} is not implemented in the reference runtime"
+    )))
+}
+
+fn external_db_adapter_bridge_value(
+    fields: &[(String, Value)],
+    provider: &str,
+    endpoint: &str,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let url = object_string_field(fields, "url").unwrap_or_default();
+    let request_args = args.iter().map(runtime_value_json).collect::<Vec<_>>();
+    let request = serde_json::json!({
+        "kind": "orv.db.adapter",
+        "contract": "http-json-v1",
+        "provider": provider,
+        "url": url,
+        "method": method,
+        "args": request_args,
+    })
+    .to_string();
+    let mut headers = Vec::new();
+    if let Some(token) = external_db_adapter_auth_token(provider) {
+        headers.push(("authorization", format!("Bearer {token}")));
+    }
+    let response =
+        http_post_json_with_headers_for("external db adapter", endpoint, &request, &headers)?;
+    let value = serde_json::from_str::<serde_json::Value>(&response).map_err(|source| {
+        RuntimeError::native(format!(
+            "external db adapter response was not JSON: {source}"
+        ))
+    })?;
+    Ok(runtime_value_from_json(value))
 }
 
 fn reference_adapter_provider(url: &str, kind: &str) -> Result<String, RuntimeError> {
@@ -4681,22 +4718,25 @@ fn http_post_json_with_headers(
     body: &str,
     extra_headers: &[(&str, String)],
 ) -> Result<String, RuntimeError> {
-    let parsed = parse_http_adapter_url(url)?;
+    http_post_json_with_headers_for("http commerce adapter", url, body, extra_headers)
+}
+
+fn http_post_json_with_headers_for(
+    context: &str,
+    url: &str,
+    body: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<String, RuntimeError> {
+    let parsed = parse_http_adapter_url(context, url)?;
     let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter failed to connect {url}: {source}"
-        ))
+        RuntimeError::native(format!("{context} failed to connect {url}: {source}"))
     })?;
     let timeout = Some(Duration::from_secs(5));
     stream.set_read_timeout(timeout).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter failed to set read timeout: {source}"
-        ))
+        RuntimeError::native(format!("{context} failed to set read timeout: {source}"))
     })?;
     stream.set_write_timeout(timeout).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter failed to set write timeout: {source}"
-        ))
+        RuntimeError::native(format!("{context} failed to set write timeout: {source}"))
     })?;
     let mut request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\ncontent-type: application/json\r\naccept: application/json\r\n",
@@ -4714,35 +4754,29 @@ fn http_post_json_with_headers(
         body
     ));
     stream.write_all(request.as_bytes()).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter failed to write request: {source}"
-        ))
+        RuntimeError::native(format!("{context} failed to write request: {source}"))
     })?;
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter failed to read response: {source}"
-        ))
+        RuntimeError::native(format!("{context} failed to read response: {source}"))
     })?;
     let header_end = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| RuntimeError::native("http commerce adapter response missing headers"))?;
+        .ok_or_else(|| RuntimeError::native(format!("{context} response missing headers")))?;
     let headers = String::from_utf8_lossy(&bytes[..header_end]);
     let status = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| RuntimeError::native("http commerce adapter response missing status"))?;
+        .ok_or_else(|| RuntimeError::native(format!("{context} response missing status")))?;
     let response_body = String::from_utf8(bytes[header_end + 4..].to_vec()).map_err(|source| {
-        RuntimeError::native(format!(
-            "http commerce adapter response body was not utf-8: {source}"
-        ))
+        RuntimeError::native(format!("{context} response body was not utf-8: {source}"))
     })?;
     if !(200..300).contains(&status) {
         return Err(RuntimeError::native(format!(
-            "http commerce adapter returned {status}: {response_body}"
+            "{context} returned {status}: {response_body}"
         )));
     }
     Ok(response_body)
@@ -4782,10 +4816,10 @@ fn provider_idempotency_key(kind: &str, args: &[Value]) -> String {
     format!("{kind}:{order}")
 }
 
-fn parse_http_adapter_url(url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
+fn parse_http_adapter_url(context: &str, url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
     let Some(rest) = url.strip_prefix("http://") else {
         return Err(RuntimeError::native(format!(
-            "http commerce adapter only supports http:// URLs in the reference runtime: {url}"
+            "{context} only supports http:// URLs in the reference runtime: {url}"
         )));
     };
     let (authority, path) = rest
@@ -4794,24 +4828,18 @@ fn parse_http_adapter_url(url: &str) -> Result<HttpAdapterUrl, RuntimeError> {
             (authority, format!("/{path}"))
         });
     if authority.is_empty() {
-        return Err(RuntimeError::native(
-            "http commerce adapter URL missing host",
-        ));
+        return Err(RuntimeError::native(format!("{context} URL missing host")));
     }
     let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
         let port = port.parse::<u16>().map_err(|source| {
-            RuntimeError::native(format!(
-                "http commerce adapter URL has invalid port: {source}"
-            ))
+            RuntimeError::native(format!("{context} URL has invalid port: {source}"))
         })?;
         (host.to_string(), port)
     } else {
         (authority.to_string(), 80)
     };
     if host.is_empty() {
-        return Err(RuntimeError::native(
-            "http commerce adapter URL missing host",
-        ));
+        return Err(RuntimeError::native(format!("{context} URL missing host")));
     }
     Ok(HttpAdapterUrl {
         host,
@@ -6464,19 +6492,36 @@ fn call_db_method(
                     return Ok(Value::Db(Rc::new(std::cell::RefCell::new(restored))));
                 }
                 if let Some(provider) = external_db_adapter_provider(&url) {
-                    return Ok(Value::Object(vec![
+                    let bridge_endpoint = external_db_adapter_bridge_endpoint(provider);
+                    let adapter_status = if bridge_endpoint.is_some() {
+                        "bridge_configured"
+                    } else {
+                        "unsupported_runtime"
+                    };
+                    let mut adapter = vec![
                         ("kind".to_string(), Value::Str("db.adapter".to_string())),
                         ("provider".to_string(), Value::Str(provider.to_string())),
                         ("url".to_string(), Value::Str(url)),
                         (
                             "adapterStatus".to_string(),
-                            Value::Str("unsupported_runtime".to_string()),
+                            Value::Str(adapter_status.to_string()),
                         ),
                         (
                             "runtime".to_string(),
-                            external_db_adapter_runtime_contract_value(),
+                            external_db_adapter_runtime_contract_value(
+                                adapter_status,
+                                bridge_endpoint.as_deref(),
+                            ),
                         ),
-                    ]));
+                    ];
+                    if let Some(endpoint) = bridge_endpoint {
+                        adapter.push(("bridgeEndpoint".to_string(), Value::Str(endpoint)));
+                        adapter.push((
+                            "contract".to_string(),
+                            Value::Str("http-json-v1".to_string()),
+                        ));
+                    }
+                    return Ok(Value::Object(adapter));
                 }
                 return Err(RuntimeError::native(format!(
                     "external db adapters are not implemented for `{url}`; supported schemes are memory://, file://, and sqlite://"
@@ -6698,22 +6743,79 @@ fn external_db_adapter_provider(url: &str) -> Option<&str> {
     None
 }
 
-fn external_db_adapter_runtime_contract_value() -> Value {
-    Value::Object(vec![
-        (
-            "status".to_string(),
-            Value::Str("unsupported_runtime".to_string()),
-        ),
+fn external_db_adapter_bridge_endpoint(provider: &str) -> Option<String> {
+    provider_env_value(external_db_adapter_endpoint_env(provider))
+        .or_else(|| provider_env_value("ORV_DB_ADAPTER_ENDPOINT"))
+}
+
+fn external_db_adapter_auth_token(provider: &str) -> Option<String> {
+    provider_env_value(external_db_adapter_auth_token_env(provider))
+        .or_else(|| provider_env_value("ORV_DB_ADAPTER_AUTH_TOKEN"))
+}
+
+fn external_db_adapter_endpoint_env(provider: &str) -> &'static str {
+    match provider {
+        "postgres" => "ORV_DB_ADAPTER_POSTGRES_ENDPOINT",
+        "mysql" => "ORV_DB_ADAPTER_MYSQL_ENDPOINT",
+        _ => "ORV_DB_ADAPTER_ENDPOINT",
+    }
+}
+
+fn external_db_adapter_auth_token_env(provider: &str) -> &'static str {
+    match provider {
+        "postgres" => "ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN",
+        "mysql" => "ORV_DB_ADAPTER_MYSQL_AUTH_TOKEN",
+        _ => "ORV_DB_ADAPTER_AUTH_TOKEN",
+    }
+}
+
+fn external_db_adapter_runtime_contract_value(
+    status: &str,
+    bridge_endpoint: Option<&str>,
+) -> Value {
+    const BRIDGE_QUERY_METHODS: &[&str] = &[
+        "create",
+        "find",
+        "findAll",
+        "update",
+        "delete",
+        "upsert",
+        "search",
+        "count",
+        "sum",
+        "transaction",
+        "schema",
+    ];
+    const UNSUPPORTED_QUERY_METHODS: &[&str] =
+        &["create", "find", "update", "delete", "transaction"];
+    let query_methods = if bridge_endpoint.is_some() {
+        BRIDGE_QUERY_METHODS
+    } else {
+        UNSUPPORTED_QUERY_METHODS
+    };
+    let mut fields = vec![
+        ("status".to_string(), Value::Str(status.to_string())),
         (
             "queryMethods".to_string(),
             Value::Array(
-                ["create", "find", "update", "delete", "transaction"]
-                    .into_iter()
-                    .map(|method| Value::Str(method.to_string()))
+                query_methods
+                    .iter()
+                    .map(|method| Value::Str((*method).to_string()))
                     .collect(),
             ),
         ),
-    ])
+    ];
+    if let Some(endpoint) = bridge_endpoint {
+        fields.push((
+            "contract".to_string(),
+            Value::Str("http-json-v1".to_string()),
+        ));
+        fields.push((
+            "bridgeEndpoint".to_string(),
+            Value::Str(endpoint.to_string()),
+        ));
+    }
+    Value::Object(fields)
 }
 
 fn db_vector(value: &Value, what: &str) -> Result<Vec<f64>, RuntimeError> {
@@ -10186,6 +10288,10 @@ let all = external.findAll("User", {{}})
 
     #[test]
     fn db_connect_external_adapter_reports_status_and_rejects_queries() {
+        let _env_guard = super::test_env::guard();
+        super::test_env::set("ORV_DB_ADAPTER_ENDPOINT", "");
+        super::test_env::set("ORV_DB_ADAPTER_POSTGRES_ENDPOINT", "");
+        super::test_env::set("ORV_DB_ADAPTER_MYSQL_ENDPOINT", "");
         let out = run_str(
             r#"let external = @db.connect "postgres://localhost/shop"
 @out external.provider
@@ -10212,6 +10318,74 @@ external.create("User", { name: "Ada" })"#,
         assert!(err
             .to_string()
             .contains("external db adapter mysql is not implemented"));
+        super::test_env::clear("ORV_DB_ADAPTER_ENDPOINT");
+        super::test_env::clear("ORV_DB_ADAPTER_POSTGRES_ENDPOINT");
+        super::test_env::clear("ORV_DB_ADAPTER_MYSQL_ENDPOINT");
+    }
+
+    #[test]
+    fn db_connect_external_adapter_bridge_posts_checked_json() {
+        let _env_guard = super::test_env::guard();
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind db adapter test server");
+        let address = listener
+            .local_addr()
+            .expect("db adapter test server address");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept db adapter request");
+            let request = read_test_http_request(&mut stream);
+            server_requests.lock().unwrap().push(request);
+            write_test_http_json_response(
+                &mut stream,
+                r#"{"status":"created_bridge","row":{"id":1,"name":"Ada"}}"#,
+            );
+        });
+        super::test_env::set(
+            "ORV_DB_ADAPTER_POSTGRES_ENDPOINT",
+            &format!("http://{address}/db"),
+        );
+        super::test_env::set("ORV_DB_ADAPTER_ENDPOINT", "");
+        super::test_env::set("ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN", "db_token_never_print");
+        let out = run_str(
+            r#"let external = @db.connect "postgres://localhost/shop"
+@out external.adapterStatus
+@out external.runtime.status
+@out external.runtime.contract
+@out external.runtime.queryMethods.length
+let created = external.create("User", { name: "Ada" })
+@out created.status
+@out created.row.name"#,
+        )
+        .expect("external adapter bridge call");
+        super::test_env::clear("ORV_DB_ADAPTER_POSTGRES_ENDPOINT");
+        super::test_env::clear("ORV_DB_ADAPTER_ENDPOINT");
+        super::test_env::clear("ORV_DB_ADAPTER_POSTGRES_AUTH_TOKEN");
+        server.join().expect("db adapter test server finished");
+
+        assert_eq!(
+            out,
+            "bridge_configured\nbridge_configured\nhttp-json-v1\n11\ncreated_bridge\nAda\n"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with("POST /db "));
+        assert!(request.contains("authorization: Bearer db_token_never_print"));
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("db adapter request body");
+        let body_json: serde_json::Value =
+            serde_json::from_str(body).expect("db adapter request json");
+        assert_eq!(body_json["kind"], "orv.db.adapter");
+        assert_eq!(body_json["contract"], "http-json-v1");
+        assert_eq!(body_json["provider"], "postgres");
+        assert_eq!(body_json["url"], "postgres://localhost/shop");
+        assert_eq!(body_json["method"], "create");
+        assert_eq!(body_json["args"][0], "User");
+        assert_eq!(body_json["args"][1]["name"], "Ada");
     }
 
     #[test]
