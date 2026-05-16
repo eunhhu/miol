@@ -22810,6 +22810,11 @@ fn verify_deploy_preflight_artifact(
     for (key, expected) in [
         ("server", artifacts.server_artifact),
         ("routes", artifacts.routes),
+        ("source_bundle", SOURCE_BUNDLE_PATH),
+        ("project_graph", "project-graph.json"),
+        ("origin_map", "origin-map.json"),
+        ("build_manifest", "build-manifest.json"),
+        ("bundle_plan", "bundle-plan.json"),
         ("env_example", artifacts.env_example),
         ("db_adapters", artifacts.db_adapters),
         ("commerce_adapters", artifacts.commerce_adapters),
@@ -29677,6 +29682,11 @@ fn deploy_preflight_artifact_value(
         "artifacts": {
             "server": artifacts.server_artifact,
             "routes": artifacts.routes,
+            "source_bundle": SOURCE_BUNDLE_PATH,
+            "project_graph": "project-graph.json",
+            "origin_map": "origin-map.json",
+            "build_manifest": "build-manifest.json",
+            "bundle_plan": "bundle-plan.json",
             "env_example": artifacts.env_example,
             "db_adapters": artifacts.db_adapters,
             "commerce_adapters": artifacts.commerce_adapters,
@@ -32192,6 +32202,26 @@ test "checkout excluded failure" {
         assert_eq!(
             preflight["artifacts"]["commerce_adapters"],
             serde_json::json!("deploy/commerce-adapters.json")
+        );
+        assert_eq!(
+            preflight["artifacts"]["source_bundle"],
+            serde_json::json!(SOURCE_BUNDLE_PATH)
+        );
+        assert_eq!(
+            preflight["artifacts"]["project_graph"],
+            serde_json::json!("project-graph.json")
+        );
+        assert_eq!(
+            preflight["artifacts"]["origin_map"],
+            serde_json::json!("origin-map.json")
+        );
+        assert_eq!(
+            preflight["artifacts"]["build_manifest"],
+            serde_json::json!("build-manifest.json")
+        );
+        assert_eq!(
+            preflight["artifacts"]["bundle_plan"],
+            serde_json::json!("bundle-plan.json")
         );
         assert_eq!(
             preflight["security_features"],
@@ -44140,6 +44170,17 @@ entry = "src/main.orv"
         assert_eq!(preflight["artifact"], "server/app.orv-runtime.json");
         assert_eq!(preflight["artifacts"]["smoke_test"], "deploy/smoke-test.sh");
         assert_eq!(preflight["artifacts"]["preflight"], "deploy/preflight.json");
+        assert_eq!(preflight["artifacts"]["source_bundle"], SOURCE_BUNDLE_PATH);
+        assert_eq!(
+            preflight["artifacts"]["project_graph"],
+            "project-graph.json"
+        );
+        assert_eq!(preflight["artifacts"]["origin_map"], "origin-map.json");
+        assert_eq!(
+            preflight["artifacts"]["build_manifest"],
+            "build-manifest.json"
+        );
+        assert_eq!(preflight["artifacts"]["bundle_plan"], "bundle-plan.json");
         assert_eq!(preflight["commands"]["verify_build"], "orv verify-build .");
         assert_eq!(preflight["commands"]["env_check"], "orv deploy-env-check .");
         assert_eq!(preflight["commands"]["run_build"], "orv run-build .");
@@ -46032,6 +46073,26 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy preflight smoke_test command must be ./deploy/smoke-test.sh"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_graph_artifact_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-graph-artifact-source");
+        let out = temp_output_dir("deploy-preflight-graph-artifact-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["artifacts"]["origin_map"] = serde_json::json!("wrong-origin-map.json");
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight graph artifact mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight artifact origin_map must be origin-map.json"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
