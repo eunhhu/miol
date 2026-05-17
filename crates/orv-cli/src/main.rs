@@ -31503,6 +31503,41 @@ done
                 route.path, origin_ref, route.path
             );
         }
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_reveal_contains "reveal GET {} route summary" "{}" '"route_target_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_reveal_contains "reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_reveal_contains "reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
+            route.path, origin_ref
+        );
+        let _ = writeln!(
+            script,
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
+            route.path, origin_ref
+        );
     }
     if deploy_routes_include(server_artifact, "POST", "/checkout") {
         let root_origin = deploy_smoke_origin_var_ref("GET", "/");
@@ -33816,6 +33851,15 @@ test "checkout excluded failure" {
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal GET / production" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"path": "/"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET / native target summary" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"native_server_target_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET / native route summary" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"native_server_route_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET / native target summary" "$ORV_SMOKE_ORIGIN_GET_ROOT" '"native_server_target_count": 1'"#
         ));
         assert!(smoke_test.contains(
             r#"orv_smoke_reveal_contains "reveal GET /health response source" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_HEALTH" '@respond'"#
@@ -45747,6 +45791,15 @@ entry = "src/main.orv"
             r#"orv_smoke_reveal_contains "reveal GET /ping response production" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '"response_origin_dispatch": true'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_reveal_contains "reveal GET /ping native target summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"native_server_target_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET /ping native route summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"native_server_route_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET /ping native target summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"native_server_target_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal GET /ping response origin" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '"name": "respond"'"#
         ));
         assert!(smoke_test.contains(
@@ -51942,6 +51995,15 @@ let sig quantity: int = 1
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        assert_eq!(reveal["production"]["summary"]["route_target_count"], 1);
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_route_count"],
+            1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -52100,6 +52162,15 @@ let sig quantity: int = 1
             .expect("routes")
             .iter()
             .any(|route| route["method"] == "GET" && route["path"] == "/ping"));
+        assert_eq!(reveal["production"]["summary"]["route_target_count"], 1);
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_route_count"],
+            1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
