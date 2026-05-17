@@ -53416,6 +53416,92 @@ define Auth() -> { @out "auth" }
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn editor_run_debug_result_summarizes_client_production_targets() {
+        let dir = temp_output_dir("editor-run-debug-client-production-summary");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("page.orv");
+        std::fs::write(
+            &path,
+            "let sig count: int = 0\n@out @html { @body { @p count } }",
+        )
+        .expect("write source");
+        let build_out = dir.join("dist");
+        let editor_out = dir.join("editor");
+
+        cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&build_out), None)
+            .expect("editor export with build");
+
+        let run = editor_debug_runner_session_json(
+            &editor_out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug runner with client production summary");
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["client_target_count"],
+            5
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["client_manifest_count"],
+            1
+        );
+        assert!(
+            run["panels"]["debug"]["production_summary"]["client_capability_surface_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2),
+            "{run}"
+        );
+        let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
+        assert!(result_html.contains("Production Summary"));
+        assert!(result_html.contains("client_target_count"));
+        assert!(result_html.contains("client targets, 1 manifests"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_result_summarizes_static_production_targets() {
+        let dir = temp_output_dir("editor-run-debug-static-production-summary");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("page.orv");
+        std::fs::write(&path, r#"@out @html { @body { @h1 "Home" } }"#).expect("write source");
+        let build_out = dir.join("dist");
+        let editor_out = dir.join("editor");
+
+        cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&build_out), None)
+            .expect("editor export with build");
+
+        let run = editor_debug_runner_session_json(
+            &editor_out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug runner with static production summary");
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["static_target_count"],
+            1
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["static_verified_count"],
+            1
+        );
+        let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
+        assert!(result_html.contains("Production Summary"));
+        assert!(result_html.contains("static_target_count"));
+        assert!(result_html.contains("1/1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn assert_editor_debug_runner_artifact(out: &Path, state: &serde_json::Value) {
         let runner =
             read_json_value(&out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH)).expect("debug runner");

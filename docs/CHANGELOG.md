@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Added client and static positive gates for `panels.debug.production_summary`, so DAP runner result tests now cover native, client bundle, and zero-runtime static production counters.
 - Split build-backed DAP runner production context into a checked `panels.debug.production_summary` section and rendered debug-result metrics, so native/static/client/smoke summary counters stay visible in `orv editor run-debug` outputs.
 - Extended generated deploy smoke tests so client-bundle builds assert CLI/editor/LSP client-origin reveal payloads carry client target, manifest, and capability summary counters.
 - Tightened static production verification so `deploy/manifest.json` static targets must match the bundle-plan `static_page` target, and LSP/editor reveal tests now assert static summary counters.
