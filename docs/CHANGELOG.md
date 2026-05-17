@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-17
 
+- Added the generated smoke-output artifact and required marker list to the shop starter README so the starter guide matches generated deploy runbooks.
 - Added the required smoke-output marker list to the generated deploy runbook and made verify-build reject runbook drift from the benchmark smoke marker contract.
 - Mirrored benchmark smoke required-marker contracts into reveal/editor/native production preflight payloads.
 - Split the large CLI and compiler implementation files into focused modules while keeping public command/artifact behavior unchanged.

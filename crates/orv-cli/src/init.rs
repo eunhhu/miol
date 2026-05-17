@@ -49,6 +49,10 @@ fn shop_init_template_source() -> String {
 }
 
 fn shop_init_readme(project_name: &str) -> String {
+    let smoke_required_markers = crate::deploy_benchmark::SMOKE_REQUIRED_MARKERS
+        .iter()
+        .map(|marker| format!("- `{marker}`\n"))
+        .collect::<String>();
     format!(
         "# {project_name}\n\
 \n\
@@ -119,6 +123,10 @@ orv benchmark-report .\n\
 \n\
 The generated `deploy/benchmark-evidence.json` template records the 5-hour shop benchmark tasks and data-to-record fields against the same preflight hash that `orv verify-build` checks. After a human run, fill the evidence file and run `orv benchmark-report dist --require-pass` from the project root, or `orv benchmark-report . --require-pass` from `dist`.\n\
 \n\
+The generated smoke test writes `deploy/smoke-output.txt`. Benchmark reports require these smoke-output markers:\n\
+\n\
+{smoke_required_markers}\n\
+\n\
 ## Native Launcher\n\
 \n\
 ```sh\n\
@@ -146,6 +154,7 @@ docker build -f dist/server/native/Dockerfile -t orv-native-server:latest dist\n
 - `deploy/preflight.json`\n\
 - `deploy/benchmark-evidence.json`\n\
 - `deploy/smoke-test.sh`\n\
+- `deploy/smoke-output.txt`\n\
 - `deploy/README.md`\n\
 - `deploy/routes.json`\n\
 - `deploy/server.sh`\n\

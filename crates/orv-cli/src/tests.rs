@@ -723,6 +723,10 @@ fn init_shop_template_writes_deploy_guide() {
     assert!(guide.contains("deploy/commerce-adapters.json"));
     assert!(guide.contains("deploy/preflight.json"));
     assert!(guide.contains("deploy/benchmark-evidence.json"));
+    assert!(guide.contains("deploy/smoke-output.txt"));
+    assert!(guide.contains("- `pass_marker`"));
+    assert!(guide.contains("- `dap_source_bundle`"));
+    assert!(guide.contains("- `trace_stream_requested`"));
     assert!(guide.contains("5-hour shop benchmark"));
     assert!(guide.contains("deploy/smoke-test.sh"));
     assert!(guide.contains("server/native-server.json"));
