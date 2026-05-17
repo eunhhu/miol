@@ -4317,6 +4317,18 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
                 }
             }
         }
+        let summary =
+            deploy_route_reveal_summary_counts(dir, &route.origin_id, origin_map, artifact)?;
+        for required in deploy_route_reveal_summary_requirements(&route.path, &origin_ref, summary)
+        {
+            if !smoke.contains(&required) {
+                let method = &route.method;
+                let path = &route.path;
+                anyhow::bail!(
+                    "deploy smoke test must verify reveal production summary for {method} {path}"
+                );
+            }
+        }
     }
     if deploy_routes_include(artifact, "POST", "/checkout") {
         for path in ["/products", "/members", "/cart/items"] {
@@ -4695,6 +4707,66 @@ pub(crate) fn deploy_native_server_summary_counts(
         targets: targets.len(),
         routes: production_native_server_route_count(&targets),
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeployRouteRevealSummaryCounts {
+    pub(crate) routes: usize,
+    pub(crate) native_targets: usize,
+    pub(crate) native_routes: usize,
+}
+
+pub(crate) fn deploy_route_reveal_summary_counts(
+    dir: &Path,
+    origin_id: &str,
+    origin_map: &orv_compiler::OriginMap,
+    artifact: &orv_compiler::ServerRuntimeArtifact,
+) -> anyhow::Result<DeployRouteRevealSummaryCounts> {
+    let server_artifacts = [(SERVER_ARTIFACT_PATH.to_string(), artifact.clone())];
+    let routes = reveal_routes(origin_id, origin_map, &server_artifacts);
+    let native_targets = reveal_native_server_targets(dir, origin_id, origin_map)?;
+    Ok(DeployRouteRevealSummaryCounts {
+        routes: routes.len(),
+        native_targets: native_targets.len(),
+        native_routes: production_native_server_route_count(&native_targets),
+    })
+}
+
+pub(crate) fn deploy_route_reveal_summary_requirements(
+    path: &str,
+    origin_ref: &str,
+    summary: DeployRouteRevealSummaryCounts,
+) -> Vec<String> {
+    vec![
+        format!(
+            r#"orv_smoke_reveal_contains "reveal GET {path} route summary" "{origin_ref}" '"route_target_count": {}'"#,
+            summary.routes
+        ),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal GET {path} native target summary" "{origin_ref}" '"native_server_target_count": {}'"#,
+            summary.native_targets
+        ),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal GET {path} native route summary" "{origin_ref}" '"native_server_route_count": {}'"#,
+            summary.native_routes
+        ),
+        format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET {path} native target summary" "{origin_ref}" '"native_server_target_count": {}'"#,
+            summary.native_targets
+        ),
+        format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal GET {path} native route summary" "{origin_ref}" '"native_server_route_count": {}'"#,
+            summary.native_routes
+        ),
+        format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {path} native target summary" "{origin_ref}" '"native_server_target_count": {}'"#,
+            summary.native_targets
+        ),
+        format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {path} native route summary" "{origin_ref}" '"native_server_route_count": {}'"#,
+            summary.native_routes
+        ),
+    ]
 }
 
 pub(crate) fn verify_deploy_preflight_artifact(
@@ -12671,41 +12743,14 @@ done
                 route.path, origin_ref, route.path
             );
         }
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_reveal_contains "reveal GET {} route summary" "{}" '"route_target_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_reveal_contains "reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_reveal_contains "reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_editor_reveal_contains "editor reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_editor_reveal_contains "editor reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {} native target summary" "{}" '"native_server_target_count": 1'"#,
-            route.path, origin_ref
-        );
-        let _ = writeln!(
-            script,
-            r#"orv_smoke_lsp_reveal_contains "lsp reveal GET {} native route summary" "{}" '"native_server_route_count": 1'"#,
-            route.path, origin_ref
-        );
+        let summary =
+            deploy_route_reveal_summary_counts(out, &route.origin_id, origin_map, server_artifact)?;
+        for requirement in
+            deploy_route_reveal_summary_requirements(&route.path, &origin_ref, summary)
+        {
+            script.push_str(&requirement);
+            script.push('\n');
+        }
     }
     if deploy_routes_include(server_artifact, "POST", "/checkout") {
         let root_origin = deploy_smoke_origin_var_ref("GET", "/");

@@ -15088,6 +15088,35 @@ fn verify_build_rejects_deploy_smoke_dap_native_route_count_mismatch() {
 }
 
 #[test]
+fn verify_build_rejects_deploy_smoke_route_reveal_summary_count_mismatch() {
+    let (src_dir, path) =
+        multi_route_prod_server_source("deploy-smoke-route-reveal-summary-source");
+    let out = temp_output_dir("deploy-smoke-route-reveal-summary");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke_path = out.join("deploy").join("smoke-test.sh");
+    let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    write_text(
+        &smoke_path,
+        &smoke.replace(
+            r#"orv_smoke_reveal_contains "reveal GET /ping route summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"route_target_count": 1'"#,
+            r#"orv_smoke_reveal_contains "reveal GET /ping route summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"route_target_count": 2'"#,
+        ),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("route reveal summary count mismatch");
+
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must verify reveal production summary for GET /ping"),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
 fn verify_build_rejects_deploy_smoke_dap_marker_contract_missing() {
     let (src_dir, path) = prod_server_source("deploy-smoke-dap-marker-contract-source");
     let out = temp_output_dir("deploy-smoke-dap-marker-contract-missing");
