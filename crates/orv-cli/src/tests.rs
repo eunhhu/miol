@@ -13372,6 +13372,14 @@ fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
         preflight["artifacts"]["smoke_output"],
         "deploy/smoke-output.txt"
     );
+    assert_eq!(
+        preflight["smoke_output_contract"]["output"],
+        "deploy/smoke-output.txt"
+    );
+    assert_eq!(
+        preflight["smoke_output_contract"]["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
     assert_eq!(preflight["artifacts"]["preflight"], "deploy/preflight.json");
     assert_eq!(
         preflight["artifacts"]["benchmark_evidence"],
@@ -13433,6 +13441,10 @@ fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
     assert_eq!(evidence["benchmark"], preflight["benchmark"]);
     assert_eq!(evidence["commands"], preflight["commands"]);
     assert_eq!(evidence["artifacts"], preflight["artifacts"]);
+    assert_eq!(
+        evidence["smoke_output_contract"],
+        preflight["smoke_output_contract"]
+    );
     assert_eq!(evidence["recording_status"], "not_recorded");
     assert_eq!(
         evidence["task_entries"]
@@ -15590,6 +15602,27 @@ fn verify_build_rejects_deploy_preflight_benchmark_mismatch() {
 }
 
 #[test]
+fn verify_build_rejects_deploy_preflight_smoke_output_contract_mismatch() {
+    let (src_dir, path) = prod_server_source("deploy-preflight-smoke-output-contract-source");
+    let out = temp_output_dir("deploy-preflight-smoke-output-contract-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let preflight_path = out.join("deploy").join("preflight.json");
+    let mut preflight = read_json_value(&preflight_path).expect("preflight");
+    preflight["smoke_output_contract"]["required_markers"] =
+        serde_json::json!(["pass_marker", "build_dir"]);
+    write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+    let err = cmd_verify_build(&out).expect_err("preflight smoke output contract mismatch");
+
+    assert!(err
+        .to_string()
+        .contains("deploy preflight smoke_output_contract must match smoke output contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
 fn verify_build_rejects_deploy_benchmark_evidence_mismatch() {
     let (src_dir, path) = prod_server_source("deploy-benchmark-evidence-source");
     let out = temp_output_dir("deploy-benchmark-evidence-mismatch");
@@ -15626,6 +15659,28 @@ fn verify_build_rejects_deploy_benchmark_evidence_smoke_marker_mismatch() {
     assert!(err
         .to_string()
         .contains("smoke_test_required_markers must match smoke output contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_benchmark_evidence_smoke_output_contract_mismatch() {
+    let (src_dir, path) =
+        prod_server_source("deploy-benchmark-evidence-smoke-output-contract-source");
+    let out = temp_output_dir("deploy-benchmark-evidence-smoke-output-contract-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+    let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+    evidence["smoke_output_contract"]["output"] = serde_json::json!("deploy/wrong-smoke.txt");
+    write_json(&evidence_path, &evidence).expect("write drifted benchmark evidence");
+
+    let err =
+        cmd_verify_build(&out).expect_err("benchmark evidence smoke output contract mismatch");
+
+    assert!(err.to_string().contains(
+        "deploy benchmark evidence smoke_output_contract must match smoke output contract"
+    ));
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(&out);
 }
@@ -15719,6 +15774,14 @@ fn benchmark_report_marks_recorded_evidence_passed() {
     let report = benchmark_report_value(&out).expect("benchmark report");
 
     assert_eq!(report["status"], "passed");
+    assert_eq!(
+        report["smoke_output_contract"]["output"],
+        "deploy/smoke-output.txt"
+    );
+    assert_eq!(
+        report["smoke_output_contract"]["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
     assert_eq!(report["time_over_limit"], false);
     assert_eq!(report["total_elapsed_minutes"], 100.0);
     assert_eq!(report["tasks"]["recorded_task_count"], 10);
@@ -18907,6 +18970,9 @@ fn reveal_origin_exposes_deploy_preflight_contract() {
             && target["artifacts"]["smoke_test"] == "deploy/smoke-test.sh"
             && target["artifacts"]["smoke_output"] == "deploy/smoke-output.txt"
             && target["artifacts"]["benchmark_evidence"] == "deploy/benchmark-evidence.json"
+            && target["smoke_output_contract"]["output"] == "deploy/smoke-output.txt"
+            && target["smoke_output_contract"]["required_markers"]
+                == serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
             && target["benchmark"]["kind"] == "orv.benchmark.shop_5h"
             && target["benchmark"]["max_elapsed_minutes"] == 300
             && target["benchmark_evidence"]["exists"] == true
@@ -22924,6 +22990,14 @@ fn editor_export_with_build_embeds_production_adapter_summary() {
     assert_eq!(
         state["production"]["preflight"][0]["artifacts"]["smoke_output"],
         "deploy/smoke-output.txt"
+    );
+    assert_eq!(
+        state["production"]["preflight"][0]["smoke_output_contract"]["output"],
+        "deploy/smoke-output.txt"
+    );
+    assert_eq!(
+        state["production"]["preflight"][0]["smoke_output_contract"]["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
     );
     assert_eq!(
         state["production"]["preflight"][0]["benchmark_evidence"]["recording_status"],

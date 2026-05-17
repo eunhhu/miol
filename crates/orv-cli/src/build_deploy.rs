@@ -44,6 +44,11 @@ pub(crate) fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::V
     let smoke_output_rel = evidence
         .pointer("/artifacts/smoke_output")
         .and_then(serde_json::Value::as_str);
+    let smoke_output_contract = evidence
+        .get("smoke_output_contract")
+        .cloned()
+        .or_else(|| smoke_output_rel.map(smoke_output_contract_value))
+        .unwrap_or(serde_json::Value::Null);
     let data_report = benchmark_report_data(&evidence, Some(dir), smoke_output_rel)?;
     let status = benchmark_report_status_summary(&task_report, &data_report, max_elapsed_minutes);
     Ok(serde_json::json!({
@@ -58,6 +63,7 @@ pub(crate) fn benchmark_report_value(dir: &Path) -> anyhow::Result<serde_json::V
             .get("preflight_hash")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "smoke_output_contract": smoke_output_contract,
         "recording_status": evidence
             .get("recording_status")
             .cloned()
@@ -4716,6 +4722,11 @@ pub(crate) fn verify_deploy_preflight_artifact(
             &format!("deploy preflight artifact {key}"),
         )?;
     }
+    if preflight.get("smoke_output_contract")
+        != Some(&deploy_smoke_output_contract_value(artifacts))
+    {
+        anyhow::bail!("deploy preflight smoke_output_contract must match smoke output contract");
+    }
     if preflight.get("runtime").and_then(serde_json::Value::as_str)
         != Some(artifact.runtime.as_str())
     {
@@ -4810,6 +4821,12 @@ pub(crate) fn verify_deploy_benchmark_evidence_artifact(
     }
     if evidence.get("artifacts") != Some(&deploy_preflight_artifacts_value(artifacts)) {
         anyhow::bail!("deploy benchmark evidence artifacts do not match deploy preflight");
+    }
+    if evidence.get("smoke_output_contract") != Some(&deploy_smoke_output_contract_value(artifacts))
+    {
+        anyhow::bail!(
+            "deploy benchmark evidence smoke_output_contract must match smoke output contract"
+        );
     }
     verify_deploy_benchmark_evidence_task_entries(&evidence)?;
     verify_deploy_benchmark_evidence_data(&evidence)?;
@@ -6332,6 +6349,15 @@ pub(crate) fn reveal_preflight_targets(dir: &Path) -> anyhow::Result<Vec<serde_j
             .get("artifacts")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({})),
+        "smoke_output_contract": artifact
+            .get("smoke_output_contract")
+            .cloned()
+            .unwrap_or_else(|| {
+                artifact
+                    .pointer("/artifacts/smoke_output")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(serde_json::Value::Null, smoke_output_contract_value)
+            }),
         "benchmark": artifact
             .get("benchmark")
             .cloned()
@@ -11927,6 +11953,7 @@ pub(crate) fn deploy_preflight_artifact_value(
         "optional_env": deploy_preflight_env_values(server_artifact.listen.as_ref(), persistence, false),
         "commands": deploy_preflight_commands_value(artifacts),
         "artifacts": deploy_preflight_artifacts_value(artifacts),
+        "smoke_output_contract": deploy_smoke_output_contract_value(artifacts),
         "benchmark": deploy_preflight_benchmark_value(),
         "client": deploy_preflight_client_value(client),
     })
@@ -11973,6 +12000,19 @@ pub(crate) fn deploy_preflight_artifacts_value(
     })
 }
 
+pub(crate) fn deploy_smoke_output_contract_value(
+    artifacts: &DeployRunbookArtifacts<'_>,
+) -> serde_json::Value {
+    smoke_output_contract_value(artifacts.smoke_output)
+}
+
+pub(crate) fn smoke_output_contract_value(smoke_output: &str) -> serde_json::Value {
+    serde_json::json!({
+        "output": smoke_output,
+        "required_markers": deploy_benchmark::smoke_required_markers_value(),
+    })
+}
+
 pub(crate) fn deploy_benchmark_evidence_artifact_value(
     artifacts: &DeployRunbookArtifacts<'_>,
     server_artifact: &orv_compiler::ServerRuntimeArtifact,
@@ -11990,6 +12030,7 @@ pub(crate) fn deploy_benchmark_evidence_artifact_value(
         "benchmark": deploy_preflight_benchmark_value(),
         "commands": deploy_preflight_commands_value(artifacts),
         "artifacts": deploy_preflight_artifacts_value(artifacts),
+        "smoke_output_contract": deploy_smoke_output_contract_value(artifacts),
         "recording_status": "not_recorded",
         "task_entries": deploy_benchmark::evidence_task_entries_value(),
         "data": deploy_benchmark::evidence_data_value(),
