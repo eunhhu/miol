@@ -14881,10 +14881,20 @@ fn build_prod_smoke_dap_source_bundle_count_uses_actual_file_count() {
     cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
     let smoke =
         std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
+    let project_graph = read_json_value(&out.join("project-graph.json")).expect("project graph");
+    let project_graph_node_count = json_array_count(project_graph.get("nodes"));
+    let origin_map = read_json_value(&out.join("origin-map.json")).expect("origin map");
+    let origin_entry_count = json_array_count(origin_map.get("entries"));
 
     assert!(smoke.contains(
         r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 2'"#
     ));
+    assert!(smoke.contains(&format!(
+        r#"orv_smoke_dap_summary_contains "dap project graph summary" '"project_graph_node_count": {project_graph_node_count}'"#
+    )));
+    assert!(smoke.contains(&format!(
+        r#"orv_smoke_dap_summary_contains "dap origin summary" '"origin_entry_count": {origin_entry_count}'"#
+    )));
     assert!(smoke.contains(
         r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 2'"#
     ));
@@ -14908,6 +14918,10 @@ fn verify_build_rejects_deploy_smoke_dap_source_bundle_count_mismatch() {
     cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
     let smoke_path = out.join("deploy").join("smoke-test.sh");
     let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    let project_graph = read_json_value(&out.join("project-graph.json")).expect("project graph");
+    let project_graph_node_count = json_array_count(project_graph.get("nodes"));
+    let origin_map = read_json_value(&out.join("origin-map.json")).expect("origin map");
+    let origin_entry_count = json_array_count(origin_map.get("entries"));
     write_text(
         &smoke_path,
         &smoke
@@ -14918,6 +14932,18 @@ fn verify_build_rejects_deploy_smoke_dap_source_bundle_count_mismatch() {
             .replace(
                 r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 2'"#,
                 r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#,
+            )
+            .replace(
+                &format!(
+                    r#"orv_smoke_dap_summary_contains "dap project graph summary" '"project_graph_node_count": {project_graph_node_count}'"#
+                ),
+                r#"orv_smoke_dap_summary_contains "dap project graph summary" '"project_graph_node_count": 1'"#,
+            )
+            .replace(
+                &format!(
+                    r#"orv_smoke_dap_summary_contains "dap origin summary" '"origin_entry_count": {origin_entry_count}'"#
+                ),
+                r#"orv_smoke_dap_summary_contains "dap origin summary" '"origin_entry_count": 1'"#,
             ),
     )
     .expect("write corrupt smoke test");

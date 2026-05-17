@@ -3654,6 +3654,7 @@ pub(crate) fn verify_deploy_server_target(
         smoke_test,
         artifact.listen.as_ref(),
         &artifact,
+        origin_map,
         &persistence,
         client,
     )?;
@@ -4030,6 +4031,7 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
     path: &str,
     listen: Option<&orv_compiler::ServerListenArtifact>,
     artifact: &orv_compiler::ServerRuntimeArtifact,
+    origin_map: &orv_compiler::OriginMap,
     persistence: &DeployPersistence,
     client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -4083,11 +4085,19 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
         anyhow::bail!("deploy smoke test must optionally verify live trace stream");
     }
     let source_bundle_file_count = artifact.source_bundle.files.len();
+    let project_graph_node_count = deploy_project_graph_node_count(dir)?;
+    let origin_entry_count = origin_map.entries.len();
     let dap_source_bundle_summary = format!(
         r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": {source_bundle_file_count}'"#
     );
     let dap_source_bundle_panel_file_count = format!(
         r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": {source_bundle_file_count}'"#
+    );
+    let dap_project_graph_summary = format!(
+        r#"orv_smoke_dap_summary_contains "dap project graph summary" '"project_graph_node_count": {project_graph_node_count}'"#
+    );
+    let dap_origin_summary = format!(
+        r#"orv_smoke_dap_summary_contains "dap origin summary" '"origin_entry_count": {origin_entry_count}'"#
     );
     if !smoke.contains("orv_smoke_graph_contract()")
         || !smoke.contains("\norv_smoke_graph_contract\n")
@@ -4095,6 +4105,8 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
             r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'"#,
         )
         || !smoke.contains(&dap_source_bundle_summary)
+        || !smoke.contains(&dap_project_graph_summary)
+        || !smoke.contains(&dap_origin_summary)
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#,
         )
@@ -4462,6 +4474,11 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
         }
     }
     Ok(())
+}
+
+pub(crate) fn deploy_project_graph_node_count(dir: &Path) -> anyhow::Result<usize> {
+    let graph = read_json_value(&dir.join("project-graph.json"))?;
+    Ok(json_array_count(graph.get("nodes")))
 }
 
 pub(crate) fn verify_deploy_smoke_db_adapter_contract(
@@ -12471,10 +12488,14 @@ orv_smoke_cookie_from_headers() {{
     }
     script.push_str("orv_smoke_graph_contract\n");
     let source_bundle_file_count = server_artifact.source_bundle.files.len();
+    let project_graph_node_count = deploy_project_graph_node_count(out)?;
+    let origin_entry_count = origin_map.entries.len();
     let _ = write!(
         script,
         r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'
 orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": {source_bundle_file_count}'
+orv_smoke_dap_summary_contains "dap project graph summary" '"project_graph_node_count": {project_graph_node_count}'
+orv_smoke_dap_summary_contains "dap origin summary" '"origin_entry_count": {origin_entry_count}'
 orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {{'
 orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'
 orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": {source_bundle_file_count}'
