@@ -23466,6 +23466,18 @@ fn verify_deploy_smoke_test_artifact(
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'"#,
         )
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#,
+        )
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'"#,
+        )
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#,
+        )
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#,
+        )
         || !smoke.contains(r#""$ORV_BIN" verify-build ."#)
         || !smoke.contains("source-bundle.json")
         || !smoke.contains("project-graph.json")
@@ -31815,6 +31827,10 @@ orv_smoke_cookie_from_headers() {{
     script.push_str(
         r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'
 orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'
+orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'
+orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'
+orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'
+orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'
 "#,
     );
     if !server_artifact.routes.is_empty() {
@@ -34240,6 +34256,18 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("\norv_smoke_graph_contract\n"));
         assert!(smoke_test.contains(r#""$ORV_BIN" verify-build ."#));
         assert!(smoke_test.contains("source-bundle.json"));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#
+        ));
         assert!(smoke_test.contains("project-graph.json"));
         assert!(smoke_test.contains("origin-map.json"));
         assert!(smoke_test.contains("orv_smoke_curl()"));
@@ -46308,6 +46336,18 @@ entry = "src/main.orv"
         assert!(smoke_test.contains("\norv_smoke_write_output\n"));
         assert!(smoke_test.contains("graph_contract=verified"));
         assert!(smoke_test.contains("dap_summary=verified"));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#
+        ));
         assert!(smoke_test.contains("server_routes=1"));
         assert!(smoke_test.contains("trace_stream_requested=%s"));
         assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
@@ -46536,6 +46576,18 @@ let sig count: int = 0
         assert!(smoke.contains("orv_smoke_write_output()"));
         assert!(smoke.contains("graph_contract=verified"));
         assert!(smoke.contains("dap_summary=verified"));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#
+        ));
         assert!(smoke.contains("server_routes=1"));
         assert!(smoke.contains("trace_stream_requested=%s"));
         assert!(smoke.contains(r#"orv_smoke_file "client/manifest.json""#));
@@ -47786,6 +47838,33 @@ let sig count: int = 0
         .expect("write corrupt smoke test");
 
         let err = cmd_verify_build(&out).expect_err("smoke graph contract mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy smoke test must verify the build graph contract"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_smoke_dap_source_bundle_panel_missing() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-dap-source-bundle-source");
+        let out = temp_output_dir("deploy-smoke-dap-source-bundle-missing");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        write_text(
+            &smoke_path,
+            &smoke.replace(
+                r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'
+"#,
+                "",
+            ),
+        )
+        .expect("write corrupt smoke test");
+
+        let err = cmd_verify_build(&out).expect_err("smoke DAP source bundle panel mismatch");
 
         assert!(err
             .to_string()
