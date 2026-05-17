@@ -4240,7 +4240,7 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must inspect shop response bodies");
     }
-    verify_deploy_smoke_client_contract(&smoke, client)?;
+    verify_deploy_smoke_client_contract(dir, &smoke, client)?;
     verify_deploy_smoke_db_adapter_contract(&smoke, persistence)?;
     if let Some(ready_path) = deploy_smoke_ready_path(artifact) {
         let ready_assignment = format!(r#"READY_PATH="{ready_path}""#);
@@ -4528,6 +4528,7 @@ pub(crate) fn verify_deploy_smoke_db_adapter_contract(
 }
 
 pub(crate) fn verify_deploy_smoke_client_contract(
+    dir: &Path,
     smoke: &str,
     client: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -4551,6 +4552,7 @@ pub(crate) fn verify_deploy_smoke_client_contract(
     let page = json_str(client, "page", "deploy client")?;
     let loader = json_str(client, "loader", "deploy client")?;
     let manifest = json_str(client, "manifest", "deploy client")?;
+    let client_summary = deploy_client_summary_counts(dir)?;
     for required in [
         format!(r#"orv_smoke_grep "client page marker" "{page}" 'data-orv-client="wasm"'"#),
         format!(r#"orv_smoke_grep "client loader reference" "{page}" 'app.js'"#),
@@ -4599,27 +4601,81 @@ pub(crate) fn verify_deploy_smoke_client_contract(
         ),
         format!(r#"orv_smoke_grep "client loader wasm reference" "{loader}" 'app.wasm'"#),
         format!(r#"orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'"#),
-        r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
-        r#"orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
-        r#"orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        ),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        ),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        ),
         format!(
             r#"orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "{manifest}"'"#
         ),
-        r#"orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
-        r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
-        r#"orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
-        r#"orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
-        r#"orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
-        r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
-        r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'"#.to_string(),
-        r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'"#.to_string(),
-        r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'"#.to_string(),
+        format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        ),
+        format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        ),
+        format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        ),
+        format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        ),
+        format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        ),
+        format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        ),
+        format!(
+            r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": {}'"#,
+            client_summary.targets
+        ),
+        format!(
+            r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        ),
+        format!(
+            r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        ),
     ] {
         if !smoke.contains(&required) {
             anyhow::bail!("deploy smoke test must include {required}");
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeployClientSummaryCounts {
+    pub(crate) targets: usize,
+    pub(crate) manifests: usize,
+    pub(crate) capability_surfaces: usize,
+}
+
+pub(crate) fn deploy_client_summary_counts(
+    dir: &Path,
+) -> anyhow::Result<DeployClientSummaryCounts> {
+    let targets = reveal_client_bundle_targets(dir)?;
+    Ok(DeployClientSummaryCounts {
+        targets: targets.len(),
+        manifests: production_client_manifest_count(&targets),
+        capability_surfaces: production_client_capability_surface_count(&targets),
+    })
 }
 
 pub(crate) fn verify_deploy_preflight_artifact(
@@ -12518,7 +12574,7 @@ orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_
         script.push_str(&deploy_smoke_reveal_marker_contract_section(&origin_ref));
     }
     script.push_str(&deploy_smoke_client_contract_section(client));
-    script.push_str(&deploy_smoke_client_reveal_section(client));
+    script.push_str(&deploy_smoke_client_reveal_section(out, client)?);
     script.push_str("orv_smoke_dap_summary_cleanup\n");
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
     script.push_str(&deploy_smoke_output_function_section(
@@ -12948,28 +13004,35 @@ orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'
     )
 }
 
-pub(crate) fn deploy_smoke_client_reveal_section(client: &serde_json::Value) -> String {
+pub(crate) fn deploy_smoke_client_reveal_section(
+    out: &Path,
+    client: &serde_json::Value,
+) -> anyhow::Result<String> {
     if client.is_null() {
-        return String::new();
+        return Ok(String::new());
     }
     let manifest = json_str_or_empty(client, "manifest");
-    format!(
-        r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
-orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
-orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
+    let summary = deploy_client_summary_counts(out)?;
+    let target_count = summary.targets;
+    let manifest_count = summary.manifests;
+    let capability_surface_count = summary.capability_surfaces;
+    Ok(format!(
+        r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {target_count}'
+orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {manifest_count}'
+orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {capability_surface_count}'
 orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "{manifest}"'
-orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
-orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
-orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
-orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
-orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
-orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
-orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'
-orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'
-orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'
+orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {target_count}'
+orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {manifest_count}'
+orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {capability_surface_count}'
+orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {target_count}'
+orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {manifest_count}'
+orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {capability_surface_count}'
+orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": {target_count}'
+orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": {manifest_count}'
+orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count": {capability_surface_count}'
 
 "#
-    )
+    ))
 }
 
 pub(crate) fn deploy_smoke_db_adapter_contract_section(persistence: &DeployPersistence) -> String {

@@ -13594,6 +13594,7 @@ let sig count: int = 0
     cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
     let smoke_path = out.join("deploy").join("smoke-test.sh");
     let smoke = std::fs::read_to_string(&smoke_path).expect("deploy smoke test");
+    let client_summary = deploy_client_summary_counts(&out).expect("client summary counts");
 
     assert!(smoke.contains("ORV_SMOKE_BUILD_DIR="));
     assert!(smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#));
@@ -13683,28 +13684,76 @@ let sig count: int = 0
     assert!(smoke.contains(
         r#"orv_smoke_grep "client loader signal setter" "client/app.js" '__ORV_SET_SIGNAL__'"#
     ));
-    assert!(smoke.contains(
-            r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#
-        ));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        )));
     assert!(smoke.contains(
             r#"orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "client/manifest.json"'"#
         ));
-    assert!(smoke.contains(
-            r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#
-        ));
-    assert!(smoke.contains(
-            r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#
-        ));
-    assert!(smoke.contains(
-        r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'"#
-    ));
-    assert!(smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'"#
-        ));
-    assert!(smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'"#
-        ));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": {}'"#,
+            client_summary.targets
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        )));
+    let dap_client_target_gate = format!(
+        r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": {}'"#,
+        client_summary.targets
+    );
+    assert!(smoke.contains(&dap_client_target_gate));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": {}'"#,
+            client_summary.manifests
+        )));
+    assert!(smoke.contains(&format!(
+            r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count": {}'"#,
+            client_summary.capability_surfaces
+        )));
     cmd_verify_build(&out).expect("verify client smoke test");
+
+    let wrong_dap_client_target_gate = format!(
+        r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": {}'"#,
+        client_summary.targets + 1
+    );
+    write_text(
+        &smoke_path,
+        &smoke.replace(&dap_client_target_gate, &wrong_dap_client_target_gate),
+    )
+    .expect("write corrupt smoke test");
+    let err = cmd_verify_build(&out).expect_err("client summary count mismatch");
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must include orv_smoke_dap_summary_contains"),
+        "{err}"
+    );
+    write_text(&smoke_path, &smoke).expect("restore smoke test");
 
     write_text(
         &smoke_path,
