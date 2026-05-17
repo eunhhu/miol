@@ -5184,6 +5184,15 @@ pub(crate) fn verify_deploy_runbook_artifact(
     if !runbook.contains("## Benchmark Evidence") {
         anyhow::bail!("deploy runbook must document benchmark evidence capture");
     }
+    if !runbook.contains("## Smoke Output Markers") {
+        anyhow::bail!("deploy runbook must document smoke output markers");
+    }
+    for marker in deploy_benchmark::SMOKE_REQUIRED_MARKERS {
+        let marker_line = format!("- `{marker}`");
+        if !runbook.contains(&marker_line) {
+            anyhow::bail!("deploy runbook must document smoke output marker {marker}");
+        }
+    }
     if !runbook.contains("orv benchmark-report .") {
         anyhow::bail!("deploy runbook must document benchmark report command");
     }
@@ -12879,6 +12888,10 @@ pub(crate) fn write_prod_deploy_runbook(
         .collect::<String>();
     let persistence_section = deploy_runbook_persistence_section(persistence);
     let client_section = deploy_runbook_client_section(client);
+    let smoke_required_markers = deploy_benchmark::SMOKE_REQUIRED_MARKERS
+        .iter()
+        .map(|marker| format!("- `{marker}`\n"))
+        .collect::<String>();
     let runbook = format!(
         r#"# orv deploy
 
@@ -12943,6 +12956,12 @@ orv benchmark-report .
 
 Record human-run timing and observation data in `{benchmark_evidence_path}` after the preflight and smoke commands pass. The file keeps the 5-hour shop benchmark tasks, data-to-record fields, and preflight hash together so benchmark reports stay tied to the checked build contract.
 The generated smoke test writes `{smoke_output_path}` on success, and `orv benchmark-report .` uses it when the evidence `smoke_test_output` field is still empty.
+
+## Smoke Output Markers
+
+The benchmark report requires these markers in `{smoke_output_path}`:
+
+{smoke_required_markers}
 
 ```sh
 orv benchmark-report . --require-pass

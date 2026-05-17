@@ -13241,6 +13241,10 @@ fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
     assert!(runbook.contains("deploy/preflight.json"));
     assert!(runbook.contains("deploy/benchmark-evidence.json"));
     assert!(runbook.contains("## Benchmark Evidence"));
+    assert!(runbook.contains("## Smoke Output Markers"));
+    assert!(runbook.contains("- `pass_marker`"));
+    assert!(runbook.contains("- `dap_source_bundle`"));
+    assert!(runbook.contains("- `trace_stream_requested`"));
     assert!(runbook.contains("orv verify-build ."));
     assert!(runbook.contains("orv deploy-env-check ."));
     assert!(runbook.contains("orv editor run-debug . --control next"));
@@ -15431,6 +15435,26 @@ fn verify_build_rejects_deploy_runbook_route_mismatch() {
     assert!(err
         .to_string()
         .contains("deploy runbook must list route GET /ping"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_runbook_smoke_marker_mismatch() {
+    let (src_dir, path) = prod_server_source("deploy-runbook-smoke-marker-source");
+    let out = temp_output_dir("deploy-runbook-smoke-marker-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let runbook_path = out.join("deploy").join("README.md");
+    let mut runbook = std::fs::read_to_string(&runbook_path).expect("runbook");
+    runbook = runbook.replace("- `dap_source_bundle`", "- `dap_source_bundle_missing`");
+    write_text(&runbook_path, &runbook).expect("write corrupt runbook");
+
+    let err = cmd_verify_build(&out).expect_err("runbook smoke marker mismatch");
+
+    assert!(err
+        .to_string()
+        .contains("deploy runbook must document smoke output marker dap_source_bundle"));
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(&out);
 }

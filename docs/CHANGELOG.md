@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-17
 
+- Added the required smoke-output marker list to the generated deploy runbook and made verify-build reject runbook drift from the benchmark smoke marker contract.
 - Mirrored benchmark smoke required-marker contracts into reveal/editor/native production preflight payloads.
 - Split the large CLI and compiler implementation files into focused modules while keeping public command/artifact behavior unchanged.
 - Made generated benchmark evidence record the required smoke-output marker list, including `dap_source_bundle`, and made `orv verify-build` reject evidence drift from that marker contract.
