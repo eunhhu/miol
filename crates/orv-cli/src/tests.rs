@@ -15016,13 +15016,16 @@ fn build_prod_smoke_dap_native_route_summary_uses_actual_route_count() {
     cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
     let smoke =
         std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
+    let native_summary = deploy_native_server_summary_counts(&out).expect("native summary counts");
 
-    assert!(smoke.contains(
-        r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#
-    ));
-    assert!(smoke.contains(
-        r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 2'"#
-    ));
+    assert!(smoke.contains(&format!(
+        r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": {}'"#,
+        native_summary.targets
+    )));
+    assert!(smoke.contains(&format!(
+        r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": {}'"#,
+        native_summary.routes
+    )));
     assert!(!smoke.contains(
         r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#
     ));
@@ -15040,6 +15043,30 @@ fn verify_build_rejects_deploy_smoke_dap_native_route_count_mismatch() {
     cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
     let smoke_path = out.join("deploy").join("smoke-test.sh");
     let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    let native_summary = deploy_native_server_summary_counts(&out).expect("native summary counts");
+    let native_target_gate = format!(
+        r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": {}'"#,
+        native_summary.targets
+    );
+    let wrong_native_target_gate = format!(
+        r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": {}'"#,
+        native_summary.targets + 1
+    );
+    write_text(
+        &smoke_path,
+        &smoke.replace(&native_target_gate, &wrong_native_target_gate),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("smoke DAP native target count mismatch");
+
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must check DAP native production summary counters"),
+        "{err:?}"
+    );
+    write_text(&smoke_path, &smoke).expect("restore smoke test");
+
     write_text(
         &smoke_path,
         &smoke.replace(

@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-18
 
+- Added exact generated deploy smoke gates for DAP native server target counts from the actual production summary instead of a one-target literal.
 - Added exact generated deploy smoke gates for client bundle target, manifest, and capability-surface counts across CLI/editor/LSP reveal and DAP production summaries.
 - Added exact generated deploy smoke gates for DAP project graph node and origin-map entry summary counts, tying the graph/source-bundle/origin-map production summary back to build artifacts.
 - Fixed generated deploy smoke DAP source-bundle count checks to use the actual build source-bundle file count, so imported multi-file projects do not fail against a one-file expectation.

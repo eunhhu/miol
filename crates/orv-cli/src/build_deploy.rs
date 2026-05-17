@@ -4194,13 +4194,16 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
         }
     }
     if !artifact.routes.is_empty() {
+        let native_summary = deploy_native_server_summary_counts(dir)?;
+        let dap_native_target_summary = format!(
+            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": {}'"#,
+            native_summary.targets
+        );
         let dap_native_route_summary = format!(
             r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": {}'"#,
-            artifact.routes.len()
+            native_summary.routes
         );
-        if !smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#,
-        ) || !smoke.contains(&dap_native_route_summary)
+        if !smoke.contains(&dap_native_target_summary) || !smoke.contains(&dap_native_route_summary)
         {
             anyhow::bail!("deploy smoke test must check DAP native production summary counters");
         }
@@ -4675,6 +4678,22 @@ pub(crate) fn deploy_client_summary_counts(
         targets: targets.len(),
         manifests: production_client_manifest_count(&targets),
         capability_surfaces: production_client_capability_surface_count(&targets),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeployNativeServerSummaryCounts {
+    pub(crate) targets: usize,
+    pub(crate) routes: usize,
+}
+
+pub(crate) fn deploy_native_server_summary_counts(
+    dir: &Path,
+) -> anyhow::Result<DeployNativeServerSummaryCounts> {
+    let targets = editor_production_native_server_targets(dir)?;
+    Ok(DeployNativeServerSummaryCounts {
+        targets: targets.len(),
+        routes: production_native_server_route_count(&targets),
     })
 }
 
@@ -12562,10 +12581,12 @@ orv_smoke_dap_summary_contains "dap smoke marker dap source bundle" '"dap_source
 "#,
     );
     if !server_artifact.routes.is_empty() {
-        let native_route_count = server_artifact.routes.len();
+        let native_summary = deploy_native_server_summary_counts(out)?;
+        let native_target_count = native_summary.targets;
+        let native_route_count = native_summary.routes;
         let _ = writeln!(
             script,
-            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'
+            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": {native_target_count}'
 orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": {native_route_count}'"#
         );
     }
