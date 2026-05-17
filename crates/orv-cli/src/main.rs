@@ -6734,6 +6734,8 @@ fn editor_debug_session_json_with_source_bundle(
     let control_summaries = editor_debug_control_summaries(&frames, control_requests);
     let watch_expression_summaries =
         editor_debug_watch_expression_summaries(&frames, watch_expression_requests);
+    let launch =
+        dap_response_for_request_seq(&frames, launch_seq).unwrap_or_else(|| serde_json::json!({}));
     let loaded_sources = dap_response_for_request_seq(&frames, loaded_sources_seq)
         .and_then(|response| response.get("body").cloned())
         .unwrap_or_else(|| serde_json::json!({}));
@@ -6770,6 +6772,7 @@ fn editor_debug_session_json_with_source_bundle(
         "function_breakpoints": function_breakpoint_summaries,
         "data_breakpoints": data_breakpoint_summaries,
         "exception_filters": exception_filter_summaries,
+        "launch": launch,
         "loaded_sources": loaded_sources,
         "source_snapshots": source_snapshot_summaries,
         "control": first_control,
@@ -6915,6 +6918,7 @@ fn editor_debug_runner_result_panels_json(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let production_summary = editor_debug_production_summary_from_context(&production_context);
+    let source_bundle = editor_debug_launch_source_bundle(debug);
     let session_summary = editor_debug_session_summary_json(
         debug,
         &selected_frame,
@@ -6929,6 +6933,7 @@ fn editor_debug_runner_result_panels_json(
             "production_context": production_context,
             "production_summary": production_summary,
             "session_summary": session_summary,
+            "source_bundle": source_bundle,
             "result_artifact": runner
                 .get("result")
                 .cloned()
@@ -7045,6 +7050,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
             {
                 "name": "session_summary",
                 "path": "panels.debug.session_summary",
+                "kind": "object",
+            },
+            {
+                "name": "source_bundle",
+                "path": "panels.debug.source_bundle",
                 "kind": "object",
             },
             {
@@ -7535,9 +7545,16 @@ fn editor_debug_session_summary_json(
         .and_then(|event| event.pointer("/body/reason"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let source_bundle = editor_debug_launch_source_bundle(debug);
+    let source_bundle_file_count = source_bundle
+        .get("fileCount")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(0));
     serde_json::json!({
         "schema_version": 1,
         "program": debug.get("program").cloned().unwrap_or(serde_json::Value::Null),
+        "source_bundle": source_bundle,
+        "source_bundle_file_count": source_bundle_file_count,
         "selected_frame_id": selected_frame_id,
         "selected_frame": selected_frame_name,
         "selected_line": selected_line,
@@ -7562,6 +7579,14 @@ fn editor_debug_session_summary_json(
         "stopped_event_count": stopped_events.len(),
         "output_event_count": output_events.len(),
     })
+}
+
+fn editor_debug_launch_source_bundle(debug: &serde_json::Value) -> serde_json::Value {
+    debug
+        .pointer("/launch/body/sourceBundle")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn editor_debug_source_navigation_json(
@@ -7618,8 +7643,25 @@ fn editor_debug_session_summary_text(summary: &serde_json::Value) -> String {
         .get("selected_line")
         .and_then(serde_json::Value::as_u64)
         .map_or_else(|| "line ?".to_string(), |line| format!("line {line}"));
+    let source_bundle = summary
+        .get("source_bundle")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let source_bundle_line = source_bundle
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|path| {
+            format!(
+                "source_bundle {} files {} hash {}",
+                path,
+                json_u64_field(&source_bundle, "fileCount"),
+                json_str_or_empty(&source_bundle, "hash")
+            )
+        })
+        .unwrap_or_default();
     [
         format!("program {}", json_str_or_empty(summary, "program")),
+        source_bundle_line,
         format!(
             "selected {} {}",
             json_str_or_empty(summary, "selected_frame"),
@@ -53980,6 +54022,10 @@ define Auth() -> { @out "auth" }
         let build_out = dir.join("dist");
 
         cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        let source_bundle_path = build_out.join(SOURCE_BUNDLE_PATH);
+        let source_bundle_value = read_json_value(&source_bundle_path).expect("source bundle");
+        let expected_source_bundle_hash =
+            stable_json_hash(&source_bundle_value).expect("source bundle hash");
         std::fs::remove_file(&path).expect("remove original source");
 
         let run = editor_debug_runner_session_json(
@@ -53995,7 +54041,31 @@ define Auth() -> { @out "auth" }
         assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
         assert_eq!(
             run["runner"]["source_bundle"],
-            build_out.join(SOURCE_BUNDLE_PATH).display().to_string()
+            source_bundle_path.display().to_string()
+        );
+        assert_eq!(
+            run["debug"]["launch"]["body"]["sourceBundle"]["path"],
+            source_bundle_path.display().to_string()
+        );
+        assert_eq!(
+            run["debug"]["launch"]["body"]["sourceBundle"]["entry"],
+            source_bundle_value["entry"]
+        );
+        assert_eq!(
+            run["debug"]["launch"]["body"]["sourceBundle"]["fileCount"],
+            1
+        );
+        assert_eq!(
+            run["debug"]["launch"]["body"]["sourceBundle"]["hash"],
+            expected_source_bundle_hash
+        );
+        assert_eq!(
+            run["panels"]["debug"]["source_bundle"],
+            run["debug"]["launch"]["body"]["sourceBundle"]
+        );
+        assert_eq!(
+            run["panels"]["debug"]["session_summary"]["source_bundle"],
+            run["debug"]["launch"]["body"]["sourceBundle"]
         );
         assert_eq!(
             run["panels"]["debug"]["production_summary"]["static_target_count"],
@@ -54029,9 +54099,18 @@ define Auth() -> { @out "auth" }
             result["panels"]["debug"]["production_summary"]["static_target_count"],
             1
         );
+        assert_eq!(
+            result["panels"]["debug"]["source_bundle"]["hash"],
+            expected_source_bundle_hash
+        );
         assert!(build_out
             .join(EDITOR_DEBUG_SESSION_RESULT_HTML_PATH)
             .is_file());
+        let result_html =
+            std::fs::read_to_string(build_out.join(EDITOR_DEBUG_SESSION_RESULT_HTML_PATH))
+                .expect("debug result html");
+        assert!(result_html.contains("source_bundle"));
+        assert!(result_html.contains("source-bundle.json"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
