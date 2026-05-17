@@ -23539,6 +23539,9 @@ fn verify_deploy_smoke_client_contract(
     if !smoke.contains("orv_smoke_file()") || !smoke.contains("orv_smoke_grep()") {
         anyhow::bail!("deploy smoke test must include client file contract helpers");
     }
+    if !smoke.contains(r#"ORV_SMOKE_CLIENT_ORIGIN="ori_"#) {
+        anyhow::bail!("deploy smoke test must declare a client reveal origin");
+    }
     for key in ["manifest", "reactive_plan", "page", "loader", "wasm"] {
         let path = json_str(client, key, "deploy client")?;
         let command = format!(r#"orv_smoke_file "{path}""#);
@@ -23598,6 +23601,18 @@ fn verify_deploy_smoke_client_contract(
         ),
         format!(r#"orv_smoke_grep "client loader wasm reference" "{loader}" 'app.wasm'"#),
         format!(r#"orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'"#),
+        r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
+        r#"orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
+        r#"orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
+        format!(
+            r#"orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "{manifest}"'"#
+        ),
+        r#"orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
+        r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
+        r#"orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
+        r#"orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
+        r#"orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
+        r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
     ] {
         if !smoke.contains(&required) {
             anyhow::bail!("deploy smoke test must include {required}");
@@ -30058,6 +30073,20 @@ fn deploy_smoke_ready_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> Op
         .map(|route| route.path.as_str())
 }
 
+fn deploy_smoke_client_reveal_origin(origin_map: &orv_compiler::OriginMap) -> Option<&str> {
+    origin_map
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.kind.as_str(), "signal" | "await"))
+        .or_else(|| {
+            origin_map
+                .entries
+                .iter()
+                .find(|entry| entry.kind == "domain" && entry.name == "html")
+        })
+        .map(|entry| entry.id.as_str())
+}
+
 fn bundle_output_path(plan: &orv_compiler::BundlePlan, kind: &str) -> Option<String> {
     plan.bundles
         .iter()
@@ -31441,11 +31470,17 @@ orv_smoke_cookie_from_headers() {{
             );
         }
     }
+    if !client.is_null() {
+        let client_origin_id = deploy_smoke_client_reveal_origin(origin_map)
+            .ok_or_else(|| anyhow::anyhow!("client bundle smoke requires a revealable origin"))?;
+        let _ = writeln!(script, r#"ORV_SMOKE_CLIENT_ORIGIN="{client_origin_id}""#);
+    }
     if !server_artifact.routes.is_empty() {
         script.push('\n');
     }
     script.push_str("orv_smoke_graph_contract\n");
     script.push_str(&deploy_smoke_client_contract_section(client));
+    script.push_str(&deploy_smoke_client_reveal_section(client));
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
     script.push_str(&deploy_smoke_output_function_section(
         server_artifact.routes.len(),
@@ -31848,6 +31883,27 @@ orv_smoke_grep "client loader embedded reactive plan hash" "{loader}" 'embeddedR
 orv_smoke_grep "client loader source bundle hash" "{loader}" 'sourceBundleHash'
 orv_smoke_grep "client loader wasm reference" "{loader}" 'app.wasm'
 orv_smoke_grep "client loader signal setter" "{loader}" '__ORV_SET_SIGNAL__'
+
+"#
+    )
+}
+
+fn deploy_smoke_client_reveal_section(client: &serde_json::Value) -> String {
+    if client.is_null() {
+        return String::new();
+    }
+    let manifest = json_str_or_empty(client, "manifest");
+    format!(
+        r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
+orv_smoke_reveal_contains "reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
+orv_smoke_reveal_contains "reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
+orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "{manifest}"'
+orv_smoke_editor_reveal_contains "editor reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
+orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
+orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
+orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
+orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
+orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
 
 "#
     )
@@ -46013,6 +46069,7 @@ let sig count: int = 0
         assert!(smoke.contains("client_page=pages/index.html"));
         assert!(smoke.contains("client_loader=client/app.js"));
         assert!(smoke.contains("client_wasm=client/app.wasm"));
+        assert!(smoke.contains(r#"ORV_SMOKE_CLIENT_ORIGIN="ori_"#));
         assert!(smoke.contains(
             r#"orv_smoke_grep "client manifest reactive plan hash" "client/manifest.json" '"reactive_plan_hash"'"#
         ));
@@ -46064,7 +46121,35 @@ let sig count: int = 0
         assert!(smoke.contains(
             r#"orv_smoke_grep "client loader signal setter" "client/app.js" '__ORV_SET_SIGNAL__'"#
         ));
+        assert!(smoke.contains(
+            r#"orv_smoke_reveal_contains "reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_reveal_contains "reveal client manifest target" "$ORV_SMOKE_CLIENT_ORIGIN" '"path": "client/manifest.json"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_editor_reveal_contains "editor reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#
+        ));
         cmd_verify_build(&out).expect("verify client smoke test");
+
+        write_text(
+            &smoke_path,
+            &smoke.replace(
+                r#""reveal client target summary""#,
+                r#""reveal client summary""#,
+            ),
+        )
+        .expect("write corrupt smoke test");
+        let err = cmd_verify_build(&out).expect_err("client reveal smoke mismatch");
+        assert!(
+            err.to_string()
+                .contains("deploy smoke test must include orv_smoke_reveal_contains"),
+            "{err}"
+        );
+        write_text(&smoke_path, &smoke).expect("restore smoke test");
 
         write_text(
             &smoke_path,
@@ -51242,6 +51327,31 @@ models = { path = "../../shared/models", version = "2.0.0" }
             .as_array()
             .expect("routes")
             .is_empty());
+        assert_eq!(reveal["production"]["summary"]["client_target_count"], 5);
+        assert_eq!(reveal["production"]["summary"]["client_manifest_count"], 1);
+        assert!(
+            reveal["production"]["summary"]["client_capability_surface_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+        );
+        let lsp_reveal = lsp_reveal_json(&build_out, &signal.id).expect("lsp reveal");
+        assert_eq!(
+            lsp_reveal["production"]["summary"]["client_target_count"],
+            5
+        );
+        assert_eq!(
+            lsp_reveal["production"]["summary"]["client_manifest_count"],
+            1
+        );
+        let editor_reveal = editor_reveal_json(&build_out, &signal.id).expect("editor reveal");
+        assert_eq!(
+            editor_reveal["production"]["summary"]["client_target_count"],
+            5
+        );
+        assert_eq!(
+            editor_reveal["production"]["summary"]["client_manifest_count"],
+            1
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 
