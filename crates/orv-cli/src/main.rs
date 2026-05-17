@@ -8354,6 +8354,7 @@ fn editor_debug_capabilities_json() -> serde_json::Value {
         "supportsReadMemoryRequest": true,
         "supportsOrvRuntimeAttach": true,
         "supportsOrvRuntimeTracePath": true,
+        "supportsOrvSourceBundleLaunch": true,
         "exceptionBreakpointFilters": [
             {
                 "filter": "orv.diagnostics",
@@ -12773,6 +12774,7 @@ impl DapSession {
                     "supportsReadMemoryRequest": true,
                     "supportsOrvRuntimeAttach": true,
                     "supportsOrvRuntimeTracePath": true,
+                    "supportsOrvSourceBundleLaunch": true,
                     "exceptionBreakpointFilters": [
                         {
                             "filter": "orv.diagnostics",
@@ -34806,6 +34808,7 @@ function greet(user: User): string -> "hello"
         assert_eq!(response["body"]["supportsReadMemoryRequest"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeAttach"], true);
         assert_eq!(response["body"]["supportsOrvRuntimeTracePath"], true);
+        assert_eq!(response["body"]["supportsOrvSourceBundleLaunch"], true);
     }
 
     #[test]
@@ -38390,6 +38393,86 @@ function greet(user: User): string -> "hello"
         assert!(user_reference > 0);
         assert_eq!(source_response["success"], true, "{source_response}");
         assert_eq!(source_response["body"]["content"], imported_source);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dap_launch_source_bundle_rehydrates_source_when_original_file_is_missing() {
+        let dir = temp_output_dir("dap-source-bundle-launch");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("app.orv");
+        let source_text = "let answer: int = 42\n@out answer\n";
+        std::fs::write(&source, source_text).expect("write source");
+        let build_out = dir.join("dist");
+        cmd_build_with_profile(&source, &build_out, BuildProfile::Production).expect("prod build");
+        std::fs::remove_file(&source).expect("remove original source");
+        let source_bundle_path = build_out.join(SOURCE_BUNDLE_PATH);
+        assert_eq!(
+            dap_launch_source_bundle_path(&serde_json::json!({
+                "arguments": {
+                    "sourceBundle": source_bundle_path.display().to_string(),
+                },
+            }))
+            .expect("camel sourceBundle path"),
+            Some(source_bundle_path.clone())
+        );
+        assert_eq!(
+            dap_launch_source_bundle_path(&serde_json::json!({
+                "arguments": {
+                    "source_bundle": source_bundle_path.display().to_string(),
+                },
+            }))
+            .expect("snake source_bundle path"),
+            Some(source_bundle_path.clone())
+        );
+        let mut session = DapSession::default();
+
+        let launch = session
+            .message_response(&serde_json::json!({
+                "seq": 37,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "program": format!("file://{}", source.display()),
+                    "sourceBundle": source_bundle_path.display().to_string(),
+                },
+            }))
+            .expect("launch response");
+        let loaded = session
+            .message_response(&serde_json::json!({
+                "seq": 38,
+                "type": "request",
+                "command": "loadedSources",
+                "arguments": {},
+            }))
+            .expect("loadedSources response");
+        let source_reference = loaded["body"]["sources"]
+            .as_array()
+            .expect("loaded sources")
+            .iter()
+            .find(|item| item["name"] == "app.orv")
+            .and_then(|item| item["sourceReference"].as_u64())
+            .expect("source reference");
+        let source_response = session
+            .message_response(&serde_json::json!({
+                "seq": 39,
+                "type": "request",
+                "command": "source",
+                "arguments": {
+                    "sourceReference": source_reference,
+                },
+            }))
+            .expect("source response");
+
+        assert_eq!(launch["success"], true, "{launch}");
+        assert!(
+            launch["body"]["projectGraphNodes"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{launch}"
+        );
+        assert_eq!(source_response["success"], true, "{source_response}");
+        assert_eq!(source_response["body"]["content"], source_text);
         let _ = std::fs::remove_dir_all(dir);
     }
 
