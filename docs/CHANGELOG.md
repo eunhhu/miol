@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Exposed DAP source-bundle launch metadata in raw launch/restart responses and made `restart` preserve the previous build `source-bundle.json` path when no program override is supplied.
 - Mirrored the DAP production-summary gate into generated deploy preflight, benchmark evidence, and runbook commands as `orv editor run-debug . --control next`, with verify-build drift checks.
 - Advertised raw DAP `sourceBundle` launch support and added a direct DAP regression that launches from build `source-bundle.json` after the original source file is removed.
 - Added a `dap_summary=verified` marker to generated `deploy/smoke-output.txt` and `orv benchmark-report` parsing, so benchmark evidence records whether the source-bundled DAP production-summary gate passed.

@@ -12354,6 +12354,7 @@ struct DapLaunchState {
     path: PathBuf,
     uri: String,
     name: String,
+    source_bundle: Option<DapLaunchSourceBundle>,
     program: orv_hir::HirProgram,
     node_count: usize,
     diagnostic_count: usize,
@@ -12374,6 +12375,20 @@ struct DapLaunchState {
     runtime_process: Option<DapRuntimeProcess>,
     attached_server: Option<orv_runtime::server::AttachedServer>,
     async_runtime: Option<DapAsyncRuntimeState>,
+}
+
+#[derive(Clone)]
+struct DapLaunchSourceBundle {
+    path: PathBuf,
+    entry: PathBuf,
+    file_count: usize,
+    hash: String,
+}
+
+struct DapLaunchProject {
+    loaded: orv_project::LoadedProject,
+    entry_path_for_lookup: PathBuf,
+    source_bundle: Option<DapLaunchSourceBundle>,
 }
 
 struct DapPendingEvent {
@@ -12871,7 +12886,12 @@ impl DapSession {
 
     fn launch_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let path = dap_program_path(request)?;
-        let (loaded, entry_path_for_lookup) = dap_loaded_project_for_launch(request, &path)?;
+        let project = dap_loaded_project_for_launch(request, &path)?;
+        let DapLaunchProject {
+            loaded,
+            entry_path_for_lookup,
+            source_bundle,
+        } = project;
         let file = lsp_source_file_for_path(&loaded.files, &entry_path_for_lookup)
             .or_else(|| lsp_source_file_for_path(&loaded.files, &path))
             .ok_or_else(|| anyhow::anyhow!("launch program is not part of loaded project"))?;
@@ -12918,10 +12938,12 @@ impl DapSession {
             .get(current_frame_index)
             .map_or(executable_lines[0], |frame| frame.line);
         let stopped_reason = self.launch_stopped_reason(&runtime, &frames, current_frame_index);
+        let source_bundle_json = dap_launch_source_bundle_json(source_bundle.as_ref());
         self.launched = Some(DapLaunchState {
             path: entry_path.clone(),
             uri: entry_uri.clone(),
             name: entry_name.clone(),
+            source_bundle,
             program: lowered.program,
             node_count: loaded.graph.nodes.len(),
             diagnostic_count,
@@ -12968,6 +12990,7 @@ impl DapSession {
                 "uri": entry_uri,
             },
             "projectGraphNodes": loaded.graph.nodes.len(),
+            "sourceBundle": source_bundle_json,
             "diagnostics": diagnostic_count,
             "runtime": dap_runtime_json(&runtime, async_runtime.as_ref()),
         }))
@@ -13077,12 +13100,26 @@ impl DapSession {
             .transpose()?
             .or_else(|| self.launched.as_ref().map(|launched| launched.path.clone()))
             .ok_or_else(|| anyhow::anyhow!("launch is required before restart"))?;
+        let has_program_override = request.pointer("/arguments/program").is_some();
+        let source_bundle_path = dap_launch_source_bundle_path(request)?.or_else(|| {
+            if has_program_override {
+                None
+            } else {
+                self.launched
+                    .as_ref()
+                    .and_then(|launched| launched.source_bundle.as_ref())
+                    .map(|source_bundle| source_bundle.path.clone())
+            }
+        });
         let mut arguments = serde_json::json!({
                 "program": path.display().to_string(),
                 "live": live_requested,
                 "attachRuntime": attach_runtime_requested,
                 "attachRuntimeMode": attach_runtime_mode.protocol_name(),
         });
+        if let Some(path) = source_bundle_path {
+            arguments["sourceBundle"] = serde_json::json!(path.display().to_string());
+        }
         if let Some(path) = runtime_request_trace_path {
             arguments["runtimeRequestTracePath"] = serde_json::json!(path.display().to_string());
         }
@@ -16570,17 +16607,40 @@ fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
 fn dap_loaded_project_for_launch(
     request: &serde_json::Value,
     path: &Path,
-) -> anyhow::Result<(orv_project::LoadedProject, PathBuf)> {
+) -> anyhow::Result<DapLaunchProject> {
     let Some(source_bundle_path) = dap_launch_source_bundle_path(request)? else {
-        return Ok((
-            orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?,
-            path.to_path_buf(),
-        ));
+        return Ok(DapLaunchProject {
+            loaded: orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?,
+            entry_path_for_lookup: path.to_path_buf(),
+            source_bundle: None,
+        });
     };
     let source_bundle = read_source_bundle_artifact(&source_bundle_path)?;
     let entry = source_bundle_entry_path(&source_bundle)?;
+    let hash = stable_json_hash(&serde_json::to_value(&source_bundle)?)?;
+    let source_bundle_meta = DapLaunchSourceBundle {
+        path: source_bundle_path,
+        entry: PathBuf::from(&source_bundle.entry),
+        file_count: source_bundle.files.len(),
+        hash,
+    };
     let loaded = load_project_from_source_bundle_artifact(&source_bundle)?;
-    Ok((loaded, entry))
+    Ok(DapLaunchProject {
+        loaded,
+        entry_path_for_lookup: entry,
+        source_bundle: Some(source_bundle_meta),
+    })
+}
+
+fn dap_launch_source_bundle_json(bundle: Option<&DapLaunchSourceBundle>) -> serde_json::Value {
+    bundle.map_or(serde_json::Value::Null, |bundle| {
+        serde_json::json!({
+            "path": bundle.path.display().to_string(),
+            "entry": bundle.entry.display().to_string(),
+            "fileCount": bundle.file_count,
+            "hash": bundle.hash,
+        })
+    })
 }
 
 fn dap_launch_source_bundle_path(request: &serde_json::Value) -> anyhow::Result<Option<PathBuf>> {
@@ -38442,6 +38502,10 @@ function greet(user: User): string -> "hello"
             Some(source_bundle_path.clone())
         );
         let mut session = DapSession::default();
+        let source_bundle_value =
+            read_json_value(&source_bundle_path).expect("source bundle json value");
+        let expected_source_bundle_hash =
+            stable_json_hash(&source_bundle_value).expect("source bundle hash");
 
         let launch = session
             .message_response(&serde_json::json!({
@@ -38479,6 +38543,14 @@ function greet(user: User): string -> "hello"
                 },
             }))
             .expect("source response");
+        let restart = session
+            .message_response(&serde_json::json!({
+                "seq": 40,
+                "type": "request",
+                "command": "restart",
+                "arguments": {},
+            }))
+            .expect("restart response");
 
         assert_eq!(launch["success"], true, "{launch}");
         assert!(
@@ -38487,8 +38559,30 @@ function greet(user: User): string -> "hello"
                 .is_some_and(|count| count > 0),
             "{launch}"
         );
+        assert_eq!(
+            launch["body"]["sourceBundle"]["path"],
+            source_bundle_path.display().to_string()
+        );
+        assert_eq!(
+            launch["body"]["sourceBundle"]["entry"],
+            source_bundle_value["entry"]
+        );
+        assert_eq!(launch["body"]["sourceBundle"]["fileCount"], 1);
+        assert_eq!(
+            launch["body"]["sourceBundle"]["hash"],
+            expected_source_bundle_hash
+        );
         assert_eq!(source_response["success"], true, "{source_response}");
         assert_eq!(source_response["body"]["content"], source_text);
+        assert_eq!(restart["success"], true, "{restart}");
+        assert_eq!(
+            restart["body"]["sourceBundle"]["path"],
+            source_bundle_path.display().to_string()
+        );
+        assert_eq!(
+            restart["body"]["sourceBundle"]["hash"],
+            expected_source_bundle_hash
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
