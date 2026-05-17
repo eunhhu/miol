@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Added a `dap_source_bundle=verified` marker to generated smoke output and benchmark-report parsing so source-bundled DAP panel coverage is recorded as benchmark evidence.
 - Added generated deploy smoke and verify-build gates for `panels.debug.source_bundle` path/file-count/hash metadata from source-bundled DAP runs.
 - Mirrored raw DAP source-bundle launch metadata into editor run-debug result JSON, `panels.debug.source_bundle`, session summaries, and the rendered debug result panel.
 - Exposed DAP source-bundle launch metadata in raw launch/restart responses and made `restart` preserve the previous build `source-bundle.json` path when no program override is supplied.

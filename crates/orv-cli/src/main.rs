@@ -19733,6 +19733,7 @@ fn benchmark_smoke_test_output_summary(output: &serde_json::Value) -> serde_json
             "passed_marker": false,
             "graph_contract_verified": false,
             "dap_summary_verified": false,
+            "dap_source_bundle_verified": false,
             "server_routes": null,
             "trace_stream_requested": null,
             "build_dir": null,
@@ -19750,6 +19751,9 @@ fn benchmark_smoke_test_output_summary(output: &serde_json::Value) -> serde_json
         .is_some_and(|value| value == "verified");
     let dap_summary_verified = fields
         .get("dap_summary")
+        .is_some_and(|value| value == "verified");
+    let dap_source_bundle_verified = fields
+        .get("dap_source_bundle")
         .is_some_and(|value| value == "verified");
     let server_routes = fields
         .get("server_routes")
@@ -19781,6 +19785,9 @@ fn benchmark_smoke_test_output_summary(output: &serde_json::Value) -> serde_json
     if !dap_summary_verified {
         missing_markers.push("dap_summary");
     }
+    if !dap_source_bundle_verified {
+        missing_markers.push("dap_source_bundle");
+    }
     if server_routes.is_none_or(|routes| routes == 0) {
         missing_markers.push("server_routes");
     }
@@ -19793,6 +19800,7 @@ fn benchmark_smoke_test_output_summary(output: &serde_json::Value) -> serde_json
         "passed_marker": passed_marker,
         "graph_contract_verified": graph_contract_verified,
         "dap_summary_verified": dap_summary_verified,
+        "dap_source_bundle_verified": dap_source_bundle_verified,
         "server_routes": server_routes,
         "trace_stream_requested": trace_stream_requested,
         "build_dir": build_dir,
@@ -23433,6 +23441,7 @@ fn verify_deploy_smoke_test_artifact(
         || !smoke.contains("\norv_smoke_write_output\n")
         || !smoke.contains("graph_contract=verified")
         || !smoke.contains("dap_summary=verified")
+        || !smoke.contains("dap_source_bundle=verified")
         || !smoke.contains("server_routes=")
         || !smoke.contains("trace_stream_requested=%s")
     {
@@ -32181,6 +32190,7 @@ fn deploy_smoke_output_function_section(route_count: usize, client: &serde_json:
     printf 'base_url=%s\n' "$BASE_URL"
     printf 'graph_contract=verified\n'
     printf 'dap_summary=verified\n'
+    printf 'dap_source_bundle=verified\n'
     printf 'server_routes={route_count}\n'
     printf 'trace_stream_requested=%s\n' "${{ORV_SMOKE_TRACE_STREAM:-0}}"
 "#,
@@ -46336,6 +46346,7 @@ entry = "src/main.orv"
         assert!(smoke_test.contains("\norv_smoke_write_output\n"));
         assert!(smoke_test.contains("graph_contract=verified"));
         assert!(smoke_test.contains("dap_summary=verified"));
+        assert!(smoke_test.contains("dap_source_bundle=verified"));
         assert!(smoke_test.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#
         ));
@@ -46576,6 +46587,7 @@ let sig count: int = 0
         assert!(smoke.contains("orv_smoke_write_output()"));
         assert!(smoke.contains("graph_contract=verified"));
         assert!(smoke.contains("dap_summary=verified"));
+        assert!(smoke.contains("dap_source_bundle=verified"));
         assert!(smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#
         ));
@@ -47924,6 +47936,32 @@ let sig count: int = 0
     }
 
     #[test]
+    fn verify_build_rejects_deploy_smoke_output_dap_source_bundle_marker_missing() {
+        let (src_dir, path) = prod_server_source("deploy-smoke-output-dap-bundle-source");
+        let out = temp_output_dir("deploy-smoke-output-dap-bundle-missing");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let smoke_path = out.join("deploy").join("smoke-test.sh");
+        let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+        write_text(
+            &smoke_path,
+            &smoke.replace("dap_source_bundle=verified", "dap_source_bundle=missing"),
+        )
+        .expect("write corrupt smoke test");
+
+        let err =
+            cmd_verify_build(&out).expect_err("smoke output DAP source bundle marker mismatch");
+
+        assert!(
+            err.to_string()
+                .contains("deploy smoke test must write deploy smoke output artifact"),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
     fn verify_build_rejects_deploy_smoke_origin_assignment_mismatch() {
         let (src_dir, path) = prod_server_source("deploy-smoke-origin-source");
         let out = temp_output_dir("deploy-smoke-origin-mismatch");
@@ -48648,7 +48686,7 @@ let sig count: int = 0
         evidence["data"]["compiler_runtime_errors"] = serde_json::json!(0);
         evidence["data"]["manual_config_edits"] = serde_json::json!([]);
         evidence["data"]["smoke_test_output"] = serde_json::json!(
-            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\nserver_routes=1\ntrace_stream_requested=0\n"
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\ndap_source_bundle=verified\nserver_routes=1\ntrace_stream_requested=0\n"
         );
         evidence["data"]["participant_notes"] = serde_json::json!("no blockers");
         write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
@@ -48668,6 +48706,10 @@ let sig count: int = 0
         );
         assert_eq!(
             report["data"]["smoke_test_summary"]["dap_summary_verified"],
+            true
+        );
+        assert_eq!(
+            report["data"]["smoke_test_summary"]["dap_source_bundle_verified"],
             true
         );
         assert_eq!(report["data"]["smoke_test_summary"]["server_routes"], 1);
@@ -48720,6 +48762,11 @@ let sig count: int = 0
             .expect("missing data")
             .iter()
             .any(|item| item == "smoke_test_output.dap_summary"));
+        assert!(report["data"]["missing_data"]
+            .as_array()
+            .expect("missing data")
+            .iter()
+            .any(|item| item == "smoke_test_output.dap_source_bundle"));
         assert!(cmd_benchmark_report(&out, true)
             .expect_err("require pass rejects weak smoke output")
             .to_string()
@@ -48752,7 +48799,7 @@ let sig count: int = 0
         write_json(&evidence_path, &evidence).expect("write recorded benchmark evidence");
         std::fs::write(
             &smoke_output_path,
-            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\nserver_routes=1\ntrace_stream_requested=1\n",
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\ndap_source_bundle=verified\nserver_routes=1\ntrace_stream_requested=1\n",
         )
         .expect("write smoke output");
 
@@ -48761,7 +48808,7 @@ let sig count: int = 0
         assert_eq!(report["status"], "passed");
         assert_eq!(
             report["data"]["smoke_test_output"],
-            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\nserver_routes=1\ntrace_stream_requested=1\n"
+            "orv deploy smoke test passed\nbuild_dir=/tmp/orv-build\nbase_url=http://127.0.0.1:8080\ngraph_contract=verified\ndap_summary=verified\ndap_source_bundle=verified\nserver_routes=1\ntrace_stream_requested=1\n"
         );
         assert_eq!(
             report["data"]["smoke_test_output_source"],
@@ -48773,6 +48820,10 @@ let sig count: int = 0
         );
         assert_eq!(
             report["data"]["smoke_test_summary"]["dap_summary_verified"],
+            true
+        );
+        assert_eq!(
+            report["data"]["smoke_test_summary"]["dap_source_bundle_verified"],
             true
         );
         assert_eq!(
