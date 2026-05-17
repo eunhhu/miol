@@ -15496,6 +15496,27 @@ fn verify_build_rejects_deploy_benchmark_evidence_mismatch() {
 }
 
 #[test]
+fn verify_build_rejects_deploy_benchmark_evidence_smoke_marker_mismatch() {
+    let (src_dir, path) = prod_server_source("deploy-benchmark-evidence-smoke-marker-source");
+    let out = temp_output_dir("deploy-benchmark-evidence-smoke-marker-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let evidence_path = out.join("deploy").join("benchmark-evidence.json");
+    let mut evidence = read_json_value(&evidence_path).expect("benchmark evidence");
+    evidence["data"]["smoke_test_required_markers"] =
+        serde_json::json!(["pass_marker", "build_dir", "base_url"]);
+    write_json(&evidence_path, &evidence).expect("write drifted benchmark evidence");
+
+    let err = cmd_verify_build(&out).expect_err("benchmark evidence smoke marker mismatch");
+
+    assert!(err
+        .to_string()
+        .contains("smoke_test_required_markers must match smoke output contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
 fn verify_build_accepts_recorded_deploy_benchmark_evidence_values() {
     let (src_dir, path) = prod_server_source("deploy-benchmark-evidence-recorded-source");
     let out = temp_output_dir("deploy-benchmark-evidence-recorded");

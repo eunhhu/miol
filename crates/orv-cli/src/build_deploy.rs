@@ -4847,6 +4847,7 @@ pub(crate) fn verify_deploy_benchmark_evidence_data(
         "first_error_to_fix_minutes",
         "manual_config_edits",
         "smoke_test_output",
+        "smoke_test_required_markers",
         "participant_notes",
     ] {
         if !data.contains_key(key) {
@@ -4886,6 +4887,12 @@ pub(crate) fn verify_deploy_benchmark_evidence_data(
         .is_some_and(json_null_or_string)
     {
         anyhow::bail!("deploy benchmark evidence data smoke_test_output must be null or a string");
+    }
+    let expected_smoke_required_markers = deploy_benchmark::smoke_required_markers_value();
+    if data.get("smoke_test_required_markers") != Some(&expected_smoke_required_markers) {
+        anyhow::bail!(
+            "deploy benchmark evidence data smoke_test_required_markers must match smoke output contract"
+        );
     }
     if !data
         .get("participant_notes")

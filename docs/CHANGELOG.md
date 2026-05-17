@@ -2,6 +2,11 @@
 
 Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual and dated.
 
+## 2026-05-17
+
+- Split the large CLI and compiler implementation files into focused modules while keeping public command/artifact behavior unchanged.
+- Made generated benchmark evidence record the required smoke-output marker list, including `dap_source_bundle`, and made `orv verify-build` reject evidence drift from that marker contract.
+
 ## 2026-05-16
 
 - Added a `dap_source_bundle=verified` marker to generated smoke output and benchmark-report parsing so source-bundled DAP panel coverage is recorded as benchmark evidence.
