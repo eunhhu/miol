@@ -24485,10 +24485,27 @@ fn verify_deploy_static_target(
     dir: &Path,
     static_target: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
+    let plan = read_json_value(&dir.join("bundle-plan.json"))?;
+    let bundles = plan
+        .get("bundles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("bundle plan bundles must be an array"))?;
+    let static_bundle = bundles.iter().find(|bundle| {
+        bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+    });
     let Some(static_target) = static_target.filter(|value| !value.is_null()) else {
+        if static_bundle.is_some() {
+            anyhow::bail!("deploy static target missing for bundle static_page");
+        }
         return Ok(());
     };
     let path = json_str(static_target, "path", "deploy static")?;
+    let Some(static_bundle) = static_bundle else {
+        anyhow::bail!("deploy static target exists without bundle static_page target");
+    };
+    if json_str(static_bundle, "path", "bundle target")? != path {
+        anyhow::bail!("deploy static path does not match bundle static_page target");
+    }
     let target = dir.join(path);
     if !target.is_file() {
         anyhow::bail!("missing deploy static target: {}", target.display());
@@ -24500,7 +24517,7 @@ fn verify_deploy_static_target(
     if !runtime_features.is_empty() {
         anyhow::bail!("deploy static target must be zero-runtime");
     }
-    Ok(())
+    verify_static_page_target(static_bundle, &target)
 }
 
 fn verify_deploy_client_target(
@@ -49511,6 +49528,75 @@ models = { path = "../../shared/models", version = "2.0.0" }
     }
 
     #[test]
+    fn build_prod_records_static_page_target() {
+        let out = temp_output_dir("build-prod-static-page");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+
+        let deploy =
+            read_json_value(&build_out.join("deploy").join("manifest.json")).expect("deploy");
+        assert_eq!(deploy["static"]["path"], "pages/index.html");
+        assert!(deploy["static"]["runtime_features"]
+            .as_array()
+            .expect("runtime features")
+            .is_empty());
+        assert_eq!(deploy["client"], serde_json::Value::Null);
+        assert_eq!(deploy["server"], serde_json::Value::Null);
+        cmd_verify_build(&build_out).expect("verify prod static build");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_static_target_drift() {
+        let out = temp_output_dir("verify-build-deploy-static-drift");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+        let deploy_path = build_out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_path).expect("deploy manifest");
+        deploy["static"]["path"] = serde_json::json!(SOURCE_BUNDLE_PATH);
+        write_json(&deploy_path, &deploy).expect("write drifted deploy manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("invalid deploy static target");
+        assert!(
+            err.to_string()
+                .contains("deploy static path does not match bundle static_page target"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_missing_deploy_static_target_for_static_bundle() {
+        let out = temp_output_dir("verify-build-deploy-static-missing");
+        std::fs::create_dir_all(&out).expect("create temp root");
+        let entry = out.join("page.orv");
+        std::fs::write(&entry, r#"@out @html { @body { @h1 "Home" } }"#).expect("write entry");
+        let build_out = out.join("dist");
+
+        cmd_build_with_profile(&entry, &build_out, BuildProfile::Production).expect("build prod");
+        let deploy_path = build_out.join("deploy").join("manifest.json");
+        let mut deploy = read_json_value(&deploy_path).expect("deploy manifest");
+        deploy["static"] = serde_json::Value::Null;
+        write_json(&deploy_path, &deploy).expect("write drifted deploy manifest");
+
+        let err = cmd_verify_build(&build_out).expect_err("missing deploy static target");
+        assert!(
+            err.to_string()
+                .contains("deploy static target missing for bundle static_page"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn verify_build_rejects_invalid_dev_hmr_session_manifest() {
         let out = temp_output_dir("verify-build-dev-hmr-session");
         std::fs::create_dir_all(&out).expect("create temp root");
@@ -50545,6 +50631,25 @@ models = { path = "../../shared/models", version = "2.0.0" }
         }));
         assert_eq!(reveal["production"]["summary"]["static_target_count"], 1);
         assert_eq!(reveal["production"]["summary"]["static_verified_count"], 1);
+        let lsp_reveal = lsp_reveal_json(&build_out, &html.id).expect("lsp reveal html origin");
+        assert_eq!(
+            lsp_reveal["production"]["summary"]["static_target_count"],
+            1
+        );
+        assert_eq!(
+            lsp_reveal["production"]["summary"]["static_verified_count"],
+            1
+        );
+        let editor_reveal =
+            editor_reveal_json(&build_out, &html.id).expect("editor reveal html origin");
+        assert_eq!(
+            editor_reveal["production"]["summary"]["static_target_count"],
+            1
+        );
+        assert_eq!(
+            editor_reveal["production"]["summary"]["static_verified_count"],
+            1
+        );
         let _ = std::fs::remove_dir_all(out);
     }
 

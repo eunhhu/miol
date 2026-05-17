@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Tightened static production verification so `deploy/manifest.json` static targets must match the bundle-plan `static_page` target, and LSP/editor reveal tests now assert static summary counters.
 - Extended generated deploy smoke tests so route-origin CLI/editor/LSP reveal payloads must carry native-server target and route summary counters.
 - Added native-server and static-page production target summaries to reveal/editor/native-host production payloads, including native route/blocker counts, static verification counts, and Production panel sections.
 - Threaded build-backed production graph and summary context into editor debug metadata, standalone DAP runner artifacts, native-host debug metadata, run-debug results, and debug result panels.
