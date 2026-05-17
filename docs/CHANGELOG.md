@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-16
 
+- Mirrored the DAP production-summary gate into generated deploy preflight, benchmark evidence, and runbook commands as `orv editor run-debug . --control next`, with verify-build drift checks.
 - Advertised raw DAP `sourceBundle` launch support and added a direct DAP regression that launches from build `source-bundle.json` after the original source file is removed.
 - Added a `dap_summary=verified` marker to generated `deploy/smoke-output.txt` and `orv benchmark-report` parsing, so benchmark evidence records whether the source-bundled DAP production-summary gate passed.
 - Added generated deploy smoke DAP gates: smoke tests now run `orv editor run-debug . --control next` from the build dir and assert graph/source-bundle, native, and client production summary counters.

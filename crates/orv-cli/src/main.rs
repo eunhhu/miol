@@ -23871,6 +23871,12 @@ fn verify_deploy_preflight_artifact(
     )?;
     verify_json_pointer_str(
         &preflight,
+        "/commands/editor_run_debug",
+        "orv editor run-debug . --control next",
+        "deploy preflight editor_run_debug command",
+    )?;
+    verify_json_pointer_str(
+        &preflight,
         "/commands/benchmark_report",
         "orv benchmark-report .",
         "deploy preflight benchmark_report command",
@@ -24436,6 +24442,9 @@ fn verify_deploy_runbook_artifact(
     }
     if !runbook.contains("orv benchmark-report .") {
         anyhow::bail!("deploy runbook must document benchmark report command");
+    }
+    if !runbook.contains("orv editor run-debug . --control next") {
+        anyhow::bail!("deploy runbook must document DAP production summary command");
     }
     if !runbook.contains("orv benchmark-report . --require-pass") {
         anyhow::bail!("deploy runbook must document benchmark report require-pass command");
@@ -31159,6 +31168,7 @@ fn deploy_preflight_commands_value(artifacts: &DeployRunbookArtifacts<'_>) -> se
         "env_check": "orv deploy-env-check .",
         "run_build": "orv run-build .",
         "smoke_test": format!("./{}", artifacts.smoke_test),
+        "editor_run_debug": "orv editor run-debug . --control next",
         "benchmark_report": "orv benchmark-report .",
         "benchmark_report_require_pass": "orv benchmark-report . --require-pass",
         "compose_up": format!("docker compose -f {} up --build -d", artifacts.compose),
@@ -32263,6 +32273,7 @@ ORV_SMOKE_TRACE_STREAM=1 ./{smoke_test_path}
 ```sh
 orv verify-build .
 orv deploy-env-check .
+orv editor run-debug . --control next
 orv benchmark-report .
 ```
 
@@ -34003,6 +34014,10 @@ test "checkout excluded failure" {
             serde_json::json!("./deploy/smoke-test.sh")
         );
         assert_eq!(
+            preflight["commands"]["editor_run_debug"],
+            serde_json::json!("orv editor run-debug . --control next")
+        );
+        assert_eq!(
             preflight["commands"]["benchmark_report"],
             serde_json::json!("orv benchmark-report .")
         );
@@ -34394,6 +34409,7 @@ test "checkout excluded failure" {
         assert!(runbook.contains("./deploy/smoke-test.sh"));
         assert!(runbook.contains("ORV_SMOKE_TRACE_STREAM=1 ./deploy/smoke-test.sh"));
         assert!(runbook.contains("orv verify-build ."));
+        assert!(runbook.contains("orv editor run-debug . --control next"));
         assert!(runbook.contains("orv benchmark-report ."));
         assert!(runbook.contains("orv benchmark-report . --require-pass"));
         assert!(runbook
@@ -46134,6 +46150,7 @@ entry = "src/main.orv"
         assert!(runbook.contains("## Benchmark Evidence"));
         assert!(runbook.contains("orv verify-build ."));
         assert!(runbook.contains("orv deploy-env-check ."));
+        assert!(runbook.contains("orv editor run-debug . --control next"));
         assert!(runbook.contains("orv benchmark-report ."));
         assert!(runbook.contains("orv benchmark-report . --require-pass"));
         assert!(runbook.contains("/__orv/trace/events"));
@@ -46240,6 +46257,10 @@ entry = "src/main.orv"
         assert_eq!(
             preflight["commands"]["smoke_test"],
             "./deploy/smoke-test.sh"
+        );
+        assert_eq!(
+            preflight["commands"]["editor_run_debug"],
+            "orv editor run-debug . --control next"
         );
         assert_eq!(
             preflight["commands"]["benchmark_report"],
@@ -48588,6 +48609,27 @@ let sig count: int = 0
         assert!(err
             .to_string()
             .contains("deploy preflight benchmark_report command"));
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_build_rejects_deploy_preflight_editor_run_debug_command_mismatch() {
+        let (src_dir, path) = prod_server_source("deploy-preflight-run-debug-source");
+        let out = temp_output_dir("deploy-preflight-run-debug-mismatch");
+
+        cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+        let preflight_path = out.join("deploy").join("preflight.json");
+        let mut preflight = read_json_value(&preflight_path).expect("preflight");
+        preflight["commands"]["editor_run_debug"] =
+            serde_json::json!("orv editor run-debug other --control next");
+        write_json(&preflight_path, &preflight).expect("write corrupt preflight");
+
+        let err = cmd_verify_build(&out).expect_err("preflight editor run-debug mismatch");
+
+        assert!(err
+            .to_string()
+            .contains("deploy preflight editor_run_debug command"));
         let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -55740,7 +55782,7 @@ define Auth() -> { @out "auth" }
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_command_count"],
-            11
+            12
         );
         assert_eq!(
             native_host["production"]["summary"]["preflight_route_count"],
@@ -55870,7 +55912,7 @@ define Auth() -> { @out "auth" }
         assert!(html.contains("Production"));
         assert!(html.contains("Graph source_bundle source-bundle.json"));
         assert!(html.contains("Preflight"));
-        assert!(html.contains("commands 11"));
+        assert!(html.contains("commands 12"));
         assert!(html.contains("route_policies 2"));
         assert!(html.contains("smoke_summary_present false"));
         assert!(html.contains("DB Adapters"));
@@ -55921,7 +55963,7 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("Smoke Summary</span><b>0/1</b>"));
         assert!(production_panel.contains("Smoke Gaps</span><b class=\"bad\">1</b>"));
         assert!(production_panel.contains("\"smoke_test_output\""));
-        assert!(production_panel.contains("Preflight Commands</span><b>11</b>"));
+        assert!(production_panel.contains("Preflight Commands</span><b>12</b>"));
         assert!(production_panel.contains("Route Policies"));
         assert!(production_panel.contains("Route Policy Summary"));
         assert!(production_panel.contains("\"csrf\": 1"));
