@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-17
 
+- Mirrored benchmark smoke required-marker contracts into reveal/editor/native production preflight payloads.
 - Split the large CLI and compiler implementation files into focused modules while keeping public command/artifact behavior unchanged.
 - Made generated benchmark evidence record the required smoke-output marker list, including `dap_source_bundle`, and made `orv verify-build` reject evidence drift from that marker contract.
 - Exposed the same required smoke-output marker list in benchmark report data and parsed smoke summaries so reveal/editor consumers can see the expected smoke contract alongside missing markers.

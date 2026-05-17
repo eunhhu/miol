@@ -18803,7 +18803,11 @@ fn reveal_origin_exposes_deploy_preflight_contract() {
             && target["benchmark_evidence"]["recorded_task_count"] == 0
             && target["benchmark_evidence"]["missing_task_count"] == 10
             && target["benchmark_evidence"]["missing_data_count"] == 3
+            && target["benchmark_evidence"]["smoke_test_required_markers"]
+                == serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
             && target["benchmark_evidence"]["smoke_test_summary"]["present"] == false
+            && target["benchmark_evidence"]["smoke_test_summary"]["required_markers"]
+                == serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
             && target["benchmark_evidence"]["smoke_test_output_source"].is_null()
             && target["benchmark_evidence"]["missing_data"]
                 .as_array()
@@ -22814,8 +22818,17 @@ fn editor_export_with_build_embeds_production_adapter_summary() {
         3
     );
     assert_eq!(
+        state["production"]["preflight"][0]["benchmark_evidence"]["smoke_test_required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
+    assert_eq!(
         state["production"]["preflight"][0]["benchmark_evidence"]["smoke_test_summary"]["present"],
         false
+    );
+    assert_eq!(
+        state["production"]["preflight"][0]["benchmark_evidence"]["smoke_test_summary"]
+            ["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
     );
     assert_eq!(
         state["production"]["summary"]["schema_version"],
@@ -23124,7 +23137,10 @@ fn editor_export_with_build_embeds_production_adapter_summary() {
         .contains("\"benchmark_report_require_pass\": \"orv benchmark-report . --require-pass\""));
     assert!(production_panel.contains("\"report_status\": \"incomplete\""));
     assert!(production_panel.contains("\"missing_task_count\": 10"));
+    assert!(production_panel.contains("\"smoke_test_required_markers\""));
+    assert!(production_panel.contains("\"dap_source_bundle\""));
     assert!(production_panel.contains("\"smoke_test_summary\""));
+    assert!(production_panel.contains("\"required_markers\""));
     assert!(production_panel.contains("\"present\": false"));
     assert!(production_panel.contains("\"preflight_smoke_summary_present_count\": 0"));
     assert!(production_panel.contains("\"preflight_smoke_summary_missing_count\": 1"));

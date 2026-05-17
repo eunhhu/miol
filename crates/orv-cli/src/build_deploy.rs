@@ -6392,6 +6392,10 @@ pub(crate) fn reveal_benchmark_evidence_summary(
             .get("smoke_test_output_source")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "smoke_test_required_markers": data_report
+            .get("smoke_test_required_markers")
+            .cloned()
+            .unwrap_or_else(deploy_benchmark::smoke_required_markers_value),
         "smoke_test_summary": data_report
             .get("smoke_test_summary")
             .cloned()
