@@ -268,6 +268,10 @@ pub(crate) fn benchmark_report_data(
         "compiler_runtime_errors": data.get("compiler_runtime_errors").cloned().unwrap_or(serde_json::Value::Null),
         "first_error_to_fix_minutes": data.get("first_error_to_fix_minutes").cloned().unwrap_or(serde_json::Value::Null),
         "manual_config_edits": data.get("manual_config_edits").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "smoke_test_required_markers": data
+            .get("smoke_test_required_markers")
+            .cloned()
+            .unwrap_or_else(deploy_benchmark::smoke_required_markers_value),
         "smoke_test_output": smoke_test_output,
         "smoke_test_output_source": smoke_test_output_source,
         "smoke_test_summary": smoke_test_summary,
@@ -288,6 +292,7 @@ pub(crate) fn benchmark_smoke_test_output_summary(output: &serde_json::Value) ->
             "build_dir": null,
             "base_url": null,
             "client": null,
+            "required_markers": deploy_benchmark::smoke_required_markers_value(),
             "missing_markers": [],
         });
     };
@@ -347,6 +352,7 @@ pub(crate) fn benchmark_smoke_test_output_summary(output: &serde_json::Value) ->
         "build_dir": build_dir,
         "base_url": base_url,
         "client": client,
+        "required_markers": deploy_benchmark::smoke_required_markers_value(),
         "missing_markers": missing_markers,
     })
 }

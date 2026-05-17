@@ -15612,6 +15612,14 @@ fn benchmark_report_marks_recorded_evidence_passed() {
     assert_eq!(report["tasks"]["failed_task_count"], 0);
     assert_eq!(report["data"]["smoke_test_summary"]["passed_marker"], true);
     assert_eq!(
+        report["data"]["smoke_test_required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
+    assert_eq!(
+        report["data"]["smoke_test_summary"]["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
+    assert_eq!(
         report["data"]["smoke_test_summary"]["graph_contract_verified"],
         true
     );
