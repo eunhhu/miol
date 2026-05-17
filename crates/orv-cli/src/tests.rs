@@ -2797,6 +2797,14 @@ let second: int = bump(1)
 }
 
 #[test]
+fn dap_hit_condition_modulo_stays_msrv_compatible() {
+    assert!(dap_hit_condition_matches("%=2", 2));
+    assert!(dap_hit_condition_matches("%2", 4));
+    assert!(!dap_hit_condition_matches("%=2", 3));
+    assert!(!dap_hit_condition_matches("%=0", 4));
+}
+
+#[test]
 fn dap_reverse_continue_stops_at_previous_verified_breakpoint_frame() {
     let dir = temp_output_dir("dap-reverse-continue");
     std::fs::create_dir_all(&dir).expect("create temp dir");

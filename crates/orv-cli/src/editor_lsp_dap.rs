@@ -10405,7 +10405,7 @@ pub(crate) fn dap_hit_condition_matches(condition: &str, hit_count: usize) -> bo
         .strip_prefix('%')
         .and_then(|value| value.trim_start_matches('=').trim().parse::<usize>().ok())
     {
-        return modulo > 0 && hit_count.is_multiple_of(modulo);
+        return modulo > 0 && hit_count % modulo == 0;
     }
     for op in [">=", "<=", ">", "<", "==", "="] {
         if let Some((_, right)) = condition.split_once(op) {

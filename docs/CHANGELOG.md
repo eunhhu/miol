@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-17
 
+- Aligned `clippy.toml` with the workspace Rust MSRV and replaced the remaining newer API use in DAP hit conditions so `cargo clippy -- -D warnings` is warning-free on the declared toolchain floor.
 - Added a checked `smoke_output_contract` to generated preflight and benchmark evidence artifacts so `deploy/preflight.json`, benchmark reports, reveal surfaces, and runbooks share the same required marker list.
 - Added generated deploy smoke gates for the smoke-output required-marker contract across CLI/editor/LSP reveal payloads and DAP production context, and cached the DAP run-debug output so smoke does not rerun it for every grep.
 - Added the generated smoke-output artifact and required marker list to the shop starter README so the starter guide matches generated deploy runbooks.
