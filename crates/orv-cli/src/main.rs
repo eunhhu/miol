@@ -6581,7 +6581,48 @@ fn editor_debug_session_json(
     exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<serde_json::Value> {
-    let loaded = orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    editor_debug_session_json_with_source_bundle(EditorDebugSessionInput {
+        path,
+        controls,
+        breakpoints,
+        function_breakpoints,
+        data_breakpoints,
+        exception_filters,
+        watch_expressions,
+        source_bundle_path: None,
+    })
+}
+
+struct EditorDebugSessionInput<'a> {
+    path: &'a Path,
+    controls: &'a [EditorDebugControl],
+    breakpoints: &'a [EditorDebugBreakpoint],
+    function_breakpoints: &'a [String],
+    data_breakpoints: &'a [String],
+    exception_filters: &'a [String],
+    watch_expressions: &'a [String],
+    source_bundle_path: Option<&'a Path>,
+}
+
+fn editor_debug_session_json_with_source_bundle(
+    input: EditorDebugSessionInput<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    let EditorDebugSessionInput {
+        path,
+        controls,
+        breakpoints,
+        function_breakpoints,
+        data_breakpoints,
+        exception_filters,
+        watch_expressions,
+        source_bundle_path,
+    } = input;
+    let loaded = if let Some(source_bundle_path) = source_bundle_path {
+        let source_bundle = read_source_bundle_artifact(source_bundle_path)?;
+        load_project_from_source_bundle_artifact(&source_bundle)?
+    } else {
+        orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?
+    };
     let sources = editor_dap_sources(&loaded.files);
     let controls = if controls.is_empty() {
         vec![EditorDebugControl::Next]
@@ -6607,14 +6648,19 @@ fn editor_debug_session_json(
     );
     let launch_seq = next_seq;
     next_seq += 1;
+    let mut launch_arguments = serde_json::json!({
+        "program": format!("file://{}", path.display()),
+        "live": true,
+    });
+    if let Some(source_bundle_path) = source_bundle_path {
+        launch_arguments["sourceBundle"] =
+            serde_json::json!(source_bundle_path.display().to_string());
+    }
     requests.push(serde_json::json!({
         "seq": launch_seq,
         "type": "request",
         "command": "launch",
-        "arguments": {
-            "program": format!("file://{}", path.display()),
-            "live": true,
-        },
+        "arguments": launch_arguments,
     }));
     let loaded_sources_seq = next_seq;
     next_seq += 1;
@@ -6746,30 +6792,40 @@ fn editor_debug_runner_session_json(
     exception_filters: &[String],
     watch_expressions: &[String],
 ) -> anyhow::Result<serde_json::Value> {
-    let state = read_json_value(state_path)?;
-    let runner = match state.get("kind").and_then(serde_json::Value::as_str) {
+    let runner = if state_path.is_dir() {
+        editor_debug_runner_from_build_dir(state_path)?
+    } else {
+        let state = read_json_value(state_path)?;
+        match state.get("kind").and_then(serde_json::Value::as_str) {
         Some("orv.editor.export") => state
             .pointer("/debug/session_runner")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("editor export state missing debug.session_runner"))?,
         Some("orv.editor.debug.runner") => state.clone(),
         _ => anyhow::bail!(
-            "editor debug runner input must be an orv.editor.export state or orv.editor.debug.runner artifact"
+            "editor debug runner input must be a build dir, orv.editor.export state, or orv.editor.debug.runner artifact"
         ),
+        }
     };
     if runner.get("kind").and_then(serde_json::Value::as_str) != Some("orv.editor.debug.runner") {
         anyhow::bail!("editor debug runner kind is invalid");
     }
     let program = json_str(&runner, "program", "editor debug runner")?;
-    let debug = editor_debug_session_json(
-        Path::new(program),
+    let source_bundle = runner
+        .get("source_bundle")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from);
+    let debug = editor_debug_session_json_with_source_bundle(EditorDebugSessionInput {
+        path: Path::new(program),
         controls,
         breakpoints,
         function_breakpoints,
         data_breakpoints,
         exception_filters,
         watch_expressions,
-    )?;
+        source_bundle_path: source_bundle.as_deref(),
+    })?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.debug.runner.result",
@@ -6781,6 +6837,21 @@ fn editor_debug_runner_session_json(
             .unwrap_or(serde_json::Value::Null),
         "debug": debug,
         "panels": editor_debug_runner_result_panels_json(&runner, &debug),
+    }))
+}
+
+fn editor_debug_runner_from_build_dir(build_dir: &Path) -> anyhow::Result<serde_json::Value> {
+    let source_bundle_path = build_dir.join(SOURCE_BUNDLE_PATH);
+    let source_bundle = read_source_bundle_artifact(&source_bundle_path)?;
+    let entry = source_bundle_entry_path(&source_bundle)?;
+    let production = editor_production_summary_json(build_dir)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "orv.editor.debug.runner",
+        "program": entry.display().to_string(),
+        "source_bundle": source_bundle_path.display().to_string(),
+        "production_context": editor_debug_production_context_json(&production),
+        "result": editor_debug_result_artifact_json(),
     }))
 }
 
@@ -7946,6 +8017,9 @@ fn resolve_editor_debug_runner_result_path(state_path: &Path, result_path: &str)
 }
 
 fn editor_debug_runner_artifact_root(state_path: &Path) -> PathBuf {
+    if state_path.is_dir() {
+        return state_path.to_path_buf();
+    }
     let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = state_path.file_name().and_then(|name| name.to_str());
     let parent_name = parent.file_name().and_then(|name| name.to_str());
@@ -8847,6 +8921,9 @@ fn editor_debug_attach_production_context(state: &mut serde_json::Value) {
         .get_mut("session_runner")
         .and_then(serde_json::Value::as_object_mut)
     {
+        if let Some(source_bundle) = production_context.get("source_bundle").cloned() {
+            runner.insert("source_bundle".to_string(), source_bundle);
+        }
         runner.insert("production_context".to_string(), production_context);
     }
 }
@@ -8855,6 +8932,17 @@ fn editor_debug_production_context_json(production: &serde_json::Value) -> serde
     if production.is_null() {
         return serde_json::Value::Null;
     }
+    let source_bundle = production
+        .get("build_dir")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            Path::new(path)
+                .join(SOURCE_BUNDLE_PATH)
+                .display()
+                .to_string()
+        })
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
     serde_json::json!({
         "schema_version": 1,
         "kind": "orv.editor.debug.production_context",
@@ -8862,6 +8950,7 @@ fn editor_debug_production_context_json(production: &serde_json::Value) -> serde
             .get("build_dir")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "source_bundle": source_bundle,
         "graph_contract": production
             .get("graph_contract")
             .cloned()
@@ -12780,8 +12869,9 @@ impl DapSession {
 
     fn launch_result(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let path = dap_program_path(request)?;
-        let loaded = orv_project::load_project(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let file = lsp_source_file_for_path(&loaded.files, &path)
+        let (loaded, entry_path_for_lookup) = dap_loaded_project_for_launch(request, &path)?;
+        let file = lsp_source_file_for_path(&loaded.files, &entry_path_for_lookup)
+            .or_else(|| lsp_source_file_for_path(&loaded.files, &path))
             .ok_or_else(|| anyhow::anyhow!("launch program is not part of loaded project"))?;
         let resolved = orv_resolve::resolve(&loaded.program);
         let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
@@ -16473,6 +16563,33 @@ fn dap_program_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("launch.arguments.program must be a path or file URI"))?;
     dap_path_from_protocol_string(program)
+}
+
+fn dap_loaded_project_for_launch(
+    request: &serde_json::Value,
+    path: &Path,
+) -> anyhow::Result<(orv_project::LoadedProject, PathBuf)> {
+    let Some(source_bundle_path) = dap_launch_source_bundle_path(request)? else {
+        return Ok((
+            orv_project::load_project(path).map_err(|e| anyhow::anyhow!("{e}"))?,
+            path.to_path_buf(),
+        ));
+    };
+    let source_bundle = read_source_bundle_artifact(&source_bundle_path)?;
+    let entry = source_bundle_entry_path(&source_bundle)?;
+    let loaded = load_project_from_source_bundle_artifact(&source_bundle)?;
+    Ok((loaded, entry))
+}
+
+fn dap_launch_source_bundle_path(request: &serde_json::Value) -> anyhow::Result<Option<PathBuf>> {
+    request
+        .pointer("/arguments/sourceBundle")
+        .or_else(|| request.pointer("/arguments/source_bundle"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(dap_path_from_protocol_string)
+        .transpose()
 }
 
 fn dap_source_path(request: &serde_json::Value) -> anyhow::Result<PathBuf> {
@@ -23212,12 +23329,14 @@ fn verify_deploy_smoke_test_artifact(
         || !smoke.contains("orv_smoke_reveal_contains()")
         || !smoke.contains("orv_smoke_editor_reveal_contains()")
         || !smoke.contains("orv_smoke_lsp_reveal_contains()")
+        || !smoke.contains("orv_smoke_dap_summary_contains()")
         || !smoke.contains("editor reveal")
         || !smoke.contains("lsp reveal")
+        || !smoke.contains("editor run-debug . --control next")
         || !smoke.contains("orv deploy smoke test requires orv")
     {
         anyhow::bail!(
-            "deploy smoke test must verify source, editor, and LSP reveal with the ORV CLI"
+            "deploy smoke test must verify source, editor, LSP, and DAP production surfaces with the ORV CLI"
         );
     }
     if !smoke.contains("orv_smoke_trace_stream()")
@@ -23228,6 +23347,12 @@ fn verify_deploy_smoke_test_artifact(
     }
     if !smoke.contains("orv_smoke_graph_contract()")
         || !smoke.contains("\norv_smoke_graph_contract\n")
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'"#,
+        )
+        || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'"#,
+        )
         || !smoke.contains(r#""$ORV_BIN" verify-build ."#)
         || !smoke.contains("source-bundle.json")
         || !smoke.contains("project-graph.json")
@@ -23286,6 +23411,15 @@ fn verify_deploy_smoke_test_artifact(
                 );
             }
         }
+    }
+    if !artifact.routes.is_empty()
+        && (!smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#,
+        ) || !smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#,
+        ))
+    {
+        anyhow::bail!("deploy smoke test must check DAP native production summary counters");
     }
     if deploy_routes_include(artifact, "POST", "/checkout")
         && !smoke.contains("orv_smoke_cookie_from_headers()")
@@ -23663,6 +23797,9 @@ fn verify_deploy_smoke_client_contract(
         r#"orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'"#.to_string(),
         r#"orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'"#.to_string(),
         r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#.to_string(),
+        r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'"#.to_string(),
+        r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'"#.to_string(),
+        r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'"#.to_string(),
     ] {
         if !smoke.contains(&required) {
             anyhow::bail!("deploy smoke test must include {required}");
@@ -26997,21 +27134,27 @@ fn lower_artifact_entry(
 fn lower_source_bundle_entry(
     artifact: &orv_compiler::SourceBundleArtifact,
 ) -> anyhow::Result<orv_analyzer::LowerResult> {
-    let entry = source_bundle_entry_path(artifact)?;
-    let loaded = orv_project::load_project_from_sources(
-        &entry,
-        artifact
-            .files
-            .iter()
-            .map(|file| (PathBuf::from(&file.path), file.source.clone())),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let loaded = load_project_from_source_bundle_artifact(artifact)?;
     report_diagnostics(&loaded.diagnostics, &loaded.files)?;
     let resolved = orv_resolve::resolve(&loaded.program);
     report_diagnostics(&resolved.diagnostics, &loaded.files)?;
     let lowered = orv_analyzer::lower_with_diagnostics(&loaded.program, &resolved);
     report_diagnostics(&lowered.diagnostics, &loaded.files)?;
     Ok(lowered)
+}
+
+fn load_project_from_source_bundle_artifact(
+    artifact: &orv_compiler::SourceBundleArtifact,
+) -> anyhow::Result<orv_project::LoadedProject> {
+    let entry = source_bundle_entry_path(artifact)?;
+    orv_project::load_project_from_sources(
+        &entry,
+        artifact
+            .files
+            .iter()
+            .map(|file| (PathBuf::from(&file.path), file.source.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn artifact_entry_path(artifact: &orv_compiler::ServerRuntimeArtifact) -> anyhow::Result<PathBuf> {
@@ -31237,6 +31380,23 @@ orv_smoke_lsp_reveal_contains() {{
   rm -f "$output_path"
 }}
 
+orv_smoke_dap_summary_contains() {{
+  label="$1"
+  pattern="$2"
+  output_path="$(mktemp)"
+  if ! "$ORV_BIN" editor run-debug . --control next > "$output_path"; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s editor run-debug command\n' "$label" >&2
+    exit 1
+  fi
+  if ! grep -F "$pattern" "$output_path" >/dev/null; then
+    rm -f "$output_path"
+    printf 'orv deploy smoke test failed: %s editor run-debug missing %s\n' "$label" "$pattern" >&2
+    exit 1
+  fi
+  rm -f "$output_path"
+}}
+
 orv_smoke_trace_stream() {{
   if [ "${{ORV_SMOKE_TRACE_STREAM:-0}}" != "1" ]; then
     return 0
@@ -31529,6 +31689,18 @@ orv_smoke_cookie_from_headers() {{
         script.push('\n');
     }
     script.push_str("orv_smoke_graph_contract\n");
+    script.push_str(
+        r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'
+orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'
+"#,
+    );
+    if !server_artifact.routes.is_empty() {
+        script.push_str(
+            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'
+orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'
+"#,
+        );
+    }
     script.push_str(&deploy_smoke_client_contract_section(client));
     script.push_str(&deploy_smoke_client_reveal_section(client));
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
@@ -31954,6 +32126,9 @@ orv_smoke_editor_reveal_contains "editor reveal client capability summary" "$ORV
 orv_smoke_lsp_reveal_contains "lsp reveal client target summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_target_count": 5'
 orv_smoke_lsp_reveal_contains "lsp reveal client manifest summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_manifest_count": 1'
 orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'
+orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'
+orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'
+orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'
 
 "#
     )
@@ -33925,7 +34100,9 @@ test "checkout excluded failure" {
         assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_editor_reveal_contains()"));
         assert!(smoke_test.contains("orv_smoke_lsp_reveal_contains()"));
+        assert!(smoke_test.contains("orv_smoke_dap_summary_contains()"));
         assert!(smoke_test.contains("lsp reveal"));
+        assert!(smoke_test.contains("editor run-debug . --control next"));
         assert!(smoke_test.contains("orv_smoke_trace_stream()"));
         assert!(smoke_test.contains("ORV_SMOKE_TRACE_STREAM"));
         assert!(smoke_test.contains("editor trace-stream"));
@@ -45923,6 +46100,12 @@ entry = "src/main.orv"
             r#"orv_smoke_lsp_reveal_contains "lsp reveal GET /ping native target summary" "$ORV_SMOKE_ORIGIN_GET_PING" '"native_server_target_count": 1'"#
         ));
         assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
+            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#
+        ));
+        assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal GET /ping response origin" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '"name": "respond"'"#
         ));
         assert!(smoke_test.contains(
@@ -46182,6 +46365,15 @@ let sig count: int = 0
         ));
         assert!(smoke.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal client capability summary" "$ORV_SMOKE_CLIENT_ORIGIN" '"client_capability_surface_count"'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap client target summary" '"client_target_count": 5'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap client manifest summary" '"client_manifest_count": 1'"#
+        ));
+        assert!(smoke.contains(
+            r#"orv_smoke_dap_summary_contains "dap client capability summary" '"client_capability_surface_count"'"#
         ));
         cmd_verify_build(&out).expect("verify client smoke test");
 
@@ -53305,12 +53497,20 @@ define Auth() -> { @out "auth" }
             production_context["summary"]["source_bundle_file_count"],
             serde_json::json!(1)
         );
+        assert_eq!(
+            production_context["source_bundle"],
+            build_out.join(SOURCE_BUNDLE_PATH).display().to_string()
+        );
         assert!(production_context["graph_contract"]
             .as_array()
             .expect("graph contract")
             .iter()
             .any(|target| target["path"] == SOURCE_BUNDLE_PATH));
         assert_eq!(runner["production_context"], *production_context);
+        assert_eq!(
+            runner["source_bundle"],
+            build_out.join(SOURCE_BUNDLE_PATH).display().to_string()
+        );
         assert_eq!(
             native_host["debug"]["production_context"],
             *production_context
@@ -53499,6 +53699,70 @@ define Auth() -> { @out "auth" }
         assert!(result_html.contains("Production Summary"));
         assert!(result_html.contains("static_target_count"));
         assert!(result_html.contains("1/1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_build_dir_rehydrates_source_bundle_when_original_source_is_missing() {
+        let dir = temp_output_dir("editor-run-debug-build-dir-source-bundle");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("page.orv");
+        std::fs::write(&path, r#"@out @html { @body { @h1 "Home" } }"#).expect("write source");
+        let build_out = dir.join("dist");
+
+        cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        std::fs::remove_file(&path).expect("remove original source");
+
+        let run = editor_debug_runner_session_json(
+            &build_out,
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug runner from build dir source bundle");
+        assert_eq!(run["runner"]["kind"], "orv.editor.debug.runner");
+        assert_eq!(
+            run["runner"]["source_bundle"],
+            build_out.join(SOURCE_BUNDLE_PATH).display().to_string()
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["static_target_count"],
+            1
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["static_verified_count"],
+            1
+        );
+        assert!(run["debug"]["source_snapshots"]
+            .as_array()
+            .expect("source snapshots")
+            .iter()
+            .any(|snapshot| snapshot["response"]["body"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("@html"))));
+
+        cmd_editor_run_debug(
+            &build_out,
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("write build-dir debug result");
+        let result =
+            read_json_value(&build_out.join(EDITOR_DEBUG_SESSION_RESULT_PATH)).expect("result");
+        assert_eq!(
+            result["panels"]["debug"]["production_summary"]["static_target_count"],
+            1
+        );
+        assert!(build_out
+            .join(EDITOR_DEBUG_SESSION_RESULT_HTML_PATH)
+            .is_file());
         let _ = std::fs::remove_dir_all(dir);
     }
 
