@@ -8830,6 +8830,8 @@ fn editor_production_summary_json(build: &Path) -> anyhow::Result<serde_json::Va
         "build_dir": build.display().to_string(),
         "graph_contract": editor_production_graph_contract_targets(build)?,
         "client": reveal_client_bundle_targets(build)?,
+        "native_server": editor_production_native_server_targets(build)?,
+        "static": editor_production_static_targets(build)?,
         "preflight": reveal_preflight_targets(build)?,
         "db_adapters": reveal_db_adapter_targets(build)?,
         "commerce_adapters": reveal_commerce_adapter_targets(build)?,
@@ -8956,6 +8958,115 @@ fn add_editor_origin_map_contract_fields(
         .filter(|edge| edge.get("kind").and_then(serde_json::Value::as_str) == Some("calls"))
         .count();
     target["call_edge_count"] = serde_json::json!(call_edges);
+}
+
+fn editor_production_native_server_targets(build: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let plan = read_json_value(&build.join("bundle-plan.json"))?;
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for bundle in bundles {
+        if bundle.get("kind").and_then(serde_json::Value::as_str) != Some("native_server_plan") {
+            continue;
+        }
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target_path = build.join(path);
+        if !target_path.is_file() {
+            targets.push(serde_json::json!({
+                "kind": "native_server_plan",
+                "path": path,
+                "exists": false,
+            }));
+            continue;
+        }
+        let native_plan = read_json_value(&target_path)?;
+        let routes = native_plan
+            .get("routes")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        targets.push(native_server_production_target_json(
+            build,
+            path,
+            &native_plan,
+            routes,
+        )?);
+    }
+    Ok(targets)
+}
+
+fn editor_production_static_targets(build: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let plan = read_json_value(&build.join("bundle-plan.json"))?;
+    let Some(bundles) = plan.get("bundles").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for bundle in bundles.iter().filter(|bundle| {
+        bundle.get("kind").and_then(serde_json::Value::as_str) == Some("static_page")
+    }) {
+        let path = json_str(bundle, "path", "bundle target")?;
+        let target_path = build.join(path);
+        let exists = target_path.is_file();
+        let verified = exists && verify_static_page_target(bundle, &target_path).is_ok();
+        targets.push(serde_json::json!({
+            "kind": "static_page",
+            "path": path,
+            "exists": exists,
+            "verified": verified,
+            "runtime_features": bundle
+                .get("runtime_features")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        }));
+    }
+    Ok(targets)
+}
+
+fn native_server_production_target_json(
+    dir: &Path,
+    path: &str,
+    native_plan: &serde_json::Value,
+    routes: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "kind": "native_server_plan",
+        "path": path,
+        "exists": true,
+        "status": native_plan
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "artifact": native_plan
+            .get("artifact")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "launcher": native_plan
+            .get("launcher")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "routes_source": reveal_native_server_routes_source(dir, native_plan)?,
+        "router_source": reveal_native_server_router_source(dir, native_plan)?,
+        "handlers_source": reveal_native_server_handlers_source(dir, native_plan)?,
+        "target": native_plan
+            .get("target")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_image": reveal_native_runtime_image_plan(dir, native_plan)?,
+        "commands": native_plan
+            .get("commands")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_features": native_plan
+            .get("runtime_features")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "blocked_by": native_plan
+            .get("blocked_by")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "route_count": json_array_count(Some(&routes)),
+        "routes": routes,
+    }))
 }
 
 fn editor_native_host_manifest_json(entry: &Path, state: &serde_json::Value) -> serde_json::Value {
@@ -9335,6 +9446,16 @@ fn editor_native_host_production_panel_contract_json() -> serde_json::Value {
                 "kind": "array",
             },
             {
+                "name": "native_server",
+                "path": "production.native_server",
+                "kind": "array",
+            },
+            {
+                "name": "static",
+                "path": "production.static",
+                "kind": "array",
+            },
+            {
                 "name": "route_policies",
                 "path": "production.summary.route_policy_kind_counts",
                 "kind": "object",
@@ -9371,6 +9492,21 @@ fn production_summary_json(production: &serde_json::Value) -> serde_json::Value 
         .unwrap_or_default();
     let preflight = production
         .get("preflight")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let routes = production
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let native_server = production
+        .get("native_server")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let static_targets = production
+        .get("static")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -9411,6 +9547,12 @@ fn production_summary_json(production: &serde_json::Value) -> serde_json::Value 
         "client_target_count": client.len(),
         "client_manifest_count": production_client_manifest_count(&client),
         "client_capability_surface_count": production_client_capability_surface_count(&client),
+        "route_target_count": routes.len(),
+        "native_server_target_count": native_server.len(),
+        "native_server_route_count": production_native_server_route_count(&native_server),
+        "native_server_blocker_count": production_native_server_blocker_count(&native_server),
+        "static_target_count": static_targets.len(),
+        "static_verified_count": production_static_verified_count(&static_targets),
         "preflight_target_count": preflight.len(),
         "preflight_command_count": production_preflight_command_count(&preflight),
         "preflight_route_count": production_preflight_route_count(&preflight),
@@ -9430,6 +9572,8 @@ fn production_summary_json(production: &serde_json::Value) -> serde_json::Value 
             + production_missing_artifact_count(&db_adapters)
             + production_missing_artifact_count(&commerce_adapters)
             + production_missing_artifact_count(&preflight)
+            + production_missing_artifact_count(&native_server)
+            + production_missing_artifact_count(&static_targets)
             + production_missing_artifact_count(&client),
     })
 }
@@ -9462,6 +9606,33 @@ fn production_client_capability_surface_count(targets: &[serde_json::Value]) -> 
         .and_then(|target| target.pointer("/capabilities/surfaces"))
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len)
+}
+
+fn production_native_server_route_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(|target| {
+            target
+                .get("route_count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_else(|| json_array_count(target.get("routes")))
+        })
+        .sum()
+}
+
+fn production_native_server_blocker_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .map(|target| json_array_count(target.get("blocked_by")))
+        .sum()
+}
+
+fn production_static_verified_count(targets: &[serde_json::Value]) -> usize {
+    targets
+        .iter()
+        .filter(|target| target.get("verified").and_then(serde_json::Value::as_bool) == Some(true))
+        .count()
 }
 
 fn production_adapter_entry_count(targets: &[serde_json::Value]) -> usize {
@@ -9616,6 +9787,11 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     let preflight_smoke_summary_missing_marker_count =
         json_usize_field(&summary, "preflight_smoke_summary_missing_marker_count");
     let route_policy_count = json_usize_field(&summary, "route_policy_count");
+    let native_server_target_count = json_usize_field(&summary, "native_server_target_count");
+    let native_server_route_count = json_usize_field(&summary, "native_server_route_count");
+    let native_server_blocker_count = json_usize_field(&summary, "native_server_blocker_count");
+    let static_target_count = json_usize_field(&summary, "static_target_count");
+    let static_verified_count = json_usize_field(&summary, "static_verified_count");
     let client_target_count = json_usize_field(&summary, "client_target_count");
     let graph_contract_count = json_usize_field(&summary, "graph_contract_count");
     let adapter_count = json_usize_field(&summary, "adapter_count");
@@ -9627,6 +9803,14 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     )?);
     let client = html_escape_text(&serde_json::to_string_pretty(
         production.get("client").unwrap_or(&serde_json::Value::Null),
+    )?);
+    let native_server = html_escape_text(&serde_json::to_string_pretty(
+        production
+            .get("native_server")
+            .unwrap_or(&serde_json::Value::Null),
+    )?);
+    let static_targets = html_escape_text(&serde_json::to_string_pretty(
+        production.get("static").unwrap_or(&serde_json::Value::Null),
     )?);
     let db_adapters = html_escape_text(&serde_json::to_string_pretty(
         production
@@ -9660,7 +9844,8 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     );
     writeln!(
         &mut html,
-        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Preflight Commands</span><b>{preflight_command_count}</b></div><div class=\"metric\"><span>Smoke Summary</span><b>{preflight_smoke_summary_present_count}/{preflight_target_count}</b></div><div class=\"metric\"><span>Smoke Gaps</span><b class=\"{}\">{}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        "<header><h1>Production Panel</h1><div class=\"muted\">{build_dir}</div><section class=\"summary\"><div class=\"metric\"><span>Graph Contracts</span><b>{graph_contract_count}</b></div><div class=\"metric\"><span>Client Targets</span><b>{client_target_count}</b></div><div class=\"metric\"><span>Native Plans</span><b>{native_server_target_count}</b></div><div class=\"metric\"><span>Native Routes</span><b>{native_server_route_count}</b></div><div class=\"metric\"><span>Native Blockers</span><b class=\"{}\">{native_server_blocker_count}</b></div><div class=\"metric\"><span>Static Pages</span><b>{static_verified_count}/{static_target_count}</b></div><div class=\"metric\"><span>Preflight</span><b>{preflight_target_count}</b></div><div class=\"metric\"><span>Preflight Commands</span><b>{preflight_command_count}</b></div><div class=\"metric\"><span>Smoke Summary</span><b>{preflight_smoke_summary_present_count}/{preflight_target_count}</b></div><div class=\"metric\"><span>Smoke Gaps</span><b class=\"{}\">{}</b></div><div class=\"metric\"><span>Route Policies</span><b>{route_policy_count}</b></div><div class=\"metric\"><span>DB Targets</span><b>{db_target_count}</b></div><div class=\"metric\"><span>Commerce Targets</span><b>{commerce_target_count}</b></div><div class=\"metric\"><span>Adapters</span><b>{adapter_count}</b></div><div class=\"metric\"><span>Missing</span><b class=\"{}\">{missing_artifact_count}</b></div></section></header>",
+        if native_server_blocker_count == 0 { "" } else { "bad" },
         if preflight_smoke_summary_missing_count + preflight_smoke_summary_missing_marker_count == 0 {
             ""
         } else {
@@ -9671,7 +9856,7 @@ fn editor_production_panel_html(production: &serde_json::Value) -> anyhow::Resul
     )?;
     writeln!(
         &mut html,
-        "<main><section class=\"panel wide\"><h2>Graph Contract</h2><pre>{graph_contract}</pre></section><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>Route Policy Summary</h2><pre>{route_policies}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
+        "<main><section class=\"panel wide\"><h2>Graph Contract</h2><pre>{graph_contract}</pre></section><section class=\"panel wide\"><h2>Client Bundles</h2><pre>{client}</pre></section><section class=\"panel wide\"><h2>Native Server</h2><pre>{native_server}</pre></section><section class=\"panel wide\"><h2>Static Pages</h2><pre>{static_targets}</pre></section><section class=\"panel wide\"><h2>Preflight</h2><pre>{preflight}</pre></section><section class=\"panel\"><h2>Route Policy Summary</h2><pre>{route_policies}</pre></section><section class=\"panel\"><h2>DB Adapters</h2><pre>{db_adapters}</pre></section><section class=\"panel\"><h2>Commerce Adapters</h2><pre>{commerce_adapters}</pre></section><section class=\"panel wide\"><h2>Panel Contract</h2><pre>{panel_contract}</pre></section></main>"
     )?;
     writeln!(
         &mut html,
@@ -10459,6 +10644,9 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
     let debug_data_breakpoint_count = editor_debug_data_breakpoint_count_from_state(state);
     let debug_exception_filter_count = editor_debug_exception_filter_count_from_state(state);
     let production_client_target_count = json_array_count(state.pointer("/production/client"));
+    let production_native_server_target_count =
+        json_array_count(state.pointer("/production/native_server"));
+    let production_static_target_count = json_array_count(state.pointer("/production/static"));
     let production_preflight_count = json_array_count(state.pointer("/production/preflight"));
     let production_db_adapter_count = json_array_count(state.pointer("/production/db_adapters"));
     let production_commerce_adapter_count =
@@ -10515,6 +10703,8 @@ fn editor_export_html(state: &serde_json::Value) -> anyhow::Result<String> {
         &mut html,
         "<span>Production<b>{}</b></span>",
         production_client_target_count
+            + production_native_server_target_count
+            + production_static_target_count
             + production_preflight_count
             + production_db_adapter_count
             + production_commerce_adapter_count
@@ -24634,44 +24824,12 @@ fn reveal_native_server_targets(
         if matching_routes.is_empty() {
             continue;
         }
-        targets.push(serde_json::json!({
-            "kind": "native_server_plan",
-            "path": path,
-            "exists": true,
-            "status": native_plan
-                .get("status")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "artifact": native_plan
-                .get("artifact")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "launcher": native_plan
-                .get("launcher")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "routes_source": reveal_native_server_routes_source(dir, &native_plan)?,
-            "router_source": reveal_native_server_router_source(dir, &native_plan)?,
-            "handlers_source": reveal_native_server_handlers_source(dir, &native_plan)?,
-            "target": native_plan
-                .get("target")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "runtime_image": reveal_native_runtime_image_plan(dir, &native_plan)?,
-            "commands": native_plan
-                .get("commands")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "runtime_features": native_plan
-                .get("runtime_features")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([])),
-            "blocked_by": native_plan
-                .get("blocked_by")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([])),
-            "routes": matching_routes,
-        }));
+        targets.push(native_server_production_target_json(
+            dir,
+            path,
+            &native_plan,
+            serde_json::json!(matching_routes),
+        )?);
     }
     Ok(targets)
 }
@@ -50332,6 +50490,8 @@ models = { path = "../../shared/models", version = "2.0.0" }
                     .expect("runtime features")
                     .is_empty()
         }));
+        assert_eq!(reveal["production"]["summary"]["static_target_count"], 1);
+        assert_eq!(reveal["production"]["summary"]["static_verified_count"], 1);
         let _ = std::fs::remove_dir_all(out);
     }
 
@@ -50479,6 +50639,15 @@ models = { path = "../../shared/models", version = "2.0.0" }
                     .iter()
                     .all(|item| item != "native-codegen")
         }));
+        assert_eq!(reveal["production"]["summary"]["route_target_count"], 1);
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            reveal["production"]["summary"]["native_server_route_count"],
+            1
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -54547,6 +54716,19 @@ define Auth() -> { @out "auth" }
             serde_json::json!(1)
         );
         assert_eq!(state["production"]["summary"]["graph_contract_count"], 3);
+        assert_eq!(
+            state["production"]["native_server"][0]["path"],
+            "server/native-server.json"
+        );
+        assert_eq!(
+            state["production"]["summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            state["production"]["summary"]["native_server_route_count"],
+            1
+        );
+        assert_eq!(state["production"]["summary"]["static_target_count"], 0);
         assert_eq!(state["production"]["summary"]["preflight_target_count"], 1);
         assert_eq!(
             state["production"]["summary"]["preflight_smoke_summary_present_count"],
@@ -54674,6 +54856,18 @@ define Auth() -> { @out "auth" }
             1
         );
         assert_eq!(
+            native_host["production"]["summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["native_server_route_count"],
+            1
+        );
+        assert_eq!(
+            native_host["production"]["summary"]["static_target_count"],
+            0
+        );
+        assert_eq!(
             native_host["production"]["summary"]["route_policy_count"],
             2
         );
@@ -54743,6 +54937,13 @@ define Auth() -> { @out "auth" }
                 && section["path"] == "production.preflight"));
         assert!(production_sections
             .iter()
+            .any(|section| section["name"] == "native_server"
+                && section["path"] == "production.native_server"));
+        assert!(production_sections
+            .iter()
+            .any(|section| section["name"] == "static" && section["path"] == "production.static"));
+        assert!(production_sections
+            .iter()
             .any(|section| section["name"] == "route_policies"
                 && section["path"] == "production.summary.route_policy_kind_counts"));
         assert!(production_sections
@@ -54809,6 +55010,11 @@ define Auth() -> { @out "auth" }
         assert!(production_panel.contains("source-bundle.json"));
         assert!(production_panel.contains("project-graph.json"));
         assert!(production_panel.contains("origin-map.json"));
+        assert!(production_panel.contains("Native Server"));
+        assert!(production_panel.contains("Native Plans</span><b>1</b>"));
+        assert!(production_panel.contains("Native Routes</span><b>1</b>"));
+        assert!(production_panel.contains("Static Pages"));
+        assert!(production_panel.contains("Static Pages</span><b>0/0</b>"));
         assert!(production_panel.contains("Preflight"));
         assert!(production_panel.contains("\"benchmark_report\": \"orv benchmark-report .\""));
         assert!(production_panel.contains(
