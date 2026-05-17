@@ -13286,6 +13286,18 @@ fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
     ));
     assert!(smoke_test
         .contains(r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#));
+    assert!(smoke_test.contains("orv_smoke_dap_summary_capture()"));
+    assert!(smoke_test.contains("orv_smoke_dap_summary_cleanup()"));
+    assert!(smoke_test.contains("\norv_smoke_dap_summary_cleanup\n"));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke required markers" '"smoke_test_required_markers": ['"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke summary required markers" '"required_markers": ['"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke marker dap source bundle" '"dap_source_bundle"'"#
+    ));
     assert!(smoke_test.contains("server_routes=1"));
     assert!(smoke_test.contains("trace_stream_requested=%s"));
     assert!(smoke_test.contains("orv_smoke_reveal_contains()"));
@@ -13336,6 +13348,21 @@ fn build_prod_writes_deploy_manifest_and_server_entrypoint() {
     assert!(smoke_test.contains(
             r#"orv_smoke_lsp_reveal_contains "lsp reveal GET /ping response production" "$ORV_SMOKE_RESPONSE_ORIGIN_GET_PING" '"response_origin_dispatch": true'"#
         ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_reveal_contains "reveal smoke required markers" "$ORV_SMOKE_ORIGIN_GET_PING" '"smoke_test_required_markers": ['"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_reveal_contains "reveal smoke summary required markers" "$ORV_SMOKE_ORIGIN_GET_PING" '"required_markers": ['"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_reveal_contains "reveal smoke marker dap source bundle" "$ORV_SMOKE_ORIGIN_GET_PING" '"dap_source_bundle"'"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_editor_reveal_contains "editor reveal smoke required markers" "$ORV_SMOKE_ORIGIN_GET_PING" '"smoke_test_required_markers": ['"#
+    ));
+    assert!(smoke_test.contains(
+        r#"orv_smoke_lsp_reveal_contains "lsp reveal smoke required markers" "$ORV_SMOKE_ORIGIN_GET_PING" '"smoke_test_required_markers": ['"#
+    ));
     let preflight = read_json_value(&deploy_preflight_path).expect("deploy preflight");
     assert_eq!(preflight["schema_version"], 1);
     assert_eq!(preflight["kind"], "orv.deploy.preflight");
@@ -14780,6 +14807,65 @@ fn verify_build_rejects_deploy_smoke_dap_source_bundle_panel_missing() {
     assert!(err
         .to_string()
         .contains("deploy smoke test must verify the build graph contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_smoke_dap_marker_contract_missing() {
+    let (src_dir, path) = prod_server_source("deploy-smoke-dap-marker-contract-source");
+    let out = temp_output_dir("deploy-smoke-dap-marker-contract-missing");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke_path = out.join("deploy").join("smoke-test.sh");
+    let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    write_text(
+        &smoke_path,
+        &smoke.replace(
+            r#"orv_smoke_dap_summary_contains "dap smoke required markers" '"smoke_test_required_markers": ['
+"#,
+            "",
+        ),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("smoke DAP marker contract mismatch");
+
+    assert!(
+        err.to_string().contains(
+            "deploy smoke test must verify smoke marker contract in DAP production context"
+        ),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_smoke_reveal_marker_contract_missing() {
+    let (src_dir, path) = prod_server_source("deploy-smoke-reveal-marker-contract-source");
+    let out = temp_output_dir("deploy-smoke-reveal-marker-contract-missing");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke_path = out.join("deploy").join("smoke-test.sh");
+    let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    write_text(
+        &smoke_path,
+        &smoke.replace(
+            r#"orv_smoke_reveal_contains "reveal smoke required markers" "$ORV_SMOKE_ORIGIN_GET_PING" '"smoke_test_required_markers": ['
+"#,
+            "",
+        ),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("smoke reveal marker contract mismatch");
+
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must verify smoke marker contract across reveal surfaces"),
+        "{err:?}"
+    );
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(out);
 }
@@ -20959,6 +21045,16 @@ fn editor_run_debug_result_summarizes_native_production_targets() {
     assert_eq!(
         run["panels"]["debug"]["production_summary"]["preflight_target_count"],
         1
+    );
+    assert_eq!(
+        run["panels"]["debug"]["production_context"]["preflight"][0]["benchmark_evidence"]
+            ["smoke_test_required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
+    );
+    assert_eq!(
+        run["panels"]["debug"]["production_context"]["preflight"][0]["benchmark_evidence"]
+            ["smoke_test_summary"]["required_markers"],
+        serde_json::json!(deploy_benchmark::SMOKE_REQUIRED_MARKERS)
     );
     let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
     assert!(result_html.contains("Production Summary"));

@@ -4103,6 +4103,23 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must verify the build graph contract");
     }
+    if !smoke.contains("orv_smoke_dap_summary_capture()")
+        || !smoke.contains("orv_smoke_dap_summary_cleanup()")
+        || !smoke.contains("\norv_smoke_dap_summary_cleanup\n")
+    {
+        anyhow::bail!("deploy smoke test must cache and clean DAP production summary output");
+    }
+    if !smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke required markers" '"smoke_test_required_markers": ['"#,
+    ) || !smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke summary required markers" '"required_markers": ['"#,
+    ) || !smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap smoke marker dap source bundle" '"dap_source_bundle"'"#,
+    ) {
+        anyhow::bail!(
+            "deploy smoke test must verify smoke marker contract in DAP production context"
+        );
+    }
     if !smoke.contains("ORV_SMOKE_BUILD_DIR=") || !smoke.contains(r#"cd "$ORV_SMOKE_BUILD_DIR""#) {
         anyhow::bail!("deploy smoke test must run from its build directory");
     }
@@ -4163,6 +4180,31 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
         ))
     {
         anyhow::bail!("deploy smoke test must check DAP native production summary counters");
+    }
+    if !artifact.routes.is_empty()
+        && (!smoke.contains(r#"orv_smoke_reveal_contains "reveal smoke required markers" "#)
+            || !smoke
+                .contains(r#"orv_smoke_reveal_contains "reveal smoke summary required markers" "#)
+            || !smoke
+                .contains(r#"orv_smoke_reveal_contains "reveal smoke marker dap source bundle" "#)
+            || !smoke.contains(
+                r#"orv_smoke_editor_reveal_contains "editor reveal smoke required markers" "#,
+            )
+            || !smoke.contains(
+                r#"orv_smoke_editor_reveal_contains "editor reveal smoke summary required markers" "#,
+            )
+            || !smoke.contains(
+                r#"orv_smoke_editor_reveal_contains "editor reveal smoke marker dap source bundle" "#,
+            )
+            || !smoke.contains(r#"orv_smoke_lsp_reveal_contains "lsp reveal smoke required markers" "#)
+            || !smoke.contains(
+                r#"orv_smoke_lsp_reveal_contains "lsp reveal smoke summary required markers" "#,
+            )
+            || !smoke.contains(
+                r#"orv_smoke_lsp_reveal_contains "lsp reveal smoke marker dap source bundle" "#,
+            ))
+    {
+        anyhow::bail!("deploy smoke test must verify smoke marker contract across reveal surfaces");
     }
     if deploy_routes_include(artifact, "POST", "/checkout")
         && !smoke.contains("orv_smoke_cookie_from_headers()")
@@ -11993,6 +12035,7 @@ cd "$ORV_SMOKE_BUILD_DIR"
 BASE_URL="${{ORV_BASE_URL:-{}}}"
 ORV_BIN="${{ORV_BIN:-orv}}"
 ORV_SMOKE_OUTPUT="${{ORV_SMOKE_OUTPUT:-{}}}"
+ORV_SMOKE_DAP_SUMMARY_OUTPUT=""
 
 if ! command -v curl >/dev/null 2>&1; then
   printf 'orv deploy smoke test requires curl\n' >&2
@@ -12058,21 +12101,34 @@ orv_smoke_lsp_reveal_contains() {{
   rm -f "$output_path"
 }}
 
-orv_smoke_dap_summary_contains() {{
-  label="$1"
-  pattern="$2"
+orv_smoke_dap_summary_capture() {{
+  if [ -n "$ORV_SMOKE_DAP_SUMMARY_OUTPUT" ] && [ -f "$ORV_SMOKE_DAP_SUMMARY_OUTPUT" ]; then
+    return 0
+  fi
   output_path="$(mktemp)"
   if ! "$ORV_BIN" editor run-debug . --control next > "$output_path"; then
     rm -f "$output_path"
-    printf 'orv deploy smoke test failed: %s editor run-debug command\n' "$label" >&2
+    printf 'orv deploy smoke test failed: DAP editor run-debug command\n' >&2
     exit 1
   fi
-  if ! grep -F "$pattern" "$output_path" >/dev/null; then
-    rm -f "$output_path"
+  ORV_SMOKE_DAP_SUMMARY_OUTPUT="$output_path"
+}}
+
+orv_smoke_dap_summary_contains() {{
+  label="$1"
+  pattern="$2"
+  orv_smoke_dap_summary_capture
+  if ! grep -F "$pattern" "$ORV_SMOKE_DAP_SUMMARY_OUTPUT" >/dev/null; then
     printf 'orv deploy smoke test failed: %s editor run-debug missing %s\n' "$label" "$pattern" >&2
     exit 1
   fi
-  rm -f "$output_path"
+}}
+
+orv_smoke_dap_summary_cleanup() {{
+  if [ -n "$ORV_SMOKE_DAP_SUMMARY_OUTPUT" ]; then
+    rm -f "$ORV_SMOKE_DAP_SUMMARY_OUTPUT"
+    ORV_SMOKE_DAP_SUMMARY_OUTPUT=""
+  fi
 }}
 
 orv_smoke_trace_stream() {{
@@ -12374,6 +12430,9 @@ orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'
 orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'
 orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'
 orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'
+orv_smoke_dap_summary_contains "dap smoke required markers" '"smoke_test_required_markers": ['
+orv_smoke_dap_summary_contains "dap smoke summary required markers" '"required_markers": ['
+orv_smoke_dap_summary_contains "dap smoke marker dap source bundle" '"dap_source_bundle"'
 "#,
     );
     if !server_artifact.routes.is_empty() {
@@ -12383,8 +12442,13 @@ orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_
 "#,
         );
     }
+    if let Some(route) = server_artifact.routes.first() {
+        let origin_ref = deploy_smoke_origin_var_ref(&route.method, &route.path);
+        script.push_str(&deploy_smoke_reveal_marker_contract_section(&origin_ref));
+    }
     script.push_str(&deploy_smoke_client_contract_section(client));
     script.push_str(&deploy_smoke_client_reveal_section(client));
+    script.push_str("orv_smoke_dap_summary_cleanup\n");
     script.push_str(&deploy_smoke_db_adapter_contract_section(persistence));
     script.push_str(&deploy_smoke_output_function_section(
         server_artifact.routes.len(),
@@ -12755,6 +12819,22 @@ pub(crate) fn deploy_smoke_output_function_section(
 "#,
     );
     out
+}
+
+pub(crate) fn deploy_smoke_reveal_marker_contract_section(origin_ref: &str) -> String {
+    format!(
+        r#"orv_smoke_reveal_contains "reveal smoke required markers" "{origin_ref}" '"smoke_test_required_markers": ['
+orv_smoke_reveal_contains "reveal smoke summary required markers" "{origin_ref}" '"required_markers": ['
+orv_smoke_reveal_contains "reveal smoke marker dap source bundle" "{origin_ref}" '"dap_source_bundle"'
+orv_smoke_editor_reveal_contains "editor reveal smoke required markers" "{origin_ref}" '"smoke_test_required_markers": ['
+orv_smoke_editor_reveal_contains "editor reveal smoke summary required markers" "{origin_ref}" '"required_markers": ['
+orv_smoke_editor_reveal_contains "editor reveal smoke marker dap source bundle" "{origin_ref}" '"dap_source_bundle"'
+orv_smoke_lsp_reveal_contains "lsp reveal smoke required markers" "{origin_ref}" '"smoke_test_required_markers": ['
+orv_smoke_lsp_reveal_contains "lsp reveal smoke summary required markers" "{origin_ref}" '"required_markers": ['
+orv_smoke_lsp_reveal_contains "lsp reveal smoke marker dap source bundle" "{origin_ref}" '"dap_source_bundle"'
+
+"#
+    )
 }
 
 pub(crate) fn deploy_smoke_client_contract_section(client: &serde_json::Value) -> String {

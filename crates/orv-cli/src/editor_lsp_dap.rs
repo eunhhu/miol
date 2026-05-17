@@ -3378,6 +3378,10 @@ pub(crate) fn editor_debug_production_context_json(
             .get("graph_contract")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
+        "preflight": production
+            .get("preflight")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
         "summary": production
             .get("summary")
             .cloned()

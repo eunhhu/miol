@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-17
 
+- Added generated deploy smoke gates for the smoke-output required-marker contract across CLI/editor/LSP reveal payloads and DAP production context, and cached the DAP run-debug output so smoke does not rerun it for every grep.
 - Added the generated smoke-output artifact and required marker list to the shop starter README so the starter guide matches generated deploy runbooks.
 - Added the required smoke-output marker list to the generated deploy runbook and made verify-build reject runbook drift from the benchmark smoke marker contract.
 - Mirrored benchmark smoke required-marker contracts into reveal/editor/native production preflight payloads.
