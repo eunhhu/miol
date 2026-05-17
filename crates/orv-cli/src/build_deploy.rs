@@ -4082,23 +4082,26 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
     {
         anyhow::bail!("deploy smoke test must optionally verify live trace stream");
     }
+    let source_bundle_file_count = artifact.source_bundle.files.len();
+    let dap_source_bundle_summary = format!(
+        r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": {source_bundle_file_count}'"#
+    );
+    let dap_source_bundle_panel_file_count = format!(
+        r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": {source_bundle_file_count}'"#
+    );
     if !smoke.contains("orv_smoke_graph_contract()")
         || !smoke.contains("\norv_smoke_graph_contract\n")
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'"#,
         )
-        || !smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'"#,
-        )
+        || !smoke.contains(&dap_source_bundle_summary)
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'"#,
         )
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'"#,
         )
-        || !smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#,
-        )
+        || !smoke.contains(&dap_source_bundle_panel_file_count)
         || !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'"#,
         )
@@ -12467,12 +12470,14 @@ orv_smoke_cookie_from_headers() {{
         script.push('\n');
     }
     script.push_str("orv_smoke_graph_contract\n");
-    script.push_str(
+    let source_bundle_file_count = server_artifact.source_bundle.files.len();
+    let _ = write!(
+        script,
         r#"orv_smoke_dap_summary_contains "dap graph summary" '"graph_contract_count": 3'
-orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'
-orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {'
+orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": {source_bundle_file_count}'
+orv_smoke_dap_summary_contains "dap source bundle panel" '"source_bundle": {{'
 orv_smoke_dap_summary_contains "dap source bundle panel path" '"path": "./source-bundle.json"'
-orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'
+orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": {source_bundle_file_count}'
 orv_smoke_dap_summary_contains "dap source bundle panel hash" '"hash":'
 orv_smoke_dap_summary_contains "dap smoke required markers" '"smoke_test_required_markers": ['
 orv_smoke_dap_summary_contains "dap smoke summary required markers" '"required_markers": ['

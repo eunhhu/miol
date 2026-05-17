@@ -4,6 +4,7 @@ Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual
 
 ## 2026-05-18
 
+- Fixed generated deploy smoke DAP source-bundle count checks to use the actual build source-bundle file count, so imported multi-file projects do not fail against a one-file expectation.
 - Fixed generated deploy smoke DAP native route summary checks to use the actual server route count, so shop-scale builds with many routes do not fail against a one-route expectation.
 
 ## 2026-05-17

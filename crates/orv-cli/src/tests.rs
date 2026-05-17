@@ -289,6 +289,31 @@ fn multi_route_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
     (dir, path)
 }
 
+fn imported_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
+    let dir = temp_output_dir(name);
+    let models = dir.join("models");
+    std::fs::create_dir_all(&models).expect("create imported prod source dir");
+    std::fs::write(
+        models.join("status.orv"),
+        r#"pub function status(): string -> "ok"
+"#,
+    )
+    .expect("write imported helper source");
+    let path = dir.join("app.orv");
+    std::fs::write(
+        &path,
+        r#"import models.status.status
+
+@server {
+  @listen 8080
+  @route GET /ping { @respond 200 { status: status() } }
+}
+"#,
+    )
+    .expect("write imported prod source");
+    (dir, path)
+}
+
 fn env_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
     let dir = temp_output_dir(name);
     std::fs::create_dir_all(&dir).expect("create env prod source dir");
@@ -14844,6 +14869,66 @@ fn verify_build_rejects_deploy_smoke_dap_source_bundle_panel_missing() {
     assert!(err
         .to_string()
         .contains("deploy smoke test must verify the build graph contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn build_prod_smoke_dap_source_bundle_count_uses_actual_file_count() {
+    let (src_dir, path) = imported_prod_server_source("deploy-smoke-dap-source-count-source");
+    let out = temp_output_dir("deploy-smoke-dap-source-count");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke =
+        std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
+
+    assert!(smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 2'"#
+    ));
+    assert!(smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 2'"#
+    ));
+    assert!(!smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'"#
+    ));
+    assert!(!smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#
+    ));
+    cmd_verify_build(&out).expect("verify prod build");
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_smoke_dap_source_bundle_count_mismatch() {
+    let (src_dir, path) =
+        imported_prod_server_source("deploy-smoke-dap-source-count-mismatch-source");
+    let out = temp_output_dir("deploy-smoke-dap-source-count-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke_path = out.join("deploy").join("smoke-test.sh");
+    let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    write_text(
+        &smoke_path,
+        &smoke
+            .replace(
+                r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 2'"#,
+                r#"orv_smoke_dap_summary_contains "dap source bundle summary" '"source_bundle_file_count": 1'"#,
+            )
+            .replace(
+                r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 2'"#,
+                r#"orv_smoke_dap_summary_contains "dap source bundle panel file count" '"fileCount": 1'"#,
+            ),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("smoke DAP source bundle count mismatch");
+
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must verify the build graph contract"),
+        "{err:?}"
+    );
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(out);
 }
