@@ -6843,6 +6843,7 @@ fn editor_debug_runner_result_panels_json(
         .get("production_context")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let production_summary = editor_debug_production_summary_from_context(&production_context);
     let session_summary = editor_debug_session_summary_json(
         debug,
         &selected_frame,
@@ -6855,6 +6856,7 @@ fn editor_debug_runner_result_panels_json(
         "debug": {
             "schema_version": 1,
             "production_context": production_context,
+            "production_summary": production_summary,
             "session_summary": session_summary,
             "result_artifact": runner
                 .get("result")
@@ -6905,6 +6907,18 @@ fn editor_debug_runner_result_panels_json(
     })
 }
 
+fn editor_debug_production_summary_from_context(
+    production_context: &serde_json::Value,
+) -> serde_json::Value {
+    if production_context.is_null() {
+        return serde_json::Value::Null;
+    }
+    production_context
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 fn editor_debug_all_event_frames(debug: &serde_json::Value) -> Vec<serde_json::Value> {
     debug
         .get("frames")
@@ -6950,6 +6964,11 @@ fn editor_debug_result_panel_contract_json() -> serde_json::Value {
             {
                 "name": "production_context",
                 "path": "panels.debug.production_context",
+                "kind": "object",
+            },
+            {
+                "name": "production_summary",
+                "path": "panels.debug.production_summary",
                 "kind": "object",
             },
             {
@@ -7109,6 +7128,10 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .pointer("/panels/debug/production_context")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let production_summary = value
+        .pointer("/panels/debug/production_summary")
+        .cloned()
+        .unwrap_or_else(|| editor_debug_production_summary_from_context(&production_context));
     let source_navigation = value
         .pointer("/panels/debug/source_navigation")
         .cloned()
@@ -7191,6 +7214,28 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
         .pointer("/panels/debug/source_snapshot_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let production_client_target_count =
+        json_usize_field(&production_summary, "client_target_count");
+    let production_client_manifest_count =
+        json_usize_field(&production_summary, "client_manifest_count");
+    let production_native_server_target_count =
+        json_usize_field(&production_summary, "native_server_target_count");
+    let production_native_server_route_count =
+        json_usize_field(&production_summary, "native_server_route_count");
+    let production_static_target_count =
+        json_usize_field(&production_summary, "static_target_count");
+    let production_static_verified_count =
+        json_usize_field(&production_summary, "static_verified_count");
+    let production_preflight_target_count =
+        json_usize_field(&production_summary, "preflight_target_count");
+    let production_preflight_smoke_present_count =
+        json_usize_field(&production_summary, "preflight_smoke_summary_present_count");
+    let production_preflight_smoke_gap_count =
+        json_usize_field(&production_summary, "preflight_smoke_summary_missing_count")
+            + json_usize_field(
+                &production_summary,
+                "preflight_smoke_summary_missing_marker_count",
+            );
     let mut html = String::new();
     html.push_str("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -7235,6 +7280,11 @@ fn editor_debug_runner_result_html(value: &serde_json::Value) -> anyhow::Result<
     )));
     html.push_str("</pre></section>\n");
     if !production_context.is_null() {
+        writeln!(
+            &mut html,
+            "<section class=\"panel wide\"><h2>Production Summary</h2><div class=\"metric\">{production_client_target_count}</div><p class=\"muted\">client targets, {production_client_manifest_count} manifests</p><div class=\"metric\">{production_native_server_target_count}</div><p class=\"muted\">native plans, {production_native_server_route_count} routes</p><div class=\"metric\">{production_static_verified_count}/{production_static_target_count}</div><p class=\"muted\">verified static pages</p><div class=\"metric\">{production_preflight_smoke_present_count}/{production_preflight_target_count}</div><p class=\"muted\">smoke summaries, {production_preflight_smoke_gap_count} gaps</p><pre>{}</pre></section>",
+            html_escape_text(&serde_json::to_string_pretty(&production_summary)?),
+        )?;
         html.push_str("<section class=\"panel wide\"><h2>Production Context</h2><pre>");
         html.push_str(&html_escape_text(&serde_json::to_string_pretty(
             &production_context,
@@ -53288,6 +53338,10 @@ define Auth() -> { @out "auth" }
             run["panels"]["debug"]["production_context"],
             *production_context
         );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"],
+            production_context["summary"]
+        );
         assert!(
             run["panels"]["debug"]["result_artifact"]["panel_contract"]["sections"]
                 .as_array()
@@ -53296,9 +53350,69 @@ define Auth() -> { @out "auth" }
                 .any(|section| section["name"] == "production_context"
                     && section["path"] == "panels.debug.production_context")
         );
+        assert!(
+            run["panels"]["debug"]["result_artifact"]["panel_contract"]["sections"]
+                .as_array()
+                .expect("debug result panel sections")
+                .iter()
+                .any(|section| section["name"] == "production_summary"
+                    && section["path"] == "panels.debug.production_summary")
+        );
         let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
+        assert!(result_html.contains("Production Summary"));
         assert!(result_html.contains("Production Context"));
         assert!(result_html.contains("source-bundle.json"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn editor_run_debug_result_summarizes_native_production_targets() {
+        let dir = temp_output_dir("editor-run-debug-production-summary");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("server.orv");
+        std::fs::write(
+            &path,
+            r"@server {
+  @listen 8080
+  @route GET /ping {
+    @respond 200 { ok: true }
+  }
+}",
+        )
+        .expect("write source");
+        let build_out = dir.join("dist");
+        let editor_out = dir.join("editor");
+
+        cmd_build_with_profile(&path, &build_out, BuildProfile::Production).expect("prod build");
+        cmd_editor_export_with_options(&path, &editor_out, Some(&build_out), None)
+            .expect("editor export with build");
+
+        let run = editor_debug_runner_session_json(
+            &editor_out.join(EDITOR_DEBUG_SESSION_RUNNER_PATH),
+            &[EditorDebugControl::Next],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("run debug runner with production summary");
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["native_server_target_count"],
+            1
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["native_server_route_count"],
+            1
+        );
+        assert_eq!(
+            run["panels"]["debug"]["production_summary"]["preflight_target_count"],
+            1
+        );
+        let result_html = editor_debug_runner_result_html(&run).expect("debug result html");
+        assert!(result_html.contains("Production Summary"));
+        assert!(result_html.contains("native_server_target_count"));
+        assert!(result_html.contains("native plans, 1 routes"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -54340,6 +54454,14 @@ define Auth() -> { @out "auth" }
         assert_eq!(panel_controls.len(), 2);
         assert_eq!(panel_controls[0]["name"], "Next");
         assert_eq!(panel_controls[1]["name"], "Next");
+        assert!(result["runner"]["result"]["panel_contract"]["sections"]
+            .as_array()
+            .expect("panel sections")
+            .iter()
+            .any(|section| {
+                section["name"] == "production_summary"
+                    && section["path"] == "panels.debug.production_summary"
+            }));
         assert!(result["runner"]["result"]["panel_contract"]["sections"]
             .as_array()
             .expect("panel sections")
