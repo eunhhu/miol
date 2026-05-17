@@ -272,6 +272,23 @@ fn prod_server_source(name: &str) -> (PathBuf, PathBuf) {
     (dir, path)
 }
 
+fn multi_route_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
+    let dir = temp_output_dir(name);
+    std::fs::create_dir_all(&dir).expect("create multi-route prod source dir");
+    let path = dir.join("app.orv");
+    std::fs::write(
+        &path,
+        r#"@server {
+  @listen 8080
+  @route GET /ping { @respond 200 { ok: true } }
+  @route GET /status { @respond 200 { status: "ok" } }
+}
+"#,
+    )
+    .expect("write multi-route prod source");
+    (dir, path)
+}
+
 fn env_prod_server_source(name: &str) -> (PathBuf, PathBuf) {
     let dir = temp_output_dir(name);
     std::fs::create_dir_all(&dir).expect("create env prod source dir");
@@ -14827,6 +14844,58 @@ fn verify_build_rejects_deploy_smoke_dap_source_bundle_panel_missing() {
     assert!(err
         .to_string()
         .contains("deploy smoke test must verify the build graph contract"));
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn build_prod_smoke_dap_native_route_summary_uses_actual_route_count() {
+    let (src_dir, path) = multi_route_prod_server_source("deploy-smoke-dap-route-count-source");
+    let out = temp_output_dir("deploy-smoke-dap-route-count");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke =
+        std::fs::read_to_string(out.join("deploy").join("smoke-test.sh")).expect("smoke test");
+
+    assert!(smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#
+    ));
+    assert!(smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 2'"#
+    ));
+    assert!(!smoke.contains(
+        r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#
+    ));
+    cmd_verify_build(&out).expect("verify prod build");
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn verify_build_rejects_deploy_smoke_dap_native_route_count_mismatch() {
+    let (src_dir, path) =
+        multi_route_prod_server_source("deploy-smoke-dap-route-count-mismatch-source");
+    let out = temp_output_dir("deploy-smoke-dap-route-count-mismatch");
+
+    cmd_build_with_profile(&path, &out, BuildProfile::Production).expect("prod build");
+    let smoke_path = out.join("deploy").join("smoke-test.sh");
+    let smoke = std::fs::read_to_string(&smoke_path).expect("smoke test");
+    write_text(
+        &smoke_path,
+        &smoke.replace(
+            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 2'"#,
+            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#,
+        ),
+    )
+    .expect("write corrupt smoke test");
+
+    let err = cmd_verify_build(&out).expect_err("smoke DAP native route count mismatch");
+
+    assert!(
+        err.to_string()
+            .contains("deploy smoke test must check DAP native production summary counters"),
+        "{err:?}"
+    );
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(out);
 }

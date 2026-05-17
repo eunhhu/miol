@@ -2,6 +2,10 @@
 
 Implementation deltas live here, not in [SPEC.md](SPEC.md). Keep entries factual and dated.
 
+## 2026-05-18
+
+- Fixed generated deploy smoke DAP native route summary checks to use the actual server route count, so shop-scale builds with many routes do not fail against a one-route expectation.
+
 ## 2026-05-17
 
 - Aligned `clippy.toml` with the workspace Rust MSRV and replaced the remaining newer API use in DAP hit conditions so `cargo clippy -- -D warnings` is warning-free on the declared toolchain floor.

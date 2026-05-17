@@ -4178,14 +4178,17 @@ pub(crate) fn verify_deploy_smoke_test_artifact(
             }
         }
     }
-    if !artifact.routes.is_empty()
-        && (!smoke.contains(
+    if !artifact.routes.is_empty() {
+        let dap_native_route_summary = format!(
+            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": {}'"#,
+            artifact.routes.len()
+        );
+        if !smoke.contains(
             r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'"#,
-        ) || !smoke.contains(
-            r#"orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'"#,
-        ))
-    {
-        anyhow::bail!("deploy smoke test must check DAP native production summary counters");
+        ) || !smoke.contains(&dap_native_route_summary)
+        {
+            anyhow::bail!("deploy smoke test must check DAP native production summary counters");
+        }
     }
     if !artifact.routes.is_empty()
         && (!smoke.contains(r#"orv_smoke_reveal_contains "reveal smoke required markers" "#)
@@ -12477,10 +12480,11 @@ orv_smoke_dap_summary_contains "dap smoke marker dap source bundle" '"dap_source
 "#,
     );
     if !server_artifact.routes.is_empty() {
-        script.push_str(
+        let native_route_count = server_artifact.routes.len();
+        let _ = writeln!(
+            script,
             r#"orv_smoke_dap_summary_contains "dap native target summary" '"native_server_target_count": 1'
-orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": 1'
-"#,
+orv_smoke_dap_summary_contains "dap native route summary" '"native_server_route_count": {native_route_count}'"#
         );
     }
     if let Some(route) = server_artifact.routes.first() {
