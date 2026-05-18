@@ -41,9 +41,9 @@ orv의 차별점은 "새 문법" 자체보다 **프로젝트 그래프를 중심
 - `orv init <dir> --template shop`
 - 일부 editor/LSP/DAP/bootstrap surface
 
-Native optimizer, production editor reveal UI, full project-specialized runtime generation, custom DB engine, CRDT, `@gpu`, `@net`, broad FFI는 아직 안정 제품 계약이 아니다.
+Native optimizer, production editor reveal UI, full project-specialized runtime generation, custom DB engine, CRDT, `@gpu`, `@net`, broad FFI는 아직 안정 제품 계약이 아니다. 현재 상태를 가장 짧게 말하면 **reference MVP와 artifact contract는 많이 구현됐고, production-grade platform과 first-party editor 제품은 아직 남아 있다**.
 
-상세 판정은 [MVP.md](MVP.md), [IMPLEMENTATION_MATRIX.md](IMPLEMENTATION_MATRIX.md), [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md)를 본다.
+상세 판정은 [MVP.md](MVP.md), [IMPLEMENTATION_MATRIX.md](IMPLEMENTATION_MATRIX.md), [IMPLEMENTATION_GAP_REPORT.md](IMPLEMENTATION_GAP_REPORT.md), [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md)를 본다.
 
 ## 현재 안정화 중심축
 
@@ -61,7 +61,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 |------|-----------|
 | `@server`, `@route`, `@html`, `@form` | `@gpu`, `@net`, CRDT |
 | `@db`, schema/migration DSL | custom DB optimizer, sharding, replication |
-| `@auth`, `@session`, `@csrf`, `@rateLimit` | full self-host editor |
+| `@Auth`, `@session`, `@csrf`, `@rateLimit` | full self-host editor |
 | `@payment`, `@shipping`, webhook safety | broad FFI and `@unsafe` workflows |
 | `orv init <dir> --template shop`, `orv dev`, `orv build --prod` | full native compiler and optimized client runtime |
 | `orv deploy-env-check`, `orv benchmark-report`, generated preflight/benchmark evidence artifacts, generated smoke-test | advanced cloud object storage/provider matrix |
@@ -92,16 +92,18 @@ Generated smoke tests are part of the MVP contract: production builds should che
 | [MVP.md](MVP.md) | 지금 되는 것과 MVP non-goal |
 | [IMPLEMENTATION_MATRIX.md](IMPLEMENTATION_MATRIX.md) | 상태, 계약 레벨, milestone, crate, fixture, CLI 표 |
 | [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) | 상태 용어와 빠른 요약 |
+| [IMPLEMENTATION_GAP_REPORT.md](IMPLEMENTATION_GAP_REPORT.md) | 전체 문서 대비 진행률과 남은 기능 분석 |
 | [SPEC.md](SPEC.md) | 공식 문법과 목표 의미론 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 현재 Rust crate 구조와 데이터 흐름 |
 | [OPERATIONAL_SURFACES.md](OPERATIONAL_SURFACES.md) | CLI/LSP/DAP/build/DB 운영 surface |
+| [AI_FEATURES.md](AI_FEATURES.md) | 에디터 AI autocomplete와 학습 전략 |
 | [BENCHMARK_SHOP_5H.md](BENCHMARK_SHOP_5H.md) | 5시간 쇼핑몰 테스트 프로토콜 |
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | 안전한 기본값과 scaffold 보안 기대치 |
 | [ROADMAP.md](ROADMAP.md) | 미래 기능 |
 | [CHANGELOG.md](CHANGELOG.md) | 날짜가 붙은 구현 델타 |
 | [DOCUMENTATION.md](DOCUMENTATION.md) | 문서 수정 규칙 |
 
-처음 읽을 때는 `README -> MVP -> IMPLEMENTATION_MATRIX -> SPEC -> ARCHITECTURE` 순서를 권장한다. 문서 간 충돌 시 언어 의미론은 `SPEC.md`, 구현/계약 상태는 `IMPLEMENTATION_MATRIX.md`, 운영 surface는 `OPERATIONAL_SURFACES.md`를 따른다.
+처음 읽을 때 빠른 경로는 `README -> MVP -> IMPLEMENTATION_MATRIX -> IMPLEMENTATION_GAP_REPORT -> SPEC -> ARCHITECTURE -> OPERATIONAL_SURFACES`이고, 전체 권장 순서는 [DOCUMENTATION.md](DOCUMENTATION.md)를 따른다. 문서 간 충돌 시 언어 의미론은 `SPEC.md`, 구현/계약 상태는 `IMPLEMENTATION_MATRIX.md`, 운영 surface는 `OPERATIONAL_SURFACES.md`, 에디터 AI 전략은 `AI_FEATURES.md`를 따른다.
 
 ## 성능 목표
 
@@ -139,9 +141,11 @@ miol/
 │   ├── MVP.md
 │   ├── IMPLEMENTATION_MATRIX.md
 │   ├── IMPLEMENTATION_STATUS.md
+│   ├── IMPLEMENTATION_GAP_REPORT.md
 │   ├── SPEC.md
 │   ├── ARCHITECTURE.md
 │   ├── OPERATIONAL_SURFACES.md
+│   ├── AI_FEATURES.md
 │   ├── BENCHMARK_SHOP_5H.md
 │   ├── SECURITY_MODEL.md
 │   ├── ROADMAP.md

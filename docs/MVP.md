@@ -8,6 +8,16 @@
 
 이 문서의 목적은 "아이디어를 MVP로 줄이자"가 아니라, 이미 구현 중인 MVP의 제품 경계를 선명하게 잡는 것이다. 상세 상태와 계약 레벨은 [IMPLEMENTATION_MATRIX.md](IMPLEMENTATION_MATRIX.md)를 따른다.
 
+## 현재 Gap 판정
+
+[IMPLEMENTATION_GAP_REPORT.md](IMPLEMENTATION_GAP_REPORT.md) 기준으로 현재 MVP는 reference runtime, shop scaffold, build/deploy/reveal artifact 경로가 강하다. 반대로 full native optimizer, production provider adapters, custom DB engine, first-party native editor UI, CRDT/GPU/media/network 같은 advanced domains는 MVP 완료 조건이 아니다.
+
+따라서 MVP 진행률을 올리는 작업은 새 domain을 늘리는 작업이 아니라 다음 세 가지를 닫는 작업이다.
+
+- `ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal` 계약을 golden regression으로 고정한다.
+- `orv init --template shop -> build --prod -> verify-build -> deploy-env-check -> smoke-test -> benchmark-report` 경로를 사람 테스트 전에 자동으로 재현 가능하게 만든다.
+- 실제 5시간 shop benchmark evidence를 기록하고, 실패 원인을 syntax/scaffold/error/editor/documentation issue로 분류한다.
+
 ## MVP 포함 범위
 
 | 영역 | 현재 목표 |
@@ -36,7 +46,7 @@ The product MVP is not "all language features". It is the smallest slice that ca
 - `@html`
 - `@form`
 - `@db`
-- `@auth`
+- `@Auth`
 - `@payment`
 - `@shipping`
 - `@design`
@@ -97,3 +107,7 @@ These remain roadmap until promoted by benchmark evidence:
 ## Success Gate
 
 MVP work should be judged by [BENCHMARK_SHOP_5H.md](BENCHMARK_SHOP_5H.md), not by feature count. A new feature belongs in MVP only if it reduces benchmark time, removes unsafe manual work, or makes the resulting shop easier to verify.
+
+## Execution Rule
+
+Work should move in small contract units. Prefer one invariant, one fixture or targeted test, and one documentation update over broad feature sweeps. Full test sweeps are reserved for release gates or shared-contract changes; day-to-day progress should use focused unit/smoke checks that directly cover the touched surface.

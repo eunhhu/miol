@@ -55,7 +55,9 @@
 - `docs/MVP.md`
 - `docs/IMPLEMENTATION_MATRIX.md`
 - `docs/IMPLEMENTATION_STATUS.md`
+- `docs/IMPLEMENTATION_GAP_REPORT.md`
 - `docs/OPERATIONAL_SURFACES.md`
+- `docs/AI_FEATURES.md`
 - `docs/ROADMAP.md`
 - `docs/CHANGELOG.md`
 
@@ -64,15 +66,19 @@
 - `MVP.md`: 지금 되는 것, MVP 포함/제외 범위
 - `IMPLEMENTATION_MATRIX.md`: 상태, 계약 레벨, milestone, crate, fixture, CLI 표
 - `IMPLEMENTATION_STATUS.md`: 상태 용어와 빠른 요약
+- `IMPLEMENTATION_GAP_REPORT.md`: 전체 문서 대비 진행률, 남은 기능, 리스크 분석 보고서
 - `OPERATIONAL_SURFACES.md`: CLI/LSP/DAP/build/DB 같은 운영 surface 세부
+- `AI_FEATURES.md`: first-party editor AI autocomplete, RAG, 평가셋, synthetic data, 로컬 파인튜닝 전략
 - `ROADMAP.md`: 미래 기능
 - `CHANGELOG.md`: 날짜가 붙은 구현 델타
 
 판정 원칙:
 
 - 구현/계약 상태는 `IMPLEMENTATION_MATRIX.md`가 기준이다.
+- `IMPLEMENTATION_GAP_REPORT.md`는 상태표의 파생 분석이다. 진행률/리스크/우선순위를 요약하되, 기능별 authoritative 판정은 `IMPLEMENTATION_MATRIX.md`에 남긴다.
 - 운영 command/method 세부는 `OPERATIONAL_SURFACES.md`가 기준이다.
 - 미래 기능은 `ROADMAP.md`에만 둔다.
+- 에디터 AI 제품/학습 전략은 `AI_FEATURES.md`에 둔다.
 - 날짜형 보충은 `CHANGELOG.md`로 보낸다.
 
 ## 3. 실험 사양 / 탐색 예제
@@ -134,6 +140,7 @@
 - 공식 문법이나 의미론을 바꾸면 `docs/SPEC.md`를 수정한다.
 - 사용감이나 미래 방향을 실험하면 `fixtures/default-syntax.orv` 또는 `fixtures/plan/*.orv`를 수정한다.
 - 구현 구조가 바뀌면 `docs/ARCHITECTURE.md`를 수정한다.
+- 에디터 AI autocomplete, synthetic data, eval, fine-tuning 방향을 바꾸면 `docs/AI_FEATURES.md`를 수정한다.
 - 문서 간 충돌을 발견하면, 우선 `SPEC.md`와 예제의 차이를 명시적으로 판단한다.
 
 ## 권장 읽기 순서
@@ -141,10 +148,12 @@
 1. `docs/README.md`
 2. `docs/MVP.md`
 3. `docs/IMPLEMENTATION_MATRIX.md`
-4. `docs/SPEC.md`
-5. `docs/ARCHITECTURE.md`
-6. `docs/OPERATIONAL_SURFACES.md`
-7. `docs/IMPLEMENTATION_STATUS.md`
-8. `fixtures/default-syntax.orv`
-9. `fixtures/plan/*.orv`
-10. `fixtures/e2e/*.orv`
+4. `docs/IMPLEMENTATION_GAP_REPORT.md`
+5. `docs/SPEC.md`
+6. `docs/ARCHITECTURE.md`
+7. `docs/OPERATIONAL_SURFACES.md`
+8. `docs/AI_FEATURES.md`
+9. `docs/IMPLEMENTATION_STATUS.md`
+10. `fixtures/default-syntax.orv`
+11. `fixtures/plan/*.orv`
+12. `fixtures/e2e/*.orv`

@@ -19,6 +19,18 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 - route, DB query, HTML node, function call, domain invocation의 동일 reveal 모델
 - first-party editor 없이도 CLI/static graph view만으로 production output에서 source로 돌아가는 경로
 
+## Promotion Priorities
+
+[IMPLEMENTATION_GAP_REPORT.md](IMPLEMENTATION_GAP_REPORT.md)는 matrix의 파생 분석이다. 상태/계약의 authoritative source는 이 문서이고, gap report는 다음 작업 순서를 제안한다.
+
+| Priority | 기준 | 승격 조건 |
+|----------|------|-----------|
+| P0 | core spine schema | ProjectGraph/origin-map/trace/build/deploy schema가 fixture와 drift gate로 고정됨 |
+| P1 | shop acceptance | generated shop smoke와 benchmark report가 fresh project에서 재현되고 human evidence가 기록됨 |
+| P2 | production boundary | DB/provider adapter와 checkout transaction/idempotency/security boundary가 명확해짐 |
+| P3 | reveal product value | route/html/db/function/domain/trace reveal이 같은 origin schema로 검증됨 |
+| P4 | advanced domains | shop benchmark나 security gap을 직접 줄일 때만 MVP로 승격 |
+
 ## Status Terms
 
 | Status | 의미 |
@@ -62,6 +74,7 @@ ProjectGraph + HIR Origin + Reference Runtime + Trace/Reveal
 | AST ProjectGraph v1 | implemented | experimental | M0/M3 | `orv-project`, `orv-cli` | CLI graph tests | `orv graph` | File/import/declaration/domain graph |
 | HIR origin map | implemented | experimental | M0/M3 | `orv-hir`, `orv-compiler` | origin/graph CLI tests | `orv origins`, `orv graph` | Contains/calls semantic edges |
 | Reference tree-walking runtime | implemented | experimental | M0 | `orv-runtime` | `fixtures/e2e/hello.orv` | `orv run` | Main execution path |
+| Source test runner | implemented | experimental | M0 | `orv-cli`, `orv-runtime` | test runner CLI tests | `orv test`, `orv test --list` | Discovers `test` blocks, filters by name, emits list JSON schema v1, and executes selected blocks through the reference runtime |
 | HTTP/1.1 `@server` / `@route` | implemented | experimental | M1 | `orv-runtime` | `fixtures/e2e/hello.orv`, `fixtures/e2e/path_param.orv` | `orv run` | Hyper reference server |
 | Route origin header | implemented | experimental | M1/M3 | `orv-runtime`, `orv-compiler` | origin runtime tests | `orv run` | Emits `x-orv-origin-id` |
 | Request body parsing | implemented | experimental | M1 | `orv-runtime` | `fixtures/e2e/shopping_mall.orv` | `orv run` | JSON/form-urlencoded into `@body`; raw body available |
