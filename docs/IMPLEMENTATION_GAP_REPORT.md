@@ -117,7 +117,7 @@ App Authoring에 필요한 schema validation은 강해지고 있다. Systems Sur
 - path param, query/header/body/rawBody request state
 - JSON/form-urlencoded body parse
 - named schema request binding: `@body: T`, `@query: T`, `@form: T`
-- validation failure 400 response
+- validation failure 400 `orv.validation.error` response
 - `@respond`, `@serve`, static files
 - route origin and response origin headers
 - basic middleware/security domains in reference runtime

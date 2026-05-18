@@ -2202,6 +2202,10 @@ mod tests {
     )]
 
     use super::*;
+    use crate::interp::{
+        VALIDATION_ERROR_RESPONSE_KIND, VALIDATION_ERROR_RESPONSE_SCHEMA_VERSION,
+        VALIDATION_FAILED_CODE,
+    };
     use hmac::{Hmac, Mac};
     use hyper::client::conn::http1 as client_http1;
     use hyper_util::rt::TokioIo;
@@ -4078,8 +4082,34 @@ mod tests {
         .await;
     }
 
+    fn assert_validation_error_payload(
+        value: &serde_json::Value,
+        expected_path: &str,
+        expected_code: &str,
+        expected_actual: serde_json::Value,
+    ) {
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(VALIDATION_ERROR_RESPONSE_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            value["kind"],
+            serde_json::json!(VALIDATION_ERROR_RESPONSE_KIND)
+        );
+        assert_eq!(value["error"], serde_json::json!(VALIDATION_FAILED_CODE));
+        let fields = value["fields"].as_array().expect("validation fields");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["path"], serde_json::json!(expected_path));
+        assert_eq!(fields[0]["code"], serde_json::json!(expected_code));
+        assert!(fields[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("constraint mismatch")));
+        assert!(fields[0]["expected"].is_string());
+        assert_eq!(fields[0]["actual"], expected_actual);
+    }
+
     #[tokio::test]
-    async fn declarative_request_bindings_validate_query_and_form() {
+    async fn declarative_request_bindings_validate_body_query_and_form() {
         run_on_localset(async {
             let ServerTestCase {
                 listen,
@@ -4100,6 +4130,10 @@ mod tests {
                     @route GET /search {
                       @query: SearchQuery
                       @respond 200 { page: @query.page, q: @query.q }
+                    }
+                    @route POST /signup-json {
+                      @body: SignupForm
+                      @respond 200 { email: @body.email, age: @body.age }
                     }
                     @route POST /signup {
                       @form: SignupForm
@@ -4125,15 +4159,50 @@ mod tests {
             assert_eq!(search["page"], serde_json::json!(2));
             assert_eq!(search["q"], serde_json::json!("hello"));
 
-            let (bad_search_status, _, bad_search_body) =
+            let (bad_search_status, bad_search_ct, bad_search_body) =
                 send_request(addr, "GET", "/search?page=0&q=hello", None).await;
             assert_eq!(bad_search_status, 400);
+            assert_eq!(bad_search_ct.as_deref(), Some("application/json"));
             let bad_search: serde_json::Value =
                 serde_json::from_slice(&bad_search_body).expect("bad search json");
-            assert_eq!(bad_search["error"], serde_json::json!("validation_failed"));
-            assert!(bad_search["fields"]
-                .as_array()
-                .is_some_and(|fields| !fields.is_empty()));
+            assert_validation_error_payload(
+                &bad_search,
+                "$.page",
+                "type_mismatch",
+                serde_json::json!("0"),
+            );
+
+            let (json_signup_status, json_signup_ct, json_signup_body) = send_request(
+                addr,
+                "POST",
+                "/signup-json",
+                Some(r#"{"email":" USER@ORV.DEV ","age":"15"}"#.to_string()),
+            )
+            .await;
+            assert_eq!(json_signup_status, 200);
+            assert_eq!(json_signup_ct.as_deref(), Some("application/json"));
+            let json_signup: serde_json::Value =
+                serde_json::from_slice(&json_signup_body).expect("json signup");
+            assert_eq!(json_signup["email"], serde_json::json!("user@orv.dev"));
+            assert_eq!(json_signup["age"], serde_json::json!(15));
+
+            let (bad_json_signup_status, bad_json_signup_ct, bad_json_signup_body) = send_request(
+                addr,
+                "POST",
+                "/signup-json",
+                Some(r#"{"email":"ok@orv.dev","age":12}"#.to_string()),
+            )
+            .await;
+            assert_eq!(bad_json_signup_status, 400);
+            assert_eq!(bad_json_signup_ct.as_deref(), Some("application/json"));
+            let bad_json_signup: serde_json::Value =
+                serde_json::from_slice(&bad_json_signup_body).expect("bad json signup");
+            assert_validation_error_payload(
+                &bad_json_signup,
+                "$.age",
+                "type_mismatch",
+                serde_json::json!(12),
+            );
 
             let (signup_status, _, signup_body) = send_request_with_content_type(
                 addr,
@@ -4149,21 +4218,25 @@ mod tests {
             assert_eq!(signup["email"], serde_json::json!("user@orv.dev"));
             assert_eq!(signup["age"], serde_json::json!(15));
 
-            let (bad_signup_status, _, bad_signup_body) = send_request_with_content_type(
-                addr,
-                "POST",
-                "/signup",
-                "email=ok%40orv.dev&age=12".to_string(),
-                "application/x-www-form-urlencoded",
-            )
-            .await;
+            let (bad_signup_status, bad_signup_ct, bad_signup_body) =
+                send_request_with_content_type(
+                    addr,
+                    "POST",
+                    "/signup",
+                    "email=ok%40orv.dev&age=12".to_string(),
+                    "application/x-www-form-urlencoded",
+                )
+                .await;
             assert_eq!(bad_signup_status, 400);
+            assert_eq!(bad_signup_ct.as_deref(), Some("application/json"));
             let bad_signup: serde_json::Value =
                 serde_json::from_slice(&bad_signup_body).expect("bad signup json");
-            assert_eq!(bad_signup["error"], serde_json::json!("validation_failed"));
-            assert!(bad_signup["fields"]
-                .as_array()
-                .is_some_and(|fields| !fields.is_empty()));
+            assert_validation_error_payload(
+                &bad_signup,
+                "$.age",
+                "type_mismatch",
+                serde_json::json!("12"),
+            );
 
             handle.abort();
         })

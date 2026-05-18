@@ -42,6 +42,9 @@ pub(crate) const ORV_CSRF_COOKIE_NAME: &str = "orv_csrf";
 pub(crate) const ORV_REFERENCE_CSRF_TOKEN: &str = "orv-reference-csrf";
 pub(crate) const ORV_SESSION_COOKIE_NAME: &str = "orv_session";
 pub(crate) const ORV_SESSION_ROLE_COOKIE_NAME: &str = "orv_session_role";
+pub(crate) const VALIDATION_ERROR_RESPONSE_SCHEMA_VERSION: i64 = 1;
+pub(crate) const VALIDATION_ERROR_RESPONSE_KIND: &str = "orv.validation.error";
+pub(crate) const VALIDATION_FAILED_CODE: &str = "validation_failed";
 const MAX_SERVE_BYTES: u64 = 10 * 1024 * 1024;
 
 fn resolve_runtime_path(path: &str, working_dir: Option<&Path>) -> PathBuf {
@@ -3752,13 +3755,7 @@ impl<W: Write> Interp<W> {
                 Ok(Some(Value::Void))
             }
             Err(errors) => {
-                let payload = Value::Object(vec![
-                    (
-                        "error".to_string(),
-                        Value::Str("validation_failed".to_string()),
-                    ),
-                    ("fields".to_string(), Value::Array(errors)),
-                ]);
+                let payload = validation_error_response_payload(errors);
                 Ok(Some(self.respond_value(400, payload)))
             }
         }
@@ -6958,6 +6955,24 @@ fn validation_error(path: &str, code: &str, message: &str, expected: &str, actua
     ])
 }
 
+fn validation_error_response_payload(errors: Vec<Value>) -> Value {
+    Value::Object(vec![
+        (
+            "schema_version".to_string(),
+            Value::Int(VALIDATION_ERROR_RESPONSE_SCHEMA_VERSION),
+        ),
+        (
+            "kind".to_string(),
+            Value::Str(VALIDATION_ERROR_RESPONSE_KIND.to_string()),
+        ),
+        (
+            "error".to_string(),
+            Value::Str(VALIDATION_FAILED_CODE.to_string()),
+        ),
+        ("fields".to_string(), Value::Array(errors)),
+    ])
+}
+
 fn child_path(parent: &str, child: &str) -> String {
     if parent == "$" {
         format!("$.{child}")
@@ -8952,17 +8967,23 @@ let third: int = 3
         assert_eq!(out, "");
         let response = outcome.response.expect("validation response");
         assert_eq!(response.status, 400);
-        let Value::Object(fields) = response.payload else {
-            panic!("validation payload must be object");
-        };
-        assert!(matches!(
-            object_field(&fields, "error"),
-            Some(Value::Str(error)) if error == "validation_failed"
-        ));
-        assert!(matches!(
-            object_field(&fields, "fields"),
-            Some(Value::Array(errors)) if !errors.is_empty()
-        ));
+        assert_eq!(
+            runtime_value_json(&response.payload),
+            serde_json::json!({
+                "schema_version": VALIDATION_ERROR_RESPONSE_SCHEMA_VERSION,
+                "kind": VALIDATION_ERROR_RESPONSE_KIND,
+                "error": VALIDATION_FAILED_CODE,
+                "fields": [
+                    {
+                        "path": "$.age",
+                        "code": "type_mismatch",
+                        "message": "constraint mismatch: 12 does not satisfy `min=13`",
+                        "expected": "int(min=13)",
+                        "actual": "12"
+                    }
+                ]
+            })
+        );
     }
 
     #[test]

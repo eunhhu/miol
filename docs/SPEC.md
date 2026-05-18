@@ -735,6 +735,8 @@ struct CheckoutForm {
 
 ```orv
 @respond 400 {
+  schema_version: 1
+  kind: "orv.validation.error"
   error: "validation_failed"
   fields: ValidationError[]
 }
