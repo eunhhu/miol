@@ -24281,6 +24281,130 @@ fn graph_json_for_path_outputs_schema_nodes_and_edges() {
 }
 
 #[test]
+fn graph_json_contract_freezes_public_object_keys_and_types() {
+    fn assert_keys(value: &serde_json::Value, expected: &[&str], context: &str) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{context} must be an object"));
+        let actual = object
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected, "{context} keys drifted");
+    }
+
+    let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
+    let value = project_graph_json_for_path(&path).expect("graph json");
+
+    assert_keys(
+        &value,
+        &["schema_version", "stats", "nodes", "edges", "semantic"],
+        "project graph",
+    );
+    assert_eq!(value["schema_version"], serde_json::json!(1));
+
+    assert_keys(
+        &value["stats"],
+        &[
+            "node_count",
+            "edge_count",
+            "file_count",
+            "import_count",
+            "declaration_count",
+            "domain_count",
+            "max_source_contains_depth",
+            "semantic_origin_count",
+            "semantic_edge_count",
+            "semantic_call_edge_count",
+            "max_semantic_contains_depth",
+        ],
+        "project graph stats",
+    );
+    for key in value["stats"].as_object().expect("stats object").keys() {
+        assert!(
+            value["stats"][key].is_u64(),
+            "project graph stats.{key} must be an unsigned integer"
+        );
+    }
+
+    let node = value["nodes"][0].clone();
+    assert_keys(&node, &["id", "kind", "name", "file", "span"], "node");
+    assert!(node["id"].is_u64());
+    assert!(node["kind"].is_string());
+    assert!(node["name"].is_string());
+    assert!(node["file"].is_u64());
+    assert_keys(&node["span"], &["file", "start", "end"], "node span");
+    assert!(node["span"]["file"].is_u64());
+    assert!(node["span"]["start"].is_u64());
+    assert!(node["span"]["end"].is_u64());
+
+    let edge = value["edges"][0].clone();
+    assert_keys(&edge, &["from", "to", "kind"], "edge");
+    assert!(edge["from"].is_u64());
+    assert!(edge["to"].is_u64());
+    assert!(edge["kind"].is_string());
+
+    let semantic = &value["semantic"];
+    assert_keys(
+        semantic,
+        &["origin_map", "origin_edges", "origin_links"],
+        "semantic",
+    );
+    assert_keys(
+        &semantic["origin_map"],
+        &["version", "entries", "edges"],
+        "semantic origin_map",
+    );
+    assert!(semantic["origin_map"]["version"].is_u64());
+
+    let origin_entry = semantic["origin_map"]["entries"][0].clone();
+    assert_keys(
+        &origin_entry,
+        &["id", "kind", "name", "span", "fingerprint"],
+        "origin entry",
+    );
+    assert!(origin_entry["id"].is_string());
+    assert!(origin_entry["kind"].is_string());
+    assert!(origin_entry["name"].is_string());
+    assert!(origin_entry["fingerprint"].is_string());
+    assert_keys(
+        &origin_entry["span"],
+        &["file", "start", "end"],
+        "origin entry span",
+    );
+
+    let origin_map_edge = semantic["origin_map"]["edges"][0].clone();
+    assert_keys(&origin_map_edge, &["from", "to", "kind"], "origin map edge");
+    assert!(origin_map_edge["from"].is_string());
+    assert!(origin_map_edge["to"].is_string());
+    assert!(origin_map_edge["kind"].is_string());
+
+    let semantic_edge = semantic["origin_edges"][0].clone();
+    assert_keys(
+        &semantic_edge,
+        &["kind", "from", "to"],
+        "semantic origin edge",
+    );
+    assert!(semantic_edge["kind"].is_string());
+    assert!(semantic_edge["from"].is_string());
+    assert!(semantic_edge["to"].is_string());
+
+    let origin_link = semantic["origin_links"][0].clone();
+    assert_keys(
+        &origin_link,
+        &["kind", "origin_id", "node_id"],
+        "semantic origin link",
+    );
+    assert_eq!(origin_link["kind"], "source_node");
+    assert!(origin_link["origin_id"].is_string());
+    assert!(origin_link["node_id"].is_u64());
+}
+
+#[test]
 fn graph_view_writes_static_html_artifact() {
     let path = workspace_path(&["fixtures", "e2e", "hello.orv"]);
     let out = temp_output_dir("graph-view");
