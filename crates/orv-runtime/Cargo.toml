@@ -11,7 +11,6 @@ rust-version.workspace = true
 [dependencies]
 orv-diagnostics = { workspace = true }
 orv-hir = { workspace = true }
-orv-syntax = { workspace = true }
 hmac = { workspace = true }
 argon2 = { workspace = true }
 rand_core = { workspace = true }
@@ -33,6 +32,7 @@ bytes = "1"
 [dev-dependencies]
 orv-analyzer = { workspace = true }
 orv-resolve = { workspace = true }
+orv-syntax = { workspace = true }
 pretty_assertions = { workspace = true }
 # 통합 테스트용 HTTP 클라이언트 + 러너.
 tokio = { version = "1", features = ["full"] }
